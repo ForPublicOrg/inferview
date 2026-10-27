@@ -1,0 +1,102 @@
+---
+id: inf-008
+title: Speculative decoding made throughput worse
+subtitle: find the cause
+track: inference
+module: faster-cheaper
+type: debug
+difficulty: medium
+seniority: [mid, senior]
+minutes: 20
+core: true
+tags: [speculative-decoding, throughput, debugging, metrics]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: techinterview.org, why speculative decoding is faster (2026-08-10)
+    url: https://www.techinterview.org/post/3233477300/why-speculative-decoding-is-faster/
+    note: source of the question "You turned on speculative decoding and throughput went down, what happened?"
+  - title: Fast Inference from Transformers via Speculative Decoding (Leviathan, Kalman and Matias, ICML 2023)
+    url: https://arxiv.org/abs/2211.17192
+    note: expected tokens per pass (1 - alpha^(gamma+1)) / (1 - alpha); walltime depends on draft cost
+  - title: vLLM docs, speculative decoding
+    url: https://docs.vllm.ai/en/latest/features/speculative_decoding/
+    note: methods and the lossless guarantee up to hardware numerics
+choices:
+  - text: The draft model is too small to predict the target well; a larger draft model would raise acceptance and fix throughput.
+    correct: false
+    why: A larger draft raises the cost of every draft step too. At this load the extra verification compute is the problem, and a bigger draft adds compute.
+  - text: At peak the step is close to compute bound, so verifying 6 positions for each of 96 sequences costs real time, and with acceptance 0.45 each pass yields only about 1.8 tokens. The saved target passes no longer pay for the extra work.
+    correct: true
+    why: It matches every number. Step time rose more than the tokens per pass, the regression appears only under load, and overnight latency improved.
+  - text: The draft model's KV cache took memory from the target, so fewer sequences fit and the batch shrank.
+    correct: false
+    why: A real cost in general, but the dashboard shows 96 running sequences before and after and no preemptions, so the batch did not shrink.
+  - text: Speculative decoding changed the sampling distribution, so answers got longer and each request now takes more steps.
+    correct: false
+    why: Rejection-sampling verification preserves the target distribution, and output tokens per request are unchanged in the dashboard.
+  - text: Enabling speculation turned off prefix caching, so every request now pays full prefill.
+    correct: false
+    why: The prefix cache hit rate is unchanged in the dashboard, and a prefill problem would show in TTFT, which barely moved.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="As asked">
+"You turned on speculative decoding and throughput went down. What happened?"
+</Callout>
+
+A team serving a dense model with continuous batching enabled a draft model with a draft length of 5. Here is their dashboard for the busiest hour, before and after, plus an overnight check at low load.
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Metric, peak hour</th><th>Before</th><th>After</th></tr></thead>
+<tbody>
+<tr><td>Running sequences per step (mean)</td><td>96</td><td>96</td></tr>
+<tr><td>Waiting requests, preemptions</td><td>0, 0</td><td>0, 0</td></tr>
+<tr><td>Mean context length</td><td>1,500 tokens</td><td>1,500 tokens</td></tr>
+<tr><td>Output tokens per request (mean)</td><td>310</td><td>310</td></tr>
+<tr><td>Prefix cache hit rate</td><td>62%</td><td>62%</td></tr>
+<tr><td>TTFT p50</td><td>280 ms</td><td>290 ms</td></tr>
+<tr><td>Draft acceptance rate</td><td>n/a</td><td>0.45</td></tr>
+<tr><td>Mean tokens per target pass</td><td>1.0</td><td>1.8</td></tr>
+<tr><td>TPOT p50</td><td>33 ms</td><td>42 ms</td></tr>
+<tr><td>Output throughput</td><td>2,900 tok/s</td><td>2,300 tok/s</td></tr>
+<tr><td colspan="3"><b>Overnight, 4 concurrent sequences</b></td></tr>
+<tr><td>TPOT p50</td><td>14 ms</td><td>8 ms</td></tr>
+</tbody>
+</table>
+</div>
+
+<p class="tiny">The dashboard is synthetic, built for this exercise; the numbers are internally consistent (96 sequences / 33 ms is about 2,900 tokens per second) but are not a measurement of any system.</p>
+
+Pick the root cause.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Tokens per pass went from 1.0 to 1.8. How much longer did each step get?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Why does the same change help overnight and hurt at peak?</p></details>
+
+## Answer
+
+The step became compute bound under load. Before, each step produced one token per sequence in 33 ms. After, each target pass yields 1.8 tokens per sequence, but TPOT is 42 ms per token, so each pass plus its draft steps takes about 1.8 x 42 = 76 ms, 2.3 times longer than before. A 1.8 times gain in tokens per pass cannot cover a 2.3 times longer step. At batch 4 overnight the step is bandwidth bound, the extra positions are nearly free, and TPOT drops from 14 to 8 ms, which is why the single-user test looked good.
+
+The acceptance numbers agree with the formula. With alpha 0.45 and a draft length of 5, the expected tokens per pass is (1 - 0.45^6) / 0.55 = 1.80. Each pass verifies 6 positions for each of 96 sequences, 576 positions, yet only about 0.8 of the 5 drafted tokens per sequence are accepted on average (0.45 + 0.45^2 + ... + 0.45^5), so about 84% of the drafted tokens are thrown away.
+
+Why the others tempt. A bigger draft model sounds like it would raise acceptance, but it raises the cost of every draft step at exactly the load where compute is short. The memory explanation is a real risk in general, but the batch and preemption rows rule it out here. The distribution and prefix-cache explanations would show up as longer outputs and slower TTFT, and neither row moved.
+
+Fixes, in order: gate speculation on load (on below a batch-size threshold, off above it); shorten the draft to 2 or 3, which lowers wasted verification at this acceptance rate; try a cheaper or better-matched draft (n-gram for repetitive outputs, or a trained head such as EAGLE-3) and compare acceptance; and measure goodput, not just throughput, for each setting.
+
+## Follow-ups
+
+- *What draft length would you try at alpha 0.45?* With a draft costing 5% of the target, Leviathan's walltime formula peaks at a draft length of 3 for this alpha, at about 1.5 times, and that is the low-load best case.
+- *How would you have caught this before production?* A load test that sweeps concurrency with and without speculation, plotting throughput and TPOT percentiles.
+- *Which metric tells you speculation is worth keeping?* Accepted tokens per verified position, next to throughput, split by batch size.
+
+## Common mistakes
+
+- Reading the overnight improvement as proof that the peak regression is noise.
+- Recommending a larger draft model to raise acceptance without accounting for its cost.
+- Assuming speculative decoding changes the outputs.
+- Looking only at tokens per pass and ignoring step time.

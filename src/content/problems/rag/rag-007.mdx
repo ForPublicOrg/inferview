@@ -1,0 +1,102 @@
+---
+id: rag-007
+title: The bot cites a deleted policy
+subtitle: find and fix
+track: rag
+module: ingestion
+type: debug
+difficulty: medium
+seniority: [mid, senior]
+minutes: 20
+core: true
+tags: [ingestion, freshness, deletes, indexing]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: techinterview.org, RAG system design interview (updated 2026-07-02)
+    url: https://www.techinterview.org/post/3233476088/rag-system-design-interview/
+    note: "The model just cited a policy we deleted last week. Why did that happen, and how do you stop it?"
+  - title: pgvector README
+    url: https://github.com/pgvector/pgvector
+    note: vectors are rows in a Postgres table; a deleted row is not returned by queries
+choices:
+  - text: The sync job only processes created or modified documents, so a deleted document's chunks are never removed
+    correct: true
+    why: The trace shows the chunk still in the index with the old document id, and `list_changed` never reports deletions, so nothing ever removes it.
+  - text: The model remembers the old policy from its training data and ignores the retrieved context
+    correct: false
+    why: The answer cites chunk `hr-remote-2024:0` from your own index, and the retrieval log shows that chunk returned at rank 1 on this request.
+  - text: A semantic cache in front of the pipeline served an answer cached before the deletion
+    correct: false
+    why: A cache hit would skip retrieval, but the log shows a fresh retrieval at request time that returned the deleted policy's chunk.
+  - text: The HNSW graph still contains nodes for deleted rows, and the index returns them until it is rebuilt
+    correct: false
+    why: Engines that delete lazily still filter deleted entries out of results; here the chunk row itself still exists, because nothing ever deleted it.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"The model just cited a policy we deleted last week. Why did that happen, and how do you stop it?"
+</Callout>
+
+The HR team deleted the 2024 remote-work policy on 20 October and published a new one. On 27 October an employee asks how many remote days are allowed and gets the old answer, with a citation. You have the ingestion job and the request trace.
+
+```python
+# runs nightly
+def sync(since):
+    for doc in source.list_changed(since):        # documents created or modified since the last run
+        chunks = chunk(doc.text)
+        for i, text in enumerate(chunks):
+            index.upsert(
+                id=f"{doc.id}:{i}",
+                vector=embed(text),
+                text=text,
+                meta={"doc": doc.id, "updated": doc.updated},
+            )
+```
+
+```text
+request 7f3a  2026-10-27T09:14:03Z  q="how many remote days per week?"
+  cache: miss
+  retrieve: k=5
+    1  hr-remote-2024:0     score=0.81  updated=2024-03-02
+    2  hr-remote-2026:0     score=0.79  updated=2026-10-20
+    3  hr-remote-2026:1     score=0.74  updated=2026-10-20
+    4  hr-travel-2025:3     score=0.52  updated=2025-06-11
+    5  hr-leave-2026:7      score=0.49  updated=2026-01-15
+  answer cites: hr-remote-2024:0
+source.get("hr-remote-2024") -> 404 Not Found
+```
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>What does `list_changed` return for a document that no longer exists?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>The source returns 404 for the cited document, but the index still has its chunk. Which code path could have removed it?</p></details>
+
+## Answer
+
+The sync is upsert-only. `list_changed(since)` reports documents that were created or modified; a deleted document is neither, so it never appears, and no code path ever removes its chunks. The index therefore holds both the 2024 and the 2026 policy, they are about the same topic, and the old one happened to score slightly higher. The model did exactly what it was asked: it answered from the top retrieved chunk and cited it.
+
+The fix has layers:
+
+1. **Process deletes.** Consume tombstones from the source (a change feed or webhook that includes deletions), and delete every chunk whose `meta.doc` matches.
+2. **Reconcile.** A periodic job lists all source ids and all indexed document ids and deletes the difference, because event streams drop messages.
+3. **Version chunk ids.** `id=f"{doc.id}:{i}"` also leaves orphans on edits: if a document shrinks from 12 chunks to 9, chunks 10 to 12 keep the old text. Write chunks under a version (`doc.id@version:i`), switch readers to the new version, then delete the old one.
+4. **Guard at query time.** Drop retrieved chunks whose document is marked deleted or superseded, and prefer the newest version when two versions of the same document match.
+5. **Test it.** Add eval questions about recently deleted and edited documents and assert the old answers do not come back.
+
+Why the wrong picks are tempting. "The model remembers its training data" is a real failure mode for public facts, but this is an internal policy and the citation points at your own chunk. Stale semantic caches are a real cause of exactly this symptom, which is why the trace shows `cache: miss`. Lazy graph deletion exists in several engines, but they filter tombstoned entries from results; the row here was never deleted at all.
+
+## Follow-ups
+
+- *How quickly must a delete propagate?* Agree a freshness target with the document owners (HR may need same-day removal for legal reasons) and alert on the lag.
+- *What about permission changes?* Same pipeline: an ACL change is a change, and stale ACL labels leak documents to people who lost access.
+- *How would you clean up the index you have now?* Run the reconciliation once with a dry run, review the list of orphaned document ids, then delete.
+
+## Common mistakes
+
+- Adding "prefer the newest document" to the prompt, which treats the symptom and leaves the deleted text searchable.
+- Full nightly re-indexes as the fix: correct, but they hide the missing delete path and get expensive as the corpus grows.
+- Forgetting the edit case, where positional chunk ids leave stale tails.

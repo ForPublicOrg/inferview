@@ -1,0 +1,112 @@
+---
+id: inf-014
+title: p99 inter-token latency doubled after a deploy
+subtitle: no model change
+track: inference
+module: operating
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 25
+core: false
+tags: [latency, chunked-prefill, vllm, incident, metrics]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: amitshekhariitbhu, AI engineering interview questions
+    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
+    note: "Your LLM endpoint's p99 latency doubled after a deploy with no model change. How do you diagnose it?"
+  - title: vLLM docs, optimization and tuning
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: smaller max_num_batched_tokens (for example 2048) gives better ITL, larger gives better TTFT, more than 8192 suggested for throughput
+  - title: "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve (2024)"
+    url: https://arxiv.org/abs/2403.02310
+    note: chunked prefills batched with decodes to avoid generation stalls
+  - title: vLLM V1 metrics loggers (source)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/v1/metrics/loggers.py
+    note: metric names used in the dashboard
+choices:
+  - text: The larger per-step token budget lets big prefill chunks share steps with decodes, so whenever a long prompt arrives every streaming user's next token waits for a much heavier step.
+    correct: true
+    why: It explains a tail-only ITL regression with better throughput and TTFT, and it matches the one line in the diff that changes step composition.
+  - text: A prompt template change broke prefix caching, so every request pays full prefill.
+    correct: false
+    why: The prefix cache hit rate is unchanged, and a prefill-cost problem would hurt TTFT first, which improved.
+  - text: The KV cache is running out, and requests are being preempted and recomputed.
+    correct: false
+    why: Preemptions are flat at zero and KV usage barely moved; preemption would also show as TTFT and queue-time spikes.
+  - text: The new base image ships a slower CUDA library, so every kernel is slower.
+    correct: false
+    why: A uniformly slower kernel would raise p50 ITL and lower throughput. p50 barely moved and throughput rose.
+  - text: The autoscaler scaled in after the deploy, leaving fewer replicas for the same traffic.
+    correct: false
+    why: Replica count and the waiting queue are unchanged, and fewer replicas would show up as queueing and worse TTFT.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="As asked">
+"Your LLM endpoint's p99 latency doubled after a deploy with no model change. How do you diagnose it?"
+</Callout>
+
+The endpoint streams chat responses from a vLLM deployment. Traffic is mostly short prompts with an occasional long document pasted in. After Tuesday's deploy, users report answers "freezing for a moment" mid-stream. The deploy diff:
+
+```diff
+-image: serving-base:2026.10.1
++image: serving-base:2026.10.2
+ engine:
+   model: same weights, same revision
+-  max_num_batched_tokens: 2048
++  max_num_batched_tokens: 16384     # "raise throughput", per the change request
+   enable_prefix_caching: true
+ log_level: info
+```
+
+Same-hour comparison, one week apart:
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Metric</th><th>Before</th><th>After</th></tr></thead>
+<tbody>
+<tr><td>Replicas, waiting requests (mean)</td><td>6, 0.4</td><td>6, 0.3</td></tr>
+<tr><td>Output throughput per replica</td><td>2,500 tok/s</td><td>2,700 tok/s</td></tr>
+<tr><td>TTFT p50 / p99</td><td>310 / 1,900 ms</td><td>270 / 1,300 ms</td></tr>
+<tr><td>ITL p50 / p99</td><td>31 / 58 ms</td><td>32 / 121 ms</td></tr>
+<tr><td>KV cache usage (mean)</td><td>58%</td><td>61%</td></tr>
+<tr><td>Prefix cache hit rate</td><td>47%</td><td>47%</td></tr>
+<tr><td>Preemptions per minute</td><td>0</td><td>0</td></tr>
+</tbody>
+</table>
+</div>
+
+<p class="tiny">The diff and dashboard are synthetic, built for this exercise.</p>
+
+Pick the root cause.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Which metrics got better, and which got worse only at the tail?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>What does one engine step contain when a 10,000-token prompt arrives while 60 users are streaming?</p></details>
+
+## Answer
+
+The pattern is a tail-only inter-token regression with better throughput and better TTFT, and only one change in the diff affects what goes into a step. With chunked prefill, the per-step token budget caps how many prompt tokens join each step alongside the decodes. At 2,048, a long pasted document is processed over several light steps and streaming users barely notice. At 16,384, most of it lands in one or two heavy steps, and every running sequence waits for those steps before getting its next token. That is the "freeze" users describe, and it shows at p99 because long prompts are occasional. vLLM's tuning docs describe exactly this trade: a smaller `max_num_batched_tokens` gives better inter-token latency, a larger one better TTFT and throughput.
+
+Diagnosis steps you would describe in the room: compare percentiles, not means; split TTFT from ITL; line up the regression with the deploy and read the diff; check the engine's own metrics (queue, KV usage, preemptions, prefix hits) to eliminate memory and caching; then confirm by replaying traffic with a few long prompts against both budget values.
+
+Fix: revert to a budget chosen from the ITL objective, or a middle value, and if long documents are frequent, route them to separate replicas or use prefill-decode disaggregation. Record the ITL objective next to the setting so the next "raise throughput" change is checked against it.
+
+Why the others tempt. Prompt changes that break prefix caching are a classic cause of latency regressions, but the hit rate did not move. Preemption storms do cause stalls, but the counter is at zero. A slower library is plausible whenever an image changes, but it would move p50 and throughput too. Scale-in is ruled out by the replica and queue rows.
+
+## Follow-ups
+
+- *How would you have caught it before users did?* A canary with an SLO check on p99 ITL, and a load test that includes long prompts.
+- *Why did TTFT improve?* Long prompts finish prefill in fewer steps, so their first token arrives sooner, and short prompts are admitted with more room per step.
+- *What if you need both good TTFT and good ITL?* Separate pools for prefill and decode, which is the case for disaggregated serving.
+
+## Common mistakes
+
+- Looking at mean latency, which barely moved.
+- Treating "no model change" as "no behaviour change"; engine settings change latency as much as weights do.
+- Rolling back the whole deploy without identifying the line, so the next attempt repeats it.

@@ -1,0 +1,25 @@
+// Small browser helpers shared by page scripts.
+
+export function readJson<T>(id: string, fallback: T): T {
+  const el = document.getElementById(id);
+  if (!el?.textContent) return fallback;
+  try {
+    return JSON.parse(el.textContent) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+export function h<K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  attrs: Record<string, string> = {},
+  ...children: (Node | string)[]
+): HTMLElementTagNameMap[K] {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'class') el.className = v;
+    else el.setAttribute(k, v);
+  }
+  el.append(...children);
+  return el;
+}

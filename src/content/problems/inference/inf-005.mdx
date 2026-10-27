@@ -1,0 +1,117 @@
+---
+id: inf-005
+title: Batching for a single GPU with synchronous callers
+track: inference
+module: batching
+type: design
+difficulty: hard
+seniority: [senior, staff]
+minutes: 45
+core: true
+tags: [batching, scheduling, queueing, backpressure, system-design]
+companies:
+  - name: Anthropic
+    url: https://www.aced.io/blog/ai-engineer-interview-questions
+updated: 2026-10-28
+sources:
+  - title: aced.io, AI engineer interview questions
+    url: https://www.aced.io/blog/ai-engineer-interview-questions
+    note: lists this prompt under Anthropic; secondary aggregator of candidate reports, paraphrased
+  - title: "Orca: A Distributed Serving System for Transformer-Based Generative Models (OSDI 2022)"
+    url: https://www.usenix.org/conference/osdi22/presentation/yu
+    note: iteration-level scheduling
+  - title: "Efficient Memory Management for Large Language Model Serving with PagedAttention (SOSP 2023)"
+    url: https://arxiv.org/abs/2309.06180
+    note: paged KV cache allocation
+  - title: vLLM docs, optimization and tuning
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: max_num_batched_tokens trade-off between ITL and TTFT; chunked prefill
+  - title: Databricks, LLM inference performance engineering best practices
+    url: https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices
+    note: batch 64 raised latency about 4x and throughput about 14x in an A100 example
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="As reported">
+"Design an inference batching system for a single GPU that can handle up to 100 inputs per batch while users wait synchronously."
+</Callout>
+
+You own one GPU running one model. Callers make a blocking HTTP request and wait for the complete result. The GPU can process at most 100 inputs in one batch. Design the component between the HTTP handlers and the model: how requests get into batches, when a batch runs, how results get back to the right caller, and what happens under overload. Start with fixed-size outputs, then extend to text generation where output lengths differ.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>There are two triggers for running a batch: it is full, or the oldest request has waited long enough.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>A blocking caller needs something to wait on that the batch worker can complete: a future or a condition variable per request.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>For generation, ask what the batch worker should do when one request finishes after 20 tokens and another needs 400.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>A bounded queue in front of a single batch worker. Each HTTP handler enqueues its input with a future and blocks on it with a timeout. The worker takes up to 100 items when the queue has 100 or when the oldest item has waited a maximum batching delay, runs the model, and completes each future. For generation, switch to continuous batching: the worker runs one decode step at a time, removes finished sequences, and admits new ones into free slots each step, bounded by KV cache memory. Overload is handled by rejecting at a queue limit with 429 rather than letting latency grow without bound.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Requirements to pin down: latency objective for callers, input and output size distribution, whether outputs are fixed (classification, embeddings) or generated, and peak arrival rate. These decide the batching delay and the queue limit.</p>
+<p>Fixed-size outputs: handlers put (input, future, deadline) into a bounded queue and wait on the future. One worker thread owns the GPU. Loop: block until the queue is non-empty; then collect until 100 items or until the oldest item's age reaches the batching delay; drop items whose deadline has passed; pad or bucket inputs by length so one long input does not inflate the whole batch; run; complete each future with its own output, or with the exception if the batch failed. The batching delay trades latency at low load (each request may wait up to it) for throughput at high load (batches fill on their own).</p>
+<p>Generated outputs: a static batch would run until its longest member finishes, leaving finished slots idle. Use iteration-level scheduling instead. The worker keeps a running set of at most 100 sequences. Each step it removes finished sequences and completes their futures, admits waiting requests while slots and KV memory allow, runs one forward pass that mixes new prompts' prefill with one decode token per running sequence, and appends results. Allocate KV cache in blocks so admission checks free blocks, not just slot count. Cap prefill tokens per step so a long new prompt does not stall the running decodes.</p>
+<p>Overload and failure: the queue limit is the backpressure point; return 429 with Retry-After once it is full, because a synchronous caller that waits longer than its own timeout has already gone. Cancel work for callers that disconnect. If the model raises, fail that batch's futures and keep the worker alive; if one input reliably crashes the batch, bisect and quarantine it. Expose queue depth, batch size per step, queue wait time and end-to-end latency percentiles.</p>
+<p>Scaling the answer: the same design runs per GPU; a load balancer that routes on queue depth spreads load across replicas.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>How do you pick the batching delay?</em> From the latency budget: if p99 must stay under a target, the delay plus the batch run time must fit inside it at the expected load. Measure throughput against batch size to see where larger batches stop paying.</li>
+<li><em>Why not one thread per request calling the model?</em> The GPU would run many batch-1 passes, each rereading all the weights, which wastes most of its bandwidth.</li>
+<li><em>Callers want streaming after all. What changes?</em> Futures become per-request channels; the worker pushes each new token, and time to first token becomes a separate objective.</li>
+</ul>
+</Fragment>
+</Depth>
+
+The parts interviewers listen for: two triggers for a batch (size and age), a per-request handle so results return to the right caller, bounded queues with explicit rejection, and recognising that generation needs per-step scheduling rather than per-batch. A strong answer also notes the trade-off that batching buys throughput at the cost of each caller's latency; Databricks' A100 example saw about 14 times the throughput for about 4 times the latency at batch 64.
+
+### Sketch
+
+```python
+class Batcher:
+    def __init__(self, model, max_batch=100, max_wait_s=0.01, max_queue=1000):
+        self.q = queue.Queue(maxsize=max_queue)
+        ...
+
+    def submit(self, x, timeout_s):
+        fut = Future()
+        try:
+            self.q.put_nowait((x, fut, time.monotonic() + timeout_s))
+        except queue.Full:
+            raise Overloaded()                 # HTTP 429 with Retry-After
+        return fut.result(timeout=timeout_s)
+
+    def worker(self):
+        while True:
+            batch = [self.q.get()]             # block for the first item
+            first_at = time.monotonic()
+            while len(batch) < self.max_batch:
+                left = self.max_wait_s - (time.monotonic() - first_at)
+                if left <= 0:
+                    break
+                try:
+                    batch.append(self.q.get(timeout=left))
+                except queue.Empty:
+                    break
+            live = [b for b in batch if b[2] > time.monotonic()]
+            ...                                # run model, set each future's result or exception
+```
+
+## Follow-ups
+
+- *Two model sizes on the same GPU?* Separate queues and a scheduler that time-slices the GPU, or separate GPUs; mixing models in one batch is not possible.
+- *Priority customers?* Two queues with weighted admission and a starvation guard for the lower tier.
+- *How do you test it?* Deterministic tests with a fake model and a fake clock for the batching triggers; a load test for latency percentiles against batch size.
+
+## Common mistakes
+
+- Waiting only for a full batch, so a single request at night waits forever.
+- An unbounded queue, which turns overload into timeouts for everyone instead of fast rejections for some.
+- Static batches for text generation, so short requests wait for long ones.
+- Admitting by slot count only, then running out of KV memory mid-generation.

@@ -1,0 +1,205 @@
+---
+title: Anatomy of inference
+track: inference
+module: inference-anatomy
+order: 1
+minutes: 16
+summary: Prefill reads the prompt in one compute-heavy pass, decode rereads every weight for each new token, and the KV cache that links them decides how many users fit on a GPU.
+prerequisites: [foundations/attention]
+updated: 2026-10-28
+sources:
+  - title: The Llama 3 Herd of Models (Meta, 2024), Table 3
+    url: https://arxiv.org/html/2407.21783
+    note: layers, model dimension, query heads and 8 KV heads for the 8B, 70B and 405B models; GQA "to improve inference speed"
+  - title: Qwen3-32B config.json
+    url: https://huggingface.co/Qwen/Qwen3-32B/raw/main/config.json
+    note: 64 layers, 64 query heads, 8 KV heads, explicit head_dim 128 (hidden size 5120)
+  - title: gpt-oss-120b config.json
+    url: https://huggingface.co/openai/gpt-oss-120b/raw/main/config.json
+    note: 36 layers alternating sliding (window 128) and full attention, 8 KV heads, head_dim 64, 128 experts with 4 active
+  - title: DeepSeek-V3 config.json
+    url: https://huggingface.co/deepseek-ai/DeepSeek-V3/raw/main/config.json
+    note: 61 layers, kv_lora_rank 512, qk_rope_head_dim 64
+  - title: "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model"
+    url: https://arxiv.org/abs/2405.04434
+    note: MLA cache size per token in Table 1; "reduces the KV cache by 93.3%" against DeepSeek 67B
+  - title: "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints (Ainslie et al., 2023)"
+    url: https://arxiv.org/abs/2305.13245
+    note: uptraining with 5% of original pre-training compute; quality close to multi-head at speed close to MQA
+  - title: NVIDIA H100 product page
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: H100 SXM 80 GB, 3.35 TB/s, 1,979 BF16 and 3,958 FP8 tensor TFLOPS with sparsity (dense is half)
+  - title: NVIDIA H200 product page
+    url: https://www.nvidia.com/en-us/data-center/h200/
+    note: 141 GB, 4.8 TB/s
+  - title: NVIDIA DGX B200 product page
+    url: https://www.nvidia.com/en-us/data-center/dgx-b200/
+    note: 1,440 GB and 64 TB/s across 8 GPUs, so 180 GB and 8 TB/s per GPU
+  - title: Scaling Laws for Neural Language Models (Kaplan et al., 2020), section 2.1
+    url: https://arxiv.org/abs/2001.08361
+    note: a forward pass costs about 2N FLOPs per token for N non-embedding parameters
+  - title: "Efficient Memory Management for Large Language Model Serving with PagedAttention (Kwon et al., 2023)"
+    url: https://arxiv.org/abs/2309.06180
+    note: OPT-13B KV cache of 800 KB per token and up to 1.6 GB per request
+  - title: NVIDIA NIM benchmarking, metrics
+    url: https://docs.nvidia.com/nim/benchmarking/llm/latest/metrics.html
+    note: definitions of TTFT, ITL (first token excluded), end-to-end latency, system and per-user tokens per second
+  - title: Databricks, LLM inference performance engineering best practices (2023-10-12)
+    url: https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices
+    note: MBU definition and the 7B example at 14 ms TPOT; batch 64 raised latency about 4x and throughput about 14x
+  - title: "DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving (2024)"
+    url: https://arxiv.org/abs/2401.09670
+    note: goodput as the request rate served while meeting both TTFT and TPOT objectives
+  - title: vLLM V1 metrics loggers (source)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/v1/metrics/loggers.py
+    note: Prometheus metric names quoted in the lesson
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+import Predict from '../../../components/Predict.astro';
+import SelfRate from '../../../components/SelfRate.astro';
+import InferenceKvCalc from '../../../components/widgets/InferenceKvCalc.astro';
+
+## The GPU that was 3% busy
+
+Scenario, not a real company: a team moves its chat feature from a hosted API to a 70B open-weight model on rented H100s. The dashboard shows GPU compute utilisation in the low single digits while users complain that answers stream slowly. Someone proposes a bigger GPU with more TFLOPS. It would not help, and by the end of this lesson you can say why in one sentence and back it with arithmetic.
+
+Generating text is two different workloads glued together. **Prefill** reads the whole prompt in one pass. **Decode** then produces one token per step, and every step has to read every weight of the model from GPU memory. The first is limited by arithmetic, the second by memory bandwidth. Almost every serving trick in this track exists because of that split.
+
+## Two phases, in a systems engineer's terms
+
+Think of the model as a function with a very large constant table: the weights. Prefill is a bulk job. It pushes all the prompt tokens through the table at once, so each weight fetched from memory is used for every prompt token. That is like a database doing a sequential scan that feeds thousands of rows through one hot loop: the CPU is busy, and memory keeps up.
+
+Decode is a loop. Each iteration produces one token, appends it, and runs again. Each iteration fetches the whole table to compute one row. That is a full table scan per output row, and the scan speed is set by memory bandwidth, not by how fast the arithmetic units are.
+
+The **KV cache** is what makes the loop affordable at all. Attention needs, for every earlier token, a key vector and a value vector in every layer. Recomputing them for the whole history on every step would make each step cost as much as a fresh prefill. So the server memoizes them: prefill writes keys and values for every prompt token, and each decode step appends one more token's worth. It is a cache in the ordinary sense, a time-for-memory trade, and like most caches it ends up as the thing that limits how many clients you can serve.
+
+Toy numbers make the split concrete. A forward pass costs about 2 floating-point operations per parameter per token (Kaplan et al., section 2.1). Take a 70B-class model stored in FP8, one byte per weight, so 70 GB of weights.
+
+- Prefill of a 2,000-token prompt: 2 x 70e9 x 2,000 = 2.8e17 FLOPs. An H100 SXM does 1,979 dense FP8 TFLOPS (NVIDIA lists 3,958 with sparsity; dense is half). Time at least 2.8e17 / 1.979e15 = 141 ms.
+- One decode step at batch 1: read 70 GB at 3.35 TB/s. Time at least 70 / 3,350 s = 20.9 ms, for one token.
+
+So the GPU processes 2,000 prompt tokens in roughly the time of 7 decode steps (141 / 20.9 = 6.8). Per token, prefill is about 300 times cheaper. The arithmetic units are the same; what differs is how many tokens share each byte read.
+
+### Arithmetic intensity and the ridge point
+
+The roofline model turns this into a single ratio. Arithmetic intensity is FLOPs done per byte moved. A GPU's ridge point is peak FLOPs divided by peak bandwidth. Below the ridge you are bandwidth bound; above it, compute bound.
+
+The example above used FP8 weights; switch to BF16 for this paragraph, two bytes per weight. For the H100 SXM in BF16: 989.5 dense TFLOPS / 3.35 TB/s gives about 295 FLOPs per byte. A BF16 weight is 2 bytes and is used for 2 FLOPs per token, so decode intensity is roughly 1 FLOP per byte per sequence in the batch. Batch 1 sits near 1, nearly 300 times below the ridge. Prefill with a 2,000-token prompt sits near 2,000, well above it. Redo it in FP8 and the numbers move together: the ridge rises to about 590 (1,979 / 3.35), batch-1 decode sits near 2 and the same prefill near 4,000, so the picture is the same. That is the whole of "prefill is compute bound, decode is memory bound", and it also tells you the fix for decode: share each weight read across more sequences. That is batching, the next lesson.
+
+<Predict id="inf-anatomy-tps" question="Upper bound on tokens per second for one user: 70B model in FP8 on one H100 SXM (3.35 TB/s), batch 1" answer={48} tolerance={6} unit="tokens/s">
+<p>Each step must read at least 70 GB. 3,350 GB/s divided by 70 GB is 47.9 steps per second, so <b>at most about 48 tokens per second</b>, before counting the KV cache, kernel launch gaps or anything else. A GPU with twice the TFLOPS and the same bandwidth gives the same answer. One with more bandwidth, such as the H200 at 4.8 TB/s, raises the ceiling to 68.6.</p>
+</Predict>
+
+## The KV cache in bytes
+
+Per token, the cache holds one key and one value vector per layer per KV head:
+
+`bytes per token = 2 x layers x kv_heads x head_dim x bytes_per_element`
+
+For Llama 3 70B (80 layers, 8 KV heads, head dimension 8192 / 64 = 128, BF16): 2 x 80 x 8 x 128 x 2 = 327,680 bytes, which is 320 KiB per token. A 32,768-token conversation therefore holds 10.7 GB of cache, and 8 of them hold 85.9 GB, exactly 80 GiB. That is more than the 70 GB of FP8 weights.
+
+<InferenceKvCalc />
+
+Things to try in the calculator. Put the 70B model on one H100 in FP8: the weights fit with 10 GB to spare, which is about 30,500 tokens of cache in total across all users (10e9 / 327,680). Switch to the hypothetical 64-KV-head variant and watch the cache grow 8 times. Move the batch slider and watch the step time rise: each extra sequence adds its own cache to the bytes read per step.
+
+### Why GQA, MQA and MLA exist
+
+Multi-head attention gives every query head its own key and value head. Multi-query attention (MQA) shares one KV head across all query heads. Grouped-query attention (GQA) sits between them: Llama 3 70B has 64 query heads and 8 KV heads, so each KV head serves a group of 8. The Llama 3 paper says it uses GQA with 8 KV heads "to improve inference speed". The GQA paper reports quality close to full multi-head attention at speed close to MQA, and shows that an existing multi-head checkpoint can be converted with 5% of its original pre-training compute.
+
+DeepSeek went further with multi-head latent attention (MLA). Instead of per-head keys and values it caches one compressed latent of 512 elements plus a 64-element positional key per layer. For DeepSeek-V3 that is 61 x (512 + 64) x 2 bytes = 70,272 bytes per token in BF16, less than a quarter of Llama 3 70B's 327,680 even though DeepSeek-V3 is a much larger model. The DeepSeek-V2 paper reports a 93.3% smaller KV cache than its earlier 67B dense model.
+
+The cost of fewer KV heads is model quality, which the architecture designers pay at training time. The serving engineer's job is to read `num_key_value_heads` and `head_dim` from `config.json` rather than assume them. Qwen3-32B is the trap: hidden size 5120 divided by 64 heads would suggest 80, but its config sets `head_dim` to 128.
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Model</th><th>Layers</th><th>Query heads</th><th>KV heads</th><th>head_dim</th><th>KV per token, BF16</th></tr></thead>
+<tbody>
+<tr><td>Llama 3 8B</td><td>32</td><td>32</td><td>8</td><td>128</td><td>128 KiB</td></tr>
+<tr><td>Qwen3-32B</td><td>64</td><td>64</td><td>8</td><td>128</td><td>256 KiB</td></tr>
+<tr><td>Llama 3 70B</td><td>80</td><td>64</td><td>8</td><td>128</td><td>320 KiB</td></tr>
+<tr><td>Llama 3 405B</td><td>126</td><td>128</td><td>8</td><td>128</td><td>504 KiB</td></tr>
+<tr><td>DeepSeek-V3 (MLA)</td><td>61</td><td>128</td><td colspan="2">latent 512 + RoPE key 64</td><td>68.6 KiB</td></tr>
+</tbody>
+</table>
+</div>
+
+For scale, the vLLM paper computes 800 KB per token for OPT-13B, which used full multi-head attention, so a single 2,048-token request could hold 1.6 GB. GQA is a large part of why modern models with far longer contexts are servable at all.
+
+## The latency vocabulary
+
+Interviewers expect these terms used precisely. NVIDIA's NIM benchmarking docs give clean definitions:
+
+- **TTFT**, time to first token: from submitting the request to receiving the first token. It is queueing time plus prefill time.
+- **ITL**, inter-token latency, which NVIDIA says is also known as **TPOT**: `(e2e_latency - TTFT) / (output_tokens - 1)`. The first token is excluded. Other tools include it, so check before you compare numbers from two benchmarks.
+- **End-to-end latency**: TTFT plus generation time.
+- **Throughput**: system tokens per second is all output tokens divided by the span from first request to last response. Per-user tokens per second is one request's output length divided by its end-to-end latency.
+
+These two throughputs move in opposite directions as you add batch. Databricks reports an A100 example where batch 64 raised latency about 4 times while throughput rose about 14 times. Your GPU did more work per second, and every user waited longer for each token.
+
+**Goodput** fixes the incentive problem. DistServe frames it as the highest request rate a system can serve while meeting both its TTFT and TPOT objectives. A configuration that doubles throughput by pushing half the requests past their latency target has worse goodput, and goodput is what users feel.
+
+Databricks also defines **model bandwidth utilisation** (MBU): achieved bandwidth, (parameter bytes + KV bytes) / TPOT, divided by peak bandwidth. Their example: a 7B model in 16-bit at 14 ms TPOT moves about 1 TB/s, which is 50% MBU on a 2 TB/s part. MBU is the decode counterpart of the compute utilisation number the team in the opening scenario was staring at. Compute utilisation in decode is low by construction; MBU tells you whether the memory system is actually busy.
+
+In vLLM these show up as Prometheus histograms and gauges: `vllm:time_to_first_token_seconds`, `vllm:inter_token_latency_seconds`, `vllm:e2e_request_latency_seconds`, `vllm:request_queue_time_seconds`, `vllm:num_requests_running`, `vllm:num_requests_waiting` and `vllm:kv_cache_usage_perc`.
+
+<Callout kind="gotcha">
+Means hide tails. If 95 requests have a 0.3 s TTFT and 5 wait 4 s behind long prefills, the mean is 0.485 s and looks fine, while the p99 is 4 s. Report p50, p95 and p99 per metric, and keep TTFT and ITL separate because different fixes move them.
+</Callout>
+
+## The arithmetic in code
+
+Two functions cover most napkin questions: the cache size from a config, and the metrics from token timestamps.
+
+```python
+def kv_bytes_per_token(layers, kv_heads, head_dim, bytes_per_elem=2):
+    return 2 * layers * kv_heads * head_dim * bytes_per_elem   # 2: one K and one V
+
+def decode_floor_s(weight_bytes, kv_bytes_total, bandwidth):
+    return (weight_bytes + kv_bytes_total) / bandwidth          # one full read per step
+
+def request_metrics(t_submit, token_times):
+    ttft = token_times[0] - t_submit
+    e2e = token_times[-1] - t_submit
+    itl = (e2e - ttft) / (len(token_times) - 1)                 # NIM definition: first token excluded
+    return ttft, itl, e2e
+
+per_tok = kv_bytes_per_token(80, 8, 128)                        # Llama 3 70B
+print(per_tok, per_tok * 32_768 * 8 / 1e9)                      # 327680  85.89934592
+print(decode_floor_s(70e9, 0, 3.35e12))                         # 0.0208955... s on an H100 SXM
+print(request_metrics(0.0, [0.80 + 0.025 * i for i in range(200)]))  # about (0.8, 0.025, 5.775)
+```
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Why does time per output token go up as you increase the batch size? At what point does a bigger batch stop helping?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Decode is bandwidth bound: each step reads all the weights once, shared by the batch, plus every sequence's own KV cache. Adding sequences adds their cache reads to every step, so each step takes longer and each user sees a slower TPOT, while total tokens per second still rises because the weight read is shared. A bigger batch stops helping when the cache no longer fits in memory, when TPOT crosses the latency objective, or when the step becomes compute bound.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Model one step as (weight bytes + sum of KV bytes) / bandwidth. With Llama 3 70B in FP8 on an H200, 70 GB of weights at 4.8 TB/s floors a step at 14.6 ms. At batch 32 with 4,096-token contexts the cache adds 32 x 4,096 x 327,680 bytes, about 43 GB, so the floor rises to about 23.5 ms. Per user that is at most 42.5 tokens per second instead of about 68, while the system produces up to about 1,360 tokens per second instead of 68.</p>
+<p>Three ceilings end the free lunch. Memory: at batch 64 the same setup needs about 156 GB and does not fit in 141 GB, so the scheduler must queue or preempt. Latency: if the product promises 30 tokens per second per user, every configuration slower than 33 ms per step is out, whatever its throughput. Compute: the weight part of the step has intensity of roughly one FLOP per byte per sequence in BF16, so on an H100 it would take a batch in the hundreds before the arithmetic units, not memory, set the pace. The KV part never gets that benefit, because each sequence's cache is read for that sequence alone.</p>
+<p>So I would pick the largest batch whose p99 TPOT meets the objective and whose cache fits with headroom, measure goodput rather than raw throughput, and use GQA-era models, FP8 KV cache or paged allocation to push the memory ceiling out.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>How would you verify it on a real server?</em> Sweep concurrency in a load test and plot TPOT p50 and p99 against system throughput; the knee is your operating point. Check MBU at each point.</li>
+<li><em>What changes with long contexts?</em> The KV term dominates the bytes per step, so batching helps less and the memory ceiling arrives at a smaller batch.</li>
+<li><em>What would you change first if TTFT, not TPOT, is the complaint?</em> Look at queue time and prefill interference first; that is chunked prefill and scheduling, not batch size.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The bandwidth model gives a floor, not a forecast. Real kernels do not hit peak bandwidth (the Databricks example ran at 50% MBU), kernel launches and CPU scheduling add gaps between steps, and tensor parallelism adds communication. Use the floor to rule configurations out, then measure the ones left.
+
+The KV formula assumes every layer attends over the full context. gpt-oss-120b alternates sliding-window layers, which keep only the last 128 tokens, with full-attention layers, so only half its 36 layers grow with context. MLA models cache a latent instead of per-head vectors. Mixture-of-experts models such as gpt-oss-120b (128 experts, 4 active per token) read only the active experts' weights for a single token, but at larger batches different tokens route to different experts and more of the weights get read per step. In each case, derive the bytes from the actual config and architecture rather than from the parameter count.
+
+Finally, "prefill is compute bound" holds for long prompts. A 20-token prompt has low arithmetic intensity too, and very long contexts make attention itself, which grows with the square of prompt length in prefill, a large share of the work. The split is a rule of thumb about where the time goes, and the thumb is the ratio of tokens per byte read.
+
+<SelfRate id="lesson:inference/inference-anatomy" />

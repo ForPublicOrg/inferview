@@ -1,0 +1,101 @@
+---
+id: fnd-006
+title: Search broke after the embedding upgrade
+subtitle: find the cause
+track: foundations
+module: embeddings
+type: debug
+difficulty: medium
+seniority: [mid, senior]
+minutes: 15
+core: true
+tags: [embeddings, matryoshka, normalisation, vector-search]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: amitshekhariitbhu, AI Engineering Interview Questions
+    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
+    note: lists questions on handling a new embedding model in production and on embedding dimensionality and cost
+  - title: EmbeddingGemma model card
+    url: https://huggingface.co/google/embeddinggemma-300m
+    note: 768-dimension output; truncate to 512, 256 or 128 and then re-normalise; queries take a task prefix
+  - title: Gemini API docs, embeddings
+    url: https://ai.google.dev/gemini-api/docs/embeddings
+    note: gemini-embedding-001 needs manual normalisation below 3072 dimensions; gemini-embedding-2 normalises for you
+  - title: OpenAI API docs, embeddings guide
+    url: https://developers.openai.com/api/docs/guides/embeddings
+    note: shortening vectors by hand requires re-normalising them
+  - title: Matryoshka Representation Learning (Kusupati et al., 2022)
+    url: https://arxiv.org/abs/2205.13147
+    note: the first k dimensions of the vector form a usable embedding
+choices:
+  - text: Old and new vectors are mixed in one index, so new queries are compared against vectors from the old model
+    correct: false
+    why: The log shows the index was rebuilt from scratch with 2,400,118 vectors, the same as the corpus count, all written by the new pipeline. Mixed spaces would be a good guess on a partial migration, not this one.
+  - text: The queries are embedded without the model's query prefix, so they land in the wrong region of the space
+    correct: false
+    why: The query path adds QUERY_PREFIX on every call. A missing prefix is a real silent bug with instruction-aware models, but the code rules it out here.
+  - text: The vectors were truncated from 768 to 256 dimensions without re-normalising, and the index ranks by dot product, so documents whose first 256 values hold more of their length win
+    correct: true
+    why: The stored norms run from 0.78 to 0.97 instead of 1.0. With a dot product, a document's score is scaled by its own norm, which has nothing to do with relevance, and the measured symptom (long boilerplate pages winning) fits a length-dependent bias.
+  - text: The HNSW search parameter ef_search is too low for 256-dimension vectors, so the approximate search misses the true nearest neighbours
+    correct: false
+    why: Exact brute-force search over the same vectors returns the same top 10 as HNSW for the sampled queries, so the approximate index is faithful. The ranking itself is wrong.
+---
+
+## Question
+
+Scenario: a team replaced its embedding model with EmbeddingGemma and, to save memory, kept only the first 256 of its 768 dimensions. They rebuilt the index on Monday. Since then, recall at 10 on their labelled query set dropped from 0.81 to 0.64, and reviewers say long boilerplate pages (terms of service, release notes) keep appearing in the top results.
+
+The pipeline:
+
+```python
+DOC_PREFIX = ...     # document prompt from the model card
+QUERY_PREFIX = ...   # query prompt from the model card
+
+def embed_docs(texts):
+    vecs = model.encode([DOC_PREFIX + t for t in texts])   # 768 dims, unit length
+    return [v[:256] for v in vecs]                          # Matryoshka: keep 256
+
+def embed_query(q):
+    v = model.encode([QUERY_PREFIX + q])[0]
+    return v[:256]
+
+index = VectorIndex(metric="dot", dims=256, kind="hnsw", ef_search=64)
+```
+
+What they checked:
+
+```text
+corpus documents:            2,400,118
+vectors in rebuilt index:    2,400,118   (index created Monday, empty before backfill)
+norms of 1,000 stored docs:  min 0.78, median 0.89, max 0.97
+brute-force top 10 vs HNSW top 10 on 50 queries: identical on 50 of 50
+```
+
+Which cause best explains the drop?
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>What should the norm of every stored vector be if the index ranks by dot product?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Each check rules out one of the four choices. Match them up.</p></details>
+
+## Answer
+
+The vectors were truncated without re-normalising. Each 768-dimension vector had length 1, but its first 256 values hold only part of that length, and how much varies by document: here between 0.78 and 0.97. The index ranks by dot product, and a dot product scales with the document's length, so documents that happened to keep more of their norm in the first 256 dimensions get a boost unrelated to relevance. EmbeddingGemma's card says to re-normalise after truncating, as do OpenAI's docs for manual shortening; gemini-embedding-2 is the exception that does it for you.
+
+The fix is one line in both paths: divide each truncated vector by its norm before writing or querying, then rebuild the index. The query side matters less for ranking (one query's norm scales every score equally) but should be normalised too so scores are comparable across queries and thresholds keep working.
+
+Why the other choices are tempting. Mixed vector spaces is the classic upgrade bug, ruled out because the index was empty before the backfill and the counts match. A missing query prefix is the second classic, ruled out by the code. ef_search is a real knob, ruled out because exact search returns the same results, which proves the approximate index is not the problem.
+
+## Follow-ups
+
+- *How would you catch this before it shipped?* An ingestion assertion that every vector's norm is 1 within a small tolerance, plus the recall check on the labelled set before switching reads.
+- *Is 256 dimensions a reasonable choice once fixed?* Measure recall at 768, 512 and 256 on the labelled set; the card lists all three as supported truncations, and the right one is the smallest that keeps recall.
+- *What if the index metric were cosine?* Cosine divides by the norms, so this bug would not have changed rankings. That is a reason to prefer cosine when you are not sure every writer normalises.
+
+## Common mistakes
+
+- Blaming the new model and rolling back without checking norms.
+- Tuning the HNSW parameters first, which costs latency and fixes nothing here.
+- Re-normalising only the queries.

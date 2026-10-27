@@ -1,0 +1,219 @@
+---
+id: inf-006
+title: Paged KV cache block allocator
+subtitle: with copy-on-write forks
+track: inference
+module: batching
+type: code
+difficulty: hard
+seniority: [senior, staff]
+minutes: 40
+core: true
+tags: [pagedattention, allocator, kv-cache, copy-on-write, reference-counting]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: techinterview.org, AI inference infrastructure interview prep 2026 (updated 2026-05-06)
+    url: https://www.techinterview.org/post/3233475331/ai-inference-infrastructure-interview-prep-2026-vllm-triton/
+    note: lists "Implement a memory allocator for variable-size KV cache" as a coding prompt
+  - title: "Efficient Memory Management for Large Language Model Serving with PagedAttention (Kwon et al., SOSP 2023)"
+    url: https://arxiv.org/abs/2309.06180
+    note: block tables, default block size 16, copy-on-write at block granularity for shared blocks
+  - title: vLLM launch blog (2023-06-20)
+    url: https://vllm.ai/blog/2023-06-20-vllm
+    note: sharing cuts memory by up to 55% for parallel sampling and beam search
+code:
+  starter: |
+    class BlockAllocator:
+        """Paged KV cache allocator. Each request owns a list of physical block ids (its block table)."""
+
+        def __init__(self, num_blocks, block_size=16):
+            raise NotImplementedError
+
+        def num_free(self):
+            """Number of blocks on the free list."""
+            raise NotImplementedError
+
+        def can_allocate(self, num_tokens):
+            """True if a new request of num_tokens prompt tokens would fit right now."""
+            raise NotImplementedError
+
+        def allocate(self, rid, num_tokens):
+            """Give a new request enough blocks for its prompt. All or nothing: raise MemoryError if it does not fit."""
+            raise NotImplementedError
+
+        def append(self, rid):
+            """Add one generated token. Take a new block only when the last one is full.
+            If the last block is shared with another request and not full, copy on write.
+            Raise MemoryError and leave the state unchanged if no block is free."""
+            raise NotImplementedError
+
+        def fork(self, parent, child):
+            """Create child sharing all of parent's blocks, as in parallel sampling. No copying."""
+            raise NotImplementedError
+
+        def free(self, rid):
+            """Release a request. A block goes back to the free list only when no request holds it."""
+            raise NotImplementedError
+
+        def block_table(self, rid):
+            raise NotImplementedError
+
+        def length(self, rid):
+            raise NotImplementedError
+  tests: |
+    def raises(exc, fn, *args):
+        try:
+            fn(*args)
+        except exc:
+            return True
+        return False
+
+    a = BlockAllocator(8, block_size=16)
+    a.allocate("r1", 40)
+    assert len(a.block_table("r1")) == 3 and a.num_free() == 5, "40 tokens need 3 blocks of 16"
+    for _ in range(8):
+        a.append("r1")
+    assert a.length("r1") == 48 and len(a.block_table("r1")) == 3, "tokens 41 to 48 fill the third block"
+    a.append("r1")
+    assert len(a.block_table("r1")) == 4 and a.num_free() == 4, "token 49 opens a fourth block"
+    assert a.can_allocate(64) and not a.can_allocate(65), "can_allocate counts whole blocks"
+    assert raises(MemoryError, a.allocate, "big", 65), "a request that does not fit raises MemoryError"
+    assert a.num_free() == 4 and raises(KeyError, a.block_table, "big"), "a failed allocate leaves no trace"
+    a.free("r1")
+    assert a.num_free() == 8, "free returns every block"
+
+    b = BlockAllocator(4, block_size=16)
+    b.allocate("p", 20)
+    b.fork("p", "c")
+    assert b.block_table("c") == b.block_table("p") and b.num_free() == 2, "fork shares blocks without copying"
+    shared_last = b.block_table("p")[-1]
+    b.append("c")
+    assert b.block_table("c")[-1] != shared_last and b.block_table("p")[-1] == shared_last, "appending to a shared partial block copies it"
+    assert b.block_table("c")[0] == b.block_table("p")[0] and b.num_free() == 1, "full shared blocks stay shared"
+    b.free("p")
+    assert b.num_free() == 2, "freeing the parent releases only blocks nobody else holds"
+    b.free("c")
+    assert b.num_free() == 4, "everything returns once both are freed"
+
+    c = BlockAllocator(2, block_size=4)
+    c.allocate("x", 8)
+    assert raises(MemoryError, c.append, "x") and c.length("x") == 8, "append with no free block raises and changes nothing"
+  solution: |
+    class BlockAllocator:
+        def __init__(self, num_blocks, block_size=16):
+            self.block_size = block_size
+            self.free_list = list(range(num_blocks - 1, -1, -1))   # pop() hands out block 0 first
+            self.refs = [0] * num_blocks
+            self.tables = {}
+            self.lengths = {}
+
+        def num_free(self):
+            return len(self.free_list)
+
+        def blocks_for(self, num_tokens):
+            return -(-num_tokens // self.block_size)
+
+        def can_allocate(self, num_tokens):
+            return self.blocks_for(num_tokens) <= len(self.free_list)
+
+        def _take(self):
+            b = self.free_list.pop()
+            self.refs[b] = 1
+            return b
+
+        def _drop(self, b):
+            self.refs[b] -= 1
+            if self.refs[b] == 0:
+                self.free_list.append(b)
+
+        def allocate(self, rid, num_tokens):
+            if rid in self.tables:
+                raise ValueError(f"{rid} already allocated")
+            if not self.can_allocate(num_tokens):
+                raise MemoryError("not enough free blocks")
+            self.tables[rid] = [self._take() for _ in range(self.blocks_for(num_tokens))]
+            self.lengths[rid] = num_tokens
+
+        def append(self, rid):
+            table, n = self.tables[rid], self.lengths[rid]
+            if n % self.block_size == 0:
+                if not self.free_list:
+                    raise MemoryError("no free block for the next token")
+                table.append(self._take())
+            elif self.refs[table[-1]] > 1:
+                # Copy on write: the partly filled last block is shared, so this request gets its own copy.
+                if not self.free_list:
+                    raise MemoryError("no free block for copy on write")
+                new = self._take()
+                self._drop(table[-1])
+                table[-1] = new
+            self.lengths[rid] = n + 1
+
+        def fork(self, parent, child):
+            if child in self.tables:
+                raise ValueError(f"{child} already allocated")
+            for b in self.tables[parent]:
+                self.refs[b] += 1
+            self.tables[child] = list(self.tables[parent])
+            self.lengths[child] = self.lengths[parent]
+
+        def free(self, rid):
+            for b in self.tables.pop(rid):
+                self._drop(b)
+            del self.lengths[rid]
+
+        def block_table(self, rid):
+            return list(self.tables[rid])
+
+        def length(self, rid):
+            return self.lengths[rid]
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="As listed">
+"Implement a memory allocator for variable-size KV cache."
+</Callout>
+
+Implement the allocator at the heart of a paged inference engine. GPU memory for the KV cache is a pool of `num_blocks` fixed-size blocks, each holding `block_size` tokens. Every request owns a block table: the list of physical block ids holding its tokens, in order.
+
+- `allocate(rid, num_tokens)` gives a new request enough blocks for its prompt, all or nothing.
+- `append(rid)` adds one generated token, taking a new block only when the last one is full.
+- `fork(parent, child)` makes a second sequence that shares all of the parent's blocks, as parallel sampling does. Nothing is copied.
+- When a request appends into a last block that is **shared and not full**, it must first get its own copy of that block (copy on write). Full shared blocks stay shared; nobody writes into them again.
+- `free(rid)` releases a request. A block returns to the free list only when no request holds it any more.
+- If there is no free block when one is needed, raise `MemoryError` and leave all state unchanged. The scheduler upstream decides whether to queue or preempt.
+
+You do not copy any tensor data; ids and reference counts are the whole job. Standard library only.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Keep a reference count per physical block; fork increments, free decrements, zero means back to the free list.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>The number of blocks for n tokens is n divided by the block size, rounded up: <code>-(-n // block_size)</code>.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>In <code>append</code>, check whether the current length is a multiple of the block size before deciding between "new block", "copy on write" and "write in place".</p></details>
+
+## Answer
+
+The reference solution keeps four pieces of state: a free list of block ids, a reference count per block, a block table per request and a token count per request.
+
+`allocate` computes the blocks needed by ceiling division and checks the free list before touching anything, which makes it all or nothing. `append` has three cases. If the request's length is a multiple of the block size, its last block is full (or it has none), so it takes a fresh block. Otherwise the token goes into the last block, which is fine if this request is the only holder; if the reference count is above one, the block is shared with a fork, so the request takes a fresh block, drops one reference to the shared one, and swaps it into its table. A real engine would also copy the partial block's keys and values on the GPU at that point. Both cases that need a block check the free list first, so a `MemoryError` leaves the length and the table unchanged.
+
+`fork` copies the parent's table (a list of ids, not data) and increments each block's count. `free` decrements, and only blocks that reach zero go back to the free list, which is why freeing the parent in the tests releases just one block while the child still holds the shared full block.
+
+This is the mechanism behind two numbers in the vLLM work: paging limits waste to the unfilled part of each request's last block, and block sharing with copy-on-write is what cuts memory for parallel sampling and beam search.
+
+## Follow-ups
+
+- *How would you add prefix caching?* Hash each full block from its parent block's hash plus its tokens, keep freed blocks with a known hash in an evictable pool instead of the free list, and look up new prompts block by block.
+- *What eviction policy for that pool?* Least recently used over blocks with a zero reference count; never evict a block a running request holds.
+- *What does the scheduler do on `MemoryError` in `append`?* Preempt a running request (vLLM V1 frees its blocks and recomputes it later) or stop admitting new ones.
+- *Thread safety?* The engine's scheduler owns the allocator and calls it from one thread per step; if not, guard it with a lock.
+
+## Common mistakes
+
+- Returning shared blocks to the free list when the first holder frees them, which corrupts the other sequence.
+- Copying on write for full shared blocks. They are never written again, so sharing them is safe.
+- Allocating partially before discovering there is not enough memory, then leaking the blocks already taken.
+- Counting blocks with floor division and losing the last partial block.

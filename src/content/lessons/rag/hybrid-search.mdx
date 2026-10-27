@@ -1,0 +1,174 @@
+---
+title: Hybrid search, reranking and query transformation
+track: rag
+module: hybrid-search
+order: 3
+minutes: 14
+summary: Lexical and dense retrieval fail on different queries, so production systems run both, fuse the rankings, rerank a short list with a slower model, and rewrite the query before any of it runs.
+prerequisites: [rag/retrieval-foundations]
+updated: 2026-10-28
+sources:
+  - title: "Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods (Cormack, Clarke and Büttcher, SIGIR 2009)"
+    url: http://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf
+    note: RRF score is the sum of 1 / (k + rank); k = 60 fixed in a pilot, near-optimal but "not critical"
+  - title: Elasticsearch docs, RRF retriever
+    url: https://www.elastic.co/docs/reference/elasticsearch/rest-apis/retrievers/rrf-retriever
+    note: rank_constant default 60; rank_window_size default 10 and at least size; per-retriever weights GA in 9.2
+  - title: Qdrant docs, hybrid and multi-stage queries
+    url: https://qdrant.tech/documentation/concepts/hybrid-queries/
+    note: RRF k set to 2 by default, configurable from 1.16; weighted RRF from 1.17; DBSF from 1.11; prefetch rescoring with a ColBERT multivector
+  - title: Weaviate docs, hybrid search
+    url: https://docs.weaviate.io/weaviate/search/hybrid
+    note: alpha 1 is pure vector, 0 pure keyword; Relative Score Fusion is the default since 1.24
+  - title: On the Theoretical Limitations of Embedding-Based Retrieval (Weller et al., 2025)
+    url: https://arxiv.org/abs/2508.21038
+    note: single-vector embeddings cannot return every top-k set; BM25 93.6 vs 18.9 recall@100 on LIMIT
+  - title: "ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT (SIGIR 2020)"
+    url: https://arxiv.org/abs/2004.12832
+    note: late interaction; two orders of magnitude faster and four orders of magnitude fewer FLOPs per query than BERT-based rankers
+  - title: "ColBERTv2 (NAACL 2022)"
+    url: https://arxiv.org/abs/2112.01488
+    note: residual compression cuts late-interaction storage 6 to 10 times
+  - title: Sentence Transformers docs, retrieve and re-rank
+    url: https://www.sbert.net/examples/sentence_transformer/applications/retrieve_rerank/README.html
+    note: a cross-encoder outputs one score per query and document pair, not a reusable vector
+  - title: Cohere docs, models
+    url: https://docs.cohere.com/docs/models
+    note: rerank-v3.5 4k context; rerank-v4.0 and rerank-v5.0 32k; query plus document tokens count toward the limit
+  - title: Cohere blog, Rerank 5 (2026-10-21)
+    url: https://cohere.com/blog/rerank-5
+    note: vendor claims; Context Focus spans; calibrated scores with a 0.50 (Pro) and 0.45 (Fast) threshold; $0.05 and $0.02 per million tokens
+  - title: Cohere pricing
+    url: https://cohere.com/pricing
+    note: a search unit is one query with up to 100 documents; documents over 500 tokens are split and counted separately
+  - title: "Precise Zero-Shot Dense Retrieval without Relevance Labels (HyDE, Gao et al., 2022)"
+    url: https://arxiv.org/abs/2212.10496
+    note: an LLM writes a hypothetical answer document, which is embedded and used to find real documents
+  - title: Claude docs, search results
+    url: https://platform.claude.com/docs/en/build-with-claude/search-results
+    note: search_result content blocks carry source and title so the model can cite retrieved text
+  - title: Claude API release notes
+    url: https://platform.claude.com/docs/en/release-notes/api.md
+    note: search results out of beta on the Claude API and Vertex AI on 2025-08-08, on Amazon Bedrock on 2025-11-21
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+import Predict from '../../../components/Predict.astro';
+import SelfRate from '../../../components/SelfRate.astro';
+import RagRrf from '../../../components/widgets/RagRrf.astro';
+
+## Two retrievers, two blind spots
+
+Scenario, not a real company: a contracts team asks their assistant "what is our liability cap with the logistics vendor?" Dense retrieval finds every clause about limiting liability across forty contracts, ranked by how typical the wording is; the vendor's contract ranks ninth. Then someone asks "what does section 4.2(b) say?" and dense retrieval returns paragraphs that discuss sections in general. BM25 gets the second query right on the first try, because `4.2(b)` is a rare exact string, and gets the first one wrong, because the contract says "aggregate exposure shall not exceed" and never uses the word "cap".
+
+Neither retriever is broken. They fail on different queries. Lexical search matches strings, so it wins on identifiers, codes, names and jargon, and loses on paraphrase. Dense search matches meaning, so it wins on paraphrase and loses on rare exact strings; the 2025 LIMIT paper shows that single vectors have a hard, dimension-bounded limit on which top-k sets they can return at all. Running both and merging the results is the standard answer, and the merge step is where the engineering is.
+
+## Fusing two rankings
+
+There are two ways to merge. **Score fusion** normalises each retriever's scores to a common range and takes a weighted sum. **Rank fusion** ignores scores and uses positions.
+
+Score fusion sounds more informative, and it has a trap: the two score scales mean different things. BM25 scores are unbounded and spread out. Cosine similarities from a modern embedding model often sit in a narrow band. Min-max normalisation stretches whatever range each list has to 0 to 1, so a 0.04 gap in cosine similarity becomes as large as a decisive BM25 win:
+
+```python
+def minmax(scores):
+    lo, hi = min(scores.values()), max(scores.values())
+    return {d: (s - lo) / (hi - lo) if hi > lo else 1.0 for d, s in scores.items()}
+
+def convex(lexical, dense, alpha):
+    """alpha = 1 is pure dense, 0 is pure lexical."""
+    lx, dn = minmax(lexical), minmax(dense)
+    docs = set(lx) | set(dn)
+    return {d: round(alpha * dn.get(d, 0.0) + (1 - alpha) * lx.get(d, 0.0), 3) for d in sorted(docs)}
+
+bm25 = {"runbook": 9.1, "timeouts": 2.2, "faq": 2.0}
+cosine = {"postmortem": 0.83, "timeouts": 0.82, "faq": 0.80, "runbook": 0.79}
+print(convex(bm25, cosine, 0.5))
+# {'faq': 0.125, 'postmortem': 0.5, 'runbook': 0.5, 'timeouts': 0.389}
+```
+
+The runbook has four times the next BM25 score and is only 0.04 below the top cosine score, yet it ties with a postmortem that BM25 never returned. Engines that fuse scores normalise more carefully: Qdrant's distribution-based score fusion (DBSF) uses the mean and three standard deviations, and Weaviate's default since 1.24 is relative score fusion. Both still depend on score distributions you should look at.
+
+**Reciprocal rank fusion** (RRF) sidesteps the scales. Each document scores the sum, over the rankings it appears in, of `1 / (k + rank)`, with ranks starting at 1. It is the merge step of a merge sort that only trusts positions. The 2009 paper fixed `k = 60` after a pilot and reported that the value was near-optimal but "not critical".
+
+<Predict id="rag-rrf-rank" question="What rank r in both lists ties with first place in only one list?" answer={62} tolerance={3} unit="rank">
+<Fragment slot="prompt">
+<p>At k = 60, a document ranked first by BM25 and absent from the dense list scores 1/61. Another document appears in both lists at the same rank r. For which r do the two documents tie?</p>
+</Fragment>
+<p>Solve 2 / (60 + r) = 1 / 61, so 60 + r = 122 and <b>r = 62</b>. A document that is mediocre in both lists ties with one that is the best in one list. Large k rewards agreement between retrievers; small k rewards being first anywhere. Neither is right in general, which is why k is a parameter.</p>
+</Predict>
+
+Move the sliders and watch the order change. The lists are the two rankings for "E1234 timeout at checkout".
+
+<RagRrf />
+
+At k = 60 with equal weights, "Payment timeouts" (second in both lists, score 0.0323) edges out the "E1234 runbook" (first and fifth, 0.0318) and the "Checkout FAQ" (third in both, 0.0317). The runbook is the answer the on-call engineer needed. Drop k to 5 and it still comes second (0.2667 against 0.2857). At k = 1 it ties for first. Raising the dense weight to 2 pushes it down to third. Rank fusion is not a substitute for a reranker; it builds the candidate list a reranker will reorder.
+
+<Callout kind="gotcha" label="Engine defaults differ">
+Elasticsearch's RRF retriever defaults to `rank_constant` 60 and `rank_window_size` 10, so unless you set the window it fuses only the top 10 of each list. Qdrant documents its RRF k as 2 by default. Weighted RRF arrived in Elasticsearch 9.2 and Qdrant 1.17. Weaviate defaults to relative score fusion, not RRF. Say which engine you mean.
+</Callout>
+
+## Rerankers: spend compute where it changes the answer
+
+Retrieval is tuned for recall over millions of documents; a reranker is tuned for precision over tens. Three architectures, from cheapest to most expensive per candidate:
+
+**Bi-encoder similarity** is what retrieval already computed. It is not a reranker.
+
+**Late interaction (ColBERT)** stores one vector per token of each document. At query time each query token finds its most similar document token (MaxSim) and the maxima are summed. Document vectors are precomputed like a bi-encoder, but the comparison is token by token, closer to a cross-encoder. The ColBERT paper reports two orders of magnitude faster than BERT-based rankers and four orders of magnitude fewer FLOPs per query. The price is storage, one vector per token, which ColBERTv2's residual compression cuts by 6 to 10 times. Qdrant's documentation shows the pattern as a pipeline: prefetch 100 dense candidates, rescore them with a ColBERT multivector, keep 10.
+
+**Cross-encoders** read query and document together and output one score. Nothing is precomputed, so cost grows with the number of candidates times the number of queries. Hosted rerankers are cross-encoders behind an API. Cohere's rerank-v3.5 accepts 4k tokens of query plus document; v4.0 and v5.0 accept 32k. Rerank 5, announced on 2026-10-21, returns scored text spans ("Context Focus") and claims calibrated scores with a "more likely useful than not" threshold of 0.50 for Pro and 0.45 for Fast, priced at $0.05 and $0.02 per million tokens. Those are vendor claims; older rerankers and other vendors do not promise calibration, so a fixed score threshold needs tuning per domain.
+
+**LLM rerankers** ask a general model to score or order candidates. They handle instructions ("prefer documents newer than 2025") but are the slowest and most expensive per candidate.
+
+The number of candidates you can rerank is a budget calculation, not a quality preference. Write the reranker's latency as a fixed cost plus a per-candidate cost, measured under load on your hardware or vendor, subtract everything else in the request path from the latency target, and solve for the candidate count. Then check the price side the same way. The estimate problems in this track walk through one.
+
+## Query transformation
+
+The user's words are often the worst query. Four transformations, each a small model call before retrieval:
+
+- **Rewriting** turns a conversational turn ("and for contractors?") into a standalone query using the chat history. Without it, the retriever searches for the literal words "and for contractors".
+- **HyDE** (Gao et al., 2022) asks a model to write a hypothetical answer, embeds that, and searches for real documents near it. It helps when queries are short and documents are long, because answer-shaped text sits closer to answer-shaped documents. It hurts when the model's guess is confidently wrong in a way that pulls retrieval towards the wrong documents.
+- **Multi-query** generates several phrasings, retrieves for each, and fuses the lists with RRF.
+- **Decomposition** splits "compare our EU and US refund policies" into two retrievals and lets the generator combine them.
+
+Each adds latency and a model call, so measure recall with and without it on your eval set.
+
+## Routing, filters and when retrieval is the wrong tool
+
+Not every question should hit the vector index. "How many open tickets does customer 4411 have?" is a SQL query; embedding it and retrieving prose about tickets produces a confident wrong number. "Thanks!" needs no retrieval at all. A router (rules, a classifier, or a model call with tool definitions) sends each request to the right backend: the vector index, a structured query, a live API, or nothing. Hard constraints such as tenant, date range, product and permission belong in metadata filters applied with the search, not in the query text.
+
+## Citations: make the model show its sources
+
+A grounded answer cites the chunks it used, so a reader can check it and you can measure it. Give every chunk an id and a source title, ask the model to cite ids, and validate after generation that every cited id was in the context you sent; reject or flag answers that cite something you did not provide. Some APIs carry this natively: Claude's `search_result` content blocks attach a source and title to retrieved text so the model's citations point at them, generally available on the Claude API since 2025-08-08.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Why does hybrid search beat pure vector search on identifier-heavy queries, and how would you merge the two result lists?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Embeddings capture meaning, so a rare exact string like an error code or SKU gets mapped near other codes and loses its identity; BM25 gives a rare term a high IDF and ranks the one document containing it first. I run both and merge with reciprocal rank fusion, because it uses positions and avoids comparing BM25 scores with cosine similarities, then rerank the fused top few dozen with a cross-encoder.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Why each fails. BM25 is exact-match on terms with IDF weighting: perfect for `E1234`, useless for "my payment keeps hanging". Dense retrieval is the reverse. There is also a theoretical limit: a 2025 paper showed single-vector embeddings cannot represent every top-k set, and on its adversarial LIMIT dataset BM25 reached 93.6 recall@100 against 18.9 for the best single-vector model.</p>
+<p>Merging. Score fusion needs normalisation and breaks when one list's scores are bunched together. RRF sums 1 / (k + rank), so it needs no calibration; k = 60 is the paper's default and Elasticsearch's, while Qdrant uses 2. I would set the fusion window explicitly, because Elasticsearch fuses only the top 10 of each list by default.</p>
+<p>After fusion. A cross-encoder reranks the fused candidates; its candidate count comes from the latency budget. Weighted RRF is available if one retriever is consistently better on our traffic.</p>
+<p>Verification. Recall@k per query segment (identifier queries, natural-language queries) for BM25 alone, dense alone and fused, on a labelled set. Hybrid should match the better retriever on each segment.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>How would you verify the fusion helps?</em> Segment the eval set by query type and compare recall@k for each retriever and the fusion; an aggregate number hides a regression on one segment.</li>
+<li><em>How does it fail?</em> If one retriever returns junk for a query class, RRF still gives its top results credit; weights or a router fix that.</li>
+<li><em>What is the alternative?</em> A learned sparse model or a fine-tuned embedding model on your jargon, or a multi-vector model, which narrows the gap but rarely removes the need for exact match on identifiers.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+This lesson assumes retrieval quality is mostly a ranking problem. When the right document is not in either candidate list, no fusion or reranking recovers it; that is an ingestion or query problem, and the debugging module shows how to tell which. When the corpus is small, the whole pipeline may be unnecessary.
+
+The numbers are defaults and vendor claims. RRF's k = 60 came from a 2009 pilot on TREC collections; engines chose other values. Cohere's calibration and price figures for Rerank 5 are from its launch post one week before this lesson was checked, not from independent tests. Re-measure on your traffic before relying on any threshold.
+
+<SelfRate id="lesson:rag/hybrid-search" />

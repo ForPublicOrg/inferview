@@ -1,0 +1,213 @@
+---
+title: Ingestion and chunking
+track: rag
+module: ingestion
+order: 2
+minutes: 16
+summary: Most retrieval failures are decided at index time, by how documents are parsed, cut into chunks, labelled with metadata and kept in step with their sources.
+prerequisites: [rag/retrieval-foundations]
+updated: 2026-10-28
+sources:
+  - title: OpenAI API reference, create vector store file (chunking strategy)
+    url: https://developers.openai.com/api/reference/resources/vector_stores/subresources/files/methods/create
+    note: auto chunking uses max_chunk_size_tokens 800 and chunk_overlap_tokens 400; static chunk size 100 to 4096; overlap at most half the chunk size
+  - title: LangChain text splitters, base.py
+    url: https://raw.githubusercontent.com/langchain-ai/langchain/master/libs/text-splitters/langchain_text_splitters/base.py
+    note: TextSplitter defaults chunk_size 4000, chunk_overlap 200, length_function len (characters)
+  - title: LangChain text splitters, character.py
+    url: https://raw.githubusercontent.com/langchain-ai/langchain/master/libs/text-splitters/langchain_text_splitters/character.py
+    note: RecursiveCharacterTextSplitter separators default to paragraph, line, space, then character
+  - title: Chroma research, Evaluating Chunking Strategies for Retrieval (2024-07-03)
+    url: https://www.trychroma.com/research/evaluating-chunking
+    note: token-level recall and IoU with text-embedding-3-large and 5 retrieved chunks; figures quoted in the table
+  - title: Anthropic, Introducing Contextual Retrieval (2024-09-19)
+    url: https://www.anthropic.com/news/contextual-retrieval
+    note: 50 to 100 tokens of context per chunk; top-20 failure rate 5.7% baseline, 3.7%, 2.9%, 1.9%; $1.02 per million document tokens with prompt caching; whole knowledge base in the prompt below about 200,000 tokens
+  - title: "Late Chunking: Contextual Chunk Embeddings Using Long-Context Embedding Models (Günther et al.)"
+    url: https://arxiv.org/abs/2409.04701
+    note: embed the whole text, then mean-pool token embeddings per chunk; works without additional training; v3 2025-07-07
+  - title: "ColPali: Efficient Document Retrieval with Vision Language Models (ICLR 2025)"
+    url: https://arxiv.org/abs/2407.01449
+    note: embeds page images with a vision language model and multi-vector late interaction; ViDoRe benchmark
+  - title: Cohere docs, models
+    url: https://docs.cohere.com/docs/models
+    note: embed-v4.0 accepts text, images and mixed text and images such as PDFs
+  - title: OpenAI API pricing
+    url: https://developers.openai.com/api/docs/pricing
+    note: text-embedding-3-small $0.02 per million tokens
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+import Predict from '../../../components/Predict.astro';
+import SelfRate from '../../../components/SelfRate.astro';
+import CodeRunner from '../../../components/CodeRunner.astro';
+import RagChunker from '../../../components/widgets/RagChunker.astro';
+
+export const chunker = `def chunk(tokens, size, overlap):
+    """Fixed-size windows over a token list. Each chunk starts size - overlap after the last."""
+    if not 0 <= overlap < size:
+        raise ValueError("need 0 <= overlap < size")
+    step = size - overlap
+    out = []
+    for start in range(0, len(tokens), step):
+        out.append(tokens[start:start + size])
+        if start + size >= len(tokens):
+            break
+    return out
+`;
+
+export const chunkerTests = `words = [f"w{i}" for i in range(10)]
+parts = chunk(words, size=4, overlap=1)
+assert parts == [["w0", "w1", "w2", "w3"], ["w3", "w4", "w5", "w6"], ["w6", "w7", "w8", "w9"]], "three windows of four with one word shared"
+assert chunk(words, size=4, overlap=0)[-1] == ["w8", "w9"], "the last chunk can be short; nothing is dropped"
+big = chunk(list(range(8000)), 800, 400)
+assert len(big) == 19, "800/400 on 8,000 tokens gives 19 chunks"
+assert sum(len(p) for p in big) == 15200, "and stores 15,200 tokens, 1.9 times the source"
+assert chunk([], 4, 1) == [], "an empty document has no chunks"
+try:
+    chunk(words, size=4, overlap=4)
+    raise AssertionError("expected ValueError")
+except ValueError:
+    pass
+`;
+
+## Fourteen days, or ninety
+
+Scenario, not a real company: an HR assistant is asked how much notice a contractor must give. It answers 90 days. The policy says 14. The table with the answer was in the index, but the chunker had cut it after the "Manager | 90 days" row, so one chunk held the header and the first three rows, and the next held "Contractor | 14 days" with no header at all. Retrieval returned the chunk that mentioned notice periods. The model read the last number it could see.
+
+Nobody would ship a database migration that silently split rows from their column names. Chunking does exactly that when it is configured by a default and never looked at. This module is about the index-time pipeline: parse, chunk, enrich, label, and keep the index consistent with its sources as they change.
+
+## Parsing: a PDF is a drawing of a document
+
+A PDF stores glyphs at coordinates, not paragraphs and tables. Text extraction has to rebuild reading order, and it fails in predictable places: two-column layouts read across the columns, running headers and footers repeat inside every chunk, tables come out as a stream of cells, and scanned pages have no text at all until OCR runs. Slides are worse, because the meaning often sits in the arrangement of boxes.
+
+Treat parsing as a stage with its own tests, like a compiler front end. The usual options, in increasing cost:
+
+- A text extractor plus cleanup rules (drop repeated headers, join hyphenated lines). Cheap, fine for prose.
+- A layout-aware parser that detects tables and emits them as Markdown or HTML, so each row can be kept with its header.
+- Embedding the page image itself. ColPali (ICLR 2025) embeds page images with a vision language model and scores them with multi-vector late interaction, and its authors report it beats text-extraction pipelines on their ViDoRe benchmark. Cohere's embed-v4.0 accepts mixed text and images, such as PDF pages. You still need text for the model to quote, but retrieval no longer depends on extraction getting the table right.
+
+For tables specifically, a reliable pattern is to write each row out as a sentence or a mini-table that repeats the header ("Role: Contractor. Notice period: 14 days."), and keep the full table as a parent the generator can see.
+
+## Chunking: the unit of retrieval
+
+The chunk is the unit you embed, retrieve, rank and pay for in the prompt. Too large and one vector has to represent several topics, so it matches none of them well and wastes context. Too small and the answer loses the sentence that gives it meaning. The strategies:
+
+**Fixed size** cuts every N tokens with an optional overlap. Simple, predictable, and blind to structure. OpenAI's vector stores use this by default with 800-token chunks and a 400-token overlap.
+
+**Recursive** splitting tries separators in order (paragraph, line, space, character) and only falls back to the next when a piece is still too long. LangChain's `RecursiveCharacterTextSplitter` is the common implementation.
+
+**Structure-aware** splitting follows headings, list items and table boundaries, then packs small sections together up to a size limit. It needs a parser that kept the structure.
+
+**Semantic** splitting embeds sentences and cuts where consecutive sentences stop being similar. It costs an embedding call per sentence at index time.
+
+**Parent-child** (small-to-big) retrieval indexes small chunks for precise matching but returns their parent section to the model. It separates the unit of matching from the unit of reading, which is often the real fix.
+
+<Callout kind="gotcha" label="Characters, not tokens">
+LangChain's base `TextSplitter` defaults to `chunk_size=4000`, `chunk_overlap=200` and `length_function=len`. That is 4,000 characters, not tokens, unless you pass a token counter. Code that says "1,000-token chunks" while using `len` is off by the characters-per-token ratio, which the tokens lesson showed varies by language.
+</Callout>
+
+Move the sliders below. The document is a short leaving-the-company policy with one table, and the question needs the contractor row together with the header that says what the numbers mean. Words stand in for tokens.
+
+<RagChunker />
+
+At the default 60 words with no overlap, the header lands in one chunk and the contractor row in the next. Drop to 40 words and they happen to share a chunk; at 45 they split again, and adding 10 words of overlap joins them. Whether the table survives is an accident of where the window starts, not a property of the size. Switch to splitting on headings and blank lines and the table stays whole at every size, because the boundary follows the document.
+
+<Predict id="rag-overlap-chunks" question="How many chunks does an 8,000-token document produce at 800 tokens with 400 overlap?" answer={19} tolerance={1} unit="chunks">
+<p>Each chunk starts 400 tokens after the previous one, so chunks start at 0, 400, 800 and so on up to 7,200, where the window reaches the end: <b>19 chunks</b>. They hold 18 x 800 + 800 = 15,200 tokens, 1.9 times the source. Overlap at half the chunk size roughly doubles what you embed, store and search.</p>
+</Predict>
+
+## What the evidence says about chunk size
+
+There is no sourced "best chunk size". The most careful public comparison is Chroma's 2024 report, which measured token-level recall and intersection over union (how much of the retrieved text was actually needed) with text-embedding-3-large and 5 retrieved chunks.
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Chunker (Chroma, 2024)</th><th>Recall</th><th>IoU</th></tr></thead>
+<tbody>
+<tr><td>Recursive, 200 tokens, no overlap</td><td>88.1</td><td>6.9</td></tr>
+<tr><td>Recursive, 400 tokens, no overlap</td><td>89.5</td><td>3.6</td></tr>
+<tr><td>Recursive, 400 tokens, 200 overlap</td><td>88.1</td><td>3.3</td></tr>
+<tr><td>Token splitter, 800 tokens, 400 overlap</td><td>87.9</td><td>1.4</td></tr>
+<tr><td>Cluster semantic chunker, 200 tokens</td><td>not quoted here</td><td>8.0 (best)</td></tr>
+<tr><td>LLM-based chunker</td><td>91.9 (best)</td><td>not quoted here</td></tr>
+</tbody>
+</table>
+</div>
+
+Two things to take from it. Overlap did not buy recall in this test: 400 tokens with 200 overlap scored lower than 400 with none. And the 800/400 setting scored lowest on IoU, meaning most of what it retrieved was not needed. That is one benchmark with one embedding model, so the lesson is the method: build a labelled set from your own documents and measure, rather than adopting anyone's default.
+
+## Context before embedding: contextual retrieval and late chunking
+
+A chunk that says "Revenue grew 3% over the previous quarter" does not say which company or which quarter. Two techniques put that context back.
+
+**Contextual retrieval** (Anthropic, September 2024) asks a model to write 50 to 100 tokens explaining where each chunk sits in its document, prepends it, and indexes the result for both embeddings and BM25. On Anthropic's datasets the top-20 retrieval failure rate fell from 5.7% to 3.7% with contextual embeddings (35% fewer failures), to 2.9% adding contextual BM25 (49%), and to 1.9% adding a reranker (67%). Those percentages are reductions in a failure rate from a 5.7% baseline, not "67% better retrieval". The one-time cost was $1.02 per million document tokens using prompt caching. The same post notes that a knowledge base under about 200,000 tokens can simply go in the prompt.
+
+**Late chunking** (Jina, 2024; revised July 2025) runs a long-context embedding model over the whole document first, then averages the token embeddings inside each chunk's span. Each chunk vector has seen the surrounding text, with no extra model calls and no training. It needs token-level outputs from the embedding model, so it does not work through an API that returns one pooled vector per input unless the provider exposes it as an option.
+
+## Metadata, access control and freshness
+
+Every chunk should carry its source id, a version or content hash, its position, the section heading path, timestamps, and the access-control labels of its source. Metadata is what lets you filter by tenant or date, cite the source, and delete precisely.
+
+Freshness is a change-data-capture problem. An ingestion job that only lists files changed since the last run and upserts their chunks has two classic bugs:
+
+1. **Deletes never propagate.** A deleted file is not in the "changed" list, so its chunks stay searchable forever. You need tombstones from the source, or a periodic full diff of source ids against index ids.
+2. **Edits leave orphans.** If chunk ids are `doc_id + chunk_number` and an edit shortens a document from 12 chunks to 9, chunks 10 to 12 survive with stale text. Delete all chunks for a document version before inserting the new ones, or key chunks by version.
+
+Changing the embedding model is a migration, not an update. Vectors from two models live in different spaces and cannot be compared, so build a new index alongside the old one, backfill it, compare recall on your eval set, and switch reads over, the same blue-green pattern you would use for a schema change. The embedding bill is the small part: 10 million chunks of 800 tokens is 8 billion tokens, which at text-embedding-3-small's $0.02 per million tokens is $160 for one pass. The backfill time, the double storage during the cutover and the eval run are the real costs.
+
+## A chunker in code
+
+The chunker below is the fixed-size strategy with overlap. Its tests include the 800/400 arithmetic from the Predict block.
+
+```python
+def chunk(tokens, size, overlap):
+    """Fixed-size windows over a token list. Each chunk starts size - overlap after the last."""
+    if not 0 <= overlap < size:
+        raise ValueError("need 0 <= overlap < size")
+    step = size - overlap
+    out = []
+    for start in range(0, len(tokens), step):
+        out.append(tokens[start:start + size])
+        if start + size >= len(tokens):
+            break
+    return out
+```
+
+<CodeRunner id="lesson-rag-chunker" title="Run the chunker against the tests" starter={chunker} tests={chunkerTests} gradable={false} />
+
+Remove the `break` and run it: the loop emits extra chunks that are suffixes of the last full one, a duplicate-content bug that inflates the index and crowds the top k with near copies.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"How do you keep a RAG index fresh when the source documents change every day?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Treat it as change data capture. Each source document has a stable id and a content hash; ingestion compares hashes, re-chunks and re-embeds only what changed, deletes all chunks of the old version before writing the new ones, and processes deletes as tombstones. A nightly reconciliation diffs source ids against index ids to catch anything the incremental path missed, and freshness lag is a metric with an alert.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Change detection. Prefer events from the source (webhooks, a change feed) and fall back to polling with content hashes. Hashing the normalised text, not the file bytes, avoids re-embedding when only metadata changed.</p>
+<p>Write path. Chunk ids include the document version, so an update is "insert the new version, then delete the old version" and a reader never sees a half-written document. Deletes come from tombstones; if the source cannot emit them, a periodic full listing finds ids that disappeared.</p>
+<p>Consistency with access control. Permission changes are changes too: if a document's ACL changes, its chunks' labels must change in the same job, or the index leaks documents to users who lost access.</p>
+<p>Model upgrades. A new embedding model means a parallel index, a backfill, an eval comparison and a cutover, because vectors from different models cannot be mixed.</p>
+<p>Observability. Track the lag between a source change and the index reflecting it, the count of orphaned chunks found by reconciliation, and recall on a small set of questions whose answers changed recently.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>How would you verify it?</em> Seed the eval set with questions about recently edited and deleted documents and assert the old answers no longer come back.</li>
+<li><em>How does it fail?</em> Upsert-only jobs keep deleted content searchable; positional chunk ids leave stale tails after an edit; a cache in front of retrieval serves the old answer after the index is fixed.</li>
+<li><em>What is the alternative?</em> For a small, fast-changing corpus, skip the index: query the source system live at request time, or put the whole corpus in the prompt if it is under the size where that is cheaper.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+This lesson treats the chunk as the unit of meaning. For some corpora it is not. Code is better split along functions and classes than by size. Conversations need speaker turns kept together. Highly cross-referenced documents (contracts that say "as defined in section 2.1") need the referenced text pulled in, which no chunker does on its own.
+
+The evidence here is thin in a specific way: Chroma's comparison is one benchmark with one embedding model, and Anthropic's contextual retrieval figures come from Anthropic's own datasets in 2024. Neither has a public 2025 or 2026 replication that this lesson could find. They tell you what to measure, not what you will get.
+
+<SelfRate id="lesson:rag/ingestion" />

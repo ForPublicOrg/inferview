@@ -1,0 +1,96 @@
+---
+id: rag-004
+title: LIMIT 10 returns 3 rows
+subtitle: find and fix
+track: rag
+module: retrieval-foundations
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 20
+core: true
+tags: [pgvector, hnsw, filtering, multi-tenant]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: llmgenai/LLMInterviewQuestions
+    url: https://github.com/llmgenai/LLMInterviewQuestions
+    note: source of the question shape ("types and challenges associated with filtering in vector DB")
+  - title: pgvector README
+    url: https://github.com/pgvector/pgvector
+    note: filtering applies after the index scan; 10% filter with ef_search 40 returns about 4 rows; iterative scans with hnsw.iterative_scan and hnsw.max_scan_tuples (default 20,000); relaxed_order trades exact distance order for better recall, re-sorted with a materialized CTE and ORDER BY distance + 0 on Postgres 17+; partial indexes and partitioning
+  - title: pgvector changelog
+    url: https://github.com/pgvector/pgvector/blob/master/CHANGELOG.md
+    note: iterative index scans added in 0.8.0
+choices:
+  - text: The graph is too sparse; rebuild the index with `m = 48` so each node has more neighbours
+    correct: false
+    why: A denser graph improves recall of the 40 candidates, but the scan still returns 40 candidates and the tenant filter still keeps about 8% of them.
+  - text: HNSW returns `hnsw.ef_search` (40) candidates and the tenant filter runs afterwards, so about 8% of 40, roughly 3, survive
+    correct: true
+    why: The arithmetic matches the symptom exactly, and it explains why large tenants get closer to 10 rows than small ones.
+  - text: "`<=>` is cosine distance but the index uses another operator class, so Postgres skips the index"
+    correct: false
+    why: The index is built with `vector_cosine_ops`, which matches `<=>`; and if the index were skipped, Postgres would run an exact scan and return all 10 rows, slowly.
+  - text: Postgres applies `LIMIT 10` before the `WHERE` clause, so it filters only the first ten rows
+    correct: false
+    why: SQL applies WHERE before LIMIT. The rows are lost inside the index scan, which hands back a fixed number of candidates before the filter ever runs.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"A multi-tenant RAG service stores all tenants' chunks in one pgvector table. Tenants complain that answers use too little context. Find out why."
+</Callout>
+
+The table holds about 30 million chunks. Tenant 42 owns about 8% of them. pgvector is 0.8.7 with default settings.
+
+```sql
+CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops);
+
+SELECT id, title
+FROM chunks
+WHERE tenant_id = 42
+ORDER BY embedding <=> $1
+LIMIT 10;
+```
+
+The application log for tenant 42 over an hour:
+
+```text
+rows_returned: 3 3 4 2 3 3 3 5 3 2 3 4 3 3
+```
+
+Tenants with smaller shares of the table see 0 or 1 rows. A tenant with about 40% of the rows usually sees 10.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>How many candidates does the HNSW scan hand to the rest of the query by default?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Multiply that number by each tenant's share of the table and compare with the log.</p></details>
+
+## Answer
+
+The HNSW scan returns `hnsw.ef_search` candidates, 40 by default, ordered by distance. The `WHERE tenant_id = 42` filter runs on those 40, not on the table. About 8% of 40 is 3.2, which is the log almost row for row. The pgvector README gives the same arithmetic: with a filter matching 10% of rows and `ef_search` 40, "only 4 rows will match on average". A tenant with 40% of rows gets about 16 candidates that pass, enough to fill `LIMIT 10`; a tenant with 1% gets 0.4.
+
+Fixes, in the order I would try them:
+
+1. **Iterative index scans** (pgvector 0.8.0 and later): `SET hnsw.iterative_scan = strict_order;` or `relaxed_order`. The scan keeps fetching candidates until enough rows pass the filter or it reaches `hnsw.max_scan_tuples`, 20,000 by default. `relaxed_order` can return results slightly out of order by distance in exchange for better recall; if order matters, wrap the query in a materialized CTE and `ORDER BY distance + 0` (the `+ 0` is needed on Postgres 17 and later).
+2. **A higher `ef_search`** for filtered queries. To expect 10 rows at 8% selectivity you need at least 10 / 0.08 = 125 candidates. It is a blunt fix: latency rises for every query that uses the setting, and it still fails for the smallest tenants.
+3. **Partial indexes or partitioning** for large tenants (`CREATE INDEX ... WHERE tenant_id = 42`, or a partition per tenant or tenant group), so the filter is part of the index and every candidate qualifies.
+4. **Exact search for small tenants**: a B-tree index on `tenant_id` lets the planner fetch one small tenant's rows and compute distances exactly, which is correct and often fast enough.
+
+Why the wrong picks are tempting. A larger `m` is the reflex for any recall problem, but the issue is not recall of the graph, it is the number of candidates. Operator-class mismatches are a real pgvector bug, but they produce slow exact scans with full results, the opposite symptom. And "LIMIT before WHERE" describes the effect well enough that it sounds right, but it misplaces the cause in SQL semantics rather than in the index scan.
+
+## Follow-ups
+
+- *How would you have caught this before tenants did?* Log `rows_returned` against the requested limit per tenant, and alert when the ratio drops. An eval set with only one large tenant would never show it.
+- *Is the iterative scan free?* No. It reads more of the graph for selective filters; cap it with `hnsw.max_scan_tuples` and watch p95 latency for small tenants.
+- *Does a dedicated vector database avoid this?* Many support filtering during the graph search rather than after it, but each has its own behaviour for very selective filters. Test the smallest tenant, not the average one.
+
+## Common mistakes
+
+- Raising `LIMIT` to 50, which changes nothing because the scan still returns 40 candidates.
+- Rebuilding the index with larger `m` or `ef_construction`.
+- Testing with the biggest tenant and concluding filtering works.
+- Turning on `relaxed_order` and forgetting that the results may need re-sorting.

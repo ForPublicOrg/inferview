@@ -1,0 +1,149 @@
+---
+id: sys-015
+title: Rate limits at peak hour
+subtitle: find the root cause
+track: system-design
+module: case-realtime
+type: debug
+difficulty: medium
+seniority: [mid, senior]
+minutes: 20
+core: false
+tags: [rate-limits, retries, backoff, circuit-breaker, fallback, incident]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: amitshekhariitbhu/ai-engineering-interview-questions, question bank
+    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
+    note: lists "Your application is hitting LLM provider rate limits during peak hours. How do you handle it?" and a single-provider outage question
+  - title: Anthropic docs, rate limits
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: limits enforced as token buckets, so 60 RPM may be enforced as 1 request per second; sharp increases can trigger acceleration limits; max_tokens does not count toward OTPM; spend-limit 429s carry no retry-after and last until the next month; error.details.error_code enforced_spend_limit_reached identifies the spend-cap 429
+  - title: Anthropic docs, API errors
+    url: https://platform.claude.com/docs/en/api/errors
+    note: 429 rate_limit_error, 529 overloaded_error; SDKs retry transient errors twice by default with exponential backoff and honour retry-after
+  - title: LiteLLM docs, router, load balancing and fallbacks
+    url: https://docs.litellm.ai/docs/routing
+    note: cooldown after allowed_fails (default 3) for cooldown_time (default 5 s); max_fallbacks default 5
+  - title: AWS Builders' Library, avoiding fallback in distributed systems (2019)
+    url: https://builder.aws.com/content/3EuS9Sakq7L3VLQIF3qzfMfke1Y/avoiding-fallback-in-distributed-systems
+    note: rarely exercised fallback paths fail when needed and can amplify outages
+choices:
+  - text: Short bursts trip the per-second enforcement of the limit, and the custom retry loop retries each 429 at once, ignoring retry-after, which multiplies the request rate
+    correct: true
+    why: Provider requests at 18:00 are almost three times user requests, every retry in the log lands within 200 ms of the last despite retry-after=6, and the problem disappears off-peak. The retries are the load.
+  - text: The organization has hit its monthly spend limit
+    correct: false
+    why: A spend-limit 429 carries no retry-after and keeps failing until the month rolls over, off-peak included. These 429s carry retry-after and stop at 03:00.
+  - text: The provider is overloaded across all customers at peak
+    correct: false
+    why: Provider-wide overload returns 529 overloaded_error. Every error here is a 429 rate_limit_error scoped to your organization.
+  - text: max_tokens is set to 8,192, which reserves output tokens and exhausts the output-tokens-per-minute limit
+    correct: false
+    why: On this provider max_tokens does not count toward the output-token limit, and the dashboard shows output-token usage at 45 percent of the limit at peak.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"We hit the provider's rate limits every evening at peak, even though our traffic is under the limit. Find out why."
+</Callout>
+
+The organization's limit is 2,000 requests a minute. The team turned off the SDK's built-in retries last month and wrote its own:
+
+```python
+client = Anthropic(max_retries=0)
+
+def call(body):
+    for attempt in range(5):
+        try:
+            return client.messages.create(**body)
+        except RateLimitError:
+            continue
+    raise Overloaded("try again later")
+```
+
+Dashboard, synthetic but consistent:
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Per minute</th><th>17:00</th><th>18:00 (peak)</th><th>03:00</th></tr></thead>
+<tbody>
+<tr><td>user requests</td><td>900</td><td>1,400</td><td>150</td></tr>
+<tr><td>requests sent to the provider</td><td>905</td><td>4,100</td><td>150</td></tr>
+<tr><td>responses that were 429</td><td>0.2%</td><td>38%</td><td>0%</td></tr>
+<tr><td>output-token usage, share of limit</td><td>30%</td><td>45%</td><td>5%</td></tr>
+</tbody>
+</table>
+</div>
+
+Log lines for one request at peak:
+
+```text
+18:02:11.204 req=8f2a attempt=1 429 rate_limit_error retry-after=6
+18:02:11.391 req=8f2a attempt=2 429 rate_limit_error retry-after=6
+18:02:11.577 req=8f2a attempt=3 429 rate_limit_error retry-after=6
+18:02:11.760 req=8f2a attempt=4 429 rate_limit_error retry-after=5
+18:02:11.948 req=8f2a attempt=5 429 rate_limit_error retry-after=5
+```
+
+Pick the root cause. The answer opens once you pick correctly.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Compare user requests with requests sent to the provider in each column.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>A limit of 2,000 a minute may be enforced over much shorter intervals.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>What does the retry loop do with retry-after?</p></details>
+
+## Answer
+
+The provider enforces its limits as token buckets over short intervals, so 2,000 a minute behaves like about 33 a second, and the evening peak has seconds that go over even though the minute does not. The first few 429s are normal. The custom loop then retries each one immediately, five times, ignoring the retry-after header, so every rejected request becomes up to five more requests in the same second. At 18:00 the service sends 4,100 requests a minute to serve 1,400 users, and 38 percent of them fail. The loop turned a small overflow into a retry storm.
+
+Why the wrong picks are tempting. A spend limit also returns 429, but it carries no retry-after and does not recover at night. Provider overload is a reasonable first guess at peak, but it has its own status code, 529. And `max_tokens` feels like a reservation, but this provider does not count it toward the output-token limit, and the dashboard shows that limit far from full.
+
+### The fix
+
+```diff
+-client = Anthropic(max_retries=0)
++client = Anthropic(max_retries=2)          # SDK backoff honours retry-after
++bucket = TokenBucket(capacity=30, refill_per_s=30)   # stay under the per-second rate
++breaker = Breaker(fail_limit=5, cooldown_s=30)
+
+ def call(body):
+-    for attempt in range(5):
+-        try:
+-            return client.messages.create(**body)
+-        except RateLimitError:
+-            continue
+-    raise Overloaded("try again later")
++    if not bucket.try_take(1):
++        return queue_or_degrade(body)       # wait in a queue, or serve a labelled fallback
++    if not breaker.allow(now()):
++        return queue_or_degrade(body)
++    try:
++        r = client.messages.create(**body)
++        breaker.record(True, now())
++        return r
++    except RateLimitError as e:
++        breaker.record(False, now())
++        code = (e.body or {}).get("error", {}).get("details", {}).get("error_code")
++        if code == "enforced_spend_limit_reached" or e.response.headers.get("retry-after") is None:
++            raise SpendLimitReached() from e   # will not recover by retrying; page someone
++        return queue_or_degrade(body)
+```
+
+Pace requests on the client to the provider's real rate, let the SDK back off with jitter and honour retry-after, and stop retrying entirely when the 429 is the kind that does not recover. Then decide what the user gets while the system is saturated: a queue with a visible wait for chat, a smaller fallback model with the response marked as degraded, or a clear "try again" for batch jobs.
+
+## Follow-ups
+
+- *Should we just add a second provider?* It helps with outages and limits, but a fallback that only runs during incidents tends to fail when needed. Send a small share of real traffic through it all the time, evaluate its answers, and cap fallbacks so a failing secondary does not double the load.
+- *How do routers handle this?* LiteLLM's router, for one, puts a deployment in cooldown after a few failures (3 by default, for 5 seconds) and caps fallbacks at 5 by default; the shape is the same breaker.
+- *How do you find the real peak-second rate?* Histogram requests per second, not per minute; the minute average hides the bursts that trip the limit.
+
+## Common mistakes
+
+- Raising the retry count, which makes the storm worse.
+- Asking for a higher tier before measuring how many provider requests are retries.
+- Treating every 429 the same, including the spend-limit one that never recovers.
+- Turning off the SDK's retries without replacing what they did.

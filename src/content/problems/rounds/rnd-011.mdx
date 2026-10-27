@@ -1,0 +1,122 @@
+---
+id: rnd-011
+title: Long chats start failing with a 400
+subtitle: debug the history trimmer
+track: rounds
+module: take-home-debug
+type: debug
+difficulty: medium
+seniority: [mid, senior]
+minutes: 15
+core: false
+tags: [memory, context-window, tool-use, debugging, take-home]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: amitshekhariitbhu/ai-engineering-interview-questions
+    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
+    note: lists "implement a conversation memory system for a chatbot (sliding window, summary, buffer)"
+  - title: Claude API docs, handle tool calls
+    url: https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls
+    note: tool_result blocks must immediately follow the assistant turn with the matching tool_use, carry its tool_use_id, and come first in the user content
+  - title: Claude API docs, Messages API reference
+    url: https://platform.claude.com/docs/en/api/messages
+    note: the system prompt is a top-level system parameter, not an entry in messages
+  - title: Claude API docs, errors
+    url: https://platform.claude.com/docs/en/api/errors
+    note: 400 invalid_request_error for malformed requests; 413 request_too_large
+  - title: Claude API docs, context editing
+    url: https://platform.claude.com/docs/en/build-with-claude/context-editing
+    note: clear_tool_uses_20250919 clears old tool results past a trigger of 100,000 input tokens by default, keeping 3 tool uses
+choices:
+  - text: The trimmer can cut between an assistant `tool_use` turn and the user turn holding its `tool_result`, so the kept history opens with an orphaned tool result
+    correct: true
+    why: Trimming walks back from the newest message and stops at the budget, wherever that falls. When it falls between a tool call and its result, the request breaks the tool-result pairing rule and the API rejects it.
+  - text: The token counter uses words instead of tokens, so trimmed requests still overflow the context window
+    correct: false
+    why: Undercounting would produce a context-length or size error, and the failing requests here are far below the window. The error names a tool result, not a length.
+  - text: The trimmer drops the system prompt once the conversation is long, so the model receives no instructions
+    correct: false
+    why: In the Claude Messages API the system prompt is a separate top-level parameter. This function only sees the messages list, so it cannot drop it.
+  - text: "`reversed()` returns an iterator, so the kept messages come back in reverse order"
+    correct: false
+    why: The function reverses twice, once to walk newest first and once with list(reversed(kept)) to restore order. The order is correct.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Debug round">
+"Users with long conversations get errors. Short conversations are fine. Here is the memory module. Find the bug."
+</Callout>
+
+A support assistant keeps the newest messages that fit a token budget and sends them, with a separate system prompt, to the Claude Messages API. The assistant uses tools, so the history contains assistant turns with `tool_use` blocks followed by user turns with `tool_result` blocks.
+
+```python
+def trim(messages, budget, count):
+    """Keep the newest messages whose total count fits the budget."""
+    kept, used = [], 0
+    for m in reversed(messages):
+        c = count(m)
+        if used + c > budget:
+            break
+        kept.append(m)
+        used += c
+    return list(reversed(kept))
+
+def reply(client, system, messages):
+    history = trim(messages, budget=6000, count=count_tokens)
+    return client.messages.create(model=MODEL, system=system, messages=history,
+                                  tools=TOOLS, max_tokens=1024)
+```
+
+Errors only appear once conversations exceed the budget. The failing requests are around 6,000 tokens, well inside the model's window, and come back as `400 invalid_request_error` with a message about a `tool_result` block that has no matching `tool_use`. Pick the root cause.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Look at where the loop stops. Is that position chosen by meaning or by arithmetic?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Write out the message sequence for one tool call. What is the smallest unit you can remove without breaking it?</p></details>
+
+## Answer
+
+The trimmer cuts at an arbitrary message. When the budget runs out just after a user turn holding `tool_result` blocks, the assistant turn with the matching `tool_use` is dropped, and the first kept message is a tool result pointing at an id the request no longer contains. The Claude docs require each `tool_result` to follow the assistant turn with its `tool_use`, so the API rejects the request. Short conversations never trim, so they never fail, which matches the symptom exactly.
+
+The fix trims in units that cannot be split: a user turn and everything up to the next plain user turn, so each tool call stays with its result. Then make sure the kept history starts with a user message that is not a tool result:
+
+```python
+def turns(messages):
+    """Group messages so each group starts at a user message that is not a tool result."""
+    groups = []
+    for m in messages:
+        starts_turn = m["role"] == "user" and not is_tool_result(m)
+        if starts_turn or not groups:
+            groups.append([])
+        groups[-1].append(m)
+    return groups
+
+def trim(messages, budget, count):
+    kept, used = [], 0
+    for group in reversed(turns(messages)):
+        c = sum(count(m) for m in group)
+        if used + c > budget:
+            break
+        kept[:0] = group
+        used += c
+    return kept
+```
+
+Why the wrong picks are tempting. Token undercounting is a real bug in many trimmers, but it produces a size error, not a pairing error. Dropping the system prompt is a real bug in APIs that put the system prompt inside the message list; in this API it is a separate parameter. The `reversed` pick is the reflex of someone who has not read the last line of the function.
+
+## Follow-ups
+
+- *The newest single turn is bigger than the budget.* Then `trim` returns nothing. Decide explicitly: shrink the tool results inside it (truncate or summarise them), or fail with a clear message, but never send an empty history.
+- *Users complain the bot forgets their preferences after a while.* Trimming forgets old turns by design. Move durable facts (preferences, account details) into a summary or a memory store that is re-injected every request instead of hoping they survive in the window.
+- *Could the API trim for you?* Claude's context-editing beta clears old tool results once input passes a token trigger, keeping the most recent ones; it changes the prompt prefix, which costs a cache miss when it fires.
+- *How do you test this?* Generate random conversations with tool calls, trim at every budget from 0 to the full size, and assert the result is a valid conversation: starts on a plain user turn, and every `tool_result` id appears in the immediately preceding assistant turn.
+
+## Common mistakes
+
+- Trimming by message count or by message instead of by turn.
+- Fixing it by catching the 400 and retrying with half the history, which still splits pairs at random.
+- Summarising tool results into plain text and leaving the `tool_use` block, which breaks the pairing the other way.
+- Testing the trimmer only on chat without tools.

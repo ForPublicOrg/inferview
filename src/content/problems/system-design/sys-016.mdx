@@ -1,0 +1,187 @@
+---
+id: sys-016
+title: Per-tenant token bucket
+subtitle: charge up front, settle after
+track: system-design
+module: capacity
+type: code
+difficulty: medium
+seniority: [mid, senior]
+minutes: 25
+core: false
+tags: [rate-limiting, token-bucket, multi-tenancy, quotas, cost-control]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Anthropic docs, rate limits
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: provider limits on requests, input tokens and output tokens per minute are enforced as token buckets; limits apply per organization
+  - title: techinterview.org, what applied-AI engineer interviews test in 2026
+    url: https://www.techinterview.org/post/3233476824/ai-engineer-interview-rag-agents-evals/
+    note: "How do you cap tool calls and spend per request so one runaway session can't cost fifty dollars?"
+code:
+  starter: |
+      import time
+
+      class TokenBucket:
+          def __init__(self, capacity, refill_per_s, now=time.monotonic):
+              self.capacity = capacity
+              self.refill = refill_per_s
+              self.now = now
+
+          def available(self):
+              """Tokens available right now, after refilling for the time that has passed."""
+              raise NotImplementedError
+
+          def try_take(self, n):
+              """Take n tokens and return True, or return False and take nothing."""
+              raise NotImplementedError
+
+          def settle(self, estimated, actual):
+              """Correct a take of `estimated` tokens once the real usage `actual` is known."""
+              raise NotImplementedError
+
+
+      class TenantLimiter:
+          """One TokenBucket per tenant, created on first use."""
+          def __init__(self, capacity, refill_per_s, now=time.monotonic):
+              raise NotImplementedError
+
+          def try_take(self, tenant, n):
+              raise NotImplementedError
+
+          def settle(self, tenant, estimated, actual):
+              raise NotImplementedError
+  tests: |
+      clock = [0.0]
+      now = lambda: clock[0]
+      b = TokenBucket(capacity=10_000, refill_per_s=1_000, now=now)
+      assert b.try_take(8_000) is True, "a fresh bucket starts full"
+      assert b.try_take(3_000) is False, "only 2,000 are left"
+      assert round(b.available()) == 2_000, "a refused take must not change the level"
+      clock[0] += 1.0
+      assert b.try_take(3_000) is True, "one second refills 1,000, so 3,000 are available"
+      b.settle(estimated=3_000, actual=1_200)
+      assert round(b.available()) == 1_800, "settle refunds the unused part of the estimate"
+      clock[0] += 100.0
+      assert round(b.available()) == 10_000, "the level never goes above capacity"
+      assert b.try_take(9_000) is True
+      b.settle(estimated=9_000, actual=12_000)
+      assert round(b.available()) == -2_000, "an under-estimate leaves debt"
+      clock[0] += 2.0
+      assert b.try_take(1) is False, "debt must be repaid before the next request"
+      clock[0] += 1.0
+      assert b.try_take(1) is True, "after three seconds the bucket holds 1,000 again"
+      try:
+          b.try_take(20_000)
+          raised = False
+      except ValueError:
+          raised = True
+      assert raised, "a request larger than the bucket can never fit, so raise ValueError"
+      lim = TenantLimiter(capacity=10_000, refill_per_s=1_000, now=now)
+      assert lim.try_take("acme", 10_000) is True
+      assert lim.try_take("globex", 10_000) is True, "tenants have separate buckets"
+      assert lim.try_take("acme", 1) is False, "acme is empty until it refills"
+      lim.settle("acme", estimated=10_000, actual=4_000)
+      assert lim.try_take("acme", 6_000) is True, "settle applies to the right tenant"
+  solution: |
+      import time
+
+      class TokenBucket:
+          def __init__(self, capacity, refill_per_s, now=time.monotonic):
+              self.capacity = capacity
+              self.refill = refill_per_s
+              self.now = now
+              self.level = capacity
+              self.t = now()
+
+          def _top_up(self):
+              t = self.now()
+              self.level = min(self.capacity, self.level + (t - self.t) * self.refill)
+              self.t = t
+
+          def available(self):
+              self._top_up()
+              return self.level
+
+          def try_take(self, n):
+              if n > self.capacity:
+                  raise ValueError("request is larger than the bucket")
+              self._top_up()
+              if self.level >= n:
+                  self.level -= n
+                  return True
+              return False
+
+          def settle(self, estimated, actual):
+              self._top_up()
+              # Refund an over-estimate; an under-estimate leaves debt that blocks until refilled.
+              self.level = min(self.capacity, self.level + estimated - actual)
+
+
+      class TenantLimiter:
+          def __init__(self, capacity, refill_per_s, now=time.monotonic):
+              self.capacity, self.refill, self.now = capacity, refill_per_s, now
+              self.buckets = {}
+
+          def _bucket(self, tenant):
+              if tenant not in self.buckets:
+                  self.buckets[tenant] = TokenBucket(self.capacity, self.refill, self.now)
+              return self.buckets[tenant]
+
+          def try_take(self, tenant, n):
+              return self._bucket(tenant).try_take(n)
+
+          def settle(self, tenant, estimated, actual):
+              self._bucket(tenant).settle(estimated, actual)
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Your platform calls one model provider for hundreds of tenants. Write the limiter that stops one tenant from using up everyone's token budget."
+</Callout>
+
+Provider limits apply to your whole organization, so a single tenant's batch job can turn into 429s for everyone else. You will write the per-tenant limiter that sits in your gateway.
+
+You cannot know how many tokens a model call will use until it finishes. So the gateway takes an **estimate** before the call (prompt tokens plus `max_tokens`, say) and **settles** afterwards with the real usage: refund the difference if the call used less, record a debt if it used more.
+
+Implement:
+
+- `TokenBucket(capacity, refill_per_s, now)`. Starts full. `now` is a function returning seconds, so tests can control time.
+- `available()` returns the current level after refilling for the time elapsed, never above `capacity`.
+- `try_take(n)` takes `n` tokens and returns `True`, or returns `False` and changes nothing. A request larger than `capacity` can never succeed: raise `ValueError`.
+- `settle(estimated, actual)` adjusts the level by `estimated - actual`, capped at `capacity`. The level may go negative; a negative level blocks requests until refills repay it.
+- `TenantLimiter(capacity, refill_per_s, now)` keeps one bucket per tenant, created on first use, with `try_take(tenant, n)` and `settle(tenant, estimated, actual)`.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Do not refill on a timer. Store the level and the time it was last updated, and refill lazily whenever someone asks.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Refill before you settle, or the debt calculation uses a stale level.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Check the oversized request before touching the level, so a refused call changes nothing.</p></details>
+
+## Answer
+
+The reference solution refills lazily: every call computes the elapsed time since the last update, adds `elapsed × refill_per_s`, caps at capacity, and records the new time. That makes the bucket exact at any moment without a background thread, and deterministic under a fake clock.
+
+`try_take` rejects requests larger than the bucket with an error rather than `False`, because `False` means "wait and retry" and that request would wait forever. A refused take leaves the level alone, so callers can safely try again later.
+
+`settle` applies `estimated - actual` after refilling. Over-estimates come back as tokens; under-estimates push the level below zero. Allowing debt is the design choice that matters: without it, a tenant can estimate low on purpose and spend more than its share, because the overage is never charged against the next request.
+
+`TenantLimiter` is a dictionary of buckets. Each tenant has its own level and its own clock reading, so one tenant draining its bucket cannot block another.
+
+In production the same structure needs three more things: shared state (one bucket per tenant in Redis or the gateway's own store, updated atomically, because gateways run as several replicas), separate buckets for input and output tokens to mirror how the provider counts them, and a global bucket sized to the organization's provider limit that every tenant's request also takes from.
+
+## Follow-ups
+
+- *How do you choose each tenant's capacity?* Reserve a share of the provider limit per paid tier and let tenants borrow from an unreserved pool, so the sum of reservations never exceeds what the provider allows.
+- *What estimate do you charge up front?* Counted prompt tokens plus `max_tokens` is safe but pessimistic; a tenant's recent average output is closer, and settle-up corrects the rest.
+- *How does this relate to a per-session spend cap?* The same bucket at a different key: per session or per agent run, with a capacity in dollars, so one runaway loop stops at its cap.
+
+## Common mistakes
+
+- Refilling on a timer thread, which drifts and is hard to test.
+- Capping settle at zero, which forgives under-estimates and lets tenants overspend.
+- Returning `False` for a request that can never fit, so the caller retries forever.
+- One shared bucket for all tenants, which is the problem the question started with.

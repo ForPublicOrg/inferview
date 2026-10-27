@@ -1,0 +1,163 @@
+---
+title: Batching and PagedAttention
+track: inference
+module: batching
+order: 2
+minutes: 14
+summary: Continuous batching refills a finished slot on the very next step, PagedAttention stores the KV cache in fixed-size blocks like virtual memory, and chunked prefill keeps one long prompt from stalling everyone else.
+prerequisites: [inference/inference-anatomy]
+updated: 2026-10-28
+sources:
+  - title: "Orca: A Distributed Serving System for Transformer-Based Generative Models (Yu et al., OSDI 2022)"
+    url: https://www.usenix.org/conference/osdi22/presentation/yu
+    note: iteration-level scheduling and selective batching; up to 36.9x throughput over FasterTransformer on GPT-3 175B at the same latency
+  - title: Anyscale, how continuous batching enables 23x throughput in LLM inference (2023-06-22)
+    url: https://www.anyscale.com/blog/continuous-batching-llm-inference
+    note: up to 23x with continuous batching plus vLLM memory optimizations; about 8x credited to continuous batching alone over naive batching
+  - title: "Efficient Memory Management for Large Language Model Serving with PagedAttention (Kwon et al., SOSP 2023)"
+    url: https://arxiv.org/abs/2309.06180
+    note: 2-4x throughput over FasterTransformer and Orca at the same latency; only 20.4% to 38.2% of KV memory held token states in earlier systems; block size 16
+  - title: vLLM launch blog (2023-06-20)
+    url: https://vllm.ai/blog/2023-06-20-vllm
+    note: earlier systems "waste 60% - 80% of memory"; waste under 4% with paging; up to 24x versus Hugging Face Transformers; sharing cuts memory by up to 55% for parallel sampling and beam search
+  - title: "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve (Agrawal et al., 2024)"
+    url: https://arxiv.org/abs/2403.02310
+    note: chunked prefills with stall-free batching; 2.6x serving capacity for Mistral-7B on one A100, up to 3.7x for Yi-34B on two A100s
+  - title: vLLM V1 alpha release blog (2025-01-27)
+    url: https://vllm.ai/blog/2025-01-27-v1-alpha-release
+    note: 1.7x throughput over V0; one scheduler that assigns tokens per request per step; prefix caching on by default with under 1% throughput cost at a 0% hit rate
+  - title: vLLM docs, optimization and tuning
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: default preemption mode RECOMPUTE in V1; chunked prefill on by default; max_num_batched_tokens trade-off between ITL and TTFT
+  - title: vLLM docs, V1 user guide
+    url: https://docs.vllm.ai/en/latest/usage/v1_guide.html
+    note: V0 fully deprecated; GPU-CPU KV cache swapping removed
+  - title: vLLM releases on GitHub
+    url: https://github.com/vllm-project/vllm/releases
+    note: v0.32.0 dated 18 Oct 2026, the release current when this lesson was checked
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+import Predict from '../../../components/Predict.astro';
+import SelfRate from '../../../components/SelfRate.astro';
+import InferenceBatchSim from '../../../components/widgets/InferenceBatchSim.astro';
+
+## The batch that waited for one essay
+
+Scenario, not a real company: an internal summarisation service collects requests into groups of 16, runs each group on the GPU, and returns the results together. Most summaries are a few dozen tokens. Now and then someone asks for a 400-token report. Whenever that happens, 15 slots finish early and sit idle until the long one is done, and the 16 requests waiting in the queue cannot start because the batch is still "running".
+
+The previous lesson showed why batching matters: every decode step reads all the weights, so sharing that read across more sequences is the cheapest throughput you will ever buy. This lesson is about doing it without the convoy.
+
+## Static versus continuous batching
+
+Static batching works like a barrier in a parallel program. A batch starts together and ends together, so its run time is the run time of its slowest member. In text generation the members differ wildly, because nobody knows the output length in advance.
+
+Continuous batching, which the Orca paper (OSDI 2022) called **iteration-level scheduling**, moves the scheduling decision from the request to the decode step. After every step the scheduler removes finished sequences and admits waiting ones into the freed slots. If you have written a worker pool that pulls the next job the moment a worker is free, you already know the idea. The engineering problem is that the "workers" share one GPU kernel launch per step, so the batch changes shape on every iteration.
+
+<Predict id="inf-batching-static" question="Toy workload: 256 requests, output lengths 20, 50 or 400 tokens, 16 slots. What percentage of slot-steps does static batching spend on real work?" answer={43} tolerance={10} unit="%">
+<p>In this workload static batching uses <b>43%</b> of its slot-steps, and continuous batching uses 92% and finishes in 3,000 steps instead of 6,400. Most static batches contain at least one 400-token request, so most slots spend most of each batch finished and waiting. The simulator below shows the same run.</p>
+</Predict>
+
+<InferenceBatchSim />
+
+Three things to notice. With the "similar lengths" mix, static batching is already at 87% and the gap almost closes, so the benefit comes from length variance, not from magic. With the long-tail mix, static batching at 16 slots drops to 15%. And continuous batching at 64 slots on the long-tail mix falls to 36%, because at the end of the run only the long requests remain and there is nothing left in the queue to fill the slots. Real servers keep receiving traffic, so that drain is an artefact of a finite toy queue.
+
+The published numbers carry their conditions with them. Orca reports up to 36.9 times the throughput of FasterTransformer on GPT-3 175B at the same latency. Anyscale reports up to 23 times when continuous batching is combined with vLLM's memory management, and credits about 8 times to continuous batching alone over naive batching. Both depend on the workload and the baseline, so quote them with their conditions or not at all.
+
+## PagedAttention: virtual memory for the KV cache
+
+Continuous batching creates a memory problem. Before vLLM, servers typically reserved a contiguous KV buffer per request sized for the maximum possible output, because the final length is unknown. A request that stops after 40 tokens still held space for 2,048. The vLLM paper measured that in existing systems "only 20.4% - 38.2% of the KV cache memory is used to store the actual token states". The rest was reserved-but-unused space and fragmentation.
+
+PagedAttention borrows the operating system's answer. The KV cache is cut into fixed-size **blocks** (16 tokens by default in vLLM). Each request has a **block table** mapping its logical blocks to physical blocks anywhere in GPU memory, exactly like a page table maps virtual pages to physical frames. A request takes a new block only when its last one fills, so the only waste is the unfilled tail of the final block. The vLLM launch blog puts that under 4%.
+
+Two consequences matter in interviews:
+
+- **More sequences fit**, so the batch grows, so throughput rises. That is where vLLM's headline gains come from: the paper reports 2 to 4 times the throughput of FasterTransformer and Orca at the same latency. The blog's "up to 24x" is against Hugging Face Transformers, a different baseline.
+- **Blocks can be shared.** Parallel samples from one prompt can point at the same prompt blocks, with copy-on-write when one of them diverges. The blog reports up to 55% less memory for parallel sampling and beam search. The same mechanism makes prefix caching possible, covered in the next lesson.
+
+PagedAttention is a memory layout and an allocator, not a faster attention formula. The attention kernel now reads keys and values from non-contiguous blocks through the table, which is extra indirection the kernel authors had to make cheap.
+
+```python
+BLOCK = 16   # tokens per block, vLLM's default
+
+class BlockAllocator:
+    def __init__(self, num_blocks):
+        self.free = list(range(num_blocks))
+        self.tables = {}      # request id -> physical block ids
+        self.lengths = {}
+
+    def append_token(self, rid):
+        n = self.lengths.get(rid, 0)
+        if n % BLOCK == 0:                     # first token, or the last block is full
+            if not self.free:
+                raise MemoryError("no free KV blocks: preempt or queue")
+            self.tables.setdefault(rid, []).append(self.free.pop())
+        self.lengths[rid] = n + 1
+
+    def release(self, rid):
+        self.free.extend(self.tables.pop(rid))
+        del self.lengths[rid]
+
+def paged_waste(token_counts):
+    slots = sum(-(-t // BLOCK) * BLOCK for t in token_counts)   # round each up to whole blocks
+    return 1 - sum(token_counts) / slots
+
+print(f"{paged_waste([37, 410, 1203, 95, 2000]):.1%}")   # 0.8% for these five lengths
+```
+
+Reserving 2,048 slots for each of those same five requests would waste 63% of the space, which is how the old approach lost most of its memory.
+
+## Chunked prefill and head-of-line blocking
+
+Continuous batching mixes prefill and decode in the same step. That creates a new failure. A 30,000-token prompt arrives; its prefill takes far longer than a decode step; and every user currently streaming a reply sees their next token stall until that prefill finishes. It is head-of-line blocking, the same thing that happens when one large message blocks a TCP connection carrying small ones.
+
+**Chunked prefill** splits a long prefill into pieces and runs one piece per step alongside the ongoing decodes. Sarathi-Serve calls this stall-free scheduling: decodes never wait for a whole prefill. It reports 2.6 times the serving capacity of vLLM at the time for Mistral-7B on one A100, and up to 3.7 times for Yi-34B on two A100s, under its latency targets.
+
+The knob is the token budget per step. In vLLM it is `max_num_batched_tokens`. The optimization docs say a smaller budget (they give 2048 as an example) gives better inter-token latency because fewer prefill tokens interfere with decodes, a larger one gives better TTFT, and more than 8192 is suggested for throughput. Chunked prefill is on by default in current vLLM "whenever possible".
+
+<Callout kind="gotcha">
+Chunking does not make the prefill cheaper. The long prompt still needs all its FLOPs; they are spread across more steps, so its own TTFT gets slightly worse while everyone else's ITL gets better. That is the trade you are choosing when you lower the budget.
+</Callout>
+
+## Scheduling, preemption and fairness
+
+vLLM V1 (alpha announced January 2025) folds all of this into one scheduler. Each step is expressed as a mapping from request id to the number of tokens to process for it: a whole prompt, a chunk of a prompt, one decode token, or several when speculative decoding proposes extra tokens. There is no separate prefill phase and decode phase in the scheduler any more. The release blog reports 1.7 times the throughput of the V0 engine.
+
+When the cache runs out of blocks mid-flight, something has to give. The scheduler **preempts** a running request, frees its blocks, and puts it back in the queue. Older vLLM could swap the blocks to CPU memory; the V1 guide says V1 "no longer requires KV cache swapping", and the optimization docs say the default preemption mode is `RECOMPUTE`: the request's cache is rebuilt by re-running its prefill when it is readmitted. Preemptions show up as `vllm:num_preemptions`, and a rising count is a sign that you admitted more concurrency than memory can hold.
+
+Fairness is a policy choice layered on top. First come, first served is the default and is easy to reason about. Priority classes let paid or interactive traffic jump the queue, at the cost of starving batch traffic unless you add aging. Preempting the newest request first wastes the least recompute. Shortest-job-first would minimise average latency, but output length is unknown in advance, so it only works with a length predictor you trust.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"How do you stop one very long prompt from starving the short requests on the same GPU?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Long prompts hurt in two places: their prefill stalls every running decode, and their KV cache crowds out other requests. Fix the first with chunked prefill under a per-step token budget, so decodes keep running while the long prompt is processed in pieces. Fix the second with admission control on KV blocks, a cap on prompt length per tier, and if needed a separate queue or pool for long-context traffic.</p>
+</Fragment>
+<Fragment slot="long">
+<p>First, name the symptom. If short requests see a slow first token, they are queued behind the long one: look at queue time. If users already streaming see a pause mid-answer, the long prefill is blocking decode steps: look at p99 ITL.</p>
+<p>For the stall, chunked prefill with a token budget per step. vLLM's guidance is that a smaller `max_num_batched_tokens` protects ITL and a larger one helps TTFT and throughput, so I would set it from the ITL objective and accept a slower TTFT for the long request.</p>
+<p>For memory, a 100,000-token prompt on Llama 3 70B holds about 33 GB of BF16 KV cache by itself (100,000 x 327,680 bytes). That is many short users' worth. Admission should check free blocks rather than request count, and preemption should be visible in metrics. If long-context traffic is a meaningful share, route it to its own replicas, or use prefill-decode disaggregation so prefills never share a step with decodes.</p>
+<p>Fairness last: priority classes with aging so the long job still finishes, and a per-tenant limit on in-flight prompt tokens so one customer cannot fill the cache.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>How would you verify the fix?</em> Replay production traffic with a few long prompts injected and compare p99 ITL and TTFT for the short requests before and after.</li>
+<li><em>What does chunking cost?</em> The long request's own TTFT rises a little, and very small chunks lower GPU efficiency because each step does less work.</li>
+<li><em>When is preemption by recompute worse than swapping?</em> For very long contexts, recomputing a large prefill can cost more than copying blocks over PCIe; V1 chose recompute and simpler code.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The simulator charges every step the same cost and gives every running request one token per step. On real hardware a step with 64 sequences takes longer than one with 4, as the previous lesson showed, so slot utilisation overstates the throughput gain. Treat it as a picture of idle slots, not a benchmark.
+
+Continuous batching helps in proportion to how much output lengths vary. For an embedding or classification workload where every request is one forward pass, there is no decode loop and static batches of similar-length inputs are fine.
+
+Finally, the specific defaults in this lesson (block size, budget, preemption mode) belong to vLLM as of the release checked, v0.32.0. SGLang, TensorRT-LLM and Hugging Face TGI make different choices, and vLLM itself changed the preemption default between V0 and V1. Read the docs of the engine and version you run.
+
+<SelfRate id="lesson:inference/batching" />

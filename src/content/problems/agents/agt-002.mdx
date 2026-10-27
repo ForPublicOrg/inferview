@@ -1,0 +1,160 @@
+---
+id: agt-002
+title: Agent loops forever
+subtitle: find and fix
+track: agents
+module: agent-loop
+type: debug
+difficulty: medium
+seniority: [mid, senior]
+minutes: 25
+core: true
+tags: [tool-calling, retries, agent-loop, error-handling]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: techinterview.org, What applied-AI engineer interviews test in 2026
+    url: https://www.techinterview.org/post/3233476824/ai-engineer-interview-rag-agents-evals/
+    note: describes a live debugging round with the prompt quoted in the question
+  - title: Claude docs, handling tool calls
+    url: https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls
+    note: tool_result blocks and the is_error flag for failed tool calls
+  - title: OpenAI Agents SDK, running agents
+    url: https://openai.github.io/openai-agents-python/running_agents/
+    note: max_turns and the MaxTurnsExceeded exception
+  - title: LangGraph docs, graph API, recursion limit
+    url: https://docs.langchain.com/oss/python/langgraph/graph-api
+    note: GraphRecursionError; the docs give a default of 1000 super-steps from version 1.0.6
+  - title: langgraph source, _internal/_config.py
+    url: https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/_internal/_config.py
+    note: DEFAULT_RECURSION_LIMIT is 10000 at tag 1.0.6 and 10007 on main, which disagrees with the docs
+  - title: Claude Agent SDK, Python reference
+    url: https://code.claude.com/docs/en/agent-sdk/python
+    note: max_turns and max_budget_usd options
+choices:
+  - text: Tool results are appended as plain user messages, not as tool results, so the model keeps asking for a result it already has
+    correct: false
+    why: Results appended as plain user messages make the model say it received no result and re-run the search. In the recorded trace it clearly has the error and says "let me retry". Inject that fault and compare the two traces.
+  - text: "`issue_refund` fails with a permanent validation error, and the loop feeds the error back as if it were retryable"
+    correct: true
+    why: Same call, same arguments, same opaque ValidationError on every step. The bare except turns a permanent error into a retry prompt, and nothing caps the repeats. The answer and the fix are unlocked below.
+  - text: "`max_steps` is 20 with no per-tool budget, so a legitimately long task looks like a hang"
+    correct: false
+    why: The gauges show one identical call repeating; a long legitimate task would show different calls. max_steps is the backstop that eventually fired, not the cause.
+  - text: The system prompt says to re-read the order after every refund, creating a verify, refund, verify cycle
+    correct: false
+    why: The system prompt says nothing about re-verification, and the trace shows refund, error, refund with no get_order in between. Inject the prompt fault and see how different it looks.
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+import AgentTrace from '../../../components/widgets/AgentTrace.astro';
+import { faults } from '../../../data/traces/agt-002.ts';
+
+## Question
+
+<Callout kind="interview" label="The round, as a public interview guide describes it">
+You are handed a running agent and a trace: "This agent loops forever on some inputs. Find out why and fix it." In this version you have 25 minutes, you may read any code, and you talk through what you see.
+</Callout>
+
+A support agent has three tools: `search_orders(customer_id)`, `get_order(order_id)` and `issue_refund(order_id, amount)`. The loop is the usual one: send messages, execute any tool call the model returns, append the result, repeat until the model returns plain text or `max_steps` is hit.
+
+```python
+async def run(messages, tools, max_steps=20):
+    for step in range(max_steps):
+        resp = await llm(messages, tools=tools)
+        if resp.tool_calls is None:
+            return resp.text
+        for call in resp.tool_calls:
+            try:
+                result = await tools[call.name](**call.args)
+            except Exception as e:
+                result = {"error": str(e)}
+            messages.append(tool_result(call.id, result))
+    raise RuntimeError("max steps")
+```
+
+Your job:
+
+1. Step through the recorded trace below and watch the gauges.
+2. Use the fault injections to test a hypothesis. Only one of them reproduces the recorded trace.
+3. Pick the root cause. The answer and the fix open once you pick correctly.
+
+<AgentTrace title="Trace stepper, run 8831" faults={faults} maxCalls={20} price={2.5} />
+
+<p class="tiny">The trace is synthetic. Token counts per step are approximate, and the $2.50 per million input tokens price is illustrative, not any provider's list price.</p>
+
+Why billed tokens grow so fast: every model call re-sends the whole context. If each step adds about 60 tokens, call *k* re-sends about 60 × *k* of them, so *n* calls bill about 60 × (1 + 2 + … + *n*) = 30 × *n* × (*n* + 1) tokens. Two calls bill 180; twenty bill 12,600. Ten times the steps, seventy times the input tokens.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Compare the arguments of the consecutive `issue_refund` calls. Is anything changing?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Read the `search_orders` result again: how much of the order has already been refunded?</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Look at the `except` branch: can the model tell a permanent error from a transient one?</p></details>
+
+## Answer
+
+The refund tool rejects the amount with a permanent validation error. The loop catches every exception the same way, appends the error as a tool result, and the model reads "error" as "retry". Nothing distinguishes a retryable failure from a terminal one, and nothing caps repeated identical calls.
+
+Why the wrong picks are tempting. Results appended as user messages also loop, but on `search_orders`, with the model saying it got nothing back. A 20-step cap with no per-tool budget is a real weakness, but it is the backstop that eventually fired, not the cause; a long legitimate task would show different calls, not one call repeated. A prompt-induced verify cycle would put a `get_order` between refunds, and the recorded trace has none.
+
+<Depth>
+<Fragment slot="short">
+<p>The refund tool rejects the amount with a permanent validation error. The loop catches every exception the same way, appends the error as a tool result, and the model reads "error" as "retry". Fix: typed tool errors (retryable versus terminal), a guard on repeated identical calls, and terminal errors surfaced to the user instead of handed back to the model.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Reading the trace. Steps 1 to 6 are healthy: search, read the order, decide. From step 7 the same `issue_refund(order_id="A-1042", amount=49.0)` repeats with the same opaque error, `refund rejected (code 422)`. The model's text between calls says "let me retry". The search result showed `"refunded": 36.50`, so the correct amount was 12.50; the model missed that, but it was never told why the refund failed, so it had no way to correct itself.</p>
+<p>Why fault B reproduces it. A transient 500 also produces errors, but different ones, and retrying is correct there; the run ends in six calls. Results appended as user messages produce a different symptom: the model says it got no result. The prompt-cycle fault would show a `get_order` between refunds.</p>
+<p>The fix has layers. Tools return structured errors with a retryable flag, and terminal errors end the loop with a user-facing message. Claude's tool_result blocks carry an is_error flag for exactly this. A guard breaks the loop when the same (tool, args) call repeats more than twice. The refund tool should say what is wrong in its error (the refundable balance), and `get_order` should expose that balance, so the model can propose a valid amount. And a metric on repeated identical calls, because this class of bug is invisible in averages and obvious in a histogram.</p>
+<p>Trade-off. Breaking on identical calls stops legitimate polling. Make the threshold per tool, and exempt tools declared as polling tools.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>How do you verify the fix?</em> Replay the recorded trace against the fixed loop in CI and assert it terminates within six steps with a user-facing error. Keep the trace as a regression test.</li>
+<li><em>How does the fix fail?</em> A tool that is flaky but retryable now has to say so, or you have turned a self-healing loop into a hard error. Audit every tool's error contract.</li>
+<li><em>What is the alternative?</em> Put the retry policy in the tool layer, like an HTTP client, so the model never sees transient errors at all. The model should only ever see terminal outcomes.</li>
+</ul>
+</Fragment>
+</Depth>
+
+### The fix
+
+```diff
+ async def run(messages, tools, max_steps=20, max_repeat=2):
++    seen = Counter()
+     for step in range(max_steps):
+         resp = await llm(messages, tools=tools)
+         if resp.tool_calls is None:
+             return resp.text
+         for call in resp.tool_calls:
++            key = (call.name, json.dumps(call.args, sort_keys=True))
++            seen[key] += 1
++            if seen[key] > max_repeat:
++                return f"I couldn't complete this: {call.name} keeps failing the same way."
+             try:
+                 result = await tools[call.name](**call.args)
++            except RetryableToolError as e:
++                result = {"error": str(e), "retryable": True}
++            except ToolError as e:
++                return f"I couldn't complete this: {e.user_message}"
+             except Exception as e:
+-                result = {"error": str(e)}
++                log.exception("tool %s crashed", call.name)   # unknown tool, bad args, bugs
++                return "Something went wrong on our side. A human will follow up."
+             messages.append(tool_result(call.id, result))
+     raise RuntimeError("max steps")
+```
+
+The final `except Exception` stays: a hallucinated tool name raises `KeyError` and bad arguments raise `TypeError`, and neither should escape the loop or go back to the model.
+
+## Follow-ups
+
+- *How would you catch this in production before a user reports it?* Emit the count of identical (tool, args) calls per run as a metric and alert on its tail, not its mean.
+- *The refund tool is not idempotent. What changes?* A retry after a timeout can refund twice. Pass an idempotency key derived from the conversation and order, and make the tool return the earlier result for a repeated key.
+- *How do the agent frameworks express the step budget?* The OpenAI Agents SDK takes `max_turns` and raises `MaxTurnsExceeded`; LangGraph raises `GraphRecursionError` past its `recursion_limit`, whose default the docs and the source code disagree on, so set it explicitly; the Claude Agent SDK takes `max_turns` and a `max_budget_usd` cap. None of them tells a permanent tool error from a transient one for you.
+
+## Common mistakes
+
+- Raising `max_steps`. It makes the loop more expensive and changes nothing about why it loops.
+- Removing the `try/except` entirely. A hallucinated tool name then crashes the request instead of ending it cleanly.
+- Fixing the prompt ("never retry a refund") instead of the error contract. The next tool with an opaque permanent error loops the same way.
+- Reading only the last step of the trace. The cause is visible in the search result at step 4, long before the loop starts.

@@ -1,0 +1,191 @@
+---
+id: rnd-008
+title: Run an LLM call over thousands of documents
+subtitle: retries, jitter and error isolation
+track: rounds
+module: llm-app-coding
+type: code
+difficulty: medium
+seniority: [mid, senior]
+minutes: 30
+core: true
+tags: [retries, backoff, jitter, batch, error-handling, llm-app]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: amitshekhariitbhu/ai-engineering-interview-questions
+    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
+    note: lists "write an async batch processor that runs an LLM call over 50,000 documents with a concurrency limit, retries with jitter, and error isolation"
+  - title: Exponential Backoff And Jitter (Marc Brooker, AWS Architecture Blog, 2015)
+    url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+    note: compares full, equal and decorrelated jitter; the full-jitter delay is uniform between 0 and the capped exponential
+  - title: Timeouts, retries, and backoff with jitter (AWS Builders' Library, 2019)
+    url: https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter
+    note: retries at every layer of a five-deep stack multiply load on the database by 243; retry at a single point
+  - title: Claude API docs, errors
+    url: https://platform.claude.com/docs/en/api/errors
+    note: the SDKs retry transient failures twice by default with exponential backoff, honouring retry-after; error codes such as 429 and 529
+  - title: Pyodide, Python compatibility and WebAssembly constraints
+    url: https://pyodide.org/en/stable/usage/wasm-constraints.html
+    note: threads cannot run in the browser build, which is why this exercise injects sleep and randomness
+  - title: openai/openai-python README
+    url: https://github.com/openai/openai-python
+    note: requests are retried 2 times by default with a short exponential backoff
+  - title: Claude API docs, batch processing
+    url: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+    note: 50 percent cost reduction; a batch expires if not done within 24 hours; results matched by custom_id
+  - title: OpenAI Batch API guide
+    url: https://developers.openai.com/api/docs/guides/batch
+    note: 50 percent discount; 24h completion window; output order may not match input order
+  - title: Claude API docs, rate limits
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: a 429 from the spend limit carries no retry-after and keeps failing until access resumes
+code:
+  starter: |
+    class Transient(Exception):
+        """A retryable failure (429, 5xx, timeout). retry_after is seconds, or None."""
+        def __init__(self, retry_after=None):
+            super().__init__("transient")
+            self.retry_after = retry_after
+
+    class Permanent(Exception):
+        """A failure that will not change on retry (400, validation error)."""
+
+    def run_batch(items, call, sleep, rng, max_retries=3, base=0.5, cap=8.0):
+        """Call `call(item)` for every item. Return [(index, "ok", result) or (index, "error", message)]
+        in input order.
+        - Transient: retry up to max_retries times. Wait retry_after if given, otherwise
+          rng.uniform(0, min(cap, base * 2 ** attempt)) where attempt counts from 0.
+        - Permanent or any other exception: record the error, no retry.
+        - Never sleep after the last attempt. One item's failure never stops the others."""
+        raise NotImplementedError
+  tests: |
+    import random
+
+    calls = {}
+    def fake_call(x):
+        calls[x] = calls.get(x, 0) + 1
+        if x == "flaky" and calls[x] < 3:
+            raise Transient()
+        if x == "told":
+            if calls[x] == 1:
+                raise Transient(retry_after=4.0)
+            return "TOLD"
+        if x == "bad":
+            raise Permanent("schema mismatch")
+        if x == "down":
+            raise Transient()
+        if x == "bug":
+            raise KeyError("oops")
+        return x.upper()
+
+    slept = []
+    out = run_batch(["a", "flaky", "bad", "told", "down", "bug", "b"], fake_call, slept.append, random.Random(0))
+    assert [r[0] for r in out] == [0, 1, 2, 3, 4, 5, 6], "results in input order"
+    assert out[0] == (0, "ok", "A") and out[6] == (6, "ok", "B"), "other items finish despite failures"
+    assert out[1] == (1, "ok", "FLAKY") and calls["flaky"] == 3, "transient errors are retried"
+    assert out[2][1] == "error" and calls["bad"] == 1, "permanent errors are not retried"
+    assert out[3] == (3, "ok", "TOLD") and 4.0 in slept, "retry_after is obeyed exactly"
+    assert out[4][1] == "error" and calls["down"] == 4, "max_retries=3 means 4 attempts in total"
+    assert out[5][1] == "error" and calls["bug"] == 1, "unknown exceptions are recorded, not retried"
+    assert len(slept) == 6, "2 sleeps for flaky, 1 for told, 3 for down, none after a final attempt"
+
+    slept2 = []
+    calls.clear()
+    run_batch(["down"], fake_call, slept2.append, random.Random(1), max_retries=3, base=0.5, cap=8.0)
+    r = random.Random(1)
+    expected = [r.uniform(0, min(8.0, 0.5 * 2 ** a)) for a in range(3)]
+    assert slept2 == expected, "full jitter: uniform(0, min(cap, base * 2 ** attempt)), one draw per retry"
+
+    slept3 = []
+    calls.clear()
+    run_batch(["down"], fake_call, slept3.append, random.Random(2), max_retries=6, base=1.0, cap=8.0)
+    assert all(0 <= s <= 8.0 for s in slept3) and len(slept3) == 6, "the cap bounds every delay"
+  solution: |
+    class Transient(Exception):
+        def __init__(self, retry_after=None):
+            super().__init__("transient")
+            self.retry_after = retry_after
+
+    class Permanent(Exception):
+        pass
+
+    def _one(item, call, sleep, rng, max_retries, base, cap):
+        for attempt in range(max_retries + 1):
+            try:
+                return "ok", call(item)
+            except Transient as e:
+                if attempt == max_retries:
+                    return "error", f"gave up after {attempt + 1} attempts"
+                if e.retry_after is not None:
+                    delay = e.retry_after                       # the server knows its own load
+                else:
+                    delay = rng.uniform(0, min(cap, base * 2 ** attempt))
+                sleep(delay)
+            except Exception as e:                              # permanent or a bug: retrying will not help
+                return "error", f"{type(e).__name__}: {e}"
+
+    def run_batch(items, call, sleep, rng, max_retries=3, base=0.5, cap=8.0):
+        results = []
+        for i, item in enumerate(items):
+            status, value = _one(item, call, sleep, rng, max_retries, base, cap)
+            results.append((i, status, value))
+        return results
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"We need to run a classification prompt over 50,000 documents. Write the runner. Some calls will hit rate limits, some will time out, and a few documents are malformed."
+</Callout>
+
+Write `run_batch`. The interviewer cares about three behaviours more than speed: transient failures are retried with backoff and jitter (or exactly `retry_after` seconds when the server says so), permanent failures are not retried, and one bad document never sinks the batch.
+
+`sleep` and `rng` are passed in. In production they are `asyncio.sleep` (or `time.sleep`) and `random`; in the tests they record delays and replay a seeded sequence. The browser runner here has no working threads, so this version processes items one at a time; the concurrency layer is in the answer.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Write the retry loop for one item first, returning a status instead of raising. Then map it over the list.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>`max_retries=3` means up to four attempts. Sleep between attempts, never after the last one.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>The order of the `except` clauses matters: catch `Transient` first, then everything else as non-retryable.</p></details>
+
+## Answer
+
+The core is `_one`, a retry loop that returns `("ok", result)` or `("error", message)` and never raises. Transient errors sleep and loop; on the final attempt they return an error instead of sleeping. Everything else returns immediately. Because nothing escapes `_one`, the outer loop gives error isolation for free, and results come back keyed by index.
+
+The delay follows the full-jitter scheme from Brooker's AWS post: a uniform draw between 0 and `min(cap, base * 2 ** attempt)`. Jitter spreads retries from many clients over time, so a burst of 429s does not come back as a synchronised second burst. When the server sends `retry-after`, use it; it knows its own load better than your formula.
+
+The production version adds concurrency with a semaphore:
+
+```python
+import asyncio
+
+async def run_batch_async(items, call, max_concurrency=16, **kw):
+    sem = asyncio.Semaphore(max_concurrency)
+
+    async def guarded(i, item):
+        async with sem:
+            return i, *(await _one_async(item, call, **kw))
+
+    return sorted(await asyncio.gather(*(guarded(i, x) for i, x in enumerate(items))))
+```
+
+`_one_async` is `_one` with `await call(item)` and `await asyncio.sleep(delay)`. The semaphore caps in-flight calls; a token-bucket limiter in front of `call` caps tokens per minute, which matters more for LLM APIs than request count.
+
+The number to have ready is from the AWS Builders' Library: if each layer of a five-deep call stack retries, load on the database multiplies by 243. Both the Anthropic and OpenAI Python SDKs already retry transient failures twice by default, so a hand-written loop on top of an SDK client multiplies attempts. Set the SDK's `max_retries=0` when you own the policy, or leave the SDK in charge and do not add a second layer.
+
+## Follow-ups
+
+- *Is a provider's batch API better here?* For an offline job, usually. Both the Claude Message Batches API and the OpenAI Batch API price batch requests at a 50 percent discount and work within a 24-hour window, and both return results that may be out of order, so you join on `custom_id`.
+- *How do you resume after the process dies at document 31,000?* Write each result to durable storage keyed by document id as it completes, and skip ids already present on restart.
+- *A 429 keeps coming back with no `retry-after`.* On the Claude API, a 429 caused by the spend limit has no `retry-after` and will not clear by retrying. Check the error details and stop the batch rather than burn retries.
+- *Should calls with side effects be retried?* Only with an idempotency key, so the second attempt cannot repeat the effect.
+
+## Common mistakes
+
+- Catching `Exception` in the retry branch, so a malformed document is retried four times and costs four calls.
+- Sleeping after the final failed attempt.
+- Exponential backoff with no jitter, so every client retries at the same instants.
+- Letting one exception propagate out of `gather`, which loses the results of every other document unless you use `return_exceptions=True` or catch inside.
+- Returning results in completion order and then joining them to inputs by position.

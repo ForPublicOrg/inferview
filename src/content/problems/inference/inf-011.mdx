@@ -1,0 +1,108 @@
+---
+id: inf-011
+title: Accuracy fell after 4-bit quantization
+subtitle: find the cause
+track: inference
+module: faster-cheaper
+type: debug
+difficulty: medium
+seniority: [mid, senior]
+minutes: 20
+core: false
+tags: [quantization, int4, gptq, awq, evals]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: amitshekhariitbhu, AI engineering interview questions
+    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
+    note: "You quantized your LLM, but accuracy dropped significantly. How do you minimize quantization loss?"
+  - title: "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers (ICLR 2023)"
+    url: https://arxiv.org/abs/2210.17323
+    note: one-shot 3 or 4 bit weight quantization using approximate second-order information, applied to models up to 175B
+  - title: "AWQ: Activation-aware Weight Quantization (MLSys 2024)"
+    url: https://arxiv.org/abs/2306.00978
+    note: protecting 1% of salient weights, found from activation statistics, greatly reduces quantization error
+  - title: llama.cpp, ggml-common.h
+    url: https://raw.githubusercontent.com/ggml-org/llama.cpp/master/ggml/src/ggml-common.h
+    note: Q8_0 stores one scale per block of 32 weights
+  - title: Hugging Face Hub docs, GGUF
+    url: https://huggingface.co/docs/hub/gguf
+    note: K-quant types store scales per block, which is why Q4_K is 4.5 bits per weight
+choices:
+  - text: One scale per tensor with round-to-nearest lets a few large-magnitude weights stretch the scale, so most weights collapse onto a handful of the 16 levels. Use finer-grained scales (per group or block) and a calibrated method such as GPTQ or AWQ, then re-run the evals.
+    correct: true
+    why: It explains why the loss is concentrated in long reasoning tasks, matches the outlier statistic, and points to the fixes that target exactly this error.
+  - text: The KV cache is still BF16 while the weights are INT4, and the precision mismatch corrupts attention. Quantize the KV cache to INT4 as well.
+    correct: false
+    why: Engines routinely mix low-bit weights with a higher-precision KV cache. Quantizing the cache too adds error rather than removing it.
+  - text: 4 bits is too few for a 70B model. Return to BF16 or FP8.
+    correct: false
+    why: Tempting after a bad result, but GPTQ and AWQ were built for 3 and 4 bit weights on large models. The method used here is the problem, not the bit width alone.
+  - text: The quantized model is more sensitive to temperature. Lower the temperature from 0.7 to 0.2.
+    correct: false
+    why: The eval ran greedy decoding, so temperature is not in play, and sampling settings cannot restore information lost in the weights.
+  - text: The quantization tool rewrote the tokenizer, so prompts are encoded differently.
+    correct: false
+    why: Weight-only quantization does not touch the tokenizer, and the token counts per prompt in the report are identical before and after.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="As asked">
+"You quantized your LLM, but accuracy dropped significantly. How do you minimize quantization loss?"
+</Callout>
+
+A team quantized a 70B model's weights to 4 bits to fit it on one GPU. Here is their quantization config and evaluation report.
+
+```yaml
+scheme: int4, weight-only
+method: round-to-nearest, symmetric
+scale granularity: one scale per weight tensor
+calibration data: none
+kv cache: bf16 (unchanged)
+```
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Eval slice (greedy decoding)</th><th>BF16</th><th>INT4</th></tr></thead>
+<tbody>
+<tr><td>Short factual QA</td><td>0.81</td><td>0.77</td></tr>
+<tr><td>Multi-step math</td><td>0.64</td><td>0.31</td></tr>
+<tr><td>Code generation (tests pass)</td><td>0.58</td><td>0.29</td></tr>
+<tr><td>Tokens per prompt (mean)</td><td>412</td><td>412</td></tr>
+</tbody>
+</table>
+</div>
+
+A weight inspection notes that in many MLP projection tensors, the largest absolute weight is about 40 times the 99th-percentile absolute weight.
+
+<p class="tiny">The config, scores and statistic are synthetic, built for this exercise.</p>
+
+Pick the root cause and the fix.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>A symmetric 4-bit format has 16 levels spread from minus the scale to plus the scale. What sets the scale here?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Why would short answers survive while long reasoning chains collapse?</p></details>
+
+## Answer
+
+With one scale per tensor, the scale must cover the largest weight in the whole tensor. If that weight is 40 times the 99th percentile, almost every weight lies within a small fraction of the range and gets rounded to one of a few levels near zero. The model loses most of its fine-grained information. Short factual answers degrade a little; long chains of reasoning, where small errors compound over many tokens, collapse, which is the pattern in the report.
+
+The fixes attack that error directly. Use finer-grained scales so an outlier only stretches the range of its own group or block; GGUF's formats do this (Q8_0 stores one scale per 32 weights, and the K-quants' per-block scales are why Q4_K costs 4.5 bits per weight rather than 4). Use a calibrated method: GPTQ adjusts the remaining weights to compensate for each rounding error using second-order information from calibration data, and AWQ finds the small share of salient weight channels from activation statistics and protects them. Then re-run the same eval slices, because the loss is task specific: report per slice, not just an average. If 4 bits still fails the bar on the slices that matter, FP8 or a mixed scheme that keeps sensitive layers at higher precision is the fallback.
+
+Why the others tempt. Mixing INT4 weights with a BF16 KV cache is normal, and quantizing the cache too would add error. Blaming the bit width is an understandable reaction, but published methods quantize large models to 3 and 4 bits; this config used the crudest available scheme. Temperature cannot be the cause under greedy decoding. The tokenizer is untouched, as the identical token counts show.
+
+## Follow-ups
+
+- *What calibration data would you use?* A few hundred samples resembling production prompts, including the languages and tasks you serve; calibration on generic web text can miss your domain.
+- *How do you decide between INT4 and FP8?* Measure both on your evals and your hardware: FP8 halves bytes and runs natively on recent GPUs; INT4 halves them again but needs a good method and an efficient kernel.
+- *Does quantization speed up prefill?* Weight-only INT4 mostly helps bandwidth-bound decode; prefill is compute bound and gains less unless the kernels compute in low precision.
+
+## Common mistakes
+
+- Judging a quantized model by perplexity or a short QA set alone.
+- Quantizing with per-tensor scales and no calibration, then concluding 4 bits does not work.
+- Reporting one averaged score that hides the collapse on reasoning tasks.
+- Quantizing the KV cache in the same change, so you cannot tell which change caused the loss.

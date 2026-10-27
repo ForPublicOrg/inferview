@@ -1,0 +1,212 @@
+---
+title: API anatomy, streaming and reliability
+track: apis
+module: api-anatomy
+order: 1
+minutes: 15
+summary: A model call is a slow, metered RPC that can fail halfway through, and the client you wrap around it decides whether a busy hour becomes an outage.
+prerequisites: [foundations/tokens]
+updated: 2026-10-28
+sources:
+  - title: Claude docs, handling stop reasons
+    url: https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
+    note: end_turn, max_tokens, stop_sequence, tool_use, pause_turn, refusal and model_context_window_exceeded
+  - title: Claude docs, streaming messages
+    url: https://platform.claude.com/docs/en/build-with-claude/streaming
+    note: SSE event order, ping events, cumulative usage in message_delta, errors after HTTP 200, resuming an interrupted stream
+  - title: Claude docs, API errors
+    url: https://platform.claude.com/docs/en/api/errors
+    note: error codes including 429 rate_limit_error and 529 overloaded_error; 32 MB Messages request limit
+  - title: Claude docs, rate limits
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: token bucket; RPM, ITPM and OTPM; Start tier Opus 5.5 limits of 1,000 RPM, 2,000,000 ITPM and 400,000 OTPM; cache reads excluded from ITPM on most models; spend-cap 429 without retry-after; OTPM ignores max_tokens
+  - title: OpenAI API docs, rate limits
+    url: https://developers.openai.com/api/docs/guides/rate-limits
+    note: the larger of max_tokens and the estimate counts toward TPM; exponential backoff with jitter; do not retry quota or billing errors
+  - title: Anthropic Python SDK
+    url: https://platform.claude.com/docs/en/cli-sdks-libraries/sdks/python
+    note: 2 retries by default on connection errors, 408, 409, 429 and 5xx; 10-minute default timeout
+  - title: openai/openai-python README
+    url: https://github.com/openai/openai-python
+    note: 2 retries by default; 10-minute default timeout; Responses API as the primary interface
+  - title: Claude docs, batch processing
+    url: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+    note: 50% of standard prices; up to 100,000 requests or 256 MB; results in any order, matched by custom_id; unprocessed requests expire after 24 hours unbilled
+  - title: Claude docs, migration to API version 2026-10-21
+    url: https://platform.claude.com/docs/en/api/migration-2026-10-21
+    note: temperature, top_p and top_k return 400 under the new version
+  - title: Claude docs, extended and adaptive thinking
+    url: https://platform.claude.com/docs/en/build-with-claude/extended-thinking
+    note: budget_tokens replaced by adaptive thinking with output_config.effort
+  - title: OpenAI API docs, reasoning models
+    url: https://developers.openai.com/api/docs/guides/reasoning
+    note: reasoning tokens billed as output; reserve at least 25,000 tokens when starting out; status incomplete with max_output_tokens
+  - title: OpenAI API docs, migrate to the Responses API
+    url: https://developers.openai.com/api/docs/guides/migrate-to-responses
+    note: Responses recommended for new projects; stored by default; previous_response_id does not carry instructions and earlier input is still billed
+  - title: Exponential Backoff And Jitter (Marc Brooker, AWS Architecture Blog)
+    url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+    note: Full, Equal and Decorrelated Jitter; the full-jitter form used in the listing
+  - title: Timeouts, retries and backoff with jitter (Marc Brooker, Amazon Builders' Library)
+    url: https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter
+    note: retries at every layer of a five-deep stack multiply load on the bottom layer; retry at one point; side effects need idempotency
+  - title: aced.io, Sierra senior AI engineer interview experience
+    url: https://www.aced.io/experiences/sierra-ai-senior-ai-engineer-interview-087f4e
+    note: candidate report of a pagination and JSON round
+  - title: Python docs, coroutines and tasks (asyncio)
+    url: https://docs.python.org/3/library/asyncio-task.html
+    note: gather with return_exceptions=False propagates the first exception and leaves the other awaitables running; wait_for cancels the task on timeout; TaskGroup (3.11+) cancels the remaining tasks when one fails
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+import Predict from '../../../components/Predict.astro';
+import SelfRate from '../../../components/SelfRate.astro';
+import ApisRetryStorm from '../../../components/widgets/ApisRetryStorm.astro';
+
+## The retry that took the feature down
+
+Scenario, not a real incident: a document-summary feature runs fine all week. On Monday at nine the provider starts returning 429s to a slice of requests. Each service in the path retries, the SDK retries underneath them, nobody adds jitter, and within minutes the feature is sending several times its normal traffic at an endpoint that already said "slow down". The provider was never down. The client turned a rate limit into an outage.
+
+Most of the interview questions in this module are about that client. Calling a model is easy. Calling it reliably, at volume, while a user watches a spinner, is the part that gets tested.
+
+## A model call is an RPC with three odd properties
+
+Treat a chat completion like any remote call you already know, with three differences that change the engineering.
+
+**It is stateless and you resend everything.** The Messages API and Chat Completions keep no session. Every request carries the system prompt, every earlier turn and every tool result, and you pay for all of it again. The OpenAI Responses API can store a conversation and chain it with `previous_response_id`, but its migration guide says the earlier input tokens are still billed and `instructions` are not carried forward, so the state is a convenience, not a discount. Roles are simple: a system prompt (a top-level `system` field on Claude, `instructions` on Responses), alternating `user` and `assistant` turns, and tool results carried inside those turns.
+
+**The response length is unknown and the call is slow.** A database query has a bounded result. A model call returns somewhere between one token and `max_tokens`, generated one token at a time. That is why both official Python SDKs default to a 10-minute timeout, and why the Anthropic SDK raises an error up front if a non-streaming request is expected to take longer than that unless you stream or override the timeout.
+
+**Success has more than one meaning.** An HTTP 200 does not mean you got a usable answer. Claude reports why generation stopped in `stop_reason`: `end_turn` is a normal finish, `max_tokens` means the answer was cut off, `stop_sequence` means one of your stop strings appeared, `tool_use` means the model wants you to run a tool, and `refusal` means it declined. A parser that reads the text without checking the stop reason will happily store half a JSON object. OpenAI's equivalent for reasoning models is a response with `status: "incomplete"` and reason `max_output_tokens`, possibly with no visible output at all, because reasoning tokens are billed as output and can use the whole budget before any answer appears. OpenAI's guide suggests reserving at least 25,000 tokens for reasoning and output when you start.
+
+<Callout kind="gotcha">
+Sampling knobs are not a reliability tool any more. Under the Claude API version dated 2026-10-21, `temperature`, `top_p` and `top_k` return a 400 even at their default values, and Claude's thinking control moved from a token budget to adaptive thinking with an `effort` setting. Old client code that sets `temperature=0` "for determinism" breaks on upgrade.
+</Callout>
+
+## Streaming: a protocol, not a firehose
+
+Streaming exists for the user, not for throughput. Total generation time barely changes; what changes is time to first token (TTFT), the gap between the click and the first visible word. With a toy model of 1 second to start and 40 tokens per second, a 600-token answer takes 16 seconds either way, but a streamed UI shows text after 1 second and a buffered one shows nothing for 16. We found no TTFT figure published by either provider for its API, so measure your own: log TTFT and total time separately, because they fail for different reasons. A slow first token usually means a long prompt or a queue; a slow total usually means a long answer.
+
+On Claude the stream is server-sent events in a fixed order: `message_start`, then for each content block a `content_block_start`, one or more `content_block_delta` events and a `content_block_stop`, then one or more `message_delta` events and `message_stop`. Four details catch people:
+
+- `ping` events can arrive anywhere and carry no content. Ignore them.
+- Usage counts in `message_delta` are cumulative. Summing them double counts.
+- A tool call's arguments arrive as `input_json_delta` fragments that are not valid JSON until the block stops. Buffer per block index and parse at `content_block_stop`.
+- An `overloaded_error` can arrive inside a stream that already returned HTTP 200. Your error handling has to live inside the stream loop, not only around the request.
+
+When a stream dies halfway, you cannot resume it. On Claude 4.6 and later the documented recovery is a new request with a user message asking the model to continue, because prefilling the assistant turn is no longer supported.
+
+## Rate limits are token buckets, and 429 is not one error
+
+The analogy is a token-bucket rate limiter you may have written for your own API, and that is exactly what Claude documents: capacity refills continuously rather than resetting at the top of the minute, so a 60 RPM limit can be enforced as one request per second. There are three buckets per model class: requests per minute (RPM), input tokens per minute (ITPM) and output tokens per minute (OTPM). At the Start tier, Claude Opus 5.5 gets 1,000 RPM, 2,000,000 ITPM and 400,000 OTPM. On most Claude models, cache reads do not count toward ITPM, so a cached prompt raises your effective input ceiling.
+
+The providers count differently, which matters when you port a client:
+
+| Question | Claude | OpenAI |
+|---|---|---|
+| Does `max_tokens` count against the limit? | No. OTPM counts tokens actually generated. | Yes. The larger of `max_tokens` and the estimated tokens counts toward TPM. |
+| Where is the wait time? | `retry-after` header, plus `anthropic-ratelimit-*` headers | `Retry-After`, plus `x-ratelimit-*` headers |
+
+Now the part that turns into a debug question. A 429 means different things:
+
+- **Rate limited.** `rate_limit_error` with a `retry-after` header. Retrying after the wait is correct.
+- **Spend cap reached.** The same error type, but no `retry-after`, and `error.details.error_code` is `enforced_spend_limit_reached`. Retrying, including the SDK's own retries, fails until someone raises the cap. OpenAI's guide likewise says not to retry quota and billing errors.
+- **Not a 429 at all.** `529 overloaded_error` means the provider is short of capacity across users. It is retryable, but it is a signal to fail over or shed load, not evidence that your own traffic is too high.
+
+## Retries multiply
+
+Both official Python SDKs already retry twice by default on connection errors, 408, 409, 429 and server errors. Retries stack, so this is the first number to get right.
+
+<Predict id="api-stacked-retries" question="Your service wraps the SDK call in its own loop of 3 attempts and leaves the SDK default alone. How many HTTP requests can one failing call send?" answer={9} unit="requests">
+<p><b>Nine.</b> The SDK makes 1 attempt plus 2 retries, 3 requests, and your loop runs the SDK call 3 times: 3 × 3 = 9. Put two such services in a chain and the bottom one sees up to 81. Marc Brooker's Builders' Library article makes the same point with a five-deep stack: if every layer makes three attempts, the bottom layer sees 3<sup>5</sup> = 243 attempts per user request. The fix is to retry in exactly one place. When your application owns the policy, set the SDK's <code>max_retries=0</code>.</p>
+</Predict>
+
+The second multiplier is synchronisation. If every client that got a 429 at 9:00:00.000 waits exactly 100 ms, they all come back at 9:00:00.100 and collide again. Exponential backoff spaces the waves out but keeps them in step. Jitter breaks the step. Try it:
+
+<ApisRetryStorm />
+
+Switch from "Retry at once" to "Exponential" with 100 clients. The total number of attempts does not move and the same clients give up; the same waves arrive later, spaced further apart; nothing shrinks them. "Full jitter" is the first policy that serves every client, because the retries spread across the window instead of landing on the same tick. Brooker's AWS post compares Full, Equal and Decorrelated Jitter and finds every jittered variant does less work than plain exponential backoff, with Equal Jitter the weakest of the three.
+
+## Idempotency, timeouts and the batch lane
+
+A retry is only safe if repeating the call is harmless. A model call with no tools is harmless to repeat; you pay twice and get a different answer. A tool that charges a card or sends an email is not. Give side-effecting operations an idempotency key derived from the request (conversation, step, arguments), and have the tool return the earlier result when it sees the key again. Retrying a timed-out request without one is how customers get two refunds.
+
+Timeouts need two numbers, not one: a deadline for the first byte (it catches queueing and dead connections) and a deadline for the whole stream (it catches runaway answers). The SDK default of 10 minutes is a ceiling, not a product decision.
+
+Not every call needs to be interactive. The Claude Message Batches API charges 50% of standard prices, takes up to 100,000 requests or 256 MB per batch, and does not bill requests that expire unprocessed after 24 hours. Results come back in any order, so match them on `custom_id`, never on position. Evaluation runs, backfills and nightly enrichment belong there.
+
+## The client in code
+
+Two pieces cover most coding rounds on this topic: a retry with full jitter that treats the server's `retry-after` as a floor and refuses to retry a spend cap, and a semaphore that bounds concurrency when you fan out calls. Both run on the standard library.
+
+```python
+import asyncio, random, time
+
+class RateLimited(Exception):
+    def __init__(self, retry_after=None):
+        self.retry_after = retry_after
+
+class SpendCapReached(Exception):
+    """A 429 with no retry-after: retrying will not help."""
+
+def call_with_backoff(fn, *, max_attempts=4, base=0.5, cap=20.0,
+                      sleep=time.sleep, rng=random.random):
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except RateLimited as e:
+            if attempt == max_attempts - 1:
+                raise
+            delay = rng() * min(cap, base * 2 ** attempt)   # full jitter
+            if e.retry_after is not None:
+                delay = max(delay, e.retry_after)           # the server's floor wins
+            sleep(delay)
+
+async def bounded_gather(make_calls, limit=8):
+    sem = asyncio.Semaphore(limit)
+    async def one(make):
+        async with sem:
+            return await make()
+    return await asyncio.gather(*(one(m) for m in make_calls))
+```
+
+`SpendCapReached` is never caught, so it propagates on the first attempt. `sleep` and `rng` are parameters so a test can run the function without waiting and with a fixed random draw. `bounded_gather` takes functions that create coroutines rather than coroutines, so nothing starts before it has a slot, and `gather` returns results in input order even though they finish in any order.
+
+Cancellation is the part that gets skipped. Wrap each attempt in `asyncio.wait_for(make(), timeout)` so one hung call cannot hold a semaphore slot forever: on timeout it cancels the call and raises `TimeoutError`, which the retry layer can treat like any other transient failure. And `gather` with the default `return_exceptions=False` hands the first exception to the caller but leaves the sibling calls running, still holding slots and spending tokens. When one failure makes the rest useless, run the fan-out in an `asyncio.TaskGroup` (Python 3.11 and later), which cancels the remaining tasks as soon as one raises, or cancel the pending tasks yourself.
+
+The same plumbing shows up in plain form too. One candidate's report of a Sierra loop describes a round that was "implement pagination for an API to retrieve all results", then compute over the JSON. Loop on the cursor until it is empty, put a cap on the number of pages so a server bug cannot loop you forever, and keep the per-page call behind the same retry wrapper.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Design a client for an LLM API that handles rate limits, timeouts and partial streams."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>One retry layer, owned by the application, with the SDK's own retries turned off: exponential backoff with full jitter, the server's <code>retry-after</code> as a minimum, a cap on attempts and on total time, and no retries for spend-cap, auth or validation errors. A first-byte timeout and a whole-stream timeout. Stream parsing that checks the stop reason, buffers tool arguments per block, and treats an error event after HTTP 200 as a failure. Idempotency keys on anything with side effects.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Classify errors first, because the policy depends on the class. Retry with backoff: 429 with <code>retry-after</code>, 408, 409, 5xx, connection resets. Fail over or shed load: 529 overloaded. Fail fast and alert: 400, 401, 403, and the spend-cap 429 that has no <code>retry-after</code>. A client-side token bucket sized from the <code>*-remaining</code> headers keeps you under the limit instead of discovering it.</p>
+<p>Streaming. Record time to first token and total time as separate metrics. Ignore pings, treat usage as cumulative, parse tool JSON at block stop, and handle a mid-stream <code>overloaded_error</code> inside the read loop. On a broken stream, decide per feature: show the partial text with a retry button, or discard it and re-request with a "continue" turn.</p>
+<p>Capacity. A semaphore per model bounds concurrency; work that can wait goes to the batch API at half price, matched by <code>custom_id</code>. For a second provider, put the fallback behind the same interface, but test prompts on it first, because a fallback that answers differently is a new feature, not a backup.</p>
+<p>Trade-off: aggressive retries improve the success rate for one user and hurt everyone else when the provider is struggling. A retry budget, such as retries allowed up to a fixed fraction of recent requests, keeps the client from amplifying an outage.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>How do you test it?</em> A fake server that returns scripted 429s, 529s and broken streams, with sleep and randomness injected, so tests run in milliseconds and assert the exact wait sequence.</li>
+<li><em>How does it fail?</em> Retries stacked under another service's retries multiply load; a missing idempotency key double-charges; counting <code>message_delta</code> usage as increments overstates cost.</li>
+<li><em>What is the alternative?</em> A gateway (LiteLLM, a cloud AI gateway) that owns retries, fallbacks and quotas for every service, so each client stays thin. The frameworks lesson covers what that buys and hides.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The limits, header names and defaults in this lesson were read from the provider docs on 28 October 2026 and they change often. The API version dated 2026-10-21 alone turned three accepted parameters into 400 errors. Read the current rate-limit and error pages before you quote one in a design doc.
+
+The retry simulator is a toy with one server and a fixed capacity. Real providers shed load per model and per organisation, may prioritise some traffic, and can return 529 to everyone at once, in which case no client-side policy saves you and the answer is a fallback model or a degraded mode. Jitter fixes synchronisation, not a shortage of capacity.
+
+Streaming is not always the right default either. Background jobs, batch evaluation and anything whose output is parsed as a whole gain nothing from it and pay in complexity. Stream when a person is waiting.
+
+<SelfRate id="lesson:apis/api-anatomy" />

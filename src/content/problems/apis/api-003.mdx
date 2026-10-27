@@ -1,0 +1,136 @@
+---
+id: api-003
+title: The 9 a.m. wall of 429s
+subtitle: find the cause in the logs
+track: apis
+module: api-anatomy
+type: debug
+difficulty: medium
+seniority: [mid, senior]
+minutes: 20
+core: true
+tags: [rate-limits, retries, http-429, incident]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: amitshekhariitbhu/ai-engineering-interview-questions
+    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
+    note: "Your application is hitting LLM provider rate limits during peak hours. How do you handle it?"
+  - title: Claude docs, rate limits
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: token bucket; retry-after and anthropic-ratelimit headers; spend-cap 429 has no retry-after and error_code enforced_spend_limit_reached; OTPM counts generated tokens and ignores max_tokens
+  - title: Claude docs, API errors
+    url: https://platform.claude.com/docs/en/api/errors
+    note: 429 rate_limit_error versus 529 overloaded_error
+  - title: OpenAI API docs, rate limits
+    url: https://developers.openai.com/api/docs/guides/rate-limits
+    note: OpenAI counts the larger of max_tokens and the estimate toward TPM, which is why choice C is tempting
+  - title: Anthropic Python SDK
+    url: https://platform.claude.com/docs/en/cli-sdks-libraries/sdks/python
+    note: retries 2 times by default on 429 and other retryable errors
+  - title: anthropic-sdk-python, _base_client.py
+    url: https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/_base_client.py
+    note: _calculate_retry_timeout returns the retry-after value as the wait when the header is present; jitter applies only on the exponential path used when it is absent
+  - title: Timeouts, retries and backoff with jitter (Marc Brooker, Amazon Builders' Library)
+    url: https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter
+    note: retries at several layers multiply load; retry at one point in the stack
+choices:
+  - text: The 429s are rate limits, and stacked retries with no jitter turn each failing document into up to 9 synchronised requests, so the workers keep the bucket empty
+    correct: true
+    why: The responses carry retry-after and requests-remaining 0, each retry burst lands within a few milliseconds, and the request count rises while useful throughput does not. The SDK's 3 requests per call times the loop's 3 attempts is up to 9 requests per document, and no layer spreads them out.
+  - text: The organisation hit its spend cap, so every request fails until the next billing period
+    correct: false
+    why: A spend-cap 429 has no retry-after header and carries error_code enforced_spend_limit_reached, and it does not clear by itself. These responses have retry-after and stop when the queue drains.
+  - text: "`max_tokens=8192` is reserved against the output-tokens-per-minute limit for every request, so 64 workers exhaust it before generating anything"
+    correct: false
+    why: That is how OpenAI counts TPM, which makes it tempting. Claude's OTPM counts tokens actually generated and ignores max_tokens, and the log shows requests-remaining at 0, not output tokens.
+  - text: The provider is overloaded at 9 a.m. and nothing on the client side can help
+    correct: false
+    why: Provider overload is a 529 overloaded_error, not a 429 rate_limit_error, and the input and output token buckets still have room in these headers.
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"Your application is hitting LLM provider rate limits during peak hours. How do you handle it?" Here it comes with logs: find the cause before you propose a fix.
+</Callout>
+
+A nightly-report service summarises documents with Claude. At 09:00 a scheduler releases the morning queue to a pool of 64 worker threads. From 09:00 to about 09:20 most calls fail with 429, the service sends far more requests per minute than it does at 08:59, and reports go out late. The queue drains by 09:20 and the errors stop. The synthetic log below is typical.
+
+```python
+client = anthropic.Anthropic()                 # SDK defaults
+
+def summarize(doc):
+    for attempt in range(3):
+        try:
+            return client.messages.create(
+                model="claude-sonnet-5-5", max_tokens=8192,
+                messages=[{"role": "user", "content": doc}])
+        except anthropic.RateLimitError:
+            time.sleep(1)
+    raise RuntimeError("gave up")
+```
+
+```text
+09:00:00.041 POST /v1/messages -> 429 rate_limit_error
+             retry-after: 2
+             anthropic-ratelimit-requests-remaining: 0
+             anthropic-ratelimit-input-tokens-remaining: 1204000
+             anthropic-ratelimit-output-tokens-remaining: 236000
+09:00:02.043 POST /v1/messages -> 429 rate_limit_error   (x 51 within 9 ms)
+09:00:04.046 POST /v1/messages -> 429 rate_limit_error   (x 48 within 11 ms)
+09:00:05.049 POST /v1/messages -> 429 rate_limit_error   (x 47 within 10 ms)
+09:00:07.052 POST /v1/messages -> 200
+...
+09:20:12.310 POST /v1/messages -> 200   queue empty
+```
+
+Pick the root cause.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Which of the three buckets in the headers is empty?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>How many HTTP requests can one `summarize` call send, counting the SDK's own retries?</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Look at the timestamps of the retries. Are they spread out, and which gaps match the <code>retry-after</code> value?</p></details>
+
+## Answer
+
+The requests bucket is empty while both token buckets have room, every response carries `retry-after`, and each burst of retries lands within about 10 ms. That is a client-made retry storm on a request-per-minute limit.
+
+Two things produce it. The first multiplies requests: the SDK retries 2 times by default, so each `messages.create` can send 3 requests, and the loop calls it 3 times, up to 9 requests per document. The second keeps them in step. The SDK honours `retry-after`, but when the header is present it waits exactly that long and adds no jitter (jitter applies only on its exponential path, when the header is absent), so workers that failed together come back together 2 seconds later. Once the SDK gives up, the loop's fixed `time.sleep(1)` ignores `retry-after` altogether and sends every worker back at the same instant again. That is the 2 s, 2 s, 1 s rhythm in the log.
+
+Why the other picks are tempting. A spend cap is also a 429, but it has no `retry-after`, carries `enforced_spend_limit_reached`, and would not clear when the queue drains. Counting `max_tokens` against the limit is exactly how OpenAI's TPM works, so engineers who know OpenAI reach for it, but Claude's OTPM counts generated tokens only. Overload would be a 529, a different error with a different response.
+
+<Depth>
+<Fragment slot="short">
+<p>Retry in one place: set the SDK's <code>max_retries=0</code> or remove the loop. Back off with full jitter and treat <code>retry-after</code> as a minimum, adding random delay on top so workers that failed together do not return together. Then remove the cause of the burst: release the queue at a steady rate with a client-side token bucket sized from the <code>*-remaining</code> headers, and cap concurrency below the RPM limit. Move work that can wait to the batch API at half price.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Immediate fix: one retry layer with jitter and a cap on total retry time, so a failing document fails fast instead of holding a worker.</p>
+<p>Structural fix: the scheduler releases 64 requests in the same millisecond against a continuously refilled token bucket. Pace the queue instead, at a rate below the limit, using the rate-limit headers as feedback. A semaphore per model bounds concurrency.</p>
+<p>Cheaper fix: a morning report is not interactive. The Message Batches API costs 50% of standard prices and is built for this; results arrive in any order and are matched on <code>custom_id</code>.</p>
+<p>Capacity: if paced traffic still exceeds the limit, the answer is a higher tier, prompt caching (cache reads do not count toward input tokens per minute on most Claude models), or a second model, not more retries.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>How do you confirm the diagnosis?</em> Count requests per document and plot retry timestamps; a fixed-interval spike pattern confirms synchronisation.</li>
+<li><em>How would you alert on this?</em> On the ratio of 429s to successful calls and on requests per completed document, not on raw 429 count.</li>
+<li><em>Why did it clear at 09:20?</em> The burst came from the queue. Once it drained, demand fell under the limit.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *What would the logs look like if it were a spend cap?* 429 with no `retry-after`, `error.details.error_code` set to `enforced_spend_limit_reached`, and failures that continue until someone raises the cap.
+- *Would raising the rate-limit tier fix it?* It would hide it until the queue grows. The retry multiplier and the burst release remain.
+- *Where else do retries stack?* A gateway that retries, a service that retries, and an SDK that retries can turn one call into 27 requests at three attempts per layer.
+
+## Common mistakes
+
+- Increasing the retry count or the sleep without adding jitter.
+- Treating every 429 the same way, which keeps hammering a spend cap.
+- Reading the problem as "the provider is slow at 9 a.m." without looking at which bucket is empty.
+- Applying OpenAI's rule that `max_tokens` counts toward the limit to a Claude client.

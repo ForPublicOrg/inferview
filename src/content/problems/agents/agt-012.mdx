@@ -1,0 +1,114 @@
+---
+id: agt-012
+title: A refund agent that waits for a human
+subtitle: persistence, interrupts and resume
+track: agents
+module: memory-state
+type: design
+difficulty: hard
+seniority: [senior, staff]
+minutes: 35
+core: true
+tags: [langgraph, checkpointing, human-in-the-loop, durable-execution, idempotency]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: techinterview.org, LangChain interview guide
+    url: https://www.techinterview.org/companies/langchain/
+    note: lists "design LangGraph's persistence layer for stateful agents with human-in-the-loop interruption" as a sample prompt
+  - title: ombharatiya, AI system design guide, question bank (Q16)
+    url: https://github.com/ombharatiya/ai-system-design-guide/blob/main/00-interview-prep/01-question-bank.md
+    note: "how do you handle long-running agent tasks (checkpointing, resume)?"
+  - title: LangGraph docs, persistence
+    url: https://docs.langchain.com/oss/python/langgraph/persistence
+    note: checkpointers for thread state, stores for cross-thread memory
+  - title: LangGraph docs, checkpointers
+    url: https://docs.langchain.com/oss/python/langgraph/checkpointers
+    note: checkpoint per super-step, pending writes, durability modes exit, async and sync
+  - title: LangGraph docs, interrupts
+    url: https://docs.langchain.com/oss/python/langgraph/interrupts
+    note: interrupt() and Command(resume=...); the node re-runs from its start on resume; rules for try/except, ordering and side effects
+  - title: Temporal docs, workflow definition
+    url: https://docs.temporal.io/workflow-definition
+    note: deterministic workflow code; side effects in activities
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Design the persistence layer for a stateful agent that pauses for human approval and resumes later."
+</Callout>
+
+A refund agent reads the order, checks the refund policy with a model call, and pays out. Refunds over $200 need a human to approve them in an internal tool, and approvers sometimes take two days. Workers are redeployed several times a day. Requirements: no refund is ever paid twice, an approval resumes the exact run it belongs to, and the team can see what every paused run is waiting for.
+
+Design the state, the pause, the resume and the failure handling. You can use LangGraph terms or describe your own.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Where does the run's state live while a human takes two days, and what key finds it again?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>When a paused node resumes, which lines of it run again?</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Which step has a side effect that must not happen twice, and what makes it safe to retry?</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Model the run as a graph whose state is persisted at every step by a database-backed checkpointer, keyed by a thread id derived from the refund request. Pause with an interrupt in its own node before the payout, store the pending approval with the thread id, and resume with the approver's decision on the same thread. The payout runs in a separate node with an idempotency key derived from the refund request id, because steps can run more than once. Run the graph with sync durability, so each checkpoint is written before the next step starts.</p>
+</Fragment>
+<Fragment slot="long">
+<p>State and keys. Graph state holds the order snapshot, the policy verdict and its reasons, the amount, and the approval decision. Thread id is the refund request id, so a retry of the same request finds the same run. The checkpointer is database-backed (Postgres or similar), never in-memory, because workers restart many times during a two-day wait.</p>
+<p>The pause. An approval node calls interrupt() with a payload describing what the human must decide. The graph saves state and stops; the worker is free. An approvals table indexes paused threads by status, amount and age, which is what the internal tool and the dashboard read.</p>
+<p>Resume. The approver's click invokes the graph with Command(resume=decision) and the same thread id. The decision becomes interrupt()'s return value. The node re-runs from its first line on resume, so the approval node does nothing before interrupt() except read state; in particular it does not pay, notify or write.</p>
+<p>The payout. Its own node, after approval, calling the payment API with an idempotency key built from the thread id and the step name, so a crash after the call and before the checkpoint re-runs the call without paying twice. Model calls (the policy check) are recorded results in state, so a replay does not re-ask the model and get a different answer.</p>
+<p>Durability and failure. Run this graph with sync durability, because a lost checkpoint around the approval or payout means confusion about whether a human approved. Durability is set per invocation, not per node, so the whole run pays for it. A sweeper expires approvals after a deadline and resumes them with a reject decision. Graph code changes need versioning: a thread paused under version 3 of the graph must resume on code that understands version 3's state.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>An approver edits the amount before approving. How?</em> The resume value carries the edited amount; the payout node reads it from state, and the idempotency key includes it so an edit after a failed payout is a new payment intent.</li>
+<li><em>How do you test it?</em> Kill the worker before the interrupt, during the wait, after resume and inside the payout, and assert exactly one payment and one audit row each time.</li>
+<li><em>Where does long-term memory fit?</em> Not in the checkpointer. Patterns across customers ("this account has three refunds this month") come from your database or a store, read as a tool.</li>
+</ul>
+</Fragment>
+</Depth>
+
+The detail that separates answers is the re-run on resume. LangGraph's docs are explicit that the interrupted node restarts from the beginning when resumed, so code before `interrupt()` executes twice. A design that sends a "waiting for approval" email in the same node, before the interrupt, sends it again on every resume. The documented rules follow: keep side effects before an interrupt idempotent, do not wrap `interrupt()` in a bare `try/except` (it works by raising), and do not reorder or conditionally skip interrupts inside a node, because resume values are matched to interrupts by position.
+
+The second detail is that durable execution is at-least-once. Checkpoints record results after a step; a crash inside the payout step, after the payment provider accepted the call, re-runs the step. Only an idempotency key turns that into one payment. Temporal's model is the same idea with different words: workflow code is replayed and must be deterministic, side effects live in activities that may be retried.
+
+A minimal sketch of the graph shape, in LangGraph terms:
+
+```python
+def approval(state):
+    if state["amount"] <= 200:
+        return {"decision": "auto"}
+    decision = interrupt({"order": state["order_id"], "amount": state["amount"],
+                          "reasons": state["policy_reasons"]})
+    return {"decision": decision}
+
+def payout(state):
+    if state["decision"] in ("auto", "approve"):
+        key = f"refund:{state['request_id']}:{state['amount']}"
+        return {"payment": payments.refund(state["order_id"], state["amount"], idempotency_key=key)}
+    return {"payment": None}
+
+# graph = builder.compile(checkpointer=PostgresSaver(...))
+# inputs carries request_id, so the node never needs to read the thread id from config
+# graph.invoke(inputs, config={"configurable": {"thread_id": refund_request_id}}, durability="sync")
+# later: graph.invoke(Command(resume="approve"), config={"configurable": {"thread_id": refund_request_id}}, durability="sync")
+```
+
+## Follow-ups
+
+- *Why not just poll a database flag in a loop?* A sleeping worker holds resources for two days and still loses its place on redeploy; the checkpoint plus interrupt frees the worker and survives restarts.
+- *What does the `"exit"` durability mode do here?* It persists only when the run ends, pauses or errors, so a crash mid-run loses progress. Acceptable for a graph of cheap, short steps; not for one that contains a payout, since the mode applies to the whole run.
+- *How do you show reviewers what the agent did?* Checkpoint history gives every state transition; render it as a timeline next to the approval request.
+
+## Common mistakes
+
+- An in-memory checkpointer in a design that must survive redeploys.
+- Side effects before `interrupt()` in the same node, which repeat on resume.
+- A new thread id per attempt, so retries start fresh instead of resuming.
+- Generating the idempotency key randomly per attempt, which defeats it.
+- No plan for graph code changing while runs are paused.

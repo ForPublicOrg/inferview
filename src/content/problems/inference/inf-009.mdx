@@ -1,0 +1,147 @@
+---
+id: inf-009
+title: Token-charged rate limiter
+subtitle: reserve, then settle
+track: inference
+module: gateways-finops
+type: code
+difficulty: medium
+seniority: [mid, senior]
+minutes: 30
+core: true
+tags: [rate-limiting, token-bucket, gateway, quotas, billing]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: amitshekhariitbhu, AI engineering interview questions
+    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
+    note: "Implement a token-bucket rate limiter for an LLM API where cost scales with tokens, then make it distributed."
+  - title: LiteLLM docs, budgets and rate limits
+    url: https://docs.litellm.ai/docs/proxy/users
+    note: tpm_limit and rpm_limit per key; budget reservation estimates the request's maximum cost before the call and rejects it if the budget would be exceeded; fail_closed_rate_limit_enforcement returns 503 when counters cannot be verified against Redis
+code:
+  starter: |
+    import time
+
+    class TokenBudget:
+        """Per-tenant token bucket charged in tokens, refilled continuously at tokens_per_minute / 60 per second.
+        burst is the bucket size and defaults to tokens_per_minute; the bucket starts full."""
+
+        def __init__(self, tokens_per_minute, burst=None, clock=time.monotonic):
+            raise NotImplementedError
+
+        def available(self):
+            """Current level after refilling."""
+            raise NotImplementedError
+
+        def try_reserve(self, prompt_tokens, max_tokens):
+            """Reserve the worst case, prompt_tokens + max_tokens. Return the amount reserved,
+            or None (and consume nothing) if the bucket does not hold that much right now."""
+            raise NotImplementedError
+
+        def settle(self, reserved, prompt_tokens, output_tokens):
+            """After the call: refund what was reserved but not used. If actual use exceeded
+            the reservation, charge the difference, even if that takes the level below zero."""
+            raise NotImplementedError
+  tests: |
+    now = [0.0]
+    clock = lambda: now[0]
+
+    b = TokenBudget(6_000, clock=clock)
+    assert b.available() == 6_000, "starts full at the burst size, which defaults to one minute of tokens"
+    r = b.try_reserve(1_000, 2_000)
+    assert r == 3_000 and b.available() == 3_000, "reserve prompt plus max_tokens up front"
+    b.settle(r, 1_000, 500)
+    assert b.available() == 4_500, "settle refunds the output tokens that were not used"
+    assert b.try_reserve(2_000, 3_000) is None and b.available() == 4_500, "a rejected request consumes nothing"
+    now[0] = 10.0
+    assert abs(b.available() - 5_500) < 1e-6, "refills at 100 tokens per second"
+    now[0] = 1_000.0
+    assert b.available() == 6_000, "refill is capped at the burst size"
+    assert b.try_reserve(1_000, 5_001) is None, "a request bigger than the burst is never admitted"
+
+    s = TokenBudget(600, burst=1_000, clock=clock)
+    r = s.try_reserve(200, 300)
+    s.settle(r, 900, 300)
+    assert abs(s.available() - (-200)) < 1e-6, "usage above the reservation drives the level negative"
+    assert s.try_reserve(1, 1) is None, "and blocks new work until it refills"
+    now[0] += 30.0
+    assert abs(s.available() - 100) < 1e-6, "30 s at 10 tokens per second pays the debt back"
+  solution: |
+    import time
+
+    class TokenBudget:
+        def __init__(self, tokens_per_minute, burst=None, clock=time.monotonic):
+            self.rate = tokens_per_minute / 60.0
+            self.capacity = burst if burst is not None else tokens_per_minute
+            self.level = float(self.capacity)
+            self.clock = clock
+            self.last = clock()
+
+        def _refill(self):
+            now = self.clock()
+            self.level = min(self.capacity, self.level + (now - self.last) * self.rate)
+            self.last = now
+
+        def available(self):
+            self._refill()
+            return self.level
+
+        def try_reserve(self, prompt_tokens, max_tokens):
+            self._refill()
+            need = prompt_tokens + max_tokens
+            if need > self.level:
+                return None
+            self.level -= need
+            return need
+
+        def settle(self, reserved, prompt_tokens, output_tokens):
+            self._refill()
+            # Refund unused output; if actual use beat the reservation, the level goes negative and pays it back later.
+            self.level = min(self.capacity, self.level + reserved - (prompt_tokens + output_tokens))
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="As listed">
+"Implement a token-bucket rate limiter for an LLM API where cost scales with tokens, then make it distributed."
+</Callout>
+
+A request-count limit is the wrong unit for a model API: one request can use 50 tokens and the next 50,000. Implement a per-tenant limiter charged in tokens.
+
+- The bucket refills continuously at `tokens_per_minute / 60` tokens per second, up to `burst` (default: one minute's worth). It starts full.
+- The output length is unknown when the request arrives, so `try_reserve(prompt_tokens, max_tokens)` reserves the worst case. If the bucket does not hold that much, return `None` and take nothing; the gateway answers 429.
+- After the call, `settle(reserved, prompt_tokens, output_tokens)` refunds what was not used. Token counts reported by the provider can exceed your estimate (your prompt count may have been approximate), in which case settle charges the difference even if the level goes below zero, and the tenant waits for the refill.
+- The clock is injected so tests can control time.
+
+Then be ready to talk through the distributed version.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Refill lazily: on every call, add elapsed seconds times the rate, cap at the burst, and remember the time.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Settle is one formula: level plus reserved minus actual, capped at the burst.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>A request larger than the burst can never be admitted, however long it waits. That is a correct outcome, not a bug to work around.</p></details>
+
+## Answer
+
+The reference solution stores the rate per second, the capacity, the current level and the time of the last refill. `_refill` runs at the start of every public method, so the level is always current without a background thread. `try_reserve` compares the worst case with the level and either subtracts it or returns `None` without side effects, so a rejected request costs the tenant nothing. `settle` adds back the reservation and subtracts the real usage in one step, capped at the capacity; when usage beat the reservation the result is negative, and the next reservations fail until the refill pays the debt back, which is what the last tests check.
+
+Reserving the worst case is conservative. If tenants set `max_tokens` far above what they use, the limiter admits fewer concurrent requests than the true usage would allow. Two common fixes: cap `max_tokens` at the gateway, or reserve an estimate (for example the tenant's recent p95 output length) and accept occasional overshoot that settle charges back.
+
+**Distributed.** With several gateway replicas, the bucket has to live in shared state. The usual design keeps level and last-refill time in Redis and runs refill-and-reserve as one atomic operation (a Lua script or a transaction), with settle as another. Each call then costs a round trip to Redis. The alternative is to split the rate: each of N replicas gets 1/N of it locally, with no coordination, at the price of unfairness when load is uneven across replicas. Either way, decide what happens when the shared store is down. LiteLLM's docs, for example, describe the global budget failing open without its database and offer fail-closed options; for a spend limit, failing open is the risky choice.
+
+## Follow-ups
+
+- *What should the 429 carry?* A Retry-After computed from the shortfall divided by the refill rate.
+- *How do you handle streaming responses?* Count output tokens as they stream and stop at the reservation, or settle at the end and accept a bounded overshoot.
+- *How do reservations leak, and how do you stop it?* A gateway crash between reserve and settle; store reservations with an expiry so they return to the bucket.
+- *Tokens per minute or dollars per month?* Both: the bucket protects capacity in the short term, and a dollar budget per period protects spend.
+
+## Common mistakes
+
+- Charging requests instead of tokens.
+- Charging only after the call, which lets one burst of large requests overshoot the limit by a wide margin.
+- Letting a rejected `try_reserve` consume tokens.
+- Refilling past the burst size after a long idle period.
+- Clamping the level at zero in settle, which forgives usage the tenant really consumed.
