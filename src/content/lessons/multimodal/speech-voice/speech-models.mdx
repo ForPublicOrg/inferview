@@ -1,0 +1,148 @@
+---
+title: Speech models for engineers
+track: multimodal
+module: speech-voice
+order: 1
+kind: lesson
+level: senior
+minutes: 14
+summary: The four models in a voice agent (recognition, turn detection, the LLM and synthesis), what each is measured by, and which one sets the latency floor of a turn.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: "Robust Speech Recognition via Large-Scale Weak Supervision (Radford et al., arXiv 2212.04356, 2022-12-06)"
+    url: https://arxiv.org/abs/2212.04356
+    note: "Whisper; the abstract reports scaling to 680,000 hours of multilingual and multitask supervision and models often competitive with prior fully supervised results in a zero-shot transfer setting, without fine-tuning"
+  - title: "Moshi: a speech-text foundation model for real-time dialogue (Défossez et al., arXiv 2410.00037, v2 2024-10-02)"
+    url: https://arxiv.org/abs/2410.00037
+    note: "user and system speech modelled as parallel streams with no explicit speaker turns; time-aligned text tokens predicted as a prefix to audio tokens (Inner Monologue); the paper reports 160 ms theoretical and 200 ms practical latency"
+  - title: OpenAI docs, Realtime voice activity detection (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/guides/realtime-vad
+    note: "server_vad (default) with threshold, prefix_padding_ms and silence_duration_ms, example values 0.5, 300 and 500 not stated as defaults; semantic_vad with eagerness low, medium, high or auto (auto equals medium); create_response and interrupt_response apply to speech-to-speech sessions only; transcription models gpt-live-transcribe and gpt-realtime-whisper commit turns manually when turn_detection is null"
+  - title: Voice AI and Voice Agents, an illustrated primer (Kwindla Hultman Kramer and Pipecat contributors; June 2026 update, checked 2026-10-28)
+    url: https://www.voiceaiandvoiceagents.com
+    note: "round-trip table totalling 1,293 ms with transcription and endpointing 300 ms, LLM TTFB 650 ms, sentence aggregation 20 ms, TTS TTFB 120 ms; 1,500 ms target; Pipecat VAD defaults VAD_STOP_SECS 0.8, VAD_START_SECS 0.2, VAD_CONFIDENCE 0.7, VAD_MIN_VOLUME 0.6; turn detection from VAD with a 200 ms trigger plus Smart Turn (about 30 ms) giving a decision about 250 ms after the pause; LLM TTFT median and P95 per model; TTS time to first audio median and P95 per model; 600 ms LLM TTFT as fast enough for most voice use"
+  - title: pipecat-ai/smart-turn README (checked 2026-10-28)
+    url: https://github.com/pipecat-ai/smart-turn
+    note: "Smart Turn v3.2: native audio turn detection, about 8M parameters, 8 MB quantized CPU and 32 MB GPU builds, 16 kHz mono PCM, up to 8 seconds of audio, 23 languages, inference as little as 10 ms on some CPUs and under 100 ms on most cloud instances, runs after a VAD such as Silero detects silence, BSD 2-clause"
+  - title: OpenAI API pricing (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/pricing
+    note: "transcription listed per audio minute, for example gpt-4o-transcribe $0.006, gpt-4o-mini-transcribe $0.003, gpt-realtime-whisper $0.017"
+  - title: ElevenLabs, voice agent latency optimization (published 2026-06-23, updated 2026-10-09; vendor)
+    url: https://elevenlabs.io/blog/voice-agent-latency-optimization
+    note: "the vendor's target of P50 time to first audio under 800 ms and P95 under 1.5 s; waiting 700 ms of silence adds 700 ms to every turn; manual commit when the application knows the turn has ended"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+A cascaded voice agent runs four models per turn: a recognizer that turns audio into text, a turn detector that decides the user has finished, an LLM, and a synthesizer. A speech-to-speech model folds all four into one. The engineering decision is which component to buy, which to run yourself, and which one you are tuning when the turn feels slow. The answer to the last question is almost never the recognizer.
+
+## The latency of a turn, by component
+
+The Pipecat maintainers publish a round trip for a typical cascaded stack, measured from the user's microphone to the agent's audio coming out of the speaker. It totals 1,293 ms. Grouping its rows by component:
+
+| Component | Rows in the table | ms | Share |
+|---|---|---|---|
+| LLM | time to first byte | 650 | 50% |
+| Recognizer and turn detector | transcription and endpointing | 300 | 23% |
+| Transport | mic, codec, network, jitter buffer, speaker, both ways | 203 | 16% |
+| Synthesizer | time to first byte | 120 | 9% |
+| Glue | sentence aggregation | 20 | 2% |
+
+The shares are 650/1,293, 300/1,293 and so on, rounded. Two components own three quarters of the turn, and neither of them is the one that turns audio into words. The recognizer's own work is mostly done before the user stops talking, because streaming recognizers transcribe as audio arrives. What is left after the last word is the decision that the user has finished, and that decision is a separate model with its own failure modes.
+
+```python
+# Pipecat primer round trip (June 2026 update), grouped by component.
+rows = {"llm_ttfb": 650, "transcription_and_endpointing": 300,
+        "transport": 40 + 21 + 10 + 2 + 40 + 1 + 21 + 2 + 10 + 40 + 1 + 15,
+        "tts_ttfb": 120, "sentence_aggregation": 20}
+total = sum(rows.values())
+for name, ms in sorted(rows.items(), key=lambda kv: -kv[1]):
+    print(f"{name:32s}{ms:6d} ms {ms / total:5.1%}")
+print(f"{'total':32s}{total:6d} ms")
+```
+
+```text
+llm_ttfb                           650 ms 50.3%
+transcription_and_endpointing      300 ms 23.2%
+transport                          203 ms 15.7%
+tts_ttfb                           120 ms  9.3%
+sentence_aggregation                20 ms  1.5%
+total                             1293 ms
+```
+
+## Recognition
+
+Whisper set the expectations most teams still carry: the paper reports training on 680,000 hours of multilingual and multitask supervision and zero-shot results often competitive with prior fully supervised systems, without fine-tuning. Two consequences matter in a voice agent. First, accuracy on clean, general speech is a solved purchase; spend evaluation effort on your domain's proper nouns, account numbers and accents, where a recognizer that is fine on a benchmark still mangles the one token your tool call needs. Second, a voice agent needs interim results while the user is still speaking, not a transcript of a finished recording. Streaming recognizers emit interim transcripts that can change and a final transcript that does not. The interim stream is what makes speculative LLM starts possible, and its stability is a number you measure per recognizer, not a property you assume.
+
+Recognizer pricing is per audio minute and small next to the rest of a voice bill. OpenAI's transcription models, for example, are listed per minute, and `gpt-realtime-whisper` and `gpt-live-transcribe` can run without turn detection, with the application committing each turn itself. That mode is the escape hatch when your application knows the turn ended (a push-to-talk button, a DTMF key) and should not wait for any detector.
+
+## Turn detection is its own model
+
+Turn detection answers one question: has this person finished their turn, or are they pausing? There are three generations of answer.
+
+**Silence threshold (plain VAD).** A voice activity detector marks speech and silence frames, and the turn ends after a fixed run of silence. Pipecat's defaults are `VAD_STOP_SECS = 0.8` and `VAD_START_SECS = 0.2`. OpenAI's `server_vad` exposes the same knobs as `threshold`, `prefix_padding_ms` and `silence_duration_ms`; the docs show 0.5, 300 and 500 as example values. ElevenLabs puts the cost plainly: waiting 700 ms of silence adds 700 ms to every turn. Shortening the window trades latency for cut-offs, because people pause mid-sentence to recall an account number, and a silence detector cannot tell that pause from the end of a turn.
+
+**Semantic turn detection.** A model judges whether the words or audio so far form a complete turn. OpenAI's `semantic_vad` takes an `eagerness` of `low`, `medium`, `high` or `auto` (which equals `medium`); `low` lets the user take their time, `high` ends turns as soon as it can. The knob moves the same trade-off as the silence window, but along a better curve, because "my account number is" no longer looks finished.
+
+**Audio-native turn models.** Pipecat's Smart Turn v3.2 is about 8M parameters (8 MB quantized for CPU), takes up to 8 seconds of 16 kHz mono audio, covers 23 languages, and runs only after a VAD has detected silence, so it does not run continuously. The README reports inference in as little as 10 ms on some CPUs and under 100 ms on most cloud instances. Because it hears audio, it can use intonation that a transcript-based detector never sees. The primer describes the combined approach: a VAD with a short 200 ms trigger, then the turn model, for a decision about 250 ms after the user pauses.
+
+<Predict id="mml-speech-models-vad" question="Start from the primer's 1,293 ms round trip, with 300 ms for transcription and endpointing. Replace that row with a plain VAD that waits 800 ms of silence (Pipecat's VAD_STOP_SECS default), and assume transcription finalization adds nothing beyond it. What is the round trip in ms?" answer={1793} tolerance={5} unit="ms">
+<p><b>1,793 ms</b>: 1,293 − 300 + 800. A silence-only endpointer at its default puts the turn 293 ms over the primer's 1,500 ms target before the LLM has done anything slow. That is why the turn detector, not the recognizer, is the component to choose with care.</p>
+</Predict>
+
+In a speech-to-speech session the turn detector also starts the response: OpenAI documents `create_response` and `interrupt_response` as applying only to speech-to-speech conversations, while in a transcription session the detector only decides how audio is chunked. Turning detection off in a speech-to-speech session moves the decision, and its latency, into your client.
+
+## The LLM sets the floor
+
+The primer measured time to first token for several hosted models, median and P95 in ms: GPT-4.1 536 and 1,771, Gemini 2.5 Flash 597 and 1,137, Claude 4.5 Haiku 637 and 1,615, GPT-5.1 739 and 1,492, and a self-hosted Nemotron 3 Ultra 541 and 712. Its rule of thumb is that 600 ms or less is fast enough for most voice use. The medians cluster within about 200 ms of each other; the P95s span 712 to 1,771 ms. A model with a 1,771 ms P95 cannot meet a 1,500 ms turn target at the 95th percentile no matter how good the rest of the pipeline is, so for a voice agent the LLM's tail is a selection criterion before its quality is.
+
+Tool calls make this worse: the primer lists several reasons a function call adds latency, including the second inference after the tool returns. A voice turn with one tool call pays the LLM's time to first token twice plus the tool, which is why the next lesson treats filler and watchdog timers as part of the design.
+
+## Synthesis is judged by time to first byte
+
+TTS quality comparisons are about voice; TTS engineering comparisons are about time to first audio and its tail. The primer's measurements, median and P95 in ms: Cartesia Sonic 3.5 195 and 240, Gradium 235 and 320, Deepgram Aura-2 310 and 600, ElevenLabs Turbo v2.5 330 and 670, Inworld TTS 1.5 Max 337 and 560. As with the LLM, the medians differ by less than the tails do. TTS only helps latency if it streams: it must accept text a clause at a time and return audio before the sentence is complete. The 20 ms "sentence aggregation" row in the table is the wait for that first clause.
+
+## Speech-to-speech removes the boundaries
+
+Moshi models the user's speech and its own as parallel streams, so there are no explicit speaker turns at all; overlap, interruptions and interjections are just audio on two channels. It predicts time-aligned text tokens before its audio tokens (the paper calls this Inner Monologue), which the abstract says improves the linguistic quality of the speech. The paper reports 160 ms theoretical and 200 ms practical latency. There is no endpointer to tune and no TTS to stream, so the levers in this lesson disappear, and so do the places you would have inspected text, logged a transcript or run a policy check. The playbook in this module weighs that trade.
+
+## Choosing components
+
+For a cascaded agent, the procedure that follows from the numbers above:
+
+1. Pick the LLM on P95 time to first token under your prompt and tool definitions, measured from your region, then on quality. A median that fits and a tail that does not is a model that fails one turn in twenty.
+2. Pick the turn detector next: semantic or audio-native for open conversation, manual commit wherever the interface already knows the turn ended. Evaluate it on your own recordings for cut-off rate and added delay together.
+3. Pick a streaming TTS on P95 time to first audio, then voice.
+4. Pick the recognizer last, on your domain's hard tokens.
+
+<Callout kind="gotcha">ElevenLabs' latency post says a natural-feeling agent "typically targets" P50 time to first audio under 800 ms and P95 under 1.5 seconds. That is one vendor's target, measured from end of speech rather than from the microphone, and it is not a standard. The Pipecat primer's June 2026 update sets 1,500 ms voice-to-voice as the target and warns against spikes above it. State which target and which start point you are using before comparing numbers.</Callout>
+
+## In the room
+
+**"You run a voice agent for pharmacy refills. Callers read out eight-digit prescription numbers with pauses between groups, and the business wants turns under 1.5 seconds at P95. Product wants a cheaper turn detector. Which component do you change, and how do you prove it?"**
+
+<Depth>
+<Fragment slot="short">
+<p>Keep a turn model that understands incomplete turns and fix the latency elsewhere. A shorter silence window would cut callers off mid-number, which turns into a wrong refill or a repeated question, both worse than 300 ms. Measure cut-off rate and added delay on recorded refill calls for each candidate detector, and move the LLM to one whose P95 time to first token leaves room in the budget.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The budget first: with the primer's stack, the LLM is half the round trip and its P95 is what breaks a P95 target. Swapping a model with a 1,771 ms P95 for one with 712 ms does more for the tail than any detector setting. The detector decision is about errors, not milliseconds. A silence threshold short enough to be fast cuts off a caller pausing between digit groups; a semantic or audio-native detector can hold the turn open on "my number is four five two" and close it quickly on "that's all". Build an evaluation set from recorded calls, labelled with the true end of each turn, and measure for each detector the cut-off rate and the delay after true end of turn. Product's cost concern is answered with numbers: Smart Turn runs on CPU after the VAD fires, so its cost is small next to the LLM. If the digit entry is the main problem, a structured fallback (DTMF entry, or a manual commit after a prompt for the number) removes the guesswork for that one field.</p>
+<p>The failure mode of this answer: a semantic detector trained on general conversation can be worse on digit strings than a tuned silence window, and you will only find out from your own recordings.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Your detector evaluation shows the cheaper silence threshold cuts off 3 percent of turns and saves 400 ms at P50. Which business metric decides it, and who owns that call?</li>
+<li>What would you need to see in production to move from the semantic detector back to a silence threshold?</li>
+<li>The LLM with the best tail is self-hosted. What do you now own that you did not before, and what does that do to the P95 when your traffic doubles?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The primer's table is one stack, measured with a macOS client and particular providers; its 300 ms for transcription and endpointing assumes a modern turn model, and your network legs depend on where your users and servers are. The per-model latency figures are the maintainers' measurements at one point in time, and hosted model tails change with provider load from week to week, so they are a reason to measure, not a ranking to cite. The component ordering above also assumes a cascaded design with text in the middle. If you adopt a speech-to-speech model, latency becomes a property of one vendor's model and serving stack, and your tuning work moves to turn-taking behaviour and cost. Finally, latency is not the whole of conversation quality: a fast agent that interrupts callers is worse than a slower one that does not, and only recordings of real calls show which you have.
+
+<SelfRate id="lesson:multimodal/speech-voice/speech-models" />

@@ -1,0 +1,112 @@
+---
+id: inf-036
+title: A platform that serves one adapter per tenant
+subtitle: two thousand adapters, thirty replicas, and a security team that read the vLLM docs
+track: inference
+module: fleet
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 50
+core: false
+tags: [lora, multi-tenant, adapter-serving, routing, eviction, eval-gates, system-design]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: vLLM documentation, LoRA adapters
+    url: https://docs.vllm.ai/en/latest/features/lora.html
+    note: "runtime loading through /v1/load_lora_adapter needs VLLM_ALLOW_RUNTIME_LORA_UPDATING, comes with security risks and should not be used in production unless in an isolated, fully trusted environment; resolver plugins load adapters on demand from a local directory or the Hugging Face Hub, and the Hub resolver's remote downloads are described as insecure and not for production; set --max-lora-rank to the highest adapter rank. Checked 2026-10-28."
+  - title: vLLM source, LoRA config (vllm/config/lora.py, main branch)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/config/lora.py
+    note: "max_loras is the maximum number of LoRAs in a single batch (default 1); max_cpu_loras is the number held in CPU memory and must be at least max_loras; max_lora_rank defaults to 16. Checked 2026-10-28."
+  - title: vLLM source, PEFT adapter validation (vllm/lora/peft_helper.py, main branch)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/lora/peft_helper.py
+    note: "validate_legal raises ValueError when the largest of r and the rank_pattern values exceeds max_lora_rank, when bias is not none, and for unsupported features including DoRA and modules_to_save outside classifier heads. Checked 2026-10-28."
+  - title: vLLM documentation, automatic prefix caching design
+    url: https://docs.vllm.ai/en/latest/design/prefix_caching.html
+    note: "a block's hash includes extra keys such as the LoRA id; a per-request cache_salt limits reuse to requests sharing the salt, to prevent timing attacks. Checked 2026-10-28."
+  - title: S-LoRA, Serving Thousands of Concurrent LoRA Adapters (Sheng et al., 2023-11-06, revised 2024-06-05)
+    url: https://arxiv.org/abs/2311.03285
+    note: "the abstract reports serving thousands of adapters on one GPU or across several, storing all adapters in main memory and fetching those used by running queries, and up to 4 times the throughput of HuggingFace PEFT and vLLM with naive LoRA support. Checked 2026-10-28."
+  - title: LoRA Land (Zhao et al., 2024-04-29)
+    url: https://arxiv.org/abs/2405.00732
+    note: "the abstract reports 310 fine-tuned models across 10 base models and 31 tasks, and LoRAX hosting 25 LoRA fine-tuned Mistral-7B models on one 80 GB A100. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Design round, 50 minutes">
+"Every enterprise customer gets a fine-tuned version of our model. Design the serving platform: how adapters get loaded, how requests find them, what gets evicted, and how a bad adapter is kept out of production."
+</Callout>
+
+What you learn by asking (scenario):
+
+- One 7B base model. 2,000 tenant adapters, rank 16 on all projections, 80.7 MB each in BF16. New adapter versions arrive at about 40 a day.
+- Thirty replicas, one GPU each. In the peak hour about 300 distinct adapters receive traffic; the 10 largest tenants send 60% of all tokens.
+- Most adapters come from the platform's own fine-tuning service. About a fifth are uploaded by tenants who trained elsewhere.
+- Contracts say one tenant's adapter never serves another tenant's request, and that a tenant can roll back to its previous version within an hour.
+- Security will not allow the engine's runtime load endpoint to be reachable from anything but the platform's own control plane.
+- The API gateway already maps an API key to a tenant; its owners will add one header, nothing more. Five engineers, one quarter.
+
+Design the platform. Say what you give up, and write the release procedure for a new adapter version with its rollback triggers and owners.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how the traffic of the largest tenants compares with what one replica serves.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the time to load one adapter from object storage, from local disk and from host memory on a serving replica.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask who decides that a tenant's adapter is good enough: the tenant, the platform, or both, and on which evals.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Two serving shapes. Tenants whose traffic fills replicas on its own get the adapter merged into a dedicated deployment, which costs nothing at runtime and isolates them completely. Everyone else shares multi-adapter pools where each adapter is placed on a small set of replicas by rendezvous hashing on the adapter id, three by default and more for hot adapters. Each replica keeps the adapters assigned to it in host memory and loads them into a bounded number of GPU slots on demand, LRU. The engine never fetches anything itself: a gate pipeline validates, evaluates and signs each adapter version into an internal store, and replicas load only from there. I give up even load across replicas, first-request latency for cold adapters, and the ability for a tenant to ship an adapter without passing the gate. The weak point is placement: a tenant whose traffic spikes is pinned to its three replicas while the other twenty-seven idle, so the placement count must grow with measured load faster than a spike saturates them.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Decision 1: merge or hot-load.</strong> Two defensible answers per tenant. A merged model is the base with the adapter folded in: no adapter kernels in the forward pass, no slot limits, no chance of serving the wrong adapter, and its prefix cache is the tenant's alone. It costs a full replica set per tenant and a full model deploy per adapter version. Hot-loading shares the base: hundreds of tenants per replica, versions shipped as 80.7 MB files. It costs adapter compute in every forward pass, slot and placement management, and a shared failure domain. The quantity to choose is the threshold: I would merge a tenant when its peak traffic keeps at least two replicas busy, because below that a merged deployment runs mostly idle. Some of the 10 largest tenants qualify; the long tail never does.</p>
+
+<p><strong>Decision 2: placement and routing.</strong> Two defensible answers.</p>
+<ul>
+<li><em>Every adapter loadable on every replica.</em> Routing ignores adapters and balances load. The cost: every replica holds or fetches all 2,000 adapters, 2,000 x 80.7 MB = 161 GB of host memory per replica, or a fetch from object storage on most first requests; and each replica's GPU slots churn through the whole catalogue.</li>
+<li><em>Each adapter on k replicas.</em> Rendezvous hashing on the adapter id picks the k; the router, given the adapter header the gateway adds, sends the request to the least-loaded of them. With k = 3 over 30 replicas each replica holds 2,000 x 3 / 30 = 200 adapters, 16.1 GB of host memory, and its GPU slots see a tenth of the catalogue. The cost: sticky routing, hot spots, and a cold load on a replica newly added to an adapter's set.</li>
+</ul>
+<p>I choose k replicas, with k raised for an adapter when its measured load per replica crosses a threshold and lowered when it falls, so that the hot tail spreads. Rendezvous hashing keeps the other assignments stable when k changes or a replica leaves.</p>
+
+<p><strong>Eviction, in three tiers.</strong> GPU slots (vLLM's <code>max_loras</code>, the adapters that can be in one batch) are LRU within the replica's assigned set; size them from the measured distinct adapters per batch, not the memory maximum, so the KV cache keeps its room. Host memory (<code>max_cpu_loras</code>) holds the whole assigned set, 200 adapters. Local disk holds the current and previous version of every assigned adapter, which is what makes the one-hour rollback promise cheap. Object storage holds everything.</p>
+
+<p><strong>Isolation.</strong> The adapter id comes from the gateway's tenant mapping, never from the request body, so a tenant cannot name another tenant's adapter. vLLM includes the LoRA id in the prefix-cache block hash, so cached blocks are not shared across adapters; I add a per-tenant cache salt as well, because the base-model path (requests without an adapter) would otherwise share blocks across tenants and allow timing probes.</p>
+
+<p><strong>The gate.</strong> vLLM's own docs say runtime loading should not run in production outside an isolated, fully trusted environment, and that the Hub resolver's remote downloads are not for production. So replicas load only from the internal store, through a filesystem resolver or the control plane, and only signed versions reach the store. The gate runs, in order: a structural check in a sandbox (safetensors only; the largest of <code>r</code> and every <code>rank_pattern</code> value at most the pool's <code>max_lora_rank</code>; target modules the base supports; no bias, DoRA or extra saved modules, which vLLM rejects on load); a platform safety suite run against the adapter and compared with the base model; and the tenant's own eval set with the threshold the tenant chose. The platform owns the first two and can block; the tenant owns the third and signs off quality.</p>
+
+<p><strong>The constraint conflict.</strong> Tenants want a new version live within minutes of training; the contract and security want nothing unvetted serving. The gate takes as long as the safety suite, and I write that time down as the platform's promise rather than cut the suite for a fast path.</p>
+
+<p><strong>How the recommended design fails.</strong> Placement is the weak point. A tenant whose traffic jumps tenfold in minutes is pinned to three replicas until the controller raises k, and the new replicas each pay a cold load. Two mitigations, neither free: keep the 10 largest tenants on k of at least six, and let the router spill to any replica in the pool when all k are above a load limit, accepting a cold load there. The second weak point is version skew during a rollout: the same tenant can be served by v3 on one replica and v4 on another for as long as the rollout takes, so evals and complaints must carry the adapter version.</p>
+
+<p><strong>Written down: release of a new adapter version.</strong></p>
+<ol>
+<li>Gate passes; version is signed into the store and pre-loaded into host memory on the adapter's k replicas next to the current version.</li>
+<li>Canary: 5% of the tenant's requests, by stable hash of the tenant's end-user id, go to the new version for a period the tenant chooses, at least one business day of their traffic.</li>
+<li>Rollback triggers: error rate on the new version above the old one's; the platform's online safety probe failing; the tenant's online probe below their threshold; any load failure on a replica.</li>
+<li>Promotion: 100%, keeping the previous version on local disk for the rollback window.</li>
+<li>Owners: the tenant decides promotion and can roll back from the console; the platform on-call can roll back any version on a safety or reliability trigger without asking.</li>
+</ol>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Pushback: the safety suite takes four hours and a large tenant's contract renewal depends on same-hour adapter updates. Which half of the gate do you cut, and what risk do you accept in writing?* Keep the structural check and the safety suite on a sample, and run the full suite after promotion with automatic rollback on failure; write down that up to four hours of traffic can be served by an adapter that later fails the full suite, and get the tenant's signature on it.
+- *Reversal: what would you need to see in production to give up per-adapter placement and let every replica load every adapter?* Host memory per replica large enough for the catalogue, measured load times from host memory that do not show in TTFT p99, and hot-spot incidents that placement keeps causing despite the controller.
+- *A tenant uploads a rank-64 adapter to a pool at rank 16. What happens, and what do you change?* The gate rejects it, as the engine would on load. Either the tenant retrains at the pool's rank, or the platform runs a rank-64 pool, where every slot costs four times as much, and routes that tenant there.
+- *What changes when the base model itself is upgraded?* Every adapter must be retrained or at least re-evaluated on the new base, because an adapter is trained against specific base weights; the platform runs both bases side by side until each tenant has passed the gate on the new one, and that dual-running cost belongs in the upgrade plan.
+
+## Common mistakes
+
+- Exposing the engine's runtime load endpoint, or letting replicas fetch adapters from a public hub.
+- Taking the adapter id from the request body instead of the authenticated tenant.
+- Checking only an adapter's <code>r</code> and missing a higher rank in <code>rank_pattern</code>.
+- Setting GPU slots to the memory maximum and starving the KV cache.
+- Placing every adapter on one replica, so one replica's failure takes a tenant down and its load cannot spread.
+- Deleting the previous version as soon as the new one is promoted, which breaks the one-hour rollback promise.

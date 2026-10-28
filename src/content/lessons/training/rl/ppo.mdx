@@ -1,0 +1,146 @@
+---
+title: PPO for language models
+track: training
+module: rl
+order: 1
+kind: lesson
+level: senior
+minutes: 12
+summary: PPO for an LLM trains a policy and a value model against a frozen reward model and a frozen reference, clips a ratio against the policy that sampled the batch, and puts the KL penalty in the reward; GRPO drops the value model and moves the KL into the loss.
+prerequisites: [training/post-training/reward-models]
+updated: 2026-10-28
+sources:
+  - title: Ouyang et al., Training language models to follow instructions with human feedback (arXiv 2203.02155v1, 2022-03-04)
+    url: https://arxiv.org/abs/2203.02155
+    note: "SFT dataset about 13k training prompts, RM dataset 33k, PPO dataset 31k (API only); only 6B reward models, because 175B RM training could be unstable and less suitable as the value function; per-token KL penalty from the SFT model at each token; value function initialised from the RM; objective r(x,y) minus beta log(pi_RL / pi_SFT) plus gamma times pretraining log-likelihood (PPO-ptx); labellers preferred the 1.3B InstructGPT over the 175B GPT-3. Checked 2026-10-28."
+  - title: Shao et al., DeepSeekMath (arXiv 2402.03300v3)
+    url: https://arxiv.org/abs/2402.03300
+    note: "PPO ratio is against pi_old, the policy that sampled the outputs; PPO adds a per-token KL penalty in the reward; the value function is typically a model of comparable size to the policy; GRPO samples G outputs per question, normalises rewards by group mean and standard deviation, and adds the KL to the loss with an unbiased, always-positive estimator; RL setup: about 144K questions, policy learning rate 1e-6, KL coefficient 0.04, 64 outputs per question, max length 1024, batch 1024, a single update per exploration stage; 88.2% GSM8K and 51.7% MATH; RL improves Maj@K but not Pass@K. Read from the HTML version (https://arxiv.org/html/2402.03300v3). Checked 2026-10-28."
+  - title: PracHub, LLM post-training interview questions (2026-09-08)
+    url: https://prachub.com/resources/llm-post-training-interview-questions-sft-dpo-ppo-and-grpo-trade-offs
+    note: "worked surrogate examples (advantage 2, ratio 1.5, epsilon 0.2 gives 2.4; advantage -2, ratio 0.5 gives -1.6); rewards [0, 0, 1, 1] normalise to about [-1, -1, 1, 1]; PPO's old policy is the one that generated the batch; critic-free is not reward-free. Checked 2026-10-28."
+  - title: Hugging Face TRL, GRPO Trainer documentation (main branch)
+    url: https://huggingface.co/docs/trl/main/en/grpo_trainer
+    note: "beta defaults to 0.0 and then the reference model is not loaded; num_iterations (mu) defaults to 1, and with mu = 1 the clipped surrogate reduces to the unclipped objective. Checked 2026-10-28 against the main-branch docs; defaults change between releases."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+An RL stage for a language model is a choice of which models sit in memory, which of them get gradients, and where the KL penalty enters. PPO as InstructGPT ran it keeps four models: a policy and a value model that train, and a reward model and a reference that stay frozen. GRPO keeps the policy, drops the value model, and replaces its baseline with the mean reward of several samples for the same prompt. The trade is optimiser memory for generation compute: GRPO saves a trainable model and pays with G samples per prompt.
+
+Two details decide whether an implementation is correct. The ratio in the clipped objective compares the current policy with the policy that sampled the batch, not with the reference. And the KL penalty can sit inside the reward, where the value model has to predict it, or inside the loss, where it is a separate gradient term.
+
+## Four models and what each costs
+
+The episode is a bandit: a prompt arrives, the policy writes a response, the reward model scores the whole response, and the episode ends. That is how Ouyang et al. describe the InstructGPT environment.
+
+**Policy.** Initialised from the SFT model. It is the only model you ship. It trains, so it carries gradients and optimiser state.
+
+**Reference.** A frozen copy of the SFT model. Its only job is the KL term: log π(y|x) minus log π_ref(y|x), per token. InstructGPT puts that term in the reward, "a per-token KL penalty from the SFT model at each token", to limit over-optimisation of the reward model.
+
+**Reward model.** Frozen during RL. InstructGPT used only 6B reward models with a 175B policy. The paper's reason is the fourth model: 175B reward-model training could be unstable, which made it "less suitable to be used as the value function during RL".
+
+**Value model.** Trains alongside the policy and predicts the return from each token position, so each token gets its own advantage instead of the whole response sharing one number. InstructGPT initialises it from the reward model. DeepSeekMath notes the value function is "typically another model of comparable size as the policy model", which is the memory GRPO removes.
+
+The cost difference is arithmetic. With bf16 weights and gradients (2 + 2 bytes per parameter) plus an fp32 master copy and two fp32 Adam moments (4 + 4 + 4), a trained model holds 16 bytes per parameter before activations. A frozen model in bf16 holds 2. Activations, rollout KV cache, and any sharding or offload come on top and depend on the system.
+
+<Predict id="trn-rl-ppo-mem" question="A 7B policy, a 7B value model, a 7B reward model and a 7B reference. Trained models hold 16 bytes per parameter (bf16 weights and grads, fp32 master and two Adam moments); frozen models hold 2. How many GB of model and optimiser state is that, ignoring activations?" answer={252} tolerance={2} unit="GB">
+<p>Policy 16 × 7 = 112 GB, value model 112 GB, reward model 2 × 7 = 14 GB, reference 14 GB: <b>252 GB</b>. GRPO with a KL term and a learned reward model drops the value model: 112 + 14 + 14 = 140 GB. GRPO with no KL term (TRL's current default, beta = 0.0, which skips loading the reference) and a rule-based reward holds only the policy: 112 GB. The value model is 44% of the PPO total because it is the only other model with optimiser state.</p>
+</Predict>
+
+## The clipped surrogate and which policy is old
+
+PPO maximises, per token,
+
+`min(ρ · A, clip(ρ, 1 − ε, 1 + ε) · A)` with `ρ = π_θ(token) / π_old(token)`
+
+where π_old is the policy that generated the batch. DeepSeekMath states it directly: outputs are "sampled from the question dataset and the old policy". The reference model never appears in the ratio. Mixing them up is a common error in hand-written trainers: using π_ref as the denominator turns the clip into a trust region around the SFT model, which is the KL term's job, and the clip stops limiting how far one batch can move the policy.
+
+Two numbers make the clip concrete. With ε = 0.2, an advantage of 2 and a ratio of 1.5, the unclipped term is 3.0 and the clipped term is 1.2 × 2 = 2.4, so the minimum is 2.4 and the gradient through ρ is zero: the policy has already moved far enough on this token. With an advantage of −2 and a ratio of 0.5, the unclipped term is −1.0 and the clipped term is 0.8 × (−2) = −1.6, so the minimum is −1.6, again flat in ρ. The clip only acts when the ratio has moved in the direction the advantage pushes.
+
+When does the ratio differ from 1? Only after the policy has taken a gradient step on data it did not sample. If each rollout batch gets exactly one optimiser step, π_old is π_θ with gradients stopped, every ratio is 1.0 at the step, and the clip never binds. DeepSeekMath ran that way ("a single update following each exploration stage"), and TRL's `num_iterations` defaults to 1, where its docs note the clipped objective reduces to the original one. The clip matters when one rollout batch is split into several mini-batches or reused for several epochs: from the second mini-batch on, the policy has moved and the ratios spread. It matters again when π_old's log-probabilities come from an inference engine whose numerics differ from the trainer's, which the infrastructure lesson in this module covers.
+
+## Where the KL goes
+
+**In the reward (InstructGPT).** The per-token reward is −β times the log-ratio against the reference at every token, plus the reward-model score at the last token. The objective in the paper adds a third term for PPO-ptx, γ times the log-likelihood of pretraining data, to recover regressions on public NLP benchmarks. Because the KL is part of the reward, the value model must learn to predict it, and β changes the advantage of every token.
+
+**In the loss (GRPO).** DeepSeekMath adds the KL directly to the loss and estimates it per token with an unbiased estimator that is always positive: with q = π_ref / π_θ, the term is q − log q − 1. The advantage stays a pure function of the reward, and β only adds a pull towards the reference. DeepSeekMath used β = 0.04.
+
+**Nowhere.** TRL's GRPO trainer defaults to β = 0.0 on the main branch as of this check, and then does not load the reference at all. The next lesson covers why DAPO argued for dropping it on long reasoning runs and when you would keep it.
+
+## GRPO's baseline
+
+GRPO samples G responses for each prompt from π_old, scores each, and gives every token of response i the same advantage: (r_i − mean(r)) / std(r) over the group. Rewards [0, 0, 1, 1] have mean 0.5 and population standard deviation 0.5, so the advantages are [−1, −1, 1, 1]. A library that uses the sample standard deviation (dividing by G − 1) gets 0.577 and advantages of ±0.87, so the same config trains at different effective step sizes across libraries. The baseline is per prompt, so a hard prompt and an easy prompt contribute on the same scale, and no model has to learn what an average response to each prompt scores.
+
+What GRPO gives up is per-token credit. Every token in a response shares one advantage, where PPO's value model could assign more to the step where the answer went wrong. And it needs G samples per prompt: DeepSeekMath sampled 64 outputs per question at a max length of 1,024 tokens, so each of its 1,024-sample batches covered 1,024 / 64 = 16 questions.
+
+```python
+import math
+
+def clipped_term(logp_new, logp_old, adv, eps=0.2):
+    ratio = math.exp(logp_new - logp_old)        # logp_old: the policy that sampled
+    return min(ratio * adv, max(1 - eps, min(ratio, 1 + eps)) * adv)
+
+def kl_k3(logp_new, logp_ref):
+    log_q = logp_ref - logp_new                  # q = pi_ref / pi_theta
+    return math.exp(log_q) - log_q - 1           # >= 0 for every token
+
+def group_advantages(rewards, sample_std=False):
+    g = len(rewards)
+    mean = sum(rewards) / g
+    var = sum((r - mean) ** 2 for r in rewards) / (g - 1 if sample_std else g)
+    std = math.sqrt(var)
+    return [0.0] * g if std == 0 else [(r - mean) / std for r in rewards]
+
+print(clipped_term(math.log(1.5), 0.0, 2.0))     # 2.4
+print(group_advantages([0, 0, 1, 1]))            # [-1.0, -1.0, 1.0, 1.0]
+print(group_advantages([1, 1, 1, 1]))            # all zero: no gradient from this prompt
+```
+
+The last line is the property the next lesson starts from: a group where every sample gets the same reward contributes nothing.
+
+## Published runs
+
+InstructGPT trained SFT on about 13k prompts, the reward model on 33k, and ran PPO on 31k prompts taken only from the API, with no human labels in the PPO set. Labellers preferred outputs of the 1.3B InstructGPT to those of the 175B GPT-3.
+
+DeepSeekMath ran GRPO from DeepSeekMath-Instruct 7B on about 144K chain-of-thought questions related to GSM8K and MATH, with a policy learning rate of 1e-6 and a KL coefficient of 0.04, and reports 88.2% on GSM8K and 51.7% on MATH. Its analysis found RL improved Maj@K but not Pass@K: RL made correct answers more likely among samples the model could already produce, rather than adding answers it could not.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+You own the RL stage for a 13B support assistant. The reward is a learned 13B reward model; there is no verifier. You have 32 GPUs with 80 GB each for three weeks, and the product team wants the first checkpoint in ten days. Do you run PPO or GRPO, and where does the KL penalty go?
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>GRPO with the KL in the loss, G around 8, and a fixed β kept above zero. Model state is 16 × 13 = 208 GB for the policy plus 26 GB each for the frozen reward model and reference, 260 GB of the 2,560 GB available, where PPO adds another 208 GB for a value model that has to be trained before its advantages are useful. With a learned reward model and no verifier, the KL term stays: it is the only thing limiting how far the policy drifts towards whatever the reward model over-scores.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Memory is not the binding constraint.</strong> Even PPO's 468 GB of model and optimiser state fits once sharded. The binding constraint is the ten-day deadline: PPO needs a value model that tracks the policy, and an untrained critic gives noisy advantages for the first stretch of the run.</p>
+<p><strong>GRPO's cost moves to generation.</strong> G = 8 means eight full responses per prompt. Support answers are short, so rollouts are cheap relative to a reasoning workload.</p>
+<p><strong>KL placement.</strong> In the loss, so the advantage is a pure function of the reward and β can be tuned without changing what the advantages mean. β above zero because the reward model is the only judge.</p>
+<p><strong>What you give up.</strong> Per-token credit. A response that is right for four paragraphs and wrong in the fifth gets one advantage. If audits show the policy learning to pad or hedge, that is the evidence to revisit PPO.</p>
+<p><strong>Failure mode of this plan.</strong> Prompts where all eight samples score about the same contribute almost nothing, so if the reward model compresses scores on easy tickets, much of each batch is wasted generation.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The reward model compresses most scores into a narrow band, so the group standard deviation is tiny and advantages blow up. Do you keep the standard-deviation division, and what do you monitor if you drop it?</li>
+<li>A research engineer wants four optimiser steps per rollout batch to save generation. What changes in the ratio and the clip, and what would you need to see in the logs to allow it?</li>
+<li>Two weeks in, the reward-model score keeps rising and the human spot-check score has been flat for three days. What do you change first, β or the stopping checkpoint, and who signs off?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The memory arithmetic assumes full-parameter training with Adam in mixed precision. LoRA on the policy, a smaller value model than the policy (InstructGPT's 6B critic for a 175B policy), offloaded optimiser state, or a reward served from a separate cluster all change the totals, and rollout KV cache for long responses can exceed model state. Treat 16 and 2 bytes per parameter as a starting point for a sharding plan, not a capacity number.
+
+The four-model picture is the 2022 RLHF shape. Reasoning runs on verifiable tasks often have no reward model at all (a rule scores the answer) and, with β = 0, no reference either, so GRPO there is one trained model plus an inference engine. The cost that dominates then is generation, not memory.
+
+GRPO's shared advantage is a real loss of information when one step decides the outcome. Where step-level signal is available and reliable, a critic or a step-level reward can assign credit that a group mean cannot; the reward-model lesson in the post-training module covers why step-level rewards are hard to optimise against.
+
+<SelfRate id="lesson:training/rl/ppo" />

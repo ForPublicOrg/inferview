@@ -1,0 +1,1251 @@
+---
+title: Build a continuous batching scheduler
+track: inference
+module: batching
+kind: lab
+minutes: 180
+summary: Grow one engine loop from iteration-level admission to paged KV, copy-on-write forks, chunked prefill, preemption by recompute, per-tenant fairness and latency metrics, tested on invariants rather than one schedule.
+updated: 2026-10-28
+sources:
+  - title: "Orca: A Distributed Serving System for Transformer-Based Generative Models (Yu et al., OSDI 2022)"
+    url: https://www.usenix.org/conference/osdi22/presentation/yu
+    note: "iteration-level scheduling and selective batching; the abstract reports 36.9 times the throughput of FasterTransformer at the same latency on GPT-3 175B; step 1. Checked 2026-10-28."
+  - title: "Efficient Memory Management for Large Language Model Serving with PagedAttention (Kwon et al., SOSP 2023, arXiv 2309.06180)"
+    url: https://arxiv.org/abs/2309.06180
+    note: "KV in fixed-size blocks with a block table per sequence, sharing within and across requests with copy on write, preemption by recompute or swap; steps 2, 3 and 5. Checked 2026-10-28."
+  - title: "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve (Agrawal et al., arXiv 2403.02310, v3 2024-06-17)"
+    url: https://arxiv.org/abs/2403.02310
+    note: "chunked prefills let new requests join a batch without pausing ongoing decodes; step 4. Checked 2026-10-28."
+  - title: vLLM V1 alpha release blog (2025-01-27)
+    url: https://vllm.ai/blog/2025-01-27-v1-alpha-release
+    note: "a scheduling decision is a dictionary of request id to tokens for the step, with no separate prefill and decode phases; the shape of schedule() in every step. Checked 2026-10-28."
+  - title: vLLM docs, Optimization and tuning (latest, checked 2026-10-28)
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: "decodes are batched before any prefill; smaller max_num_batched_tokens gives better inter-token latency and larger better time to first token; RECOMPUTE is the default preemption mode; steps 4, 5 and 7. Checked 2026-10-28."
+  - title: vLLM source, v1/core/sched/scheduler.py (main branch, read 2026-10-28)
+    url: https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/sched/scheduler.py
+    note: "running requests are scheduled before waiting ones from one token budget; a positive long_prefill_token_threshold caps a request's tokens per step; under FCFS the preemption victim is the last running request; steps 4 and 5. Checked 2026-10-28."
+steps:
+  - title: "A request queue and iteration-level admission"
+    brief: |
+      The engine plans one forward pass per step and returns it as a dictionary of request id to tokens computed, the shape vLLM V1 uses. Running requests go first, then waiting ones are admitted in order while the running cap, the step's token budget and the reserve() hook allow. A request whose computed count reaches its known tokens emits one token from the mock model in that same step, so the step that computes a prompt also produces the first output. A finished request leaves the running set at the end of the step, and the next step fills its slot. That is the whole difference from a static batch, which holds every slot until its longest member finishes. A prompt longer than the budget cannot be computed in one step yet, so submit refuses it; step 4 lifts that.
+    starter: |
+      from collections import deque
+
+
+      def next_token(rid, tokens):
+          """The mock model: the next token depends only on the request id and the tokens so far."""
+          seed = sum(ord(c) for c in rid)
+          return (seed * 31 + sum(tokens[-4:]) * 7 + len(tokens)) % 1000
+
+
+      class Request:
+          def __init__(self, rid, prompt, max_new):
+              self.rid = rid
+              self.tokens = list(prompt)      # the prompt, then every generated token
+              self.prompt_len = len(prompt)
+              self.max_new = max_new
+              self.computed = 0               # tokens whose KV has been computed
+              self.out = []                   # generated tokens
+
+
+      class Engine:
+          def __init__(self, max_running=8, token_budget=512):
+              if max_running > token_budget:
+                  raise ValueError("every running request needs at least one token of budget per step")
+              self.max_running = max_running
+              self.token_budget = token_budget
+              self.waiting = deque()          # Request objects, oldest first
+              self.running = []               # Request objects, in admission order
+              self.reqs = {}                  # rid -> Request
+              self.finished = []              # rids, in the order they finished
+
+          # Hooks that later steps override. Leave them as they are.
+          def prompt_limit(self):
+              return self.token_budget
+
+          def slots(self, r):
+              return 1
+
+          def reserve(self, r, n):
+              return True
+
+          def on_finish(self, r):
+              pass
+
+          def submit(self, rid, prompt, max_new):
+              """Queue a request. Raise ValueError for a duplicate rid or a prompt longer than prompt_limit()."""
+              raise NotImplementedError
+
+          def schedule(self):
+              """Return {rid: tokens to compute this step}: running requests first, then admit waiting ones in order
+              while len(running) + slots(r) <= max_running, the whole prompt fits the budget left, and reserve(r, n) is True."""
+              raise NotImplementedError
+
+          def execute(self, sched):
+              """Advance computed by the scheduled tokens. A request whose computed reaches len(tokens) emits next_token."""
+              raise NotImplementedError
+
+          def retire(self):
+              """Move requests with max_new outputs from running to finished, calling on_finish for each."""
+              raise NotImplementedError
+
+          def step(self):
+              sched = self.schedule()
+              self.execute(sched)
+              self.retire()
+              return sched
+
+          def done(self):
+              return not self.waiting and not self.running
+
+          def output(self, rid):
+              return list(self.reqs[rid].out)
+    tests: |
+      def expected(rid, prompt, k):
+          toks = list(prompt)
+          for _ in range(k):
+              toks.append(next_token(rid, toks))
+          return toks[len(prompt):]
+
+      e = Engine(max_running=2, token_budget=64)
+      e.submit("long", [1] * 10, 6)
+      e.submit("short", [2] * 10, 2)
+      e.submit("late", [3] * 10, 2)
+      s1 = e.step()
+      assert s1 == {"long": 10, "short": 10}, f"the first step admits two requests and computes their prompts; got {s1}"
+      assert e.output("long") and e.output("short"), "the step that computes a prompt also emits its first token"
+      s2 = e.step()
+      assert s2 == {"long": 1, "short": 1} and "short" in e.finished, f"one decode token each; short is done after 2 outputs; got {s2}"
+      s3 = e.step()
+      assert "late" in s3, "the slot short freed is used on the next step, while long is still decoding"
+      while not e.done():
+          e.step()
+      assert e.output("long") == expected("long", [1] * 10, 6), "outputs follow the mock model"
+      assert e.finished == ["short", "late", "long"]
+      def raises(exc, fn):
+          try:
+              fn()
+          except exc:
+              return True
+          return False
+
+      e2 = Engine(max_running=4, token_budget=32)
+      assert raises(ValueError, lambda: e2.submit("big", [0] * 33, 1)), "a prompt longer than the step budget is refused at submit"
+    hidden: |
+      import random
+
+      def expected(rid, prompt, k):
+          toks = list(prompt)
+          for _ in range(k):
+              toks.append(next_token(rid, toks))
+          return toks[len(prompt):]
+
+      def run_random(seed):
+          rng = random.Random(seed)
+          e = Engine(max_running=rng.choice([2, 4, 8]), token_budget=rng.choice([64, 128]))
+          reqs = {}
+          for i in range(40):
+              p = [rng.randrange(1000) for _ in range(rng.randint(1, 60))]
+              reqs[f"r{i}"] = (p, rng.randint(1, 12))
+              e.submit(f"r{i}", p, reqs[f"r{i}"][1])
+          steps = 0
+          while not e.done():
+              s = e.step()
+              steps += 1
+              assert sum(s.values()) <= e.token_budget
+              assert len(e.running) <= e.max_running
+              assert steps < 2000
+          return all(e.output(r) == expected(r, p, k) for r, (p, k) in reqs.items()) and sorted(e.finished) == sorted(reqs)
+
+      assert all(run_random(s) for s in range(6))
+      e = Engine(max_running=3, token_budget=40)
+      for i in range(6):
+          e.submit(f"q{i}", [i] * 30, 3)
+      s = e.step()
+      assert sum(s.values()) <= 40 and len(s) == 1
+    solution: |
+      from collections import deque
+
+
+      def next_token(rid, tokens):
+          """The mock model: the next token depends only on the request id and the tokens so far."""
+          seed = sum(ord(c) for c in rid)
+          return (seed * 31 + sum(tokens[-4:]) * 7 + len(tokens)) % 1000
+
+
+      class Request:
+          def __init__(self, rid, prompt, max_new):
+              self.rid = rid
+              self.tokens = list(prompt)
+              self.prompt_len = len(prompt)
+              self.max_new = max_new
+              self.computed = 0
+              self.out = []
+
+
+      class Engine:
+          def __init__(self, max_running=8, token_budget=512):
+              if max_running > token_budget:
+                  raise ValueError("every running request needs at least one token of budget per step")
+              self.max_running = max_running
+              self.token_budget = token_budget
+              self.waiting = deque()
+              self.running = []
+              self.reqs = {}
+              self.finished = []
+
+          def prompt_limit(self):
+              return self.token_budget
+
+          def slots(self, r):
+              return 1
+
+          def reserve(self, r, n):
+              return True
+
+          def on_finish(self, r):
+              pass
+
+          def submit(self, rid, prompt, max_new):
+              if rid in self.reqs:
+                  raise ValueError(f"duplicate request id {rid}")
+              if not prompt or len(prompt) > self.prompt_limit():
+                  raise ValueError("the prompt is empty or longer than this engine accepts")
+              r = Request(rid, prompt, max_new)
+              self.reqs[rid] = r
+              self.waiting.append(r)
+              return r
+
+          def schedule(self):
+              sched, budget = {}, self.token_budget
+              for r in self.running:
+                  n = len(r.tokens) - r.computed
+                  if n <= budget and self.reserve(r, n):
+                      sched[r.rid] = n
+                      budget -= n
+              while self.waiting:
+                  r = self.waiting[0]
+                  n = len(r.tokens) - r.computed
+                  if len(self.running) + self.slots(r) > self.max_running or n > budget or not self.reserve(r, n):
+                      break
+                  self.waiting.popleft()
+                  self.running.append(r)
+                  sched[r.rid] = n
+                  budget -= n
+              return sched
+
+          def execute(self, sched):
+              for rid, n in sched.items():
+                  r = self.reqs[rid]
+                  r.computed += n
+                  if r.computed == len(r.tokens):
+                      t = next_token(r.rid, r.tokens)
+                      r.tokens.append(t)
+                      r.out.append(t)
+
+          def retire(self):
+              still = []
+              for r in self.running:
+                  if len(r.out) >= r.max_new:
+                      self.finished.append(r.rid)
+                      self.on_finish(r)
+                  else:
+                      still.append(r)
+              self.running = still
+
+          def step(self):
+              sched = self.schedule()
+              self.execute(sched)
+              self.retire()
+              return sched
+
+          def done(self):
+              return not self.waiting and not self.running
+
+          def output(self, rid):
+              return list(self.reqs[rid].out)
+  - title: "A paged KV block allocator"
+    brief: |
+      KV memory becomes a pool of blocks with a reference count each, and every request gets a block table. reserve(r, n) takes the blocks r needs to hold computed + n tokens, all or nothing, and returns False when they are not free; admission stops there, and a running request that cannot get a block skips the step. Blocks are taken as tokens are computed, never reserved for max_new, so a 20-token prompt with 40 tokens to generate holds 2 blocks of 16 after its first step. execute writes each computed token into its block in self.kv, which stands in for keys and values, and the tests rebuild every request's sequence from its table. A running request that never gets a block can stall the engine; preemption in step 5 is what removes that.
+    starter: |
+      class BlockAllocator:
+          """A pool of KV blocks with a reference count per block. Step 3 shares blocks, so keep the counts honest now."""
+
+          def __init__(self, num_blocks):
+              raise NotImplementedError
+
+          def num_free(self):
+              raise NotImplementedError
+
+          def take(self):
+              """Return a free block id with reference count 1. Raise MemoryError if none is free."""
+              raise NotImplementedError
+
+          def share(self, b):
+              """One more holder for block b."""
+              raise NotImplementedError
+
+          def release(self, b):
+              """One fewer holder; the block is free again when nobody holds it."""
+              raise NotImplementedError
+
+
+      class Engine(Engine):
+          def __init__(self, max_running=8, token_budget=512, num_blocks=64, block_size=16):
+              super().__init__(max_running, token_budget)
+              self.block_size = block_size
+              self.alloc = BlockAllocator(num_blocks)
+              self.tables = {}                # rid -> list of block ids, in token order
+              self.kv = {}                    # block id -> the tokens written into it, standing in for keys and values
+
+          def reserve(self, r, n):
+              """Take the blocks r needs to hold computed + n tokens, all or nothing. Return False if they are not free."""
+              raise NotImplementedError
+
+          def execute(self, sched):
+              """Write each scheduled token into its block in self.kv, then advance as before."""
+              raise NotImplementedError
+
+          def on_finish(self, r):
+              """Release the request's blocks."""
+              raise NotImplementedError
+    tests: |
+      def check(e):
+          bs = e.block_size
+          held = [b for t in e.tables.values() for b in t]
+          assert len(held) == len(set(held)), "a block appears in two tables"
+          assert not set(held) & set(e.alloc.free_ids), "a block is both held and free"
+          assert len(held) + e.alloc.num_free() == e.alloc.num_blocks, "blocks leaked"
+          for r in e.running:
+              t = e.tables.get(r.rid, [])
+              assert len(t) == -(-r.computed // bs), f"{r.rid} holds {len(t)} blocks for {r.computed} tokens"
+              assert [x for b in t for x in e.kv[b]] == r.tokens[:r.computed], f"{r.rid}: KV does not match its tokens"
+          return True
+
+      e = Engine(max_running=4, token_budget=256, num_blocks=8, block_size=16)
+      e.submit("a", list(range(20)), 40)
+      e.step()
+      assert len(e.tables["a"]) == 2 and e.alloc.num_free() == 6, "20 computed tokens hold 2 blocks; nothing is reserved for the 40 outputs"
+      assert check(e)
+      for _ in range(12):
+          e.step()
+      assert len(e.tables["a"]) == 2 and e.reqs["a"].computed == 32 and check(e)
+      e.step()
+      assert len(e.tables["a"]) == 3, "the 33rd token opens a third block"
+      e.submit("b", list(range(90)), 2)
+      s = e.step()
+      assert "b" not in s and "a" in s, "b needs 6 blocks and only 5 are free, so it waits while a decodes"
+      while not e.done():
+          e.step()
+          check(e)
+      assert e.alloc.num_free() == 8 and e.tables == {}, "every block comes back"
+    hidden: |
+      import random
+
+      def expected(rid, prompt, k):
+          toks = list(prompt)
+          for _ in range(k):
+              toks.append(next_token(rid, toks))
+          return toks[len(prompt):]
+
+      def check(e):
+          held = [b for t in e.tables.values() for b in t]
+          if len(held) != len(set(held)) or set(held) & set(e.alloc.free_ids):
+              return False
+          if len(held) + e.alloc.num_free() != e.alloc.num_blocks:
+              return False
+          for r in e.running:
+              t = e.tables.get(r.rid, [])
+              if [x for b in t for x in e.kv[b]] != r.tokens[:r.computed]:
+                  return False
+          return True
+
+      def run_random(seed):
+          rng = random.Random(seed)
+          bs = rng.choice([4, 8, 16])
+          e = Engine(max_running=4, token_budget=128, num_blocks=200, block_size=bs)
+          reqs = {}
+          for i in range(30):
+              p = [rng.randrange(1000) for _ in range(rng.randint(1, 100))]
+              reqs[f"r{i}"] = (p, rng.randint(1, 20))
+              e.submit(f"r{i}", p, reqs[f"r{i}"][1])
+          steps = 0
+          while not e.done():
+              e.step()
+              steps += 1
+              if not check(e) or steps > 3000:
+                  return False
+          return e.alloc.num_free() == 200 and all(e.output(r) == expected(r, p, k) for r, (p, k) in reqs.items())
+
+      assert all(run_random(s) for s in range(6))
+      a = BlockAllocator(3)
+      x, y, z = a.take(), a.take(), a.take()
+      assert len({x, y, z}) == 3
+      try:
+          a.take()
+          ok = False
+      except MemoryError:
+          ok = True
+      assert ok
+      a.share(x); a.release(x)
+      assert a.num_free() == 0
+      a.release(x)
+      assert a.num_free() == 1
+    solution: |
+      class BlockAllocator:
+          def __init__(self, num_blocks):
+              self.num_blocks = num_blocks
+              self.free_ids = list(range(num_blocks - 1, -1, -1))
+              self.refs = [0] * num_blocks
+
+          def num_free(self):
+              return len(self.free_ids)
+
+          def take(self):
+              if not self.free_ids:
+                  raise MemoryError("no free KV block")
+              b = self.free_ids.pop()
+              self.refs[b] = 1
+              return b
+
+          def share(self, b):
+              self.refs[b] += 1
+
+          def release(self, b):
+              self.refs[b] -= 1
+              if self.refs[b] == 0:
+                  self.free_ids.append(b)
+
+
+      class Engine(Engine):
+          def __init__(self, max_running=8, token_budget=512, num_blocks=64, block_size=16):
+              super().__init__(max_running, token_budget)
+              self.block_size = block_size
+              self.alloc = BlockAllocator(num_blocks)
+              self.tables = {}
+              self.kv = {}
+
+          def blocks_needed(self, r, n):
+              have = len(self.tables.get(r.rid, ()))
+              return max(0, -(-(r.computed + n) // self.block_size) - have)
+
+          def reserve(self, r, n):
+              k = self.blocks_needed(r, n)
+              if k > self.alloc.num_free():
+                  return False
+              table = self.tables.setdefault(r.rid, [])
+              for _ in range(k):
+                  b = self.alloc.take()
+                  self.kv[b] = []
+                  table.append(b)
+              return True
+
+          def execute(self, sched):
+              bs = self.block_size
+              for rid, n in sched.items():
+                  r = self.reqs[rid]
+                  table = self.tables[rid]
+                  for pos in range(r.computed, r.computed + n):
+                      block = self.kv[table[pos // bs]]
+                      del block[pos % bs:]            # a recomputed position overwrites what was there
+                      block.append(r.tokens[pos])
+              super().execute(sched)
+
+          def on_finish(self, r):
+              for b in self.tables.pop(r.rid, []):
+                  self.alloc.release(b)
+  - title: "Copy-on-write prefix sharing"
+    brief: |
+      submit gains n, the number of parallel samples. The request is admitted as one prefill holding n running slots. When its prompt is computed it forks into sequences named rid, rid#1 and so on, which share the prompt's blocks through their reference counts, each emitting its own first token. Full shared blocks are never written again, so they stay shared. The partly filled last block is written by every sample at its next token, so a sample that writes into it while another sequence holds it first takes its own copy. reserve does the copy, because the copy needs a block and the step must know before it schedules the token.
+    starter: |
+      class Engine(Engine):
+          def submit(self, rid, prompt, max_new, n=1):
+              """n parallel samples. The request is admitted as one prefill; when its prompt is computed it forks into
+              n sequences named rid, rid#1, ..., rid#(n-1) that share the prompt's blocks, each emitting its own first token."""
+              raise NotImplementedError
+
+          def slots(self, r):
+              """A request with n samples needs n running slots."""
+              raise NotImplementedError
+
+          def reserve(self, r, n):
+              """Before r writes into a partly filled block that another sequence also holds, give r its own copy."""
+              raise NotImplementedError
+
+          def execute(self, sched):
+              """Advance as before, then fork every request whose prompt just finished and that asked for n > 1."""
+              raise NotImplementedError
+    tests: |
+      from collections import Counter
+
+      def expected(rid, prompt, k):
+          toks = list(prompt)
+          for _ in range(k):
+              toks.append(next_token(rid, toks))
+          return toks[len(prompt):]
+
+      def check(e):
+          held = Counter(b for t in e.tables.values() for b in t)
+          assert all(e.alloc.refs[b] == c for b, c in held.items()), "a reference count does not match the tables"
+          assert not set(held) & set(e.alloc.free_ids), "a block is both held and free"
+          assert len(held) + e.alloc.num_free() == e.alloc.num_blocks, "blocks leaked"
+          for r in e.running:
+              t = e.tables.get(r.rid, [])
+              assert [x for b in t for x in e.kv[b]] == r.tokens[:r.computed], f"{r.rid}: KV does not match its tokens"
+          return True
+
+      prompt = list(range(100, 140))
+      e = Engine(max_running=8, token_budget=256, num_blocks=32, block_size=16)
+      e.submit("s", prompt, 5, n=4)
+      e.step()
+      names = sorted(r.rid for r in e.running)
+      assert names == ["s", "s#1", "s#2", "s#3"], f"the prefill forks into four sequences; got {names}"
+      assert e.alloc.num_free() == 29 and check(e), "four sequences share the prompt's 3 blocks"
+      e.step()
+      assert check(e) and e.alloc.num_free() == 26, "each first write into the shared partial block takes a copy; the full blocks stay shared"
+      assert len({e.tables[x][0] for x in names}) == 1, "the first block is still shared"
+      while not e.done():
+          e.step()
+          check(e)
+      assert all(e.output(x) == expected(x, prompt, 5) for x in names), "each sample follows the mock model from its own first token"
+      assert e.alloc.num_free() == 32
+      e = Engine(max_running=3, token_budget=256, num_blocks=32, block_size=16)
+      e.submit("w", prompt, 2, n=4)
+      assert e.step() == {}, "four samples do not fit three running slots"
+    hidden: |
+      import random
+      from collections import Counter
+
+      def expected(rid, prompt, k):
+          toks = list(prompt)
+          for _ in range(k):
+              toks.append(next_token(rid, toks))
+          return toks[len(prompt):]
+
+      def check(e):
+          held = Counter(b for t in e.tables.values() for b in t)
+          if any(e.alloc.refs[b] != c for b, c in held.items()) or set(held) & set(e.alloc.free_ids):
+              return False
+          if len(held) + e.alloc.num_free() != e.alloc.num_blocks:
+              return False
+          return all([x for b in e.tables.get(r.rid, []) for x in e.kv[b]] == r.tokens[:r.computed] for r in e.running)
+
+      def run_random(seed):
+          rng = random.Random(seed)
+          bs = rng.choice([4, 8, 16])
+          e = Engine(max_running=8, token_budget=128, num_blocks=400, block_size=bs)
+          reqs = {}
+          for i in range(20):
+              p = [rng.randrange(1000) for _ in range(rng.randint(1, 100))]
+              k, n = rng.randint(1, 20), rng.choice([1, 1, 2, 3])
+              e.submit(f"r{i}", p, k, n=n)
+              for j in range(n):
+                  reqs[f"r{i}" + (f"#{j}" if j else "")] = (p, k)
+          steps = 0
+          while not e.done():
+              e.step()
+              steps += 1
+              if not check(e) or steps > 3000:
+                  return False
+          return e.alloc.num_free() == 400 and all(e.output(r) == expected(r, p, k) for r, (p, k) in reqs.items())
+
+      assert all(run_random(s) for s in range(6))
+      e = Engine(max_running=8, token_budget=256, num_blocks=40, block_size=16)
+      e.submit("x", list(range(64)), 3, n=3)
+      e.step()
+      e.step()
+      assert e.alloc.num_free() == 40 - 4 - 3 and check(e)
+    solution: |
+      class Engine(Engine):
+          def submit(self, rid, prompt, max_new, n=1):
+              r = super().submit(rid, prompt, max_new)
+              r.n = n
+              r.forked = n == 1
+              return r
+
+          def slots(self, r):
+              return 1 if getattr(r, "forked", True) else r.n
+
+          def reserve(self, r, n):
+              table = self.tables.get(r.rid)
+              shared_tail = bool(table) and r.computed % self.block_size != 0 and self.alloc.refs[table[-1]] > 1
+              need = self.blocks_needed(r, n) + (1 if shared_tail else 0)
+              if need > self.alloc.num_free():
+                  return False
+              if shared_tail:
+                  old = table[-1]
+                  new = self.alloc.take()
+                  self.kv[new] = list(self.kv[old])
+                  self.alloc.release(old)
+                  table[-1] = new
+              return super().reserve(r, n)
+
+          def execute(self, sched):
+              super().execute(sched)
+              for rid in list(sched):
+                  r = self.reqs[rid]
+                  if r.forked or r.computed < r.prompt_len:
+                      continue
+                  r.forked = True
+                  prompt = r.tokens[:r.prompt_len]
+                  for i in range(1, r.n):
+                      child = Request(f"{rid}#{i}", prompt, r.max_new)
+                      child.n, child.forked = 1, True
+                      child.computed = r.computed
+                      t = next_token(child.rid, child.tokens)
+                      child.tokens.append(t)
+                      child.out.append(t)
+                      self.tables[child.rid] = list(self.tables[rid])
+                      for b in self.tables[rid]:
+                          self.alloc.share(b)
+                      self.reqs[child.rid] = child
+                      self.running.append(child)
+  - title: "Chunked prefill under a token budget"
+    brief: |
+      A prompt may now be longer than the budget; submit refuses only what the KV pool could never hold. schedule() becomes three passes over one budget: decodes, then running prefills, then waiting requests, each prefill getting a chunk of what is left. Decodes first means a long prompt never makes a running stream wait for the whole prefill, which is the case Sarathi-Serve built chunked prefills for. A running prefill still takes everything the decodes leave, so a waiting prompt behind a long one gets nothing until it completes. long_prefill_token_threshold, when positive, caps the tokens one prefill takes per step, at the price of that prompt's time to first token. make_room and can_admit are hooks for step 5; leave them as they are.
+    starter: |
+      class Engine(Engine):
+          def __init__(self, max_running=8, token_budget=512, num_blocks=64, block_size=16, long_prefill_threshold=0):
+              super().__init__(max_running, token_budget, num_blocks, block_size)
+              self.long_prefill_threshold = long_prefill_threshold    # 0: no cap on one request's prefill tokens per step
+
+          def prompt_limit(self):
+              """A prompt may now be longer than the budget; refuse only what the KV pool could never hold."""
+              raise NotImplementedError
+
+          def make_room(self, r, n, sched):
+              """Called for a running request that needs n more tokens of KV. Step 5 preempts here; for now, reserve."""
+              return self.reserve(r, n)
+
+          def can_admit(self):
+              """Whether this step may admit waiting requests at all. Step 5 overrides it."""
+              return True
+
+          def schedule(self):
+              """Decodes first, then running prefills in chunks, then admit waiting requests with a chunk of what is left.
+              A chunk is at most the budget left and, when long_prefill_threshold > 0, at most that threshold."""
+              raise NotImplementedError
+    tests: |
+      def expected(rid, prompt, k):
+          toks = list(prompt)
+          for _ in range(k):
+              toks.append(next_token(rid, toks))
+          return toks[len(prompt):]
+
+      e = Engine(max_running=8, token_budget=256, num_blocks=512, block_size=16)
+      for i in range(4):
+          e.submit(f"chat{i}", [i] * 20, 60)
+      e.step()
+      e.submit("doc", list(range(3000)), 4)
+      first = None
+      steps = 0
+      while not e.done():
+          decoding = {r.rid for r in e.running if len(r.tokens) - r.computed == 1}
+          s = e.step()
+          steps += 1
+          assert sum(s.values()) <= 256, "the step budget is never exceeded"
+          assert decoding <= set(s), "every decode runs in every step, also while the long prompt is chunked"
+          if first is None and e.output("doc"):
+              first = steps
+      assert first == 12, f"3,000 prompt tokens at 252 per step finish in step 12; got {first}"
+      assert e.output("doc") == expected("doc", list(range(3000)), 4)
+      e = Engine(max_running=8, token_budget=1024, num_blocks=1024, block_size=16, long_prefill_threshold=256)
+      e.submit("doc", list(range(5000)), 2)
+      e.step()
+      e.submit("short", [7] * 40, 2)
+      s = e.step()
+      assert s.get("doc") == 256 and s.get("short") == 40, f"with a threshold the long prefill leaves room for a short prompt; got {s}"
+    hidden: |
+      import random
+      from collections import Counter
+
+      def expected(rid, prompt, k):
+          toks = list(prompt)
+          for _ in range(k):
+              toks.append(next_token(rid, toks))
+          return toks[len(prompt):]
+
+      def ok_state(e):
+          held = Counter(b for t in e.tables.values() for b in t)
+          if any(e.alloc.refs[b] != c for b, c in held.items()) or set(held) & set(e.alloc.free_ids):
+              return False
+          if len(held) + e.alloc.num_free() != e.alloc.num_blocks:
+              return False
+          return all([x for b in e.tables.get(r.rid, []) for x in e.kv[b]] == r.tokens[:r.computed] for r in e.running)
+
+      def run_random(seed, threshold):
+          rng = random.Random(seed)
+          e = Engine(max_running=6, token_budget=rng.choice([64, 200]), num_blocks=2000, block_size=rng.choice([8, 16]), long_prefill_threshold=threshold)
+          reqs = {}
+          for i in range(25):
+              p = [rng.randrange(1000) for _ in range(rng.choice([rng.randint(1, 50), rng.randint(300, 1500)]))]
+              k, n = rng.randint(1, 15), rng.choice([1, 1, 2])
+              e.submit(f"r{i}", p, k, n=n)
+              for j in range(n):
+                  reqs[f"r{i}" + (f"#{j}" if j else "")] = (p, k)
+          steps = 0
+          while not e.done():
+              before = {r.rid for r in e.running if len(r.tokens) - r.computed == 1}
+              s = e.step()
+              steps += 1
+              if sum(s.values()) > e.token_budget or any(v < 1 for v in s.values()) or steps > 5000:
+                  return False
+              if threshold and any(v > threshold for v in s.values()):
+                  return False
+              if any(rid not in s for rid in before):
+                  return False
+              if not ok_state(e):
+                  return False
+          return all(e.output(r) == expected(r, p, k) for r, (p, k) in reqs.items())
+
+      assert all(run_random(s, 0) for s in range(4))
+      assert all(run_random(s, 48) for s in range(4, 8))
+      e = Engine(max_running=4, token_budget=64, num_blocks=4, block_size=16)
+      try:
+          e.submit("huge", [1] * 65, 1)
+          refused = False
+      except ValueError:
+          refused = True
+      assert refused
+    solution: |
+      class Engine(Engine):
+          def __init__(self, max_running=8, token_budget=512, num_blocks=64, block_size=16, long_prefill_threshold=0):
+              super().__init__(max_running, token_budget, num_blocks, block_size)
+              self.long_prefill_threshold = long_prefill_threshold
+
+          def prompt_limit(self):
+              return self.alloc.num_blocks * self.block_size
+
+          def make_room(self, r, n, sched):
+              return self.reserve(r, n)
+
+          def can_admit(self):
+              return True
+
+          def chunk(self, r, budget):
+              n = min(len(r.tokens) - r.computed, budget)
+              if self.long_prefill_threshold > 0:
+                  n = min(n, self.long_prefill_threshold)
+              return n
+
+          def schedule(self):
+              sched, budget = {}, self.token_budget
+              decodes = [r for r in self.running if len(r.tokens) - r.computed == 1]
+              prefills = [r for r in self.running if len(r.tokens) - r.computed > 1]
+              for r in decodes + prefills:
+                  if budget == 0:
+                      break
+                  if r not in self.running:           # preempted earlier in this step (step 5)
+                      continue
+                  n = self.chunk(r, budget)
+                  if self.make_room(r, n, sched):
+                      sched[r.rid] = n
+                      budget -= n
+              while self.waiting and budget > 0 and self.can_admit():
+                  r = self.waiting[0]
+                  n = self.chunk(r, budget)
+                  if len(self.running) + self.slots(r) > self.max_running or not self.reserve(r, n):
+                      break
+                  self.waiting.popleft()
+                  self.running.append(r)
+                  sched[r.rid] = n
+                  budget -= n
+              return sched
+  - title: "Preemption by recompute with an order the reader chooses"
+    brief: |
+      When a running request needs blocks and none are free, make_room preempts. The victim comes from choose_victim, which is your policy: the candidates are the running requests not yet scheduled this step, in admission order, including the request that needs the room. A victim releases its blocks, its computed count returns to zero, and it goes to the front of the waiting queue with its outputs kept, so it re-enters as a longer prompt and the mock model continues where it stopped. If the request needing room is itself the victim, it is not scheduled. No waiting request is admitted in a step that preempted, because it would take the blocks just freed. vLLM's FCFS order, the most recently admitted first, guarantees the oldest request always progresses; a different order has to keep that guarantee another way, and the tests check that every request finishes.
+    starter: |
+      class Engine(Engine):
+          def __init__(self, *args, **kwargs):
+              super().__init__(*args, **kwargs)
+              self.preemptions = 0
+              self.preempted_now = []         # requests preempted during the current step
+
+          def choose_victim(self, candidates):
+              """Your policy. candidates: running requests not yet scheduled this step, in admission order; it includes the
+              request that needs room. Return one of them."""
+              raise NotImplementedError
+
+          def preempt(self, v):
+              """Recompute mode: release v's blocks, forget its computed KV, put it at the front of the waiting queue."""
+              raise NotImplementedError
+
+          def make_room(self, r, n, sched):
+              """Preempt victims until r's blocks fit. Return False if r itself was preempted."""
+              raise NotImplementedError
+
+          def can_admit(self):
+              """Admitting a request in the step that preempted one would hand it the blocks just freed."""
+              raise NotImplementedError
+
+          def schedule(self):
+              self.preempted_now = []
+              return super().schedule()
+    tests: |
+      from collections import Counter
+
+      def expected(rid, prompt, k):
+          toks = list(prompt)
+          for _ in range(k):
+              toks.append(next_token(rid, toks))
+          return toks[len(prompt):]
+
+      def check(e, s):
+          held = Counter(b for t in e.tables.values() for b in t)
+          assert all(e.alloc.refs[b] == c for b, c in held.items()), "a reference count does not match the tables"
+          assert len(held) + e.alloc.num_free() == e.alloc.num_blocks, "blocks leaked"
+          assert all(e.reqs[rid] in e.running or rid in e.finished for rid in s), "a request was preempted after it was scheduled"
+          assert all(r not in e.running for r in e.waiting), "a request is both waiting and running"
+          for r in e.running:
+              assert [x for b in e.tables.get(r.rid, []) for x in e.kv[b]] == r.tokens[:r.computed], f"{r.rid}: KV does not match"
+          return True
+
+      reqs = {f"r{i}": ([i] * (6 + i % 7), 10 + i % 11) for i in range(12)}
+      e = Engine(max_running=6, token_budget=64, num_blocks=10, block_size=4)
+      for rid, (p, k) in reqs.items():
+          e.submit(rid, p, k)
+      steps = 0
+      while not e.done():
+          s = e.step()
+          steps += 1
+          assert check(e, s) and steps < 2000
+      assert e.preemptions > 0, "a 40-token pool cannot hold six growing requests without preempting"
+      assert all(e.output(r) == expected(r, p, k) for r, (p, k) in reqs.items()), "recomputed requests continue exactly where they stopped"
+      assert e.alloc.num_free() == 10
+    hidden: |
+      import random
+      from collections import Counter
+
+      def expected(rid, prompt, k):
+          toks = list(prompt)
+          for _ in range(k):
+              toks.append(next_token(rid, toks))
+          return toks[len(prompt):]
+
+      def ok(e, s):
+          held = Counter(b for t in e.tables.values() for b in t)
+          if any(e.alloc.refs[b] != c for b, c in held.items()) or len(held) + e.alloc.num_free() != e.alloc.num_blocks:
+              return False
+          if sum(s.values()) > e.token_budget or not all(e.reqs[rid] in e.running or rid in e.finished for rid in s):
+              return False
+          return all([x for b in e.tables.get(r.rid, []) for x in e.kv[b]] == r.tokens[:r.computed] for r in e.running)
+
+      def run_random(seed):
+          rng = random.Random(seed)
+          bs = rng.choice([4, 8])
+          blocks = rng.randint(12, 30)
+          e = Engine(max_running=rng.choice([4, 8]), token_budget=rng.choice([32, 96]), num_blocks=blocks, block_size=bs, long_prefill_threshold=rng.choice([0, 16]))
+          reqs = {}
+          for i in range(20):
+              n = rng.choice([1, 1, 1, 2])
+              k = rng.randint(1, 12)
+              plen = rng.randint(1, max(1, (blocks * bs) // (2 * n) - k))
+              p = [rng.randrange(1000) for _ in range(plen)]
+              e.submit(f"r{i}", p, k, n=n)
+              for j in range(n):
+                  reqs[f"r{i}" + (f"#{j}" if j else "")] = (p, k)
+          steps = 0
+          while not e.done():
+              s = e.step()
+              steps += 1
+              if not ok(e, s) or steps > 20000:
+                  return False
+          return e.alloc.num_free() == blocks and all(e.output(r) == expected(r, p, k) for r, (p, k) in reqs.items())
+
+      assert all(run_random(s) for s in range(10))
+      def no_admit_after_preempt(seed):
+          rng = random.Random(seed)
+          e = Engine(max_running=8, token_budget=64, num_blocks=8, block_size=4)
+          for i in range(10):
+              e.submit(f"q{i}", [rng.randrange(1000) for _ in range(rng.randint(2, 8))], rng.randint(4, 12))
+          seen_preempt = False
+          while not e.done():
+              before = {r.rid for r in e.running}
+              e.step()
+              if e.preempted_now:
+                  seen_preempt = True
+                  if {r.rid for r in e.running} - before:
+                      return False
+          return seen_preempt
+
+      assert all(no_admit_after_preempt(s) for s in range(5))
+    solution: |
+      class Engine(Engine):
+          def __init__(self, *args, **kwargs):
+              super().__init__(*args, **kwargs)
+              self.preemptions = 0
+              self.preempted_now = []
+
+          def choose_victim(self, candidates):
+              return candidates[-1]          # the most recently admitted, as vLLM V1 does under FCFS
+
+          def preempt(self, v):
+              for b in self.tables.pop(v.rid, []):
+                  self.alloc.release(b)
+              v.computed = 0
+              self.running.remove(v)
+              self.waiting.appendleft(v)
+              self.preemptions += 1
+              self.preempted_now.append(v)
+
+          def make_room(self, r, n, sched):
+              while not self.reserve(r, n):
+                  candidates = [x for x in self.running if x.rid not in sched]
+                  victim = self.choose_victim(candidates)
+                  self.preempt(victim)
+                  if victim is r:
+                      return False
+              return True
+
+          def can_admit(self):
+              return not self.preempted_now
+
+          def schedule(self):
+              self.preempted_now = []
+              return super().schedule()
+  - title: "Per-tenant fairness"
+    brief: |
+      The waiting queue becomes one queue per tenant behind the same interface the engine already uses: len, [0], popleft, append and appendleft. Which tenant's request sits at [0] is your policy. The tests ask for two properties: a tenant that arrives behind another tenant's backlog of 60 requests is served before that backlog drains, and a tenant that was idle earns no credit for the idle time, so it cannot take every slot when it returns. The reference charges each tenant the tokens computed for it and serves the least-served tenant, starting a newly active tenant level with the least-served tenant still waiting. Counting requests instead of tokens is simpler, and lets a tenant with long prompts take more than its share of the GPU.
+    starter: |
+      class FairQueue:
+          """The waiting queue, one deque per tenant. The engine uses it as it used the deque: len(), [0], popleft(),
+          append() and appendleft(). Which tenant's request is at [0] is your policy."""
+
+          def __init__(self):
+              raise NotImplementedError
+
+          def __len__(self):
+              raise NotImplementedError
+
+          def __iter__(self):
+              raise NotImplementedError
+
+          def __getitem__(self, i):
+              raise NotImplementedError
+
+          def popleft(self):
+              raise NotImplementedError
+
+          def append(self, r):
+              raise NotImplementedError
+
+          def appendleft(self, r):
+              """A preempted request goes back to the front of its own tenant's queue."""
+              raise NotImplementedError
+
+          def charge(self, tenant, n):
+              """The engine reports n tokens computed for a tenant."""
+              raise NotImplementedError
+
+
+      class Engine(Engine):
+          def __init__(self, *args, **kwargs):
+              super().__init__(*args, **kwargs)
+              self.waiting = FairQueue()
+
+          def submit(self, rid, prompt, max_new, n=1, tenant="default"):
+              raise NotImplementedError
+
+          def execute(self, sched):
+              raise NotImplementedError
+    tests: |
+      def expected(rid, prompt, k):
+          toks = list(prompt)
+          for _ in range(k):
+              toks.append(next_token(rid, toks))
+          return toks[len(prompt):]
+
+      e = Engine(max_running=4, token_budget=256, num_blocks=256, block_size=16)
+      for i in range(60):
+          e.submit(f"a{i}", [i] * 30, 6, tenant="A")
+      e.step()
+      e.step()
+      for i in range(4):
+          e.submit(f"b{i}", [i] * 30, 6, tenant="B")
+      while not e.done():
+          e.step()
+      a_done = [x for x in e.finished if x.startswith("a")]
+      b_last = max(e.finished.index(f"b{i}") for i in range(4))
+      assert b_last < 20, f"B's four requests finish while A still has a backlog; the last finished at position {b_last}"
+      assert all(e.output(f"a{i}") == expected(f"a{i}", [i] * 30, 6) for i in range(60))
+
+      e = Engine(max_running=4, token_budget=256, num_blocks=256, block_size=16)
+      for i in range(80):
+          e.submit(f"a{i}", [i] * 30, 6, tenant="A")
+      for _ in range(60):
+          e.step()
+      for i in range(40):
+          e.submit(f"b{i}", [i] * 30, 6, tenant="B")
+      admitted, seen = [], set()
+      while len(admitted) < 12:
+          for rid in e.step():
+              if rid not in seen:
+                  seen.add(rid)
+                  admitted.append(rid)
+      assert sum(x.startswith("a") for x in admitted[-10:]) >= 3, f"B gets no credit for the time it was idle; admissions {admitted}"
+    hidden: |
+      import random
+      from collections import Counter
+
+      def expected(rid, prompt, k):
+          toks = list(prompt)
+          for _ in range(k):
+              toks.append(next_token(rid, toks))
+          return toks[len(prompt):]
+
+      def run_random(seed):
+          rng = random.Random(seed)
+          blocks = 24
+          e = Engine(max_running=6, token_budget=64, num_blocks=blocks, block_size=4, long_prefill_threshold=rng.choice([0, 16]))
+          reqs = {}
+          for i in range(30):
+              t = rng.choice("ABC")
+              n = rng.choice([1, 1, 2])
+              k = rng.randint(1, 8)
+              p = [rng.randrange(1000) for _ in range(rng.randint(1, 40 // n - k))]
+              e.submit(f"{t}{i}", p, k, n=n, tenant=t)
+              for j in range(n):
+                  reqs[f"{t}{i}" + (f"#{j}" if j else "")] = (p, k)
+          steps = 0
+          while not e.done():
+              s = e.step()
+              steps += 1
+              held = Counter(b for tb in e.tables.values() for b in tb)
+              if len(held) + e.alloc.num_free() != blocks or sum(s.values()) > 64 or steps > 20000:
+                  return False
+              if len(e.waiting) != len(list(e.waiting)) or any(r in e.running for r in e.waiting):
+                  return False
+          return e.preemptions > 0 and all(e.output(r) == expected(r, p, k) for r, (p, k) in reqs.items())
+
+      assert all(run_random(s) for s in range(8))
+      e = Engine(max_running=2, token_budget=128, num_blocks=128, block_size=16)
+      for i in range(10):
+          e.submit(f"x{i}", [1] * 10, 3, tenant="X")
+      e.submit("y0", [2] * 10, 3, tenant="Y")
+      while not e.done():
+          e.step()
+      assert e.finished.index("y0") < e.finished.index("x3")
+    solution: |
+      from collections import deque
+
+
+      class FairQueue:
+          def __init__(self):
+              self.queues = {}                # tenant -> deque of Request
+              self.served = {}                # tenant -> tokens computed for it
+              self.size = 0
+
+          def __len__(self):
+              return self.size
+
+          def __iter__(self):
+              for q in self.queues.values():
+                  yield from q
+
+          def head_tenant(self):
+              return min((t for t, q in self.queues.items() if q), key=lambda t: (self.served.get(t, 0), t))
+
+          def __getitem__(self, i):
+              if i != 0 or not self.size:
+                  raise IndexError("only the head is visible")
+              return self.queues[self.head_tenant()][0]
+
+          def popleft(self):
+              r = self.queues[self.head_tenant()].popleft()
+              self.size -= 1
+              return r
+
+          def _queue(self, r):
+              t = getattr(r, "tenant", "default")
+              q = self.queues.setdefault(t, deque())
+              if not q:
+                  # A tenant that was idle gets no credit for it: it starts level with the least-served backlogged tenant.
+                  backlogged = [self.served.get(u, 0) for u, other in self.queues.items() if other and u != t]
+                  if backlogged:
+                      self.served[t] = max(self.served.get(t, 0), min(backlogged))
+              return q
+
+          def append(self, r):
+              self._queue(r).append(r)
+              self.size += 1
+
+          def appendleft(self, r):
+              self._queue(r).appendleft(r)
+              self.size += 1
+
+          def charge(self, tenant, n):
+              self.served[tenant] = self.served.get(tenant, 0) + n
+
+
+      class Engine(Engine):
+          def __init__(self, *args, **kwargs):
+              super().__init__(*args, **kwargs)
+              self.waiting = FairQueue()
+
+          def submit(self, rid, prompt, max_new, n=1, tenant="default"):
+              if rid in self.reqs:
+                  raise ValueError(f"duplicate request id {rid}")
+              if not prompt or len(prompt) > self.prompt_limit():
+                  raise ValueError("the prompt is empty or longer than this engine accepts")
+              r = Request(rid, prompt, max_new)
+              r.tenant, r.n, r.forked = tenant, n, n == 1
+              self.reqs[rid] = r
+              self.waiting.append(r)
+              return r
+
+          def execute(self, sched):
+              for rid, n in sched.items():
+                  self.waiting.charge(getattr(self.reqs[rid], "tenant", "default"), n)
+              super().execute(sched)
+              for r in self.running:
+                  if not hasattr(r, "tenant"):
+                      r.tenant = self.reqs[r.rid.split("#")[0]].tenant
+  - title: "Metrics: time to first token, inter-token latency, throughput"
+    brief: |
+      A clock makes the trade-offs measurable. The scenario cost model charges a step 5 ms plus 0.02 ms per scheduled token, and every output token is stamped with the clock at the end of its step. metrics() reports, over finished requests, time to first token and the gap between consecutive tokens at p50 and p99 by nearest rank, and output tokens per second. A sample inherits its request's arrival time. The last test runs one mixed workload, chat-sized prompts every other step and a 6,000-token prompt every 40 steps, at budgets of 512 and 8,192 tokens. The larger budget lowers p99 time to first token and raises p99 inter-token latency, the direction the vLLM docs give for max_num_batched_tokens.
+    starter: |
+      import math
+
+
+      def percentile(values, q):
+          """Nearest rank: the smallest value with at least q percent of the values at or below it."""
+          raise NotImplementedError
+
+
+      class Engine(Engine):
+          def __init__(self, *args, step_cost=(5.0, 0.02), **kwargs):
+              super().__init__(*args, **kwargs)
+              self.step_cost = step_cost      # scenario cost model: a step takes base + per_token x tokens scheduled, in ms
+              self.clock = 0.0                # ms
+              self.arrival = {}               # rid -> clock at submit (a sample inherits its request's arrival)
+              self.times = {}                 # rid -> clock at which each output token was emitted
+
+          def submit(self, rid, *args, **kwargs):
+              raise NotImplementedError
+
+          def execute(self, sched):
+              """Advance the clock by the step's cost, run the step, then stamp every new output token."""
+              raise NotImplementedError
+
+          def metrics(self):
+              """Over finished requests: ttft_p50, ttft_p99, itl_p50, itl_p99 in ms, and throughput in output tokens per second."""
+              raise NotImplementedError
+    tests: |
+      import random
+
+      e = Engine(max_running=4, token_budget=512, num_blocks=64, block_size=16)
+      e.submit("one", list(range(100)), 3)
+      while not e.done():
+          e.step()
+      m = e.metrics()
+      assert abs(m["ttft_p50"] - 7.0) < 1e-9, f"the prefill step costs 5 + 0.02 x 100 = 7 ms; got {m['ttft_p50']}"
+      assert abs(m["itl_p50"] - 5.02) < 1e-9 and abs(m["itl_p99"] - 5.02) < 1e-9, "each decode step costs 5 + 0.02 x 1 ms"
+      assert abs(m["throughput"] - 3 / 0.01704) < 1e-6, "3 tokens over 17.04 ms"
+      assert percentile([5, 1, 4, 2, 3], 50) == 3 and percentile(list(range(1, 101)), 99) == 99 and percentile([7], 99) == 7
+
+      def workload(budget):
+          rng = random.Random(7)
+          e = Engine(max_running=32, token_budget=budget, num_blocks=4096, block_size=16)
+          i = 0
+          for step in range(400):
+              if step % 2 == 0:
+                  e.submit(f"c{i}", [rng.randrange(1000) for _ in range(rng.randint(50, 300))], rng.randint(20, 60))
+                  i += 1
+              if step % 40 == 0:
+                  e.submit(f"d{i}", [rng.randrange(1000) for _ in range(6000)], 20)
+                  i += 1
+              e.step()
+          while not e.done():
+              e.step()
+          return e.metrics()
+
+      small, large = workload(512), workload(8192)
+      assert small["itl_p99"] < large["itl_p99"], "a smaller budget keeps long prefill chunks from stretching decode steps"
+      assert large["ttft_p99"] < small["ttft_p99"], "a larger budget gets prompts through prefill in fewer steps"
+    hidden: |
+      import random
+
+      def run_random(seed):
+          rng = random.Random(seed)
+          e = Engine(max_running=6, token_budget=rng.choice([32, 128]), num_blocks=30, block_size=4, long_prefill_threshold=rng.choice([0, 16]), step_cost=(rng.choice([2.0, 5.0]), 0.01))
+          total = 0
+          for i in range(25):
+              n = rng.choice([1, 1, 2])
+              k = rng.randint(1, 8)
+              e.submit(f"r{i}", [rng.randrange(1000) for _ in range(rng.randint(1, 50 // n - k))], k, n=n, tenant=rng.choice("AB"))
+              total += n * k
+              if rng.random() < 0.5:
+                  e.step()
+          while not e.done():
+              e.step()
+          m = e.metrics()
+          if len(e.finished) != len(e.times) or sum(len(t) for t in e.times.values()) != total:
+              return False
+          if any(t != sorted(t) for t in e.times.values()):
+              return False
+          if not (0 < m["ttft_p50"] <= m["ttft_p99"] and 0 < m["itl_p50"] <= m["itl_p99"]):
+              return False
+          return abs(m["throughput"] - total / (e.clock / 1000)) < 1e-6
+
+      assert all(run_random(s) for s in range(8))
+      e = Engine(max_running=4, token_budget=512, num_blocks=64, block_size=16)
+      e.submit("p", list(range(40)), 2, n=3)
+      while not e.done():
+          e.step()
+      m = e.metrics()
+      assert all(e.times[x][0] == e.times["p"][0] for x in ("p#1", "p#2")) and abs(m["ttft_p99"] - (5 + 0.02 * 40)) < 1e-9
+    solution: |
+      import math
+
+
+      def percentile(values, q):
+          ordered = sorted(values)
+          return ordered[max(0, math.ceil(q / 100 * len(ordered)) - 1)]
+
+
+      class Engine(Engine):
+          def __init__(self, *args, step_cost=(5.0, 0.02), **kwargs):
+              super().__init__(*args, **kwargs)
+              self.step_cost = step_cost
+              self.clock = 0.0
+              self.arrival = {}
+              self.times = {}
+
+          def submit(self, rid, *args, **kwargs):
+              r = super().submit(rid, *args, **kwargs)
+              self.arrival[rid] = self.clock
+              return r
+
+          def execute(self, sched):
+              if sched:
+                  base, per_token = self.step_cost
+                  self.clock += base + per_token * sum(sched.values())
+              super().execute(sched)
+              for r in self.running:
+                  if r.rid not in self.arrival:
+                      self.arrival[r.rid] = self.arrival[r.rid.split("#")[0]]
+                  stamps = self.times.setdefault(r.rid, [])
+                  while len(stamps) < len(r.out):
+                      stamps.append(self.clock)
+
+          def metrics(self):
+              ttft, itl, tokens = [], [], 0
+              for rid in self.finished:
+                  stamps = self.times[rid]
+                  ttft.append(stamps[0] - self.arrival[rid])
+                  itl.extend(b - a for a, b in zip(stamps, stamps[1:]))
+                  tokens += len(stamps)
+              return {
+                  "ttft_p50": percentile(ttft, 50), "ttft_p99": percentile(ttft, 99),
+                  "itl_p50": percentile(itl, 50) if itl else 0.0, "itl_p99": percentile(itl, 99) if itl else 0.0,
+                  "throughput": tokens / (self.clock / 1000),
+              }
+---
+This lab builds the scheduling loop of an inference engine in standard-library Python, one mechanism per step, against a mock model. The model is a function of the request id and the tokens so far, so a request preempted and recomputed in step 5 must produce exactly the outputs it would have produced without preemption, and the tests check that.
+
+Steps 1 to 3 build the loop and its memory: iteration-level admission, a paged block allocator with reference counts, and samples that share a prompt's blocks until they write. Step 4 adds the token budget and chunked prefill. Step 5 adds preemption by recompute, and the victim order is yours. Step 6 replaces the single waiting queue with one per tenant, and the fairness policy is yours. Step 7 adds a clock and the metrics that show the budget's trade-off between time to first token and inter-token latency.
+
+The tests check invariants rather than one schedule: the budget is never exceeded, no block is held twice or leaked, every request's KV rebuilds to its own tokens, every request finishes, and every output matches the mock model. Two engines with different policies can both pass.
+
+Each step subclasses the last (`class Engine(Engine)`) and overrides only what it changes, so later steps call earlier ones through `super()`. Your code is saved with your progress as you type, and passing a step's tests unlocks the next one. Python runs in your browser, with the standard library only.

@@ -1,0 +1,194 @@
+---
+title: Queues, backpressure and flow control for model work
+track: workflows
+module: retries-flow-control
+order: 2
+kind: lesson
+level: senior
+minutes: 15
+summary: The provider's token bucket is shared by every workflow on the organisation, so admission control has to sit in front of it, weighted by tokens, isolated per tenant, and alarmed on the age of the oldest message.
+prerequisites: [workflows/retries-flow-control/retries-model-steps]
+updated: 2026-10-28
+sources:
+  - title: Avoiding insurmountable queue backlogs (Amazon Builders' Library, 2019-12-05)
+    url: https://builder.aws.com/content/3EuRcgkTP1MI0c7zM8W6HL3WIqA/avoiding-insurmountable-queue-backlogs
+    note: age of the oldest work rather than depth; depth-based backpressure punishes innocent workloads; shuffle sharding in Lambda; spillover queues; per-workload concurrency limits; alarm on any message in a dead-letter queue; heartbeats on long work; an hour-long outage needs double capacity for another hour to recover
+  - title: Claude docs, rate limits
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: token bucket replenished continuously; RPM, ITPM and OTPM per model; Start tier Claude Opus 5.5 at 1,000 RPM, 2,000,000 ITPM and 400,000 OTPM; cache reads excluded from ITPM for most models; OTPM ignores max_tokens; short bursts and acceleration limits; workspace limits under organisation limits; Message Batches limits (Build tier 300,000 batch requests in the processing queue)
+  - title: OpenAI API docs, rate limits
+    url: https://developers.openai.com/api/docs/guides/rate-limits
+    note: the rate limit is calculated as the maximum of max_tokens and the estimated tokens; unsuccessful requests count toward the per-minute limit
+  - title: Inngest docs, flow control
+    url: https://www.inngest.com/docs/guides/flow-control
+    note: step concurrency, throttling, rate limiting, batching, singleton, debounce, priority and multi-tenancy; throttling queues and rate limiting skips; batching cannot be combined with rate limiting or priority; key-queue scheduling requires Enterprise access
+  - title: Inngest docs, throttling
+    url: https://www.inngest.com/docs/guides/throttling
+    note: limit, period from 1 second to 7 days, burst and key; each distinct key value gets its own limit
+  - title: Inngest docs, concurrency
+    url: https://www.inngest.com/docs/guides/concurrency
+    note: limits count executing steps, not runs; sleeping and waiting steps do not hold a slot; up to 2 concurrency constraints per function, each with an optional key
+  - title: n8n docs, queue mode
+    url: https://docs.n8n.io/hosting/scaling/queue-mode/
+    note: main instance generates executions, Redis holds the queue, workers run them; worker concurrency defaults to 10 and n8n recommends 5 or higher; low concurrency with many workers can exhaust the database connection pool; SQLite not supported for queue mode
+  - title: Grab Engineering, LLM-powered data classification for data entities at scale (2024-07-15 update of an October 2023 post)
+    url: https://engineering.grab.com/llm-powered-data-classification
+    note: mini-batches through a message queue at fixed intervals; workflow-level rate limiter; all Azure OpenAI deployments share one 240K tokens-per-minute quota; GPT-3.5 context of 4,000 tokens shared by input and output; about 300 to 400 entities per day
+  - title: Claude docs, batch processing
+    url: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+    note: 50 percent of standard prices; most batches finish within 1 hour; requests expire after 24 hours unbilled; cache hits best effort, typically 30 to 98 percent
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## One bucket, many workflows
+
+Every workflow that calls the same model on the same organisation draws from one rate limit. Claude's rate-limit page says the API uses a token bucket that is replenished continuously up to the maximum, with separate limits for requests per minute (RPM), input tokens per minute (ITPM) and output tokens per minute (OTPM), per model class, enforced at the organisation level. It adds two details that matter for queues: a 60 RPM limit may be enforced as 1 request per second, so short bursts trip it, and a sharp increase in usage can hit acceleration limits even under the published numbers.
+
+So the provider is a shared downstream with a hard, token-denominated capacity, and the Workers are a fleet of independent clients. Without admission control in front of it, the fleet discovers the limit through 429s, and the retry layer from the previous lesson turns each discovery into more traffic. With admission control, work waits in a queue you own, where you can see it, prioritise it and shed it.
+
+The unit of admission is the difference from an ordinary rate limiter. A request is not one unit of work; it is a number of input tokens and an unknown number of output tokens, and each provider counts them differently.
+
+**Claude** counts only uncached input toward ITPM on most models: cache reads are excluded, and cache writes count. OTPM is evaluated as tokens are produced, and `max_tokens` does not factor in.
+
+**OpenAI** calculates the rate limit as the maximum of `max_tokens` and the estimated token count, so an oversized `max_tokens` consumes headroom whether or not the model uses it, and unsuccessful requests count toward the per-minute limit.
+
+## Which limit binds
+
+<Predict id="wfl-rfc-binding-limit" question="Start tier, Claude Opus 5.5: 1,000 RPM, 2,000,000 ITPM, 400,000 OTPM. Each request sends 8,000 uncached input tokens and produces 1,000 output tokens. How many requests per minute can the organisation sustain?" answer={250} tolerance={0} unit="requests per minute">
+<p><b>250.</b> ITPM allows 2,000,000 / 8,000 = 250 per minute; OTPM allows 400,000 / 1,000 = 400; RPM allows 1,000. Input binds. If 6,000 of the 8,000 input tokens are a cached prefix, uncached input drops to 2,000 and ITPM allows 1,000 per minute, so OTPM becomes the binding limit at 400. Prompt caching moved the bottleneck; it did not remove it.</p>
+</Predict>
+
+Little's law then sizes the in-flight work. At 250 requests per minute (4.17 per second) and a mean call time of 20 seconds, about 83 calls are in flight; at a mean of 60 seconds, 250. The concurrency limit on the Workers is a consequence of the token limit and the latency, not an independent knob. Set it from the token limit and the latency you measure, and recompute it when either moves.
+
+An admission controller for model work therefore reserves an estimate before the call and settles the difference after it, because input is countable before the request and output is only known afterwards:
+
+```python
+class Admission:
+    """Token-weighted admission in front of one provider limit (per minute)."""
+    def __init__(self, per_minute, now=0.0):
+        self.rate = per_minute / 60.0          # refill per second
+        self.cap = float(per_minute)
+        self.level = float(per_minute)
+        self.t = now
+
+    def _refill(self, now):
+        self.level = min(self.cap, self.level + (now - self.t) * self.rate)
+        self.t = now
+
+    def try_admit(self, estimate, now):
+        """Reserve the estimate; the caller queues the work when this is False."""
+        self._refill(now)
+        if self.level < estimate:
+            return False
+        self.level -= estimate
+        return True
+
+    def settle(self, estimate, actual, now):
+        """Return the over-reservation, or charge the shortfall, once usage is known."""
+        self._refill(now)
+        self.level = min(self.cap, self.level + estimate - actual)
+
+itpm = Admission(per_minute=2_000_000)
+admitted = sum(itpm.try_admit(8_000, now=0.0) for _ in range(400))
+print(admitted)                     # 250: a full bucket holds one minute of 8,000-token requests
+print(itpm.try_admit(8_000, 0.24))  # True: 0.24 s refills exactly 8,000 tokens
+```
+
+Run one controller per limit that can bind (ITPM, OTPM, RPM) and admit only when all three agree. In a fleet the level lives in a shared store, and the provider's `anthropic-ratelimit-*-remaining` headers are the correction signal when your estimate drifts from the provider's count. Keep the controller's limit a little under the provider's, because the provider's bucket also absorbs traffic you do not route through it.
+
+## Alarm on age, not depth
+
+The Builders' Library article on queue backlogs makes the case for measuring the age of the oldest work instead of queue depth: age catches both a system that has fallen behind and one that keeps erroring and retrying, while backpressure driven by depth in a shared queue punishes workloads that happened to share the queue with the noisy one. AWS IoT goes further and tracks age of first attempt, so that retries and re-enqueues do not hide a real backlog.
+
+For model work depth is worse still: a message can be one sentence or a whole document, and the queue does not know which. Age is in the unit the user feels.
+
+Backlog recovery is the other number to know before an incident.
+
+<Predict id="wfl-rfc-backlog-drain" question="Work arrives at 80 percent of the admitted token rate. The provider is unavailable for 30 minutes and nothing is shed. Once it returns, how many minutes does the backlog take to drain?" answer={120} tolerance={5} unit="minutes">
+<p><b>120 minutes.</b> In 30 minutes the queue accumulates 30 × 0.8 = 24 minutes of capacity. On recovery, new work still takes 80 percent of capacity, so only 20 percent drains the backlog: 24 / 0.2 = 120 minutes. The article's version: an hour-long outage needs double the system's capacity for another hour. At 95 percent utilisation the same outage takes 30 × 0.95 / 0.05 = 570 minutes to drain, which is why a provider limit run near its ceiling turns a short outage into a long day.</p>
+</Predict>
+
+The drain time is also the argument for shedding. Interactive work that has waited longer than its user will wait is waste: the article notes that real-time systems built on FIFO queues prefer LIFO behaviour under backlog, and approximates it by moving old messages to a backlog queue that is worked only after live traffic catches up. For a chat feature, the oldest request is the one most likely to have been abandoned.
+
+## Isolation per tenant
+
+A single queue in front of a shared limit lets one tenant's backfill consume the bucket. The article lists the isolation options and their costs.
+
+**A queue per tenant** gives complete isolation, but polling cost grows with the number of queues, so it does not scale to many small tenants.
+
+**Shuffle sharding**, as Lambda uses it, hashes each customer to a small set of queues and enqueues to the least loaded one, so a surge backs up the surging customer's queues while other customers are routed away.
+
+**Spillover queues** move a customer's excess beyond a configured rate to a separate queue, worked when there is spare capacity.
+
+**Per-workload concurrency limits** cap what any one workload can hold in flight.
+
+For model work the limits must be token-weighted, or a tenant with long prompts gets several times the share of a tenant with short ones. Claude offers one isolation layer below yours: workspace limits per limiter type, with the organisation limit still applying even when workspace limits add up to more. A backfill in its own workspace with a lower ITPM limit cannot starve the interactive workspace at the provider, whatever your own controller does wrong.
+
+## Dead letters and heartbeats
+
+The article's rule for dead-letter queues is to alarm when any message is in one, because it means a bug that needs fixing, and to keep the messages so they can be reprocessed after the fix. In a model workflow the dead-letter queue collects the non-retryable class from the previous lesson: prompts over the context window, schema rejections, refusals the code did not expect. A dead-letter queue nobody pages on is a silent drop with extra storage.
+
+Long steps need heartbeats. The article describes handlers that either stop work when a message's visibility expires or heartbeat to keep it; without that, the message is redelivered to a second processor while the first is still working. For model work that means two Workers paying for the same generation, and if the step has an effect, the idempotency key is the only thing between you and a duplicate. Temporal's heartbeat timeout plays the same role for Activities.
+
+## The flow-control vocabulary
+
+Inngest names the controls precisely, and the names are a useful checklist even if you use another engine.
+
+**Step concurrency** caps steps executing at once; sleeping and waiting steps do not hold a slot. A function can carry up to two concurrency constraints, each with an optional key, so one can be per tenant and one global. This is the control that maps to in-flight model calls.
+
+**Throttling** limits how often runs start and queues the excess, with a limit, a period from 1 second to 7 days, a burst and an optional key. **Rate limiting** also limits run starts but skips the excess. The difference is the decision you must make about surplus work: model work that must eventually happen is throttled; work that is stale once superseded can be rate limited or debounced.
+
+**Debounce** waits for a quiet period so a burst of updates starts one run, which suits re-summarising a document that is still being edited. **Singleton** keeps one active run per key. **Priority** moves higher-value work ahead in the queue. **Batching** groups events into one run, and cannot be combined with rate limiting or priority. **Multi-tenancy** applies limits by tenant key; the page says key-queue scheduling currently requires Enterprise access on request.
+
+What none of these knows is the provider's token count. Throttling counts run starts and concurrency counts steps; a token-weighted controller still sits inside the step.
+
+n8n's queue mode has the same gap at a different layer. The main instance generates executions, Redis holds the queue, and Workers run them, with a per-Worker concurrency that defaults to 10 (n8n recommends 5 or higher and warns that many Workers at low concurrency can exhaust the database's connection pool). Five Workers at the default run 5 × 10 = 50 executions at once, and every model node inside them calls the provider with no admission in between. Queue mode scales execution; it does not describe a provider-token limit, so that limit has to come from a gateway or from the workflows themselves.
+
+## Worked case: one quota, every deployment
+
+Grab's data-classification pipeline is the public example of this problem. Its orchestration service, which Grab calls Gemini (an internal name, unrelated to Google's model), groups classification requests into mini-batches through a message queue at fixed intervals, and attaches a rate limiter at the workflow level so calls to the cloud provider stay under its rate. The reason is in the constraints Grab lists: all of its Azure OpenAI deployments shared one quota of 240K tokens per minute, and GPT-3.5's context was 4,000 tokens, shared between input and output.
+
+The arithmetic shows why the limiter is about sharing and bursts, not volume. Grab reports about 300 to 400 entities classified per day. If every entity took one full-context request, 400 × 4,000 = 1.6 million tokens per day, or 1,600,000 / 240,000 = 6.7 minutes of the quota. The daily total is small; the risk is a burst from a new data platform or a backfill landing in the same minute as every other team's traffic on the shared quota. A fixed-interval queue smooths the burst and the limiter enforces the share. The teardown of the [Grab pipeline](/learn/workflows/retries-flow-control/grab-classification) walks the rest of the system.
+
+<Callout kind="aside">
+The move that removes a backfill from the online bucket entirely is a batch interface. Claude's Message Batches API has its own limits (at Build tier, 300,000 batch requests in the processing queue), charges 50 percent of standard prices, finishes most batches within an hour, and expires unprocessed requests after 24 hours without billing them.
+</Callout>
+
+## In the room
+
+One Claude organisation at Build tier serves an interactive assistant with a p95 latency target and a nightly backfill that re-summarises the document store. The backfill has grown to three times the assistant's daily token volume, it must finish by 06:00, and there is no budget to move up a tier this quarter. Design the admission control.
+
+<Depth>
+<Fragment slot="short">
+<p>Separate the two at the provider first: the backfill gets its own workspace with ITPM and OTPM limits below the organisation's, so the assistant keeps guaranteed headroom even if my own controller is wrong. Then move the backfill to the Message Batches API, which has separate limits and half the price, and keep a small online lane for documents that miss the batch. In front of the online lane, a token-weighted admission controller per limit, an alarm on the age of the oldest backfill item against the 06:00 deadline, and a dead-letter queue that pages.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The binding constraint is a token rate shared by work with opposite needs: the assistant needs latency, the backfill needs throughput by a deadline. Workspace limits give a hard partition at the provider; a client controller alone is only as good as every caller's discipline.</p>
+<p>Batch changes the shape of the problem. The Message Batches API has its own set of limits, an RPM limit on its endpoints and a processing-queue limit counted in batch requests, documented separately from the Messages limits. What I give up: results arrive when the batch finishes, which is usually within the hour but not bounded below 24 hours, and requests can expire under load; cache hits are best effort. So submission time is set from the deadline, for example by 01:00 for a 06:00 finish, with expired requests re-submitted to the online lane under the backfill workspace's limits.</p>
+<p>The online lane drains under a controller that reserves estimated input and settles on actual usage, ordered by age. The alarm is the age of the oldest item against the time left before 06:00, not the depth. Failure mode of this design: if batch processing slows and many requests expire at once, the online lane inherits a burst at the worst time, so the re-submission path needs its own throttle and a written rule for which documents are left stale when the deadline arrives.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The backfill owner says workspace limits waste capacity overnight when the assistant is idle. What do you measure to size the split, and what do you accept in writing if you let the backfill borrow?</li>
+<li>Batch results come back late twice in one week and the 06:00 deadline is missed. What would you need to see before abandoning batch for the online lane, given the cost doubles?</li>
+<li>Half the backfill shares a 6,000-token system prompt. How does that change which limit binds, and does it change your workspace split?</li>
+<li>A second team wants to put its agent on the same organisation next month. Who decides its share, and what do you need from them before you agree?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Admission in front of the provider assumes you know the limit and are its only significant consumer. Claude's acceleration limits can return 429s below the published numbers after a sharp increase in usage, and other services on the same organisation draw from the same bucket. The controller's limit is a target, and the 429 path from the previous lesson still has to work.
+
+Age of the oldest message misleads when work is deliberately delayed. Scheduled retries, debounced runs and items parked in a spillover queue are old by design; measure age of first attempt, as AWS IoT does, or exclude intentionally delayed items, or the alarm fires every night.
+
+Token-weighted fairness assumes token cost is the scarce resource. When the provider is fast and the expensive part is a downstream human review or a tool with its own limit, the queue should be weighted by that resource instead, and the model limit is no longer the one to protect.
+
+Limits and tier numbers were read from the vendor docs on 28 October 2026; the Start tier figures are an example, not a capacity plan.
+
+<SelfRate id="lesson:workflows/retries-flow-control/queues-backpressure" />

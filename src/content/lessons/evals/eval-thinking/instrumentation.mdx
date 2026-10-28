@@ -1,0 +1,208 @@
+---
+title: "Instrumentation: GenAI spans, what to log and what never to log"
+track: evals
+module: eval-thinking
+order: 3
+kind: lesson
+level: senior
+minutes: 12
+summary: Every model call logs the resolved model, prompt version, tokens with cache detail, cost, latency and its tool calls under the OpenTelemetry GenAI names, while message content stays off spans by default and a per-environment capture policy decides where it goes before an incident decides it for you.
+prerequisites: [evals/eval-thinking/error-analysis]
+updated: 2026-10-28
+sources:
+  - title: "OpenTelemetry semantic conventions for GenAI, README (semantic-conventions-genai repository, main, checked 2026-10-28)"
+    url: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/README.md
+    note: "Status: Development; documents for client inference, embeddings, events, exceptions, metrics, token metrics, model spans and agent spans"
+  - title: "OpenTelemetry GenAI spans (semantic-conventions-genai, main, checked 2026-10-28)"
+    url: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md
+    note: "execute_tool {gen_ai.tool.name} span, kind INTERNAL; gen_ai.tool.name Required, gen_ai.tool.call.id Conditionally Required, gen_ai.tool.call.arguments and gen_ai.tool.call.result Opt-In; instrumentations SHOULD NOT capture content by default; three patterns (none, on attributes for pre-production, external storage recommended in production); OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT with NO_CONTENT (default), SPAN_ONLY, EVENT_ONLY, SPAN_AND_EVENT; invalid values fall back to NO_CONTENT; list of governed content attributes including prompt variables and memory records; a content attribute MUST NOT be reported on a signal whose conventions do not reference it; upload hook invoked regardless of the span sampling decision and able to modify content before attributes are recorded"
+  - title: "OpenTelemetry GenAI client inference spans (semantic-conventions-genai, main, checked 2026-10-28)"
+    url: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/client-inference.md
+    note: "span name {gen_ai.operation.name} {gen_ai.request.model}, kind CLIENT; requirement levels for operation, provider, request and response model, prompt name and version, finish reasons, conversation id, time to first chunk; gen_ai.usage.input_tokens SHOULD include all input tokens including cached; cache_read, cache_write and reasoning token attributes; input, output, system instructions and tool definitions Opt-In; credentials NOT RECOMMENDED in _ref URIs"
+  - title: "OpenTelemetry GenAI agent and framework spans (semantic-conventions-genai, main, checked 2026-10-28)"
+    url: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-agent-spans.md
+    note: "create_agent, invoke_agent (CLIENT for remote, INTERNAL in process), invoke_workflow {gen_ai.workflow.name} (INTERNAL, for user-facing composed processes, not standalone agent invocations), plan, and execute_tool refinements for agents as tools, skills and commands"
+  - title: "OpenTelemetry semantic conventions v1.42.0 release (2026-06-12, checked 2026-10-28)"
+    url: https://github.com/open-telemetry/semantic-conventions/releases/tag/v1.42.0
+    note: "all gen_ai.* attributes, metrics, events and spans deprecated in the main repository and moved to semantic-conventions-genai"
+  - title: "OpenTelemetry semantic conventions v1.37.0, GenAI attribute registry (release 2025-08-25, checked 2026-10-28)"
+    url: https://github.com/open-telemetry/semantic-conventions/blob/v1.37.0/docs/registry/attributes/gen-ai.md
+    note: "gen_ai.system deprecated, replaced by gen_ai.provider.name; gen_ai.usage.prompt_tokens and completion_tokens replaced by input_tokens and output_tokens"
+  - title: "Anthropic, Prompt caching (Claude API docs, checked 2026-10-28)"
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: "input_tokens counts only tokens after the last cache breakpoint; total input = cache_read_input_tokens + cache_creation_input_tokens + input_tokens; cache read and write multipliers on the base input price, with model-specific exceptions for cache reads"
+  - title: "OpenAI, Prompt caching (API docs, checked 2026-10-28)"
+    url: https://developers.openai.com/api/docs/guides/prompt-caching
+    note: "Responses API usage example: input_tokens 12000 with input_tokens_details.cached_tokens 4000 and cache_write_tokens 7000, so 1000 tokens are ordinary input"
+  - title: "OpenTelemetry, Sampling (concepts, checked 2026-10-28)"
+    url: https://opentelemetry.io/docs/concepts/sampling/
+    note: "head sampling cannot ensure that every trace with an error is kept; tail sampling considers all or most spans of a trace and needs stateful components; the Collector ships a tail sampling processor"
+  - title: "Hamel Husain and Shreya Shankar, AI Evals FAQ (published 2026-09-18, modified 2026-09-21, checked 2026-10-28)"
+    url: https://hamel.dev/blog/posts/evals-faq/
+    note: "a session or trace id per request, each message's source and sequence position; for handoffs the decision and reason, context transferred, wait time, human actions, resolution and whether the human had enough context"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+Error analysis reads traces, so what a trace contains decides what can be analysed later. Two decisions are made once and early. The first is the set of fields every model call records, which is cheap and mostly settled by the OpenTelemetry GenAI semantic conventions. The second is the content-capture policy per environment: where prompts, completions, tool arguments and results go, who can read them, and how long they live. That policy is the expensive one, because the content is what error analysis needs and also what a privacy review objects to. Written down before launch, it is a design decision; written during an incident, it is whatever the on-call engineer could switch on.
+
+## The span tree
+
+The conventions are tracing with a vocabulary for model calls. The difference from ordinary RPC tracing is that the payload, not the status code, carries the failure, and the payload is personal data.
+
+Three facts about the documents themselves. Every GenAI document is marked Development, not Stable. Since release v1.42.0 of the main semantic-conventions repository (12 June 2026), all `gen_ai.*` attributes, metrics, events and spans there are deprecated and live in a separate repository, `semantic-conventions-genai`. And names have changed before: the v1.37.0 registry (August 2025) replaced `gen_ai.system` with `gen_ai.provider.name` and `gen_ai.usage.prompt_tokens` with `gen_ai.usage.input_tokens`. Pin the version your instrumentation emits and record it.
+
+A support agent's request becomes this tree:
+
+```text
+invoke_workflow support-triage             INTERNAL  the user-facing entry point that composes agents
+  invoke_agent triage                      INTERNAL  in-process agent; CLIENT when the agent is remote
+    chat example-model                     CLIENT    one inference call: {operation} {request.model}
+    execute_tool lookup_order              INTERNAL  one tool execution: execute_tool {tool.name}
+    chat example-model                     CLIENT
+  invoke_agent refunds                     INTERNAL
+    ...
+```
+
+The agent document limits `invoke_workflow` to composed processes such as graphs and orchestrators that a user or application starts; it is not reported for a standalone agent invocation, nor when a framework spins up a runner internally to delegate to a sub-agent. That rule matters for analysis: the root span is the unit you sample and label, so it should be the unit a user experienced.
+
+## What every call records
+
+The table lists what each inference span carries, with the requirement level the conventions assign. A team policy promotes several Recommended attributes to mandatory, because error analysis cannot use a trace without them.
+
+| Field | Attribute | Spec level | Why it is mandatory here |
+|---|---|---|---|
+| Operation and provider | `gen_ai.operation.name`, `gen_ai.provider.name` | Required | Splits chat, embeddings and tool spans |
+| Requested model | `gen_ai.request.model` | Conditionally Required | The alias your code asked for |
+| Resolved model | `gen_ai.response.model` | Recommended | The snapshot that answered; catches an alias moving under you |
+| Prompt version | `gen_ai.prompt.name`, `gen_ai.prompt.version` | Conditionally Required when a named template is used | Every failure count splits by prompt release |
+| Tokens | `gen_ai.usage.input_tokens`, `output_tokens`, `cache_read.input_tokens`, `cache_write.input_tokens`, `reasoning.output_tokens` | Recommended (cache and reasoning when non-zero) | Cost, cache hit rate, context growth |
+| Latency | span duration; `gen_ai.response.time_to_first_chunk` | Recommended for streaming | Time to first chunk and total time fail differently |
+| Stop reason | `gen_ai.response.finish_reasons` | Recommended | A truncation at the token limit looks like a short answer otherwise |
+| Errors | `error.type` | Conditionally Required on error | Separates provider and tool errors from model failures |
+| Conversation | `gen_ai.conversation.id` | Conditionally Required when available | Joins turns for multi-turn analysis |
+| Tool calls | `execute_tool` spans with `gen_ai.tool.name`, `gen_ai.tool.call.id` | Required; call id when the provider supplies one | Ties a tool result to the model call that requested it |
+| Cost | none in the conventions | | An application attribute plus the price-table version used |
+
+The AI Evals FAQ adds fields that matter for reading rather than for dashboards: a trace or session id per request, the source of each message (agent or tool) and its position in the sequence, and for hand-offs to a person, the decision and its reason, the context transferred, the wait, what the person did, the resolution and whether the person had enough context. Without the last one, a failure after a hand-off cannot be charged to the model or to the process.
+
+## Token accounting across providers
+
+The conventions say `gen_ai.usage.input_tokens` SHOULD include all input tokens, cached ones included, with cache reads and writes as subsets. Providers disagree with each other. Anthropic's `input_tokens` counts only tokens after the last cache breakpoint, and its docs give total input as `cache_read_input_tokens + cache_creation_input_tokens + input_tokens`. OpenAI's Responses API `input_tokens` already includes `cached_tokens` and `cache_write_tokens`; its documented example is 12,000 input tokens, of which 4,000 are cache reads and 7,000 cache writes, leaving 1,000 ordinary. The mapping lives in one function per provider, tested against both shapes.
+
+```python
+def otel_usage(provider, usage):
+    """Map a provider usage object to OTel GenAI usage attributes (input_tokens includes cached tokens)."""
+    if provider == "anthropic":
+        # input_tokens counts only tokens after the last cache breakpoint.
+        read = usage.get("cache_read_input_tokens", 0)
+        write = usage.get("cache_creation_input_tokens", 0)
+        total_in = usage["input_tokens"] + read + write
+    elif provider == "openai":
+        # input_tokens already includes cached reads and cache writes.
+        details = usage.get("input_tokens_details", {})
+        read = details.get("cached_tokens", 0)
+        write = details.get("cache_write_tokens", 0)
+        total_in = usage["input_tokens"]
+    else:
+        raise ValueError(f"no usage mapping for {provider}")
+    attrs = {"gen_ai.usage.input_tokens": total_in, "gen_ai.usage.output_tokens": usage["output_tokens"]}
+    if read:
+        attrs["gen_ai.usage.cache_read.input_tokens"] = read
+    if write:
+        attrs["gen_ai.usage.cache_write.input_tokens"] = write
+    return attrs
+
+
+def cost_usd(attrs, price):
+    """price: USD per million tokens for uncached input, cache read, cache write and output, from a dated price table."""
+    read = attrs.get("gen_ai.usage.cache_read.input_tokens", 0)
+    write = attrs.get("gen_ai.usage.cache_write.input_tokens", 0)
+    plain = attrs["gen_ai.usage.input_tokens"] - read - write
+    return (plain * price["in"] + read * price["read"] + write * price["write"]
+            + attrs["gen_ai.usage.output_tokens"] * price["out"]) / 1e6
+
+
+# The same 12,000-token prompt as each provider reports it: 4,000 read from cache, 7,000 written, 1,000 plain.
+anthropic = {"input_tokens": 1000, "cache_read_input_tokens": 4000,
+             "cache_creation_input_tokens": 7000, "output_tokens": 500}
+openai = {"input_tokens": 12000, "output_tokens": 500,
+          "input_tokens_details": {"cached_tokens": 4000, "cache_write_tokens": 7000}}
+price = {"in": 3.0, "read": 0.3, "write": 3.75, "out": 15.0}  # placeholder prices, not a provider's list
+
+for name, usage in [("anthropic", anthropic), ("openai", openai)]:
+    attrs = otel_usage(name, usage)
+    print(name, attrs["gen_ai.usage.input_tokens"], round(cost_usd(attrs, price), 6))
+# anthropic 12000 0.03795
+# openai 12000 0.03795
+```
+
+The failure this prevents is silent. An exporter that copies Anthropic's raw `input_tokens` (1,000) into the OTel attribute makes `plain` equal 1,000 − 4,000 − 7,000 = −10,000, and the cost becomes (−10,000 × 3 + 4,000 × 0.3 + 7,000 × 3.75 + 500 × 15) / 10<sup>6</sup> = $0.00495, which is 13% of the true $0.03795. Nothing errors; the dashboard reports that caching made the feature nearly free. A test asserting that `input_tokens` is at least `cache_read + cache_write` on every span catches it.
+
+## Content: off by default, and where it goes instead
+
+The conventions mark `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions` and `gen_ai.tool.definitions` as Opt-In, and so are `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result` and the prompt template variables. Instrumentations SHOULD NOT capture content by default. If the switch is an environment variable it is `OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT`, with `NO_CONTENT` as the default, then `SPAN_ONLY`, `EVENT_ONLY` and `SPAN_AND_EVENT`; an invalid value falls back to `NO_CONTENT`. Tool definitions are schemas rather than payloads and are not governed by that switch.
+
+The spec names three patterns: record nothing; record content on span attributes, suited to pre-production or to storage that already meets the privacy rules; or upload content to external storage and put a reference on the span (`gen_ai.input.messages_ref` and its siblings), which it recommends for production because the store can carry its own access control. Two details change the design. The upload hook, when configured, is invoked regardless of the span sampling decision, so the content store sees every call even when only a fraction of spans are kept. And the hook can modify the messages before the instrumentation records any attribute, which makes it the single place for redaction: both the stored copy and any on-span copy get the redacted values. Reference URIs should not embed credentials such as signed query parameters.
+
+The policy, written per environment:
+
+| Environment | Capture switch | Content destination | Who reads it |
+|---|---|---|---|
+| Local and CI | `SPAN_ONLY` | On spans; test data only | Engineers |
+| Staging with internal users | `SPAN_ONLY` | On spans, short retention | Engineers and the labelling expert |
+| Production | `NO_CONTENT` on spans | Upload hook: redact, then store with a reference on the span | A labelling group with its own access grant |
+| Labelling pool | Copied from the production store | The annotation tool | The expert and second labeller, under the privacy owner's terms |
+
+Two rules sit beside the table. Content never goes into a custom attribute or a span name: an `app.user_query` attribute bypasses the capture switch, and the spec forbids reporting a content attribute on a signal whose conventions do not reference it. And retention periods are set by whoever signs for privacy, in the same document, so error analysis knows how far back it can read.
+
+## Sampling a trace whose failure is not an error
+
+<Predict id="evl-head-sampling" question="How many traces showing this failure does the backend keep per week?" answer={70} unit="traces">
+<Fragment slot="prompt">
+<p>Scenario: 50,000 requests a day, head sampling keeps 10% of traces, and a failure mode the error analysis cares about occurs in 0.2% of requests. The failure is a fluent wrong answer, so its span status is OK.</p>
+</Fragment>
+<p>50,000 × 7 × 0.002 = 700 failing requests a week, and 10% of them survive: <b>70</b>. They are mixed into 35,000 kept traces with nothing marking them, because the span status is OK. The OpenTelemetry sampling docs state the general limit: head sampling alone cannot ensure that every trace with an error is kept, and here the failure is not even an error.</p>
+</Predict>
+
+Tail sampling in the Collector decides after seeing the trace, at the cost of stateful components that the OpenTelemetry docs say must accept and store large volumes. It only helps if something on the trace marks the failure before the decision: a guardrail verdict, a cheap assertion result, a user's thumbs-down or an escalation flag recorded as an attribute. The useful rule keeps every trace carrying such a mark, plus a uniform slice for the error analysis that finds modes nobody has a mark for yet.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Launch is in two weeks. Legal says no customer content in the observability backend. The eval lead needs 100 production traces with content every two weeks for error analysis. Write the capture policy, and say what you lose."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Spans carry no content in production: `NO_CONTENT`, with model, prompt version, tokens, cost, latency and tool spans on every call. Content goes through the upload hook, redacted there, into a separate store with its own access grant and a retention period legal signs. The eval lead's 100 traces a cycle come from that store into the annotation tool under the same terms. The observability backend never holds content; the labelling group can read a redacted copy.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Two weeks is enough for the policy and the hook, not for a new data platform, so the content store is an existing bucket with a dedicated access role and lifecycle rule. The hook runs for every call regardless of span sampling, so either the store takes 100% of content or the hook samples itself; I sample in the hook, keeping every trace with a guardrail mark or a thumbs-down and a uniform slice, which is also what error analysis wants.</p>
+<p>Redaction in the hook covers the patterns we can name, such as emails, phone numbers and account ids. It does not cover free-text personal details, so the store is treated as personal data regardless, which is why access is a separate grant rather than the observability role.</p>
+<p>What I give up: on-call engineers cannot read a prompt from the trace view during an incident; they request access to the store, which takes time. For the first two weeks after launch I would ask legal for a break-glass role with audit logging, and write down that the delay is accepted if they refuse.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Legal refuses any production content, even redacted. What does error analysis read instead?</em> Internal and consenting users' traces with full capture, production traces with metadata only to find where failures cluster, and replay of real prefixes with synthetic personal data; the analysis states that production-only modes may be missed.</li>
+<li><em>The content store costs more than the rest of telemetry. Which half do you cut?</em> Keep content for marked traces and the uniform slice, drop it for the unmarked remainder; the metadata on every span still supports cost and latency analysis.</li>
+<li><em>What would make you turn on `SPAN_ONLY` in production?</em> A backend that already meets the same access and retention terms as the content store, so that a separate store adds cost without adding control.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The attribute names are from Development-status documents as of 28 October 2026, and they have been renamed before. Check the version your instrumentation library emits before writing queries against the names here; a library that predates the move may still emit names the current documents mark as deprecated.
+
+Structured content may not be supported on spans in your language yet; the spec then asks for a JSON string on spans and the structured form on events, and large payloads can exceed backend limits on attribute size. Measure payload sizes before choosing `SPAN_ONLY` anywhere.
+
+Provider-specific documents may set different span names; the conventions allow it. A mixed-provider system needs a check that the names it queries actually appear.
+
+Cost is not a convention. Prices change and cache multipliers vary by model, so the cost attribute is only as good as the dated price table behind it, and recomputing history after a price change is a reason to store tokens rather than only dollars.
+
+<SelfRate id="lesson:evals/eval-thinking/instrumentation" />

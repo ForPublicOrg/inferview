@@ -1,0 +1,98 @@
+---
+id: wfl-015
+title: Five layers of retries against a provider outage
+subtitle: count the attempts, then choose the one layer that keeps them
+track: workflows
+module: retries-flow-control
+type: estimate
+difficulty: medium
+seniority: [senior, staff]
+minutes: 15
+core: true
+tags: [retries, retry-amplification, temporal, outage, estimation]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: AWS Builder Center, Timeouts, retries and backoff with jitter (published 2019-12-05)
+    url: https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter
+    note: five layers retrying three times each put 243 times the load on a failing database; retry at a single point in the stack; a local token bucket as a retry budget
+  - title: Temporal docs, retry policies (checked 2026-10-28)
+    url: https://docs.temporal.io/encyclopedia/retry-policies
+    note: maximum attempts counts attempts (1 means one attempt and no retries); the default policy has unlimited attempts and a 100-second maximum interval; Schedule-To-Close bounds total retry time; a per-error next retry delay overrides the interval
+  - title: Claude API docs, errors (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/errors
+    note: 529 overloaded_error; the SDK retries connection errors, 429 and 5xx twice by default, honours retry-after, and takes max_retries
+  - title: Claude API docs, rate limits (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: Scale tier limit of 10,000 requests per minute for Claude Sonnet 5.5; the spend-cap 429 carries no retry-after and keeps failing until access resumes
+range: { low: 324, high: 576, unit: provider requests per user request }
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Five service layers each retry three times while the model provider is down. What load reaches the provider, and where should retries live?"
+</Callout>
+
+The system and its numbers are a scenario. A ticket-summary feature runs on Claude Sonnet 5.5. A user request crosses five layers before it reaches the provider, and each layer was configured by a different team:
+
+```text
+layer  component                   retry setting, as written in its config
+1      mobile app HTTP client      retries: 3
+2      API gateway route           max_attempts: 3
+3      summary-service             retry_count = 3   (each try starts a new workflow with a fresh ID)
+4      Temporal activity           RetryPolicy(maximum_attempts=3)
+5      Anthropic Python SDK        Anthropic(max_retries=3)
+```
+
+For twenty minutes the provider answers every request with `529 overloaded_error`, quickly. Each layer waits for the layer below it to give up before it tries again, and no layer cancels work it has stopped waiting for. Forty user requests a second keep arriving. The organisation's Scale tier limit for the model is 10,000 requests per minute (Claude rate-limits page, checked 28 October 2026).
+
+**Estimate how many requests reach the provider for each user request during the outage.** Then turn it into a request rate, and say where the retries should live.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>For each of the five settings, does the number count every attempt or only the tries after the first? Which libraries document it, and which two are internal code you would have to read?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what layer 3 does with the workflows it has stopped waiting for: are they cancelled, or do they keep calling the provider?</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the provider's limit for this model in requests per second, so you can compare the attempt rate with it when the provider comes back.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Attempts multiply down the stack. Temporal's maximum_attempts and the gateway's max_attempts count attempts, so 3 each; the SDK's max_retries counts retries, so 4 attempts; the two in-house settings are 3 or 4 depending on how their code reads them. That gives 3 × 3 × 4 × (3 or 4) × (3 or 4), between 324 and 576 provider requests per user request, or roughly 13,000 to 23,000 requests a second against a limit of about 167. Keep retries in one layer, the Temporal activity, and turn the others off for model errors.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Count each layer in attempts. Temporal documents that a maximum of 1 means a single attempt with no retries, so maximum_attempts=3 is three attempts. The Anthropic SDK's max_retries counts retries on top of the first try (its default of 2 means three attempts), so max_retries=3 is four. The gateway's max_attempts names attempts. retries: 3 in the mobile client and retry_count = 3 in summary-service depend on code you would have to read: 3 if the loop counts tries, 4 if it counts retries after the first.</p>
+<p>Every attempt at layer n runs the whole retry chain of layer n+1, so the counts multiply. The known part is 3 × 3 × 4 = 36. The two unknowns give 36 × 9 = 324, 36 × 12 = 432 or 36 × 16 = 576. At 40 user requests a second the provider receives 40 × 324 = 12,960 to 40 × 576 = 23,040 requests a second, against a limit of 10,000 a minute, about 167 a second. The steady-state attempt rate is the arrival rate times attempts per request, so it holds for as long as the outage does.</p>
+<p>The provider being down is not the dangerous moment; recovery is. When it starts answering, the retry chains still in flight arrive at roughly a hundred times the rate limit, most get 429s, and the SDK retries 429s too. Load that exists only because of the outage keeps the quota saturated after the cause is gone.</p>
+<p>Where retries live. The AWS guidance is to retry at a single point in the stack. For a model step the candidates are the SDK and the Temporal activity. The activity is the better owner: it is durable, it knows which step it is, its attempts are visible in workflow history, a Schedule-To-Close timeout bounds total retry time, and a per-error next retry delay lets it honour retry-after. Set the SDK to max_retries=0, have summary-service start the workflow once with a stable workflow ID so a retry finds the running workflow instead of starting another, and stop the gateway and mobile client from retrying 5xx on this route. Attempts per user request become 3.</p>
+<p>The cost and the failure mode of that choice. Each retry is now a full activity task, slower to schedule and an extra set of history events, and a connection reset the SDK would have absorbed in milliseconds becomes a Temporal retry. The larger risk is that the activity is now the only limit: Temporal's default policy has unlimited attempts, so if a later change drops maximum_attempts, the count goes from 3 to unbounded with no other layer to notice. Pair the policy with a Schedule-To-Close timeout and a retry budget (a local token bucket, as in the AWS article) so retries stop when most calls are failing.</p>
+<p>The other defensible placement is the SDK, with the activity retrying only on worker loss. It keeps fast transient retries cheap and honours retry-after without code, but its retries are invisible to the workflow, cannot see a step budget, and start again from zero if the worker dies.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The provider's 429 says retry-after: 30. Which layer reads it once the SDK no longer retries?</em> The activity, which raises an error carrying a next retry delay of 30 seconds instead of using its own backoff.</li>
+<li><em>Some 429s never clear this month. How does the single retrying layer tell them apart?</em> The spend-cap 429 has no retry-after header and carries the error code enforced_spend_limit_reached; the activity raises it as non-retryable.</li>
+<li><em>The mobile team refuses to remove client retries. What do you ask for instead?</em> Retries only on connection failure, with jitter, carrying the same request ID so summary-service maps them to the same workflow.</li>
+</ul>
+</Fragment>
+</Depth>
+
+The accepted band is 324 to 576. The dominant term is the product of attempts per layer: removing any one layer divides the load by 3 or 4, while tuning backoff changes when the attempts land, not how many there are. 243 is the AWS article's figure, 3 to the fifth power for five layers that each try three times; here it misses that the SDK's 3 means four attempts. 1,024 assumes every setting counts retries, which contradicts the Temporal and gateway documentation. A sum such as 15 or 16 treats the layers as if they took turns.
+
+The assumption that flips the picture is fast failure. If the outage shows up as hanging connections instead of quick 529s, upper layers time out and retry while the chains below them keep running, because nothing cancels them. The attempt count does not fall, and the number of calls in flight at once multiplies on top of it. If every layer cancels its child on timeout, the count does fall; check that before trusting the arithmetic.
+
+## Follow-ups
+
+- *Summary-service retries with the same workflow ID instead of a fresh one. What changes?* Temporal allows one open workflow per ID, so the retry cannot start a second one and summary-service waits on the first; layer 3 stops multiplying model calls, and attempts per user request fall by a factor of 3 or 4 without touching any other layer.
+- *Product wants a summary even during a provider outage. Where does a fallback model go?* In the same activity, as a branch taken after the primary's retry budget is spent, with its own attempt limit, so the fallback is not retried by four other layers.
+- *How would you have seen this before the outage?* Record the attempt number as a span attribute at each layer and alert on the ratio of provider calls to user requests.
+
+## Common mistakes
+
+- Adding the retries instead of multiplying them.
+- Treating every "3" as the same unit, when one library counts attempts and another counts retries.
+- Lowering timeouts at the outer layers and expecting fewer provider calls, while the inner chains keep running.
+- Removing retries from the activity and keeping them in the SDK, then finding the workflow cannot bound or observe them.

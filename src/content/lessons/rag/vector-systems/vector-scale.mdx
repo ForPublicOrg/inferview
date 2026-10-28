@@ -1,0 +1,137 @@
+---
+title: Sharding, multi-tenancy and freshness in vector search
+track: rag
+module: vector-systems
+order: 4
+kind: lesson
+level: staff
+minutes: 12
+summary: At scale vector search is a storage-tier decision (RAM graphs, SSD graphs or object storage behind caches), and the tenant layout and freshness bound follow from which bytes a query must touch cold and how writes reach the index.
+prerequisites: [rag/vector-systems/vector-quantisation, rag/vector-systems/filtered-search]
+updated: 2026-10-28
+sources:
+  - title: turbopuffer docs, Architecture (checked 2026-10-28)
+    url: https://turbopuffer.com/docs/architecture
+    note: "object storage is the durable store, one prefix per namespace, WAL at s3://tpuf/{namespace_id}/wal; writes batched and committed as WAL entries, one commit per namespace per second; write p50 165 ms for 500 kB; strong consistency by default, eventual consistency optional with worst-case staleness about one hour; committed but unindexed WAL entries searched exhaustively; indexers build indexes asynchronously; namespaces too large for one index sharded across internal indexes sharing one WAL; vector index based on SPFresh, centroid-based, fewer round trips and less write amplification than graph indexes such as HNSW or DiskANN; query nodes cache on NVMe SSD and memory, later queries routed to the same node; cold query p50 874 ms and warm p50 14 ms at 1M documents; object storage round trip about 100 ms; cold query often about 400 ms in 3 to 4 round trips; pre-flight query to warm the cache"
+  - title: turbopuffer docs, Limits (checked 2026-10-28)
+    url: https://turbopuffer.com/docs/limits
+    note: "namespaces unlimited (seen 250M+); max documents per shard 500M at 1 TB; max shards per namespace 256; write throughput per namespace 10k writes/s at 32 MB/s; max ingested unindexed data 2 GB; max concurrent queries per unpinned namespace 16; max pinned namespaces 256; vector search recall@10 90-100%; max inactive time in cache listed as hours"
+  - title: "Subramanya et al., DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node (NeurIPS 2019)"
+    url: https://proceedings.neurips.cc/paper/2019/hash/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Abstract.html
+    note: "billion-point index on a workstation with 64 GB RAM and an SSD; over 5,000 QPS, mean latency under 3 ms, 95%+ 1-recall@1 on SIFT1B with 16 cores; PQ codes (e.g. 32 bytes per point) in RAM, graph and full-precision vectors on SSD; aims for a few dozen random reads and under ten, preferably five, round trips per query; merged index from k = 40 overlapping k-means partitions, each point sent to 2 nearest, at most 20% extra latency for a target recall against a single index"
+  - title: "Xu et al., SPFresh: Incremental In-Place Update for Billion-Scale Vector Search (arXiv 2410.14452, SOSP 2023)"
+    url: https://arxiv.org/abs/2410.14452
+    note: "in-place updates instead of periodic global rebuilds; LIRE splits partitions and reassigns vectors at partition boundaries; 1% of the DRAM and under 10% of the cores of the state of the art at peak, on a billion-scale index with a 1% daily update rate"
+  - title: Pinecone docs, Implement multitenancy (API version 2026-07, checked 2026-10-28)
+    url: https://docs.pinecone.io/guides/index-data/implement-multitenancy
+    note: "one namespace per tenant on serverless indexes; physical isolation; queries cost 1 RU per GB of namespace; 100 tenants of 1 GB: 1 RU per tenant query against 100 RU with metadata filtering in one 100 GB namespace; 100 (Starter) to 1,000,000 (Enterprise) namespaces per serverless index; $in and $nin limited to 10,000 values; deleting a namespace offboards a tenant"
+  - title: Qdrant docs, Multitenancy (checked 2026-10-28)
+    url: https://qdrant.tech/documentation/guides/multiple-partitions/
+    note: "a collection per tenant is rarely efficient; Qdrant Cloud limits a cluster to 1,000 collections by default; payload partitioning with is_tenant (v1.11.0); tiered multitenancy (v1.16.0) promotes a growing tenant from a shared fallback shard to a dedicated shard, suggested at about 20,000 points; keep dedicated shards under 1,000 per cluster"
+  - title: "Malkov and Yashunin, HNSW (arXiv 1603.09320 v4, 2018-08-14)"
+    url: https://arxiv.org/abs/1603.09320
+    note: "search always starts from the top layer, so the structure cannot be distributed with NSW's techniques; partitioning data across nodes works but total throughput does not scale well with node count"
+  - title: "PracHub, Vector database interview questions: HNSW, IVF, filtering and recall vs latency (2026-08-13)"
+    url: https://prachub.com/resources/vector-database-interview-questions-hnsw-ivf-filtering-and-recall-vs-latency
+    note: "synthesised question bank covering index freshness, embedding versioning, blue-green rebuilds, sharding and fan-out, and per-tenant partitions versus shared indexes; no company attribution"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+Once the vectors outgrow the RAM of the machines you are willing to pay for, the algorithm matters less than where the bytes a query touches live. Three published designs mark the range. A RAM-resident graph (HNSW) keeps everything in memory and pays for it in RAM. An SSD-resident graph (DiskANN) keeps compressed codes in RAM and the graph with full vectors on local SSD. An object-storage engine (turbopuffer) keeps everything durable in S3-compatible storage and caches what is being queried on NVMe and in memory. Each step down the list cuts the cost per stored gigabyte and raises the latency of the first query that finds nothing in a faster tier.
+
+The tenant layout and the freshness bound follow from that choice. With many small tenants, most tenants are cold most of the time, so the cold-query latency of the tier is the latency those tenants see. With a write path that commits to a log and indexes later, freshness is the commit interval plus whatever it costs to search the part of the log not yet indexed.
+
+## The three tiers, with their published numbers
+
+**RAM.** HNSW's graph adds about 151 bytes per node at M = 16 to the vector itself, so RAM is set by vector bytes, and the quantisation lesson's budget arithmetic applies. Latency is a few distance computations per hop and no I/O. The HNSW paper notes a limit for scale-out: search always starts at the single top layer, so the structure is distributed by partitioning the data across nodes, and the authors report that total throughput then does not scale well with node count. With data partitioned by hash, every query has to search every partition.
+
+**Local SSD.** DiskANN (NeurIPS 2019) indexed a billion SIFT vectors on one workstation with 64 GB of RAM and an inexpensive SSD, serving over 5,000 queries per second with mean latency under 3 ms at 95%+ 1-recall@1 on 16 cores. The layout is the point: product-quantised codes (32 bytes per point in the paper's example, so 32 GB for a billion points) stay in RAM to steer the walk, and each node's full vector and neighbour list sit together on SSD so one read returns both. The authors set the design target as a few dozen random reads and fewer than ten round trips per query, preferably five, because each SSD round trip costs a few hundred microseconds.
+
+**Object storage behind caches.** turbopuffer's architecture page describes a write-ahead log per namespace in object storage, indexers that build indexes asynchronously from it, and query nodes that cache a namespace's data on NVMe and in memory after its first query, with later queries routed to the same node. Its published latencies at 1M documents are a cold p50 of 874 ms and a warm p50 of 14 ms. An object-storage round trip is about 100 ms, and a cold vector query takes 3 to 4 of them (often about 400 ms, per the same page): fetch the centroid index, find the nearest centroids, then fetch all the needed clusters in one large request, plus consistency checks. That is why the vector index is centroid-based (derived from SPFresh) rather than a graph: the docs state centroid indexes need fewer round trips and less write amplification than HNSW or DiskANN, whose walks are sequences of dependent reads.
+
+The analogy for the object-storage design is a log-structured store with its log in S3. The difference that matters is the read path: an LSM read touches a few sorted files by key, while a cold vector query must first learn which clusters to read, which is one extra round trip that no key layout removes.
+
+## Tenants
+
+There are three layouts, and every engine offers some combination.
+
+**An index per tenant.** Pinecone recommends one namespace per tenant on serverless indexes, with physical isolation, and prices queries at 1 read unit per GB of the namespace searched: its own example is 100 tenants of 1 GB, where a tenant's query costs 1 RU in its namespace and 100 RU through a metadata filter on a shared 100 GB namespace. Offboarding is deleting the namespace. The limit is a count: 100 namespaces per serverless index on Starter up to 1,000,000 on Enterprise (API version 2026-07). turbopuffer lists namespaces as unlimited, having seen more than 250M, with each namespace its own prefix in object storage.
+
+**A shared index with a tenant filter.** Cheapest to operate and the worst for isolation: one tenant's data shapes the graph every other tenant searches, and a small tenant's predicate is the narrow-filter case from the filtered-search playbook.
+
+**A shared collection laid out by tenant.** Qdrant's guide says a collection per tenant is rarely efficient and caps Qdrant Cloud clusters at 1,000 collections by default; instead it co-locates each tenant's vectors with an `is_tenant` payload index and, from version 1.16, promotes a tenant that grows past about 20,000 points from a shared fallback shard to a dedicated one without application changes.
+
+The cost the per-tenant layout hides is cold start. A tenant that queries once a day pays the cold path once a day, and on an object-storage engine that is the first query of that tenant's session.
+
+<Predict id="rag-vs-scale-warm-set" question="Cache needed to keep every tenant active in the past hour warm, in GB?" answer={246} tolerance={3} unit="GB">
+<Fragment slot="prompt">
+<p>Scenario: 1M tenants averaging 2,000 chunks, 1,024-dimension float32 vectors (4,096 bytes each), vectors only. In a typical hour, 3% of tenants send at least one query.</p>
+</Fragment>
+<p><b>About 246 GB.</b> One tenant is 2,000 x 4,096 = 8.19 MB; the corpus is 8.19 TB; 3% of tenants is 30,000, and 30,000 x 8.19 MB = 245.8 GB. That fits on the NVMe of a few nodes, so the hourly working set is cheap to hold. The expensive part is the arrival rate of first queries: 30,000 tenants an hour is about 8 cold queries a second, each paying the cold path. turbopuffer's published cold p50 is for a 1M-document namespace; a 2,000-chunk namespace still needs its round trips, so the round-trip count, not the size, sets its first-query latency.</p>
+</Predict>
+
+Engines offer two levers on cold start, and both are trades. A pre-flight query (turbopuffer documents one) warms a namespace when the application knows a session is starting, such as at login, which moves the cold path off the user's first search. Pinning or provisioning keeps chosen namespaces resident and turns a latency problem into a cost line; turbopuffer's limits page lists up to 256 pinned namespaces and 16 concurrent queries per unpinned namespace, and does not state how long an idle namespace stays cached beyond "hours".
+
+## Sharding a large tenant
+
+Many small tenants is a placement problem; one large tenant is a sharding problem, and the costs are the usual fan-out costs plus one specific to graphs. Partition by vector neighbourhood and a query must still visit several partitions, because its neighbours straddle boundaries; partition by hash and every query visits every shard, which is the throughput ceiling the HNSW authors describe.
+
+DiskANN's merged index is a published middle path: k-means into 40 partitions, each point sent to its 2 nearest centres, a graph built per partition in memory, and the graphs merged into one by taking the union of edges. The build stayed under 64 GB of RAM, and the merged index needed no more than 20% extra latency for a target recall compared with a single-shot build. turbopuffer shards a namespace that is too large for one index across several internal indexes that share one log, with a stated ceiling of 500M documents per shard and 256 shards per namespace.
+
+## Freshness
+
+On the object-storage design, a write is durable when it is in the log. turbopuffer commits at most one log entry per namespace per second, batching writes that arrive in the same window, and reports a write p50 of 165 ms for 500 kB. Queries are strongly consistent by default, so a query after a successful write sees it: the committed but unindexed tail of the log is searched exhaustively until the indexers catch up, with at most 2 GB of ingested, unindexed data per namespace in the limits. The bound on freshness is therefore the commit interval, and its price is the exhaustive scan of the tail, which grows with write bursts. Eventual consistency is the opt-out: warm queries get faster and may be stale by up to about an hour.
+
+On graph indexes, freshness is a delete problem. Inserts go into the graph, but updates and deletes become tombstones that degrade recall until a rebuild, which is the HNSW lesson's policy question at a larger scale. SPFresh is the published alternative for centroid indexes: instead of buffering updates and rebuilding globally, it splits partitions that grow and reassigns only the vectors near partition boundaries. The paper reports needing 1% of the DRAM and under 10% of the cores of the state of the art at peak, on a billion-scale index with a 1% daily update rate.
+
+```python
+def cold_starts_per_second(tenants, active_share_per_hour):
+    """First queries per second if each active tenant goes cold between hours."""
+    return tenants * active_share_per_hour / 3600
+
+
+def warm_set_gb(tenants, active_share_per_hour, chunks, bytes_per_vector):
+    return tenants * active_share_per_hour * chunks * bytes_per_vector / 1e9
+
+
+print(round(cold_starts_per_second(1_000_000, 0.03), 1))           # 8.3
+print(round(warm_set_gb(1_000_000, 0.03, 2_000, 4_096), 1))        # 245.8
+print(round(warm_set_gb(1_000_000, 0.03, 2_000, 4_096 // 32), 1))  # 7.7 with binary codes
+```
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You run retrieval for 20,000 business tenants with 500M chunks in total; the five largest tenants hold 40% of the chunks and most tenants query a few times a week. Contracts promise a 300 ms p95 for search, including the first query of a session, and deletion within 24 hours with evidence. Four engineers own it and the storage bill must fall by half this year. Which storage tier and tenant layout do you choose?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Two layouts in one system. The five large tenants get dedicated, always-warm indexes, RAM or SSD resident, because they carry the traffic and their size makes cold starts expensive. The long tail goes to an index per tenant on object storage, with a pre-flight warm at session start to keep the first query inside 300 ms. Deletion is per-tenant deletion of a namespace or log entries, with the timestamp recorded as evidence.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Where the bytes go. The five tenants hold 200M chunks; at 1,024 float32 dimensions that is 819 GB of vectors, and quantised codes in RAM with full vectors on SSD (the DiskANN layout) cuts RAM to a fraction of it. The other 300M chunks across 19,995 tenants average 15,000 chunks each, rarely queried, which is the case object storage prices well.</p>
+<p>The p95 promise. A published cold p50 of 874 ms (turbopuffer, 1M documents) does not meet 300 ms at the median, let alone p95, so the first query of a session cannot be cold. Warming at login moves it off the user's path; for tenants whose sessions begin with a search and no login event, pinning is the fallback, at a cost I would price against the savings.</p>
+<p>Deletion. Per-tenant indexes make tenant offboarding a namespace delete; row deletes inside a tenant are log entries, and the evidence is the commit time plus the indexer's catch-up time. What I give up: two systems to operate with four engineers, and a p95 that depends on a warm-up hook in the application. Written down: the warm-up contract with the application team, the large-tenant threshold, and the measured cold and warm latencies per tier before signing the 300 ms promise.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Finance says the always-warm tier for five tenants eats most of the savings. What do you cut?</em> Quantise their in-RAM codes further and move full vectors to SSD, or move the smallest of the five to the object-storage tier with pinning, and record which tenant's p95 now depends on the cache.</li>
+<li><em>What would you need to see to put everything on object storage?</em> Measured warm-up coverage near all first queries and a cold p95 inside the promise for the large tenants' namespace sizes.</li>
+<li><em>A large tenant asks for proof that deleted chunks are gone from caches and backups too. Can you give it?</em> Only for what the design controls: log and index deletion times; cache eviction and object-storage version retention need their own documented windows, or the contract wording changes.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The latencies here are from vendor documentation and one paper, each under its own conditions: turbopuffer's at 1M documents with unstated dimensions and percentiles beyond p50, DiskANN's on SIFT1B with 128-dimension vectors on 2019 hardware. They show the ratios between tiers, roughly 100 ms per object-storage round trip against hundreds of microseconds per SSD read against nothing for RAM; your numbers come from running your namespace sizes on your hardware.
+
+The tenant arithmetic assumes tenants go cold independently. Real activity is correlated by time zone and working hours, so first queries arrive in a burst at the start of each business day, and the warm-up path has to absorb that burst. Finally, the cheapest tier is only cheap while the workload matches it: a tenant that queries constantly lives in the cache tier anyway and gains nothing from cheap cold bytes, and the right layout moves tenants between tiers as their traffic changes, which is what tenant promotion in Qdrant and pinning in turbopuffer are for.
+
+<SelfRate id="lesson:rag/vector-systems/vector-scale" />

@@ -1,0 +1,199 @@
+---
+title: Human-in-the-loop mechanics across stacks
+track: workflows
+module: approvals-handoffs
+order: 1
+kind: lesson
+level: senior
+minutes: 13
+summary: A pause is a persisted checkpoint plus a re-entry rule, and the re-entry rule decides which of your code runs twice when a human answers.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: LangGraph docs, interrupts (checked 2026-10-28)
+    url: https://docs.langchain.com/oss/python/langgraph/interrupts
+    note: the node restarts from the beginning on resume; index-based matching; try/except, loop and idempotency rules; resume map by interrupt id; response_schema needs langgraph 1.2.12 or later
+  - title: OpenAI Agents SDK docs, human-in-the-loop (checked 2026-10-28)
+    url: https://openai.github.io/openai-agents-python/human_in_the_loop/
+    note: needs_approval as bool or callable that fails closed; interruptions and ToolApprovalItem; to_state, approve, reject, RunState.from_json; sticky decisions and their scope; ShellTool and ApplyPatchTool default to no approval; version marker for long approvals
+  - title: Temporal docs, workflow message passing (checked 2026-10-28)
+    url: https://docs.temporal.io/encyclopedia/workflow-message-passing
+    note: Signals are asynchronous writes, Updates are synchronous tracked writes with validators, Queries are reads that add nothing to history
+  - title: Temporal docs, Python message passing (checked 2026-10-28)
+    url: https://docs.temporal.io/develop/python/message-passing
+    note: workflow.update and validator syntax; a rejected Update adds no WorkflowExecutionUpdateAccepted event; all_handlers_finished
+  - title: Temporal Python SDK reference, wait_condition (checked 2026-10-28)
+    url: https://python.temporal.io/temporalio.workflow._context.html
+    note: timeout raises asyncio.TimeoutError; switching the timeout between None and a positive value is a nondeterministic change
+  - title: Temporal Cloud docs, limits (checked 2026-10-28)
+    url: https://docs.temporal.io/cloud/limits
+    note: 10 in-flight Updates and 2,000 total Updates per execution; up to 10,000 Signals per execution
+  - title: Dify docs, Human Input node (checked 2026-10-28)
+    url: https://docs.dify.ai/en/use-dify/nodes/human-input
+    note: web app and email delivery; anyone with the email link can respond; closes after the first response; default timeout 3 days; timeout branch or the workflow ends
+  - title: Flowise docs, Agentflow V2 (checked 2026-10-28)
+    url: https://docs.flowiseai.com/using-flowise/agentflowv2
+    note: Human Input node with proceed and reject outputs, fixed or LLM-generated description, checkpoints that survive a restart, Require Human Input flag on agent tools
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The re-entry rule is the design
+
+Every stack implements a human pause the same way at the storage layer: persist enough state to continue, surface a payload to a person, release the worker, accept a decision later, continue. Where they differ is the point at which execution re-enters after the decision arrives. That point decides which lines run twice, how a decision is matched to the pause it answers, and what has to be idempotent. Establish the stack's re-entry rule first; the rest of the approval design follows from it.
+
+| Stack (docs checked 2026-10-28) | What is persisted | Where execution re-enters | How a decision finds its pause | Timeout |
+|---|---|---|---|---|
+| LangGraph `interrupt()` | a checkpoint per `thread_id` | the first line of the interrupted node | by position of the `interrupt()` call in the node; by interrupt id across parallel branches | not part of the interrupt API |
+| OpenAI Agents SDK approvals | a `RunState` you serialise and store | the paused run, with the decision recorded per tool call | by tool call id; optionally sticky per tool | not described in the docs |
+| Temporal Update or Signal | the workflow's event history | the workflow function replays from history; the wait returns | by the handler you call on a workflow id | `wait_condition(timeout=...)` raises `asyncio.TimeoutError` |
+| Dify Human Input node | managed by the engine | the branch wired to the chosen button | the first response closes the request | 3 days by default, then the timeout branch |
+| Flowise Agentflow V2 Human Input node | checkpoints that survive a restart | the proceed or reject output | one decision per node | not documented |
+
+## LangGraph: the node runs again from line one
+
+`interrupt(value)` saves state through the checkpointer and surfaces `value` to the caller under `__interrupt__` (or on `stream.interrupts` with the v3 streaming API). You resume by invoking the graph again on the same `thread_id` with `Command(resume=...)`, and the resume value becomes the return value of `interrupt()`. Three requirements come with it: a checkpointer (durable in production, since the in-memory one dies with the process), the same thread id on resume (a new id starts an empty thread), and a JSON-serialisable payload.
+
+The docs are blunt about re-entry: the runtime "restarts the entire node from the beginning", not from the line that called `interrupt()`. This is a re-executed transaction body, not a resumed coroutine. Anything before the pause runs on the first pass and again on resume.
+
+```python
+from langgraph.types import interrupt
+
+def approve_refund(state):
+    db.insert_audit(state["refund_id"], "approval requested")
+    decision = interrupt({"refund_id": state["refund_id"], "amount": state["amount"]})
+    if decision["approved"]:
+        payments.refund(state["refund_id"], state["amount"])
+    return {"approved": decision["approved"]}
+```
+
+Two audit rows per approved refund, and nothing errors. The fixes, in order of preference: put the insert in its own node that runs before `approve_refund`, so it is committed in an earlier checkpoint and never re-entered; or make it an upsert keyed on something stable across passes, such as `(thread_id, "approve_refund", refund_id)`. A `uuid4()` minted inside the node is not stable; it changes on every pass and defeats the key. The refund call after the interrupt has the opposite exposure: a crash after `payments.refund` returns and before the node's checkpoint is written runs it again on recovery. It needs a provider idempotency key derived from the same stable tuple.
+
+The second rule is matching. With several `interrupt()` calls in one node, "matching is strictly index-based": the first resume value answers the first call, the second answers the second. A conditional interrupt is safe only if the condition reads the node's input state, which is identical on every pass. A condition that reads a feature flag, the clock or a database row can change between the first pass and the resume; the call disappears, every later index shifts by one, and the finance approver's answer is read as the manager's.
+
+<Predict id="hitl-node-passes" question="By the time the node returns, how many times has its first line executed?" answer={4} tolerance={0} unit="executions">
+<Fragment slot="prompt">
+<p>A node calls <code>interrupt()</code> three times in sequence, and the human answers each pause in a separate resume call. The first line of the node is a log statement.</p>
+</Fragment>
+<p><b>Four.</b> The initial run executes it and stops at the first interrupt. Each of the three resumes restarts the node: the first resume gets a value back from interrupt 1 and stops at interrupt 2, the second stops at interrupt 3, the third runs to the end. Splitting into one pause per node, with a conditional edge back where input must be re-asked, keeps every node at two executions.</p>
+</Predict>
+
+Two more rules fall out of the same mechanism. `interrupt()` pauses by raising an exception, so a bare `try/except` around it catches the pause and the graph never stops; catch specific exception types. A `while True` validation loop with `interrupt()` inside replays every earlier iteration on each resume; call `interrupt()` once and route back with a conditional edge until the input is valid. When parallel branches each interrupt, the result carries one entry per pending interrupt with an `id`, and you resume them together with a map from id to value. From langgraph 1.2.12, `interrupt()` accepts a `response_schema` (Pydantic model, `TypedDict` or dataclass) and validates the resume value against it; without it, whatever the client sends becomes the return value.
+
+## OpenAI Agents SDK: decisions per tool call, state you carry
+
+Approval is declared on the tool. `needs_approval=True` always pauses; an async callable receives the run context, the parsed arguments and the call id and decides per call. The callable fails closed: if the arguments cannot be inspected safely, it is not invoked and the call waits for a human. For the local `ShellTool` and `ApplyPatchTool`, `needs_approval` defaults to `False`, so the two tools with the widest blast radius in a coding agent run unreviewed unless you opt in.
+
+When a call needs a decision and none is stored, the run stops and `result.interruptions` holds `ToolApprovalItem` entries with the agent name, tool name and arguments. The resume path, with storage left to you:
+
+```python
+state = result.to_state()
+store.put(run_id, state.to_string())
+
+# later, possibly in another process
+state = await RunState.from_json(agent, json.loads(store.get(run_id)))
+for item in state.get_interruptions():
+    if reviewer_said_yes(item):
+        state.approve(item)
+    else:
+        state.reject(item, rejection_message="Refund denied by finance.")
+result = await Runner.run(agent, state)   # the original top-level agent
+```
+
+Decisions are keyed by call id. `always_approve=True` or `always_reject=True` makes a decision sticky for later calls to the same tool identity, and the scope differs by tool type: for function tools it is the requesting agent, while for shell and file-edit tools it is tool type and name, so a sticky approval can survive a handoff to another agent. You can resolve some interruptions and resume; the unresolved ones pause the run again. For approvals that sit for days, the docs recommend storing a version marker for your agent definitions with the serialised state and routing deserialisation to the matching code path, which is the in-flight code change problem again.
+
+## Temporal: an Update carries the decision
+
+Temporal gives three message types. A Query reads workflow state and adds nothing to history. A Signal is an asynchronous write: the sender cannot wait for a result or an error. An Update is a synchronous, tracked write: the sender waits for the worker to accept it and gets a result or an error back, and a validator can reject it before it enters history (a rejected Update adds no `WorkflowExecutionUpdateAccepted` event). For a reviewer clicking approve, the Update is the right shape, because the click needs to learn "already decided" or "arguments changed since you looked" before the page says done. A Signal followed by Query polling gets there with more moving parts.
+
+Re-entry runs the other way from LangGraph. The workflow function replays from its event history on any worker; completed activities return their recorded results instead of running, and the accepted Update replays into its handler. Side effects live in activities, so the double insert above does not happen in workflow code, but activities themselves are at-least-once and still need keys.
+
+```python
+import asyncio
+from dataclasses import dataclass
+from datetime import timedelta
+from temporalio import workflow
+
+@dataclass
+class Decision:
+    approved: bool
+    args_digest: str   # digest of the exact arguments the reviewer was shown
+
+@workflow.defn
+class RefundApproval:
+    def __init__(self) -> None:
+        self.decision: Decision | None = None
+        self.digest = ""
+
+    @workflow.run
+    async def run(self, req: dict) -> str:
+        self.digest = req["args_digest"]
+        try:
+            await workflow.wait_condition(lambda: self.decision is not None,
+                                          timeout=timedelta(hours=24))
+        except asyncio.TimeoutError:
+            return "escalated"
+        if not self.decision.approved:
+            return "rejected"
+        await workflow.execute_activity("issue_refund", req,
+                                        start_to_close_timeout=timedelta(minutes=2))
+        return "refunded"
+
+    @workflow.update
+    def decide(self, d: Decision) -> str:
+        self.decision = d
+        return "recorded"
+
+    @decide.validator
+    def validate_decide(self, d: Decision) -> None:
+        if self.decision is not None:
+            raise ValueError("already decided")
+        if d.args_digest != self.digest:
+            raise ValueError("decision is for different arguments")
+```
+
+The client calls `await handle.execute_update(RefundApproval.decide, Decision(True, digest))` and gets either `"recorded"` or the validator's error. Two operating details matter. The SDK reference warns that switching a `wait_condition` timeout between `None` and a positive value is a nondeterministic change, so adding a timeout to a deployed approval workflow needs a versioning branch, not a plain edit. And Temporal Cloud caps a single execution at 10 in-flight Updates, 2,000 total Updates in history and 10,000 Signals. One long-lived workflow that collects every approval for a stream of invoices stops accepting Updates at its 2,000th decision, which argues for one workflow per approvable item. A workflow that can return while a handler is still running should first `await workflow.wait_condition(workflow.all_handlers_finished)`.
+
+## Dify and Flowise: the pause is a node
+
+Dify's Human Input node pauses the workflow and renders a form with buttons; each button routes to its own branch, and downstream nodes read `__action_id`, `__action_value` and the field values. Delivery is either the web app (not available when a Trigger started the workflow) or email to workspace members, external addresses or the whole workspace. On the email path, anyone holding the link can respond without a Dify account, so the link is a bearer credential. The request closes after the first response, which settles a double-submit race inside the engine but says nothing about who submitted. The default timeout is 3 days; on expiry the workflow takes the timeout branch, and if none is wired, the workflow ends.
+
+Flowise's Agentflow V2 Human Input node has two outputs, proceed and reject, with optional feedback appended to the node's output. Its description can be fixed text with variables or generated by an LLM from a prompt, which means the reviewer may be reading a model's account of the action rather than the action. Checkpoints are saved so a paused flow resumes after an application restart, and the Agent node has a per-tool Require Human Input flag. The page documents neither a timeout nor where checkpoints are stored, so for both low-code tools the test before production is to kill the server mid-pause and confirm the run resumes with its state intact.
+
+<Callout kind="gotcha">On every stack above, the pause is not a transaction boundary with the outside world. Whatever ran before the pause, and whatever runs after the decision until the next checkpoint, can run again. Count the side effects in each of those two windows before choosing where the pause goes.</Callout>
+
+## In the room
+
+Your LangGraph refund agent writes an audit row and then calls `interrupt()`. Finance has found duplicate audit rows and wants approval enforced for refunds above a threshold within three weeks. The platform team offers Temporal but cannot onboard you until next quarter. What do you ship, and what do you accept?
+
+<Depth>
+<Fragment slot="short">
+<p>Stay on LangGraph for this deadline and fix the re-entry problem rather than the engine. Move the audit insert into its own node before the approval node, put the refund in a node after it with a provider idempotency key derived from the thread id and refund id, validate the resume value with a response schema, and run a durable checkpointer. The cost I accept is that timeouts and "already decided" checks live in my code, not in the engine.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The duplicates come from the node restarting from its first line, so the engine is working as documented. Splitting the node gives three checkpoints: audit committed, decision recorded, refund issued. The refund node needs a provider key because a crash after the provider accepts and before the checkpoint is written re-runs the node. The audit node can also be an upsert on (thread_id, refund_id), so a retry of that node is harmless.</p>
+<p>LangGraph's interrupt API has no timeout, so a sweeper resumes stale threads with a reject decision. That sweeper is a second writer to the thread, so every resume goes through one function that checks the thread is still pending and refuses otherwise; it is the same compare-and-set the approval endpoint needs for double clicks. The reviewer is shown the amount and recipient read from state, not text produced by the model.</p>
+<p>What Temporal would add is a validator that rejects a stale decision before it enters history and a durable timer in place of the sweeper. Those are real gains, and I would write them down as the reason to move when onboarding opens, not as a reason to miss finance's date.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The sweeper and a reviewer resume the same thread within the same second. Which wins, where is that enforced, and what does the losing caller see?</li>
+<li>Finance now wants reviewers to edit the amount before approving. What changes in the response schema, the audit record and the idempotency key?</li>
+<li>What would you need to see in production over the next quarter to decide the move to Temporal is not worth it?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The table describes docs checked on 2026-10-28, and these APIs move: LangGraph's docs now show interrupts on `stream.interrupts` under `stream_events(..., version="v3")` alongside `__interrupt__` from `invoke()`, and `response_schema` arrived in 1.2.12. Re-check the re-entry rule against the version you pin.
+
+The "runs twice" hazard only exists where side effects sit inside the re-entered window. A pure LangGraph node, or Temporal workflow code that only calls activities, can be re-entered any number of times. If no writes happen before any pause, the restart rule costs nothing and the effort belongs in the window after the decision.
+
+Low-code engines document behaviour, not guarantees. Dify's and Flowise's pages do not say how pending requests are stored, whether two engine replicas can both resume one, or what happens to a pending form when the workflow definition is edited. Treat those as unknown until a test shows otherwise.
+
+A blocking pause is also one design among several. When reviewers are slower than the business tolerates and actions are reversible, executing immediately and sampling decisions for review afterwards can be the better control. That is a policy question, taken up in the next lesson.
+
+<SelfRate id="lesson:workflows/approvals-handoffs/hitl-mechanics" />

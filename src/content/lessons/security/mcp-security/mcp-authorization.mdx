@@ -1,0 +1,294 @@
+---
+title: Implementing MCP authorisation correctly
+track: security
+module: mcp-security
+order: 1
+kind: lesson
+level: staff
+minutes: 16
+summary: What the 2026-07-28 MCP revision requires of a protected server and of a client, which of those checks hold by construction, and a tested implementation of token validation, issuer binding and authorisation URL handling.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: MCP specification 2026-07-28, Authorization
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization
+    note: "optional for HTTP transports, stdio takes credentials from the environment; servers MUST implement RFC 9728; scope in WWW-Authenticate; scope selection order; issuer recorded with the PKCE verifier; the iss validation table and the ban on normalisation; resource parameter on authorization and token requests even when the AS ignores it; audience validation; no other tokens accepted or transited; 403 insufficient_scope with all needed scopes in one challenge; servers account for scope hierarchies; read 2026-10-28"
+  - title: MCP 2026-07-28, Authorization Server Discovery
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/authorization-server-discovery
+    note: "PRM via WWW-Authenticate resource_metadata or well-known URIs, path first; RFC 8414 then OIDC discovery endpoints in priority order; metadata issuer MUST be identical to the issuer used to build the URL (attacker.example serving honest.example is rejected); separate registration state per AS"
+  - title: MCP 2026-07-28, Client Registration
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/client-registration
+    note: "priority: pre-registered, then Client ID Metadata Documents when client_id_metadata_document_supported, then DCR, then ask the user; DCR deprecated; credentials keyed by issuer and never reused with another AS; CIMD client IDs portable across AS"
+  - title: MCP 2026-07-28, Authorization Security Considerations
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/security-considerations
+    note: "PKCE required, S256 when capable, refuse if code_challenge_methods_supported is absent; AS endpoints over HTTPS; redirect URIs localhost or HTTPS; mix-up mitigation; short-lived access tokens, refresh token rotation for public clients; the MCP server MUST NOT pass through the token it received"
+  - title: MCP 2026-07-28, Security Best Practices
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/security_best_practices
+    note: "token passthrough risks; SSRF from resource_metadata, authorization_servers and AS metadata URLs, ranges to block, no hand-written IP parsers, DNS TOCTOU; authorization URL validation: only http and https (http only for loopback in development), reject javascript:, data:, file:, vbscript:, never open through a shell; PKCE alone does not stop mix-up because the verifier goes to the attacker's token endpoint; localhost redirect impersonation under CIMD; scope minimisation and its common mistakes"
+  - title: MCP 2026-07-28, Key Changes (changelog)
+    url: https://modelcontextprotocol.io/specification/2026-07-28/changelog
+    note: "iss SHOULD be sent and MUST be validated when present (SEP-2468); application_type in DCR (SEP-837); credentials bound to the issuing AS (SEP-2352); DCR deprecated in favour of CIMD (PR 2858)"
+  - title: MCP 2026-07-28, Deprecated features registry
+    url: https://modelcontextprotocol.io/specification/2026-07-28/deprecated
+    note: "Dynamic Client Registration deprecated in 2026-07-28; earliest removal is the first revision released on or after 2027-07-28"
+  - title: MCP specification, Versioning
+    url: https://modelcontextprotocol.io/specification/versioning
+    note: "2026-07-28 is the current revision as of 2026-10-28; deprecated features stay at least twelve months (ninety days under expedited removal)"
+  - title: RFC 9207, OAuth 2.0 Authorization Server Issuer Identification
+    url: https://www.rfc-editor.org/rfc/rfc9207
+    note: "the authorization response carries no issuer identity without iss; clients that talk to one AS are not vulnerable to mix-up until they add a second"
+  - title: RFC 7636, Proof Key for Code Exchange
+    url: https://www.rfc-editor.org/rfc/rfc7636
+    note: "section 4.1: code_verifier is 43 to 128 characters"
+  - title: RFC 8693, OAuth 2.0 Token Exchange
+    url: https://www.rfc-editor.org/rfc/rfc8693
+    note: "exchanging a subject token for a token with a different resource or audience; the act claim records delegation"
+  - title: OpenID Connect Core 1.0, section 5.7 Claim Stability and Uniqueness
+    url: https://openid.net/specs/openid-connect-core-1_0.html
+    note: "sub is unique only within the issuer; iss and sub together are the only stable identifier"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Two parties, two checklists
+
+Over HTTP, a protected MCP server is an OAuth 2.1 resource server and the MCP client is an OAuth client. Authorisation is optional in the specification; when a server implements it over HTTP it should follow this flow, and a stdio server should not, taking credentials from its environment instead. Everything below is the HTTP case, against the 2026-07-28 revision, which the versioning page names as current on 2026-10-28.
+
+What makes MCP different from the OAuth integrations most teams have shipped is the trust direction. A web app talks to one or two authorisation servers that someone on the team configured. An MCP client is pointed at arbitrary servers by its users, and each server tells the client which authorisation server to use, where its endpoints are and which URL to open in a browser. Every one of those values is attacker input until checked. Most of the client's duties in the specification are checks on values a malicious server chose; most of the server's duties are refusals to treat a token as more than it is.
+
+## What the server owes
+
+**Advertise where tokens come from.** The server must publish Protected Resource Metadata (RFC 9728) with at least one entry in `authorization_servers`. It can point to the document from the `resource_metadata` parameter of a 401 challenge, serve it at a well-known path, or both; clients try the challenge first, then the path-suffixed well-known URI, then the root one.
+
+**Challenge with the scopes the operation needs.** A request without a token gets 401 with `WWW-Authenticate: Bearer resource_metadata="...", scope="..."`. A valid token that lacks scope gets 403 with `error="insufficient_scope"`, the `scope` the operation needs, and the metadata URL again. The specification asks for every scope the current operation needs in a single challenge, because a server that reveals one missing scope per retry forces one browser round trip per scope. The client, not the server, accumulates scopes: on step-up it requests the union of what it had and what the challenge names, so the server can stay stateless about grants.
+
+**Accept only its own tokens.** The server must validate tokens per OAuth 2.1 section 5.2, must check that it is the audience, and must not "accept or transit any other tokens". If it calls an upstream API, it does so as an OAuth client with a separate token issued by the upstream's authorisation server. Forwarding the inbound token is token passthrough, and the best-practices page lists what breaks: upstream rate limits and audit attribute calls to the wrong principal, the MCP server cannot tell clients apart, and a stolen token gains a proxy.
+
+**Check scopes against a hierarchy.** If `files:admin` implies `files:write`, the server must honour that when deciding sufficiency. Claimed scopes are an input to authorisation, not the decision; the best-practices page lists treating claimed scopes as sufficient without server-side authorisation logic as a common mistake.
+
+## What the client owes
+
+Nine checks, each on a value the server or an authorisation server chose:
+
+1. **Fetch discovery URLs as SSRF-prone requests.** `resource_metadata`, `authorization_servers` and every endpoint in authorisation server metadata come from the server. A client running server-side should require HTTPS, block private, loopback and link-local ranges (the page lists `169.254.0.0/16` for cloud metadata), apply the same rules to each redirect hop, and preferably route through an egress proxy. The page warns against hand-written IP parsers because of octal, hex and IPv4-mapped IPv6 encodings.
+2. **Reject metadata whose `issuer` differs from the issuer used to build its URL.** The specification's example is a document at `https://attacker.example/.well-known/oauth-authorization-server` that claims `"issuer": "https://honest.example"`.
+3. **Refuse to proceed without PKCE.** If `code_challenge_methods_supported` is absent from the metadata, the client must stop, and it must use `S256` when it can.
+4. **Send `resource`** with the canonical URI of the MCP server on both the authorisation and token requests, whether or not the authorisation server supports RFC 8707. The canonical form has no fragment and, by the specification's recommendation, no trailing slash.
+5. **Record the expected issuer** next to the PKCE verifier and `state` before redirecting.
+6. **Validate `iss` on the response** before sending the code anywhere (table below).
+7. **Open only `https` authorisation URLs**, with `http` allowed only for loopback during development, and reject `javascript:`, `data:`, `file:` and `vbscript:` by allowlist.
+8. **Never open the URL through a shell**: no `cmd.exe`, `sh` or PowerShell.
+9. **Key stored client credentials by issuer** and never present credentials from one authorisation server to another; re-register when the server's metadata names a new one.
+
+### Issuer binding is the 2026-07-28 change
+
+RFC 9207 states the gap plainly: an authorisation response carries no information about which server issued it. A client that talks to several authorisation servers, which every general MCP client does, can be steered into redeeming a code from the honest server at the attacker's token endpoint. The best-practices page also says why PKCE does not close this: the client sends the `code_verifier` to whichever token endpoint it believes is right, so in a mix-up the verifier goes to the attacker along with the code. Resource indicators do not help either when the attacker's server sits in front of the honest one.
+
+The 2026-07-28 revision (SEP-2468) makes the check a client MUST:
+
+| AS metadata advertises `iss` support | `iss` in the response | Client action |
+|---|---|---|
+| `true` | present | compare to the recorded issuer by simple string comparison |
+| `true` | absent | reject |
+| `false` or absent | present | compare to the recorded issuer by simple string comparison |
+| `false` or absent | absent | proceed |
+
+After form-decoding, the client must not fold scheme or host case, drop a default port, add or strip a trailing slash, or normalise percent-encoding before comparing. On a mismatch it must not act on or display `error`, `error_description` or `error_uri`, since those came from a server it cannot attribute. The fourth row is the residual risk: the specification says the mitigation gives no protection against an honest server that does not emit `iss`, and expects a later revision to raise emission from SHOULD to MUST.
+
+<Predict id="sec-mcp-iss-table" question="How many of the seven callbacks must the client reject?" answer={5} tolerance={0} unit="callbacks">
+<Fragment slot="prompt">
+<p>The client recorded <code>https://auth.example.com</code> as the issuer. Seven callbacks arrive, each with a valid <code>state</code>:</p>
+<ol>
+<li>metadata flag <code>true</code>, <code>iss=https://auth.example.com</code></li>
+<li>metadata flag <code>true</code>, no <code>iss</code></li>
+<li>flag absent, <code>iss=https://auth.example.com/</code></li>
+<li>flag absent, no <code>iss</code></li>
+<li>flag <code>true</code>, <code>iss=https://AUTH.example.com</code></li>
+<li>flag <code>false</code>, <code>iss=https://login.example.net</code>, <code>error=access_denied</code></li>
+<li>flag <code>true</code>, <code>iss=https://auth.example.com:443</code></li>
+</ol>
+</Fragment>
+<p>Callbacks 2, 3, 5, 6 and 7 are rejected: <b>5</b>. Number 2 fails the second row of the table. Numbers 3, 5 and 7 differ only by a slash, case or an explicit default port, all of which RFC 3986 normalisation would treat as equivalent and the specification forbids normalising. Number 6 is a mismatch carrying an error, so the client also must not show the error text. Only 1 and 4 proceed, and 4 is the case the check cannot help with.</p>
+</Predict>
+
+### Registration moved to Client ID Metadata Documents
+
+The 2026-07-28 revision deprecates Dynamic Client Registration (PR 2858). A client that supports everything should use pre-registered credentials if it has them, then a Client ID Metadata Document when the authorisation server advertises `client_id_metadata_document_supported`, then DCR, then ask the user. With CIMD the `client_id` is an HTTPS URL with a path, pointing at a JSON document whose `client_id` matches that URL exactly and which lists `client_name` and `redirect_uris`; the authorisation server fetches it and checks the redirect URI against it. The deprecation registry lists the earliest removal of DCR as the first revision released on or after 2027-07-28, so servers that only offer DCR will be around for at least that long.
+
+CIMD moves two risks to the authorisation server. It now fetches a URL supplied by an unknown client, so the SSRF controls apply to it. And a metadata document proves control of a domain, not of the process on a `localhost` port: an attacker can present the legitimate client's URL, bind any loopback port, and the user sees the legitimate name on the consent screen. The specification's countermeasures are warnings for localhost-only redirect URIs and showing the redirect hostname, which lower the success rate of that attack rather than prevent it.
+
+## The implementation
+
+The server half takes claims whose signature has already been verified against the issuer's JWKS (or an introspection response for opaque tokens) and returns the principal that keys all later state. The client half covers metadata validation, PKCE, the `resource` parameter, URL checks and the callback. Python 3 standard library only.
+
+```python
+import base64, hashlib, secrets, time
+from urllib.parse import urlsplit, urlencode
+
+# ---- server: the MCP server as a resource server ----
+RESOURCE = "https://mcp.example.com/mcp"          # canonical URI, no trailing slash
+ISSUER = "https://auth.example.com"               # the one AS this server trusts
+PRM = "https://mcp.example.com/.well-known/oauth-protected-resource/mcp"
+IMPLIES = {"files:admin": {"files:write", "files:read"}, "files:write": {"files:read"}}
+
+class Challenge(Exception):
+    def __init__(self, status, error=None, scope=None):
+        parts = ([f'error="{error}"'] if error else []) + [f'resource_metadata="{PRM}"']
+        if scope:
+            parts.append(f'scope="{scope}"')
+        self.status, self.header = status, "Bearer " + ", ".join(parts)
+
+def effective(scopes):
+    out = set(scopes)
+    for s in scopes:
+        out |= IMPLIES.get(s, set())
+    return out
+
+def authorize(claims, needed, now=None):
+    """claims: a JWT payload whose signature already verified against the AS's JWKS
+    (or an introspection response). Returns the principal that keys all state."""
+    now = time.time() if now is None else now
+    if claims is None:
+        raise Challenge(401, scope=" ".join(sorted(needed)))
+    aud = claims.get("aud")
+    aud = [aud] if isinstance(aud, str) else list(aud or [])
+    if claims.get("iss") != ISSUER or RESOURCE not in aud or claims.get("exp", 0) <= now:
+        raise Challenge(401, "invalid_token")
+    if not set(needed) <= effective(claims.get("scope", "").split()):
+        raise Challenge(403, "insufficient_scope", " ".join(sorted(needed)))
+    return (claims["iss"], claims["sub"])
+
+# ---- client: discovery, authorization request, callback ----
+LOOPBACK = {"localhost", "127.0.0.1", "::1"}
+
+def safe_auth_url(url, dev=False):
+    if any(c.isspace() or ord(c) < 32 for c in url):
+        raise ValueError("control or space characters")
+    u = urlsplit(url)
+    ok = u.scheme == "https" or (dev and u.scheme == "http" and u.hostname in LOOPBACK)
+    if not ok or not u.hostname:
+        raise ValueError(f"refusing to open {u.scheme or '?'}: URL")
+    return url
+
+def check_as_metadata(meta, issuer_used):
+    if meta.get("issuer") != issuer_used:            # RFC 8414 3.3: identical, byte for byte
+        raise ValueError("metadata issuer differs from the URL it was fetched for")
+    if "S256" not in meta.get("code_challenge_methods_supported", []):
+        raise ValueError("no PKCE S256: refuse to proceed")
+
+PENDING = {}
+
+def begin(meta, issuer_used, client_id, redirect_uri, scope, dev=False):
+    check_as_metadata(meta, issuer_used)
+    endpoint = safe_auth_url(meta["authorization_endpoint"], dev)
+    verifier = secrets.token_urlsafe(64)             # 86 characters, inside 43..128
+    digest = hashlib.sha256(verifier.encode()).digest()
+    state = secrets.token_urlsafe(32)
+    PENDING[state] = {"verifier": verifier, "issuer": meta["issuer"],
+                      "iss_required": meta.get("authorization_response_iss_parameter_supported") is True,
+                      "token_endpoint": meta["token_endpoint"]}
+    q = {"response_type": "code", "client_id": client_id, "redirect_uri": redirect_uri,
+         "scope": scope, "state": state, "resource": RESOURCE, "code_challenge_method": "S256",
+         "code_challenge": base64.urlsafe_b64encode(digest).rstrip(b"=").decode()}
+    return endpoint + ("&" if "?" in endpoint else "?") + urlencode(q), state
+
+def callback(params):
+    rec = PENDING.pop(params.get("state"), None)     # single use
+    if rec is None:
+        raise ValueError("unknown or replayed state")
+    iss = params.get("iss")
+    if iss is None and rec["iss_required"]:
+        raise ValueError("iss missing but the AS advertises it")
+    if iss is not None and iss != rec["issuer"]:     # no case folding, no slash or port fixes
+        raise ValueError("issuer mismatch: do not redeem, do not show error text")
+    if "error" in params:
+        raise RuntimeError(params["error"])
+    return {"url": rec["token_endpoint"], "grant_type": "authorization_code", "code": params["code"],
+            "code_verifier": rec["verifier"], "resource": RESOURCE}
+```
+
+The tests are the attacks from this page and the payload shapes from the mcp-remote CVE in the next lesson. Run them after the block above:
+
+```python
+def raises(f, *a, **k):
+    try: f(*a, **k)
+    except (ValueError, Challenge, RuntimeError) as e: return e
+    raise AssertionError("no raise")
+
+NOW = 1_800_000_000
+ok = {"iss": ISSUER, "aud": RESOURCE, "sub": "u1", "exp": NOW + 300, "scope": "files:read"}
+assert authorize(ok, {"files:read"}, NOW) == (ISSUER, "u1")
+assert raises(authorize, None, {"files:read"}, NOW).status == 401
+upstream = dict(ok, aud="https://api.github.com")                      # a token meant for someone else
+assert raises(authorize, upstream, {"files:read"}, NOW).header.startswith('Bearer error="invalid_token"')
+assert raises(authorize, dict(ok, exp=NOW), {"files:read"}, NOW).status == 401
+e = raises(authorize, ok, {"files:read", "files:write"}, NOW)
+assert e.status == 403 and 'scope="files:read files:write"' in e.header
+assert authorize(dict(ok, scope="files:admin"), {"files:write"}, NOW)
+
+meta = {"issuer": "https://auth.example.com", "authorization_endpoint": "https://auth.example.com/authorize",
+        "token_endpoint": "https://auth.example.com/token", "code_challenge_methods_supported": ["S256"],
+        "authorization_response_iss_parameter_supported": True}
+for bad in ["file:/c:/windows/system32/calc.exe", "javascript:alert(1)", "a:$(calc)",
+            "http://auth.example.com/authorize", "https://auth.example.com/a b"]:
+    assert raises(begin, dict(meta, authorization_endpoint=bad), meta["issuer"], "https://c.example/c.json", "http://127.0.0.1:3000/cb", "files:read")
+assert raises(begin, meta, "https://auth.example.com/", "c", "r", "s")     # trailing slash is a different issuer
+assert raises(begin, dict(meta, code_challenge_methods_supported=["plain"]), meta["issuer"], "c", "r", "s")
+
+url, st = begin(meta, meta["issuer"], "https://c.example/c.json", "http://127.0.0.1:3000/cb", "files:read")
+assert "resource=https%3A%2F%2Fmcp.example.com%2Fmcp" in url and "code_challenge_method=S256" in url
+assert raises(callback, {"state": st, "code": "x", "iss": "https://AUTH.example.com"})
+assert raises(callback, {"state": st, "code": "x", "iss": meta["issuer"]})           # state already consumed
+url, st = begin(meta, meta["issuer"], "c", "r", "files:read")
+assert raises(callback, {"state": st, "code": "x"})                                   # iss advertised, absent
+url, st = begin(meta, meta["issuer"], "c", "r", "files:read")
+req = callback({"state": st, "code": "x", "iss": meta["issuer"]})
+assert req["resource"] == RESOURCE and 43 <= len(req["code_verifier"]) <= 128
+print("all checks pass")
+```
+
+Three choices in the code are policy, not specification. `authorize` returns `(iss, sub)` rather than `sub`, because OpenID Connect guarantees `sub` unique only within an issuer, and a server trusting two issuers would otherwise merge users. Audience accepts a list containing this server; a stricter server rejects multi-audience tokens, since a token valid at two resources is replayable at either. And the 403 lists exactly the scopes the operation needs, the specification's minimum approach; the best-practices page also describes adding related scopes to save step-up rounds, which trades fewer prompts for broader tokens.
+
+## Which checks hold by construction
+
+The audience check, the issuer comparison, the PKCE refusal, the scheme allowlist and shell-free URL opening hold by construction: once implemented, the attack each targets cannot proceed, whatever the attacker sends. Each depends on one precondition worth writing next to it in the design document. Audience binding needs the authorisation server to put the resource in `aud`, which is why clients must send `resource` regardless. Issuer binding needs honest servers to emit `iss`. The scheme check needs the opener to do what the scheme says and nothing more.
+
+Three controls only lower a rate. SSRF blocking by IP range loses to DNS rebinding unless resolution is pinned between check and use, as the best-practices page notes. Localhost redirect warnings depend on the user reading them. Short-lived access tokens, which the specification asks authorisation servers to issue, shrink the window of a stolen token without closing it.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your company exposes an internal ticketing API through a new remote MCP server. The corporate IdP issues tokens with a single fixed audience for all internal APIs and ignores the resource parameter. The ticketing API accepts those tokens today. Launch is in three weeks, and security wants audience-bound tokens before any external MCP client connects. What do you ship?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>I would not forward the IdP token to the ticketing API, and I would not accept a token whose audience is every internal API at the MCP server. The MCP server gets its own audience, either from a small authorisation server in front of the IdP that issues MCP-audience tokens after IdP login, or from an IdP registration with a distinct audience. Upstream, the MCP server exchanges the user's token for a ticketing-API token (RFC 8693) or uses its own credential plus the verified user identity. If neither is ready in three weeks, launch to first-party clients only and keep external clients behind the gate.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The fixed audience is the problem: any internal service that receives such a token can replay it at the MCP server, and the MCP server could replay it anywhere. Clients will still send <code>resource</code> as the specification requires; an authorisation server that ignores it issues the same broad token, so the protection has to come from what the MCP server accepts.</p>
+<p>Option one is an authorisation server we run, federated to the IdP for login, issuing short-lived tokens with <code>aud</code> set to the MCP server's canonical URI and scopes per tool family. It costs a component to operate and a security review, and it is also the path to CIMD support for external clients. Option two is a distinct IdP audience for the MCP server, if the IdP team can register one in time: cheaper, but the scopes are whatever the IdP supports. Upstream, token exchange with the ticketing API as the target keeps per-user attribution in the API's logs; the alternative, a service credential plus the user id, is faster to build and moves the authorisation decision into the MCP server, which then must enforce the ticket ACLs itself.</p>
+<p>What I would write down: with option two and a service credential, a bug in the MCP server's ACL check exposes every ticket, and the ticketing API's own checks no longer stand behind it. Rollout gate: no external client until audience validation and the upstream path pass the passthrough and wrong-audience tests above.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The IdP team says a new audience takes eight weeks. Do you build the authorisation server, slip the launch, or ship first-party only, and who signs the residual risk?</em></li>
+<li><em>Security accepts token exchange but the ticketing API cannot validate exchanged tokens until next quarter. What runs in between, and which test proves it is not passthrough?</em></li>
+<li><em>An external client vendor only supports Dynamic Client Registration. What would make you accept DCR knowing it is deprecated, and what would you need to see to reverse that?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The specification covers the HTTP transport. A stdio server inherits the client's environment and privileges, and none of the checks above apply to it; its risks are the local ones in the next lesson.
+
+Audience binding is only as strong as the authorisation server's handling of resource indicators. Against a server that ignores `resource` and issues one audience to every client, the MCP server's audience check still rejects tokens meant for other services but cannot distinguish two MCP servers behind the same audience. Per-server canonical URIs help only if the issuer honours them.
+
+Issuer binding has a gap the specification states: it protects nothing when the honest server omits `iss` and does not advertise support. Until emission becomes a MUST, a client that wants to close the fourth row has to refuse authorisation servers that lack `authorization_response_iss_parameter_supported`, which will break some of them.
+
+Correct authorisation decides who may call a tool. It says nothing about what the model does with tool output, or with tool descriptions from a server the user chose to connect, which is where the attacks in the next lesson start.
+
+<SelfRate id="lesson:security/mcp-security/mcp-authorization" />

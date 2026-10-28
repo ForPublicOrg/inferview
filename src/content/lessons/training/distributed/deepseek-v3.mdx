@@ -1,0 +1,146 @@
+---
+title: DeepSeek-V3 training system
+track: training
+module: distributed
+order: 8
+kind: teardown
+level: staff
+minutes: 15
+summary: DeepSeek-V3 trained a 671B-total, 37B-active MoE on 2,048 H800 GPUs with pipeline, expert and ZeRO-1 data parallelism and no tensor parallelism, and every unusual piece of the system, from DualPipe to node-limited routing to FP8 with fine-grained scaling, exists to make that layout fit and to hide its cross-node all-to-all.
+prerequisites: [training/distributed/pipeline-schedules, training/moe/expert-parallelism]
+updated: 2026-10-28
+sources:
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: 671B total, 37B activated per token; 14.8T tokens; 61 layers, hidden 7168, first 3 dense, 1 shared and 256 routed experts, 8 routed active, MLA with 128 heads; 2.788M H800 GPU hours, 2,664K pre-training, 119K context extension, 5K post-training, $5.576M at an assumed $2 per GPU hour, official run only, excluding prior research and ablations; 180K GPU hours per trillion tokens, 3.7 days on 2,048 GPUs; 2,048 H800, 8 per node on NVLink/NVSwitch, IB between nodes; PP 16, EP 64 over 8 nodes, ZeRO-1 DP, avoids costly TP; DualPipe Table 2 formulas, 2x parameters, PP+1 activations, stages and micro-batches divisible by 2; chunks of attention, dispatch, MLP, combine; 20 of 132 SMs for communication in 10 channels; at most 4 nodes per token, IB to the same in-node index then NVLink, NVLink 160 GB/s against IB 50 GB/s, 3.2 experts per node on average, up to 13 at the same cost; computation-to-communication ratio about 1:1; FP8 dispatch, BF16 combine; aux-loss-free bias update speed 0.001, then 0.0 for the last 500B tokens; MTP depth 1, lambda 0.3 for the first 10T tokens and 0.1 for the last 4.8T; FP8 with 1x128 activation tiles and 128x128 weight blocks, accumulation promoted every 128 elements, relative loss error below 0.25% against BF16; recompute RMSNorm and MLA up-projections, EMA on CPU, shared embedding and output head with MTP; sequence 4K, batch 3,072 to 15,360 over the first 469B tokens; learning-rate schedule; context 4K to 32K to 128K; no irrecoverable loss spikes and no rollbacks. Checked 2026-10-28.
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: DualPipe propagates two streams from both ends of the PP dimension; tuning needs measured operation durations and an ILP; DeepSeek-V3 used PP with ZeRO-1; ZeRO-1 and ZeRO-2 combine easily with PP. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Diagram from '../../../../components/Diagram.astro';
+import Trace from '../../../../components/Trace.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What it is and who runs it
+
+DeepSeek-V3 is DeepSeek-AI's mixture-of-experts language model: 671B parameters in total, 37B activated per token, pre-trained on 14.8T tokens. The technical report describes the model and, unusually, the training system in enough detail to reconstruct its parallel layout, its pipeline schedule, its communication kernels and its FP8 recipe. This teardown covers the training system only, from that report. Inference deployment is covered in the expert-parallelism lesson of the mixture-of-experts module.
+
+The headline layout is the reason to study it. On 2,048 H800 GPUs, 8 per node on NVLink and NVSwitch with InfiniBand between nodes, it trained with 16-way pipeline parallelism, 64-way expert parallelism spanning 8 nodes, and ZeRO-1 data parallelism, and no tensor parallelism. Every dense-model playbook puts TP 8 inside the node. DeepSeek-V3 spent its engineering on making TP unnecessary.
+
+## The system
+
+<Diagram
+  title="DeepSeek-V3 training system, as the report describes it"
+  nodes={[
+    { id: "data", label: "Token batches", note: "4K seq, batch 3,072 to 15,360" },
+    { id: "pp", label: "PP 16 with DualPipe", note: "two streams, 2x params" },
+    { id: "attn", label: "MLA attention", note: "dense on each GPU, no TP" },
+    { id: "router", label: "Router", note: "aux-loss-free bias" },
+    { id: "moe", label: "MoE layer", note: "1 shared + 256 routed, top 8" },
+    { id: "a2a", label: "All-to-all, EP 64", note: "at most 4 nodes per token" },
+    { id: "mtp", label: "MTP module", note: "depth 1, shared head" },
+    { id: "fp8", label: "FP8 GEMMs", note: "1x128 and 128x128 scaling" },
+    { id: "zero", label: "ZeRO-1 DP", note: "optimizer states sharded" }
+  ]}
+  edges={[
+    { from: "data", to: "pp" },
+    { from: "pp", to: "attn", label: "micro-batch chunk" },
+    { from: "attn", to: "router" },
+    { from: "router", to: "a2a", label: "dispatch FP8" },
+    { from: "a2a", to: "moe" },
+    { from: "moe", to: "a2a", label: "combine BF16" },
+    { from: "pp", to: "mtp", label: "last stage" },
+    { from: "moe", to: "fp8" },
+    { from: "pp", to: "zero", label: "gradients" }
+  ]}
+  rows={[["data"], ["pp", "zero"], ["attn", "mtp"], ["router", "fp8"], ["a2a", "moe"]]}
+/>
+
+**MoE with shared and routed experts.** 61 layers with hidden size 7168; the first three use dense feed-forward layers, the rest are MoE layers with 1 shared expert, which every token passes through, and 256 routed experts of which each token uses 8. The shared expert carries common computation without routing, so the routed experts can specialise. Attention is Multi-head Latent Attention with 128 heads.
+
+**Auxiliary-loss-free balancing.** Instead of a balance loss that fights the language-modelling loss, each expert has a bias added to its routing score for top-k selection, nudged up when the expert is under-loaded and down when over-loaded. The report gives the bias update speed as 0.001, set to 0.0 for the final 500B tokens. Balance matters to the system as much as to the model: an all-to-all finishes when its most loaded receiver finishes.
+
+**Multi-token prediction.** One extra module, depth 1, predicts the token after next from the main model's representation, with its own Transformer block and a projection, and shares the embedding and output head with the main model. Its loss is weighted 0.3 for the first 10T tokens and 0.1 for the remaining 4.8T. At inference it can be dropped or used for speculative decoding. For the system, the MTP module is extra compute and memory on the last pipeline stage, which already holds the output head.
+
+**FP8 training with fine-grained scaling.** Most GEMMs run in FP8. Scaling factors are per 1x128 tile for activations and per 128x128 block for weights, so one outlier only affects its own tile. Because FP8 tensor-core accumulation loses precision over long reductions, partial sums are promoted to FP32 on CUDA cores every 128 elements. The report puts the relative loss error against BF16 below 0.25%. MoE dispatch is sent in FP8; the combine stays in BF16.
+
+**DualPipe.** The pipeline schedule feeds micro-batches from both ends of the 16 stages, so each GPU holds the parameters of two stages, one per direction. Each chunk is split into attention, all-to-all dispatch, MLP and all-to-all combine, and the backward chunks are further split into input-gradient and weight-gradient parts. A forward chunk of one micro-batch is paired with a backward chunk of another, so each one's communication runs during the other's computation. The report's Table 2 gives the bubble as (PP/2 - 1)(F&B + B - 3W) against (PP - 1)(F + B) for 1F1B, at twice the parameters and PP + 1 micro-batches of activations.
+
+**PP 16, EP 64, ZeRO-1, no TP.** With EP 64, each GPU holds 256 / 64 = 4 routed experts per MoE layer, and with PP 16 over 61 layers, about 4 layers per stage. That leaves little parameter memory per GPU, which the report gives as the reason DualPipe's two parameter copies do not significantly raise memory. The Playbook notes that PP combines easily with ZeRO-1, while PP with ZeRO-3 is rarely used.
+
+## A training step
+
+<Trace
+  title="One micro-batch pair through a pipeline stage, as the report describes the schedule"
+  note="the report gives the structure and the constraints, not per-step timings"
+  steps={[
+    { actor: "system", text: "DualPipe injects micro-batches from both ends of the 16-stage pipeline; this stage holds one chunk for each direction." },
+    { actor: "system", text: "Forward chunk of micro-batch A: MLA attention runs on this GPU's tokens with FP8 GEMMs, while the backward chunk of micro-batch B computes its input gradients." },
+    { actor: "tool", text: "A's router picks 8 of 256 experts per token, restricted to at most 4 nodes; tokens are quantised to FP8 and dispatched.", note: "IB to the GPU with the same in-node index on each target node, then NVLink to the expert's GPU." },
+    { actor: "system", text: "While A's dispatch is on the wire, B's MLP backward runs; 20 of the 132 SMs drive the communication." },
+    { actor: "system", text: "A's routed experts and the shared expert compute; B's combine-gradient exchange overlaps." },
+    { actor: "tool", text: "A's expert outputs return in BF16 through the combine all-to-all and are summed with gate weights on the token's home GPU." },
+    { actor: "system", text: "A's activations go point-to-point to the next stage; B's weight-gradient work fills the remaining slot." },
+    { actor: "system", text: "On the last stage, the main head and the depth-1 MTP module compute their losses with the shared output head." },
+    { actor: "system", text: "After all micro-batches, gradients are reduced across data-parallel replicas and each rank updates its ZeRO-1 optimizer shard." }
+  ]}
+/>
+
+The step shows where the hard constraint is. The report states that cross-node expert parallelism gives a computation-to-communication ratio of about 1:1, so without overlap the step would spend about as long waiting as computing. The schedule's job is to make one micro-batch's exchange coincide with another micro-batch's math, and its constraints follow: an even number of stages and micro-batches, and a bubble and activation footprint that do not grow with the micro-batch count.
+
+## Context strategy
+
+Pre-training ran at 4K tokens with a batch ramped from 3,072 to 15,360 sequences over the first 469B tokens, then held. The learning rate warmed up over 2K steps to 2.2e-4, stayed there to 10T tokens, then followed a cosine decay to 2.2e-5 over 4.3T tokens, with two further constant phases in the final 500B tokens. Long context came afterwards in two extension phases, 4K to 32K and then 32K to 128K, which the cost table counts at 119K GPU hours. Keeping pre-training at 4K is what lets the layout avoid context parallelism entirely.
+
+## Memory and communication budget
+
+The report lists the memory measures that, together with the large EP degree, let it skip tensor parallelism: recomputing RMSNorm and the MLA up-projections in the backward pass instead of storing their outputs, keeping the exponential moving average of the parameters in CPU memory, and sharing the embedding and output head between the MTP module and the main model on the same pipeline stage.
+
+The communication design follows the hardware. NVLink is about 160 GB/s per GPU and InfiniBand 50 GB/s, a ratio of 3.2. Node-limited routing sends each token to at most 4 nodes. A token's hidden state crosses InfiniBand once per target node, to the GPU with the same local index, and is forwarded on NVLink to the GPUs holding its experts. Since a token selects 3.2 experts per node on average, the report notes the same InfiniBand traffic could serve up to 13 experts. The communication kernels occupy 20 of the H800's 132 SMs, in 10 channels with warp specialisation, compute permanently given up to move bytes.
+
+## Cost and latency
+
+The report's cost table: 2,664K H800 GPU hours for pre-training, 119K for context extension and 5K for post-training, 2.788M in total, which it prices at $5.576M assuming $2 per GPU hour. Pre-training took about 180K GPU hours per trillion tokens; on 2,048 GPUs that is 180,000 / 2,048 = 88 hours, the report's 3.7 days. Over 14.8T tokens, 2,664K GPU hours is 1,302 hours of wall-clock time on the full cluster, about 54 days.
+
+One derived figure is useful for comparison. With the 6 x active parameters x tokens approximation, pre-training is 6 x 37e9 x 14.8e12 = 3.29e24 FLOPs. Divided by 2,664K GPU hours, that is 3.43e14 FLOP per second per GPU, 343 TFLOP/s of model FLOPs, counting attention as zero and mixing FP8 and BF16 work. It is a lower bound on the hardware throughput achieved, not an MFU, since it ignores attention FLOPs and the peak it should be divided by depends on the precision mix.
+
+## Failure modes
+
+The report states that training had no irrecoverable loss spikes and needed no rollbacks. It does not publish hardware failure counts, restart counts or checkpoint intervals.
+
+The design has failure modes its own description implies. A routing collapse onto a few experts would break the 1:1 compute-to-communication balance before it showed in the loss, because the most loaded receiver sets the all-to-all time; the bias mechanism is the guard, and the decision to freeze it for the final 500B tokens is a bet that routing has stabilised. FP8 training risks silent accuracy loss from outliers; the fine-grained tiles and periodic FP32 promotion are the guard, and the 0.25% bound is the report's validation against BF16 at the scales it tested. DualPipe's two parameter copies are cheap only while EP keeps per-GPU parameters small; at a smaller EP degree the same schedule would cost real memory.
+
+## What is not public
+
+The full pre-training data mixture is not public. The report describes the corpus at a high level but not the proportions that would let someone rebuild it.
+
+The cost of prior research and ablation experiments is not public. The report says so directly: the $5.576M covers only the official DeepSeek-V3 training run, priced at an assumed $2 per H800 GPU hour, not the experiments that chose the architecture and recipe, and not the cluster's purchase price. Any comparison of "training cost" with another lab's total spend compares different quantities.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You are asked to reproduce DeepSeek-V3's layout, PP 16, EP 64, ZeRO-1, no TP, for a 400B-total MoE with 128 experts per layer on 1,024 H100s. You have four weeks of engineering before the run and no DualPipe implementation. What do you keep, what do you change, and what does it cost?"**
+</Callout>
+
+<p class="tiny">The model, cluster and timeline are a scenario.</p>
+
+<Depth>
+<Fragment slot="short">
+<p>Keep PP with ZeRO-1 and no TP if memory allows; change EP 64 to the smallest EP that fits, because without DualPipe the cross-node all-to-all cannot be hidden. With 128 experts, EP 8 inside a node keeps the exchange on NVLink at 16 experts per GPU per layer. Use interleaved 1F1B with extra warm-up micro-batches to overlap whatever all-to-all remains. The cost is more expert parameters per GPU and more memory pressure, which recomputation pays for.</p>
+</Fragment>
+<Fragment slot="long">
+<p>DeepSeek-V3's EP 64 is affordable only because DualPipe hides a 1:1 compute-to-communication ratio, and the report's own SM budget, 20 of 132, shows the custom-kernel cost. Without that, EP across nodes exposes the exchange in every MoE layer. So the first change is EP placement: 128 experts at EP 8 is 16 experts per GPU per layer, all on NVLink. Memory decides whether it fits: count expert parameters per GPU under PP 16, 400B total minus the dense part, divided by 16 stages and 8 expert ranks, and compare with the 80 GB card after ZeRO-1 shards optimizer states across data-parallel replicas.</p>
+<p>If EP 8 does not fit, EP 16 across two nodes with node-limited routing, at most 2 nodes per token, bounds the InfiniBand traffic, and interleaved 1F1B with more warm-up micro-batches gives some overlap. Keep FP8 only if the team has validated it against BF16 on a smaller run in the four weeks; otherwise BF16 and accept the memory. Failure mode: at EP 8, each expert's parameters are replicated across all data-parallel replicas, so the gradient synchronisation for experts grows and runs across nodes once per step. Written down: the per-GPU memory plan, the expected exposed all-to-all per step, and the trigger to move to EP 16.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The modelling lead insists on node-limited routing at 2 nodes for quality reasons even at EP 8. Does it change anything, and what does it cost the router?</li>
+<li>Your FP8 validation run shows 0.4% higher loss than BF16 at 30B tokens. Ship FP8, and who signs off?</li>
+<li>What would you need to measure in week one of the run to justify building DualPipe for the next one?</li>
+</ul>
+</Fragment>
+</Depth>
+
+<SelfRate id="lesson:training/distributed/deepseek-v3" />

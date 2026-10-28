@@ -1,0 +1,89 @@
+---
+id: trn-042
+title: How many tokens make an MoE layer compute-bound
+subtitle: DeepSeek-V3's expert configuration, labelled as an estimate
+track: training
+module: moe
+type: estimate
+difficulty: hard
+seniority: [staff]
+minutes: 20
+core: false
+tags: [mixture-of-experts, roofline, arithmetic-intensity, estimation, inference]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Austin et al., How to Scale Your Model, Part 4 Transformers (JAX scaling book)
+    url: https://jax-ml.github.io/scaling-book/transformers/
+    note: "an MoE has E MLP blocks per layer and each token activates k; sparsity E/k usually between 8 and 64; DeepSeek v3 effectively k = 8, E = 256; one expert weight matrix costs 2 k B D F FLOPs and E D F bytes in int8; with int8 weights and bf16 FLOPs on TPU v5e, compute-bound needs B > 120 E / k, which is 3,840 for DeepSeek, called a remarkably large batch at generation time. Checked 2026-10-28."
+  - title: Austin et al., How to Scale Your Model, GPUs chapter (JAX scaling book)
+    url: https://jax-ml.github.io/scaling-book/gpus/
+    note: "H100: 9.9e14 bf16 FLOP/s dense, about 3.35 TB/s HBM, critical intensity 990e12 / 3.35e12 = 295 FLOPs per byte in bf16, about 590 in fp8. Checked 2026-10-28."
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: "1 shared and 256 routed experts per MoE layer, 8 routed active, expert intermediate dimension 2048, hidden 7168; prefill deployed with EP32 and decode with EP320. Checked 2026-10-28."
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "during DeepSeek-V3/R1 training the batch size grows from 3,072 to 15,360 input sequences. Checked 2026-10-28."
+range: { low: 3500, high: 10000, unit: tokens }
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Take DeepSeek-V3's routed experts: 256 per layer, 8 active per token. How many tokens does one MoE layer need in a batch before its expert matmuls are limited by compute rather than by loading expert weights? Pick your hardware and precision and say why."
+</Callout>
+
+Published inputs: 256 routed experts with 8 active (DeepSeek-V3 report). The scaling book gives the H100 at 9.9e14 bf16 FLOP/s and about 3.35 TB/s of HBM, and works the same question for a TPU v5e with int8 weights. Everything else is yours to choose: the accelerator, the weight precision, the compute precision, and whether the shared expert counts. Answer in tokens per batch for the layer, as an estimate.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which precision the expert weights are stored in and which the matmuls run in on the target hardware.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask how evenly the router spreads one batch over the 256 experts in production traffic.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask whether the batch in question is a training micro-batch, a prefill chunk or a decode step.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Each expert must see enough tokens to amortise loading its weights. With bf16 weights on an H100, the layer does B x k / E FLOPs per weight byte loaded, which must exceed about 295, so B is about 295 x 256 / 8 = 9,440 tokens. Storing weights in fp8 but computing in bf16 halves it to about 4,720. On the scaling book's TPU v5e with int8 weights it is 3,840. The dominant term is weight bytes over all E experts; imbalance raises the number.</p>
+</Fragment>
+<Fragment slot="long">
+<p>For one expert weight matrix of D x F, a batch of B tokens with top-k routing does 2 x k x B x D x F FLOPs in total (each token uses k experts) and, once B is large enough that every expert is touched, loads E x D x F weights. With bf16 weights that is 2 x E x D x F bytes, so the arithmetic intensity is B x k / E FLOPs per byte. D and F cancel.</p>
+<p>The H100 does 9.9e14 FLOP/s against 3.35e12 bytes/s, 295 FLOPs per byte. Compute-bound needs B x k / E above 295: B above 295 x 256 / 8 = 9,440 tokens. Per expert that is 9,440 x 8 / 256 = 295 tokens, which is the way to remember it: each expert needs about as many tokens as a dense matmul needs on that chip.</p>
+<p>Fp8 weights with bf16 compute halve the bytes: B above 4,720. Fp8 weights with fp8 compute halve the bytes and double the FLOP rate, so the threshold stays at 9,440. The scaling book's int8-weight, bf16-compute case on TPU v5e gives 120 x 256 / 8 = 3,840.</p>
+<p>The shared expert is a dense FFN that every token uses, so it is compute-bound at about 295 tokens on the H100 regardless of E and k; it is not the binding term.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The router sends 3 times the mean load to the hottest expert and a third of the mean to the coldest. Which expert sets your threshold, and what is the new number?</li>
+<li>Decode on EP320 puts one expert per GPU. How many decode tokens per step does each GPU need to stay compute-bound, and is that reachable?</li>
+<li>What would you need to see in a profile to conclude that the layer is limited by the all-to-all rather than either compute or HBM?</li>
+</ul>
+</Fragment>
+</Depth>
+
+**The dominant term** is weight bytes for all E experts against FLOPs that only k of them do per token: the threshold scales with E / k, the sparsity. DeepSeek-V3's sparsity of 32 multiplies the dense threshold by 32.
+
+**Reasonable choices** land between about 3,800 and 9,500 tokens: TPU v5e with int8 weights (3,840), H100 with fp8 weights and bf16 compute (4,720), and H100 in bf16 or end-to-end fp8 (9,440). **Unreasonable choices:** using only the activated parameters for the weight bytes gives about 295 tokens, as if the layer were a dense FFN of k experts, which is only true when the batch is so small that few experts are touched, and then it is badly memory-bound anyway. Using total parameters for the FLOPs as well gives the same 295 for the opposite wrong reason.
+
+**The assumption that flips the conclusion** is even routing. The derivation assumes every expert gets B x k / E tokens. Under skew, the cold experts see fewer and stay memory-bound while the hot ones are compute-bound, so the layer as a whole needs a larger batch. Redundant copies of hot experts, as DeepSeek-V3 deploys for prefill, spread the hot load but add weights to load.
+
+**What this means in practice.** In training, the batch is not the constraint: the playbook reports DeepSeek-V3/R1 batches growing from 3,072 to 15,360 sequences, far above the threshold per layer. At generation, it is the constraint. A decode step for one replica rarely carries 9,440 tokens, which is why decode MoE layers are memory-bound and why DeepSeek-V3 spreads decode over 320 GPUs with one expert each: the weight bytes per GPU shrink to one expert, and each GPU needs about 295 tokens routed to its expert, which still adds up to about 9,440 tokens per step across the group; the layout spreads the weight reads over 320 HBMs rather than lowering the threshold.
+
+**How this estimate fails.** It ignores the all-to-all. With expert parallelism across nodes, the dispatch and combine traffic can dominate before either HBM or compute does, and a batch large enough for the roofline can still be network-bound.
+
+## Follow-ups
+
+- *Your serving team can afford 4,000 decode tokens per step per replica. Do you change the expert configuration, the precision, or the deployment layout, and what does each cost?*
+- *A colleague argues the threshold is irrelevant because grouped-GEMM kernels already hit high utilisation at small per-expert batches. What measurement settles it?*
+- *Two senior engineers disagree on fp8 weights for serving: one cites the halved threshold, the other cites quality risk on rare experts. How do you decide without deciding by rank?*
+
+## Common mistakes
+
+- Using activated parameters for the bytes and arriving at a dense-model threshold.
+- Forgetting that the threshold is per expert: 295 tokens each, not 295 in total.
+- Quoting the TPU number for a GPU without redoing the FLOPs-per-byte ratio.
+- Treating the shared expert as part of the sparse threshold.

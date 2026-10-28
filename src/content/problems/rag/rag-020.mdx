@@ -1,0 +1,134 @@
+---
+id: rag-020
+title: Keep a RAG index fresh when sources change every day
+subtitle: content hashes, deletes without a feed, lineage and a gate that has to pick between freshness and completeness
+track: rag
+module: ingestion
+type: workflow
+difficulty: hard
+seniority: [senior, staff]
+minutes: 40
+core: false
+tags: [ingestion, freshness, idempotency, content-hash, deletes, lineage, quality-gates, pgvector]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: NVIDIA NeMo Curator documentation, About (v1.4.0, 26.09)
+    url: https://docs.nvidia.com/nemo/curator/latest/about/index.html
+    note: "text pipeline stages: download, extraction, language detection, rule-based quality filtering, deduplication (exact, fuzzy and semantic), model-based quality filtering. Checked 2026-10-28."
+  - title: Lee et al., Deduplicating Training Data Makes Language Models Better (arXiv 2107.06499, v2 2022-03-24)
+    url: https://arxiv.org/abs/2107.06499
+    note: "the paper reports near-duplicates and long repeated substrings across standard datasets, including a 61-word sentence repeated over 60,000 times in C4. Checked 2026-10-28."
+  - title: Microsoft Presidio
+    url: https://presidio.dataprivacystack.org/
+    note: "analyzer combines NER, regular expressions, rules, checksums and context; the docs warn there is no guarantee it finds all sensitive information. Checked 2026-10-28."
+  - title: pgvector README (v0.8.7 in the install instructions)
+    url: https://github.com/pgvector/pgvector
+    note: "vectors are Postgres rows, so writes are transactional; dead tuples can reduce HNSW results until vacuum, and vacuuming HNSW indexes can take a while. Checked 2026-10-28."
+checklist:
+  - Detects change on a hash of the normalised extracted text, so byte-level or metadata-only changes do not re-embed
+  - Makes re-ingest idempotent on document id and content hash, and drops redelivered or out-of-order events older than the live version
+  - Replaces a document's chunks atomically, in one Postgres transaction or with versioned ids and a switch, so no reader sees a mix of versions
+  - Computes the embedding load for a normal day and for the bulk-change day against the rate limit, and chooses document-level or chunk-level reuse with the cost of each
+  - Handles deletes per source, events where they exist and a full id listing diff where they do not, inside the 24-hour target
+  - Caps what one reconciliation may delete and sends a larger deletion to a person
+  - Records lineage per chunk (source version, content hash, parser, chunker config and embedding model versions, run id) and uses it for targeted re-runs
+  - Sets gate thresholds per source from the measured baseline and defends the numbers
+  - Chooses between failing the batch and quarantining documents, states the cost, and never removes the live version of a document whose new version failed
+  - Keeps the policy source inside its 4-hour target on a bulk-change day
+  - Alerts on freshness lag, quarantine age and reconciliation diff size, not only on job success
+  - States what is given up and writes a runbook or risk note with rollback triggers for the first weeks
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The round">
+"Our assistant answers from three sources that change every day, and the index drifts: edited pages answer with old text, deleted ones keep coming back, and last month a parser upgrade silently emptied a few thousand documents. Design the ingestion workflow that keeps the index fresh and tells us when it is not."
+</Callout>
+
+The constraints, as a scenario:
+
+- 1.2 million documents, about 12 chunks each, in one pgvector table that stays this quarter.
+- The wiki emits change events, including deletes, delivered at least once and sometimes out of order. The policy system has a "modified since" listing, 1,000 ids per page, and no deletes. The shared drive arrives as a nightly file export.
+- About 25,000 documents change on a normal day. Once a month a template update changes the footer of about 200,000 wiki pages at once.
+- Embedding goes through a hosted API limited to 3,000 chunks per minute for your account.
+- Policy changes must be searchable within 4 hours. Compliance requires a deleted document to be unsearchable within 24 hours.
+- Last 30 nights, per source: documents with empty extracted text 0.3 to 0.6 percent, parse failures 0.1 to 0.4 percent, mean chunk length 270 to 290 tokens. About 8 percent of drive files are scanned PDFs.
+- Two engineers own this.
+
+Design the steps, the state, the idempotency, the deletes, the gate and its thresholds, and the rollout.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what changes in the extracted text when the monthly template update runs.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask how the policy system's listing behaves when it fails halfway through a page sequence.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the per-source numbers for the night the parser upgrade went out, next to the 30-night baseline.</p></details>
+
+## Answer
+
+### The steps
+
+1. **Detect.** Per source: consume wiki events, list the policy system since the last saved cursor (saved as the listing's start time minus a margin), diff the drive export against the last one. Each change becomes a work item `(source, doc_id, source_version)`.
+2. **Extract and normalise.** Parse, strip boilerplate (headers, footers, navigation), normalise whitespace, record the parser version.
+3. **Hash and skip.** `content_hash = sha256(normalised text)`. If the live version of `doc_id` already has this hash, stop: the item is a no-op. If the work item's `source_version` is older than the live one, stop: it is a late or redelivered event.
+4. **Gate per document.** Empty text, a parse error or a page count that disagrees with the source sends the document to quarantine with the reason. Its live version is untouched.
+5. **Chunk and embed.** Chunk, then look each chunk up by `(embedding_model, normaliser_version, sha256(chunk_text))` in the existing rows; embed only the misses.
+6. **Swap.** In one Postgres transaction: delete the document's rows, insert the new rows. Embedding happens before the transaction, so it stays short.
+7. **Gate per batch.** Before the run is marked published, compare the batch's rates with the source's baseline. A breach stops publishing the rest of that source's batch and pages.
+8. **Deletes and reconciliation.** Wiki deletes come from events. Policy and drive deletes come from a nightly diff of the full id listing against the ids in the index.
+
+### State and lineage
+
+Each chunk row carries `doc_id`, `source_version`, `content_hash`, `parser_version`, `chunker_config`, `embedding_model`, `run_id` and its position. A work-item table records every item's outcome: published, skipped as no-op, skipped as stale, quarantined with reason. With that, a parser bug found next month is a query (`parser_version = 'x'`) and a targeted re-run, not a full rebuild, and any citation resolves to the source version it was built from.
+
+### The embedding load, and two defensible answers
+
+Normal day: 25,000 × 12 = 300,000 chunks; at 3,000 a minute that is 100 minutes. Template day: 200,000 × 12 = 2.4 million chunks, 800 minutes, over 13 hours, and every policy change queued behind it misses its 4-hour target.
+
+- **Document-level: re-embed every chunk of a changed document.** One path, nothing to keep consistent. If boilerplate stripping removes the footer, the template update produces the same hash and costs nothing. The cost: it depends on the stripper catching every template change; when it misses one, the day is 13 hours long.
+- **Chunk-level reuse: embed only chunks whose text is new.** On template day only the chunk holding the footer changes, about 200,000 chunks, 67 minutes. The cost: the reuse key must include the embedding model and normaliser versions or a model change silently mixes old and new vectors, and a packing chunker shifts every boundary after an insertion, so one added paragraph near the top can still re-embed the whole document.
+
+I would do both: strip boilerplate so most template changes are no-ops, and reuse chunks so the ones that leak through are cheap. On top, a priority lane: policy items are embedded before bulk wiki items, so the 4-hour target holds on template day even if the rest of the wiki is late.
+
+### The gate: fail the batch or quarantine
+
+The conflict is freshness against completeness. Failing the whole batch on any breach keeps a bad parser out of the index, and also holds back the urgent policy update that was in the same batch. Quarantining failing documents and publishing the rest keeps freshness, and risks publishing a batch where the failures are exactly the documents someone needed.
+
+My choice: per-document quarantine always (the live version stays, so a failed parse means stale, never missing), and a per-source batch gate on rates. Thresholds from the baseline, per source:
+
+- Empty text above 2 percent, about three times the worst night. The parser upgrade that empties scanned PDFs on the drive moves this to about 8 percent and trips it.
+- Parse failures above 1.5 percent.
+- Mean chunk length outside 240 to 320 tokens. A splitter config change shows up here before any eval.
+- Exact duplicate rate and PII hit rate (Presidio, whose docs say there is no guarantee it finds all sensitive information) at three times their baseline; these are drift alarms, not guarantees.
+
+Zero tolerance is unreasonable: the baseline is never zero, so the gate trips every night and gets disabled. A 20 percent threshold is unreasonable too: the scanned-PDF regression stays under it.
+
+### Deletes
+
+Wiki: delete by `doc_id` on the event. Policy and drive: the nightly listing diff, which meets the 24-hour target if it runs nightly and completes. A listing that fails halfway returns half the ids, and the diff then "deletes" half the source. So the reconciliation refuses to delete more than 1 percent of a source's documents in one run (normal is a few hundred) and sends a larger set to a person with the list.
+
+### Where this fails
+
+The 1 percent cap blocks a legitimate mass deletion, for example a legal purge of a department's documents that compliance needs done within the day. The person who approves the override has to be reachable, and that is written in the runbook. Quarantine has the opposite failure: a document whose new version fails to parse every night keeps serving its old version for weeks. Alert on quarantine age, not only on count.
+
+### What you give up, and the rollout
+
+Given up: same-hour freshness for bulk wiki changes on template day; deletions of more than 1 percent of a source without a person; and simplicity, since there are now three ingestion paths that share one swap step.
+
+Rollout: run the new workflow into a shadow table for two weeks next to the current job. Compare per night: documents present in one and not the other, documents with different content hashes, and answers on an eval set that includes recently edited and deleted documents. Switch readers when the differences are explained. Rollback triggers in the first month: any reconciliation that hits the cap without a known cause, policy freshness lag over 4 hours on two consecutive days, or a quarantine count above three times baseline.
+
+## Follow-ups
+
+- *Pushback: the shadow period doubles embedding spend for two weeks and the rate limit cannot absorb it. Which source do you shadow, and what risk do you accept in writing for the others?*
+- *Reversal: what would you need to see in three months of work-item records to drop chunk-level reuse and go back to re-embedding whole documents?*
+- *The embedding model is retired in 60 days and a full re-embed at this rate limit takes over three days. How do you run it without breaking the freshness targets, and when do readers switch?*
+- *Compliance asks you to prove a deleted document was unsearchable within 24 hours on a date last month. What do you show them?*
+
+## Common mistakes
+
+- Hashing file bytes, so a re-export with new metadata re-embeds everything.
+- Deleting a document's chunks before the new version has parsed and embedded.
+- A batch gate on absolute thresholds that trips every night until someone turns it off.
+- A listing diff that deletes whatever the listing did not return.
+- Measuring success as "the job finished" instead of freshness lag and quarantine age.

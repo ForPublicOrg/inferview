@@ -1,0 +1,143 @@
+---
+title: Kimi K2
+track: training
+module: numerics
+order: 5
+kind: teardown
+level: staff
+minutes: 14
+summary: A teardown of how Moonshot trained Kimi K2, a 1.04T-total, 32B-active MoE, from the public technical report, covering MuonClip, rephrased pretraining data, the sparsity choice, colocated RL with a checkpoint engine, the tool environments, and what the report does not disclose.
+prerequisites: [training/numerics/loss-spikes, training/numerics/optimizers]
+updated: 2026-10-28
+sources:
+  - title: Kimi Team, Kimi K2, Open Agentic Intelligence (arXiv 2507.20534)
+    url: https://arxiv.org/html/2507.20534
+    note: "1.04T total, 32B activated (32.6B in Table 2); 384 experts, 8 active, 1 shared, sparsity 48; 64 attention heads against DeepSeek-V3's 128, doubling heads cut validation loss by about 0.5% to 1.2% and raised inference FLOPs by 83% at 128k context; at validation loss 1.5, sparsity 48 needs 1.69x, 1.39x and 1.15x fewer FLOPs than sparsity 8, 16 and 32; 15.5T tokens in four domains (web text, code, mathematics, knowledge) with no mixture proportions given; rephrasing with SimpleQA 23.76 (raw, 10 epochs), 27.39 (1 rephrasing, 10 epochs), 28.94 (10 rephrasings, 1 epoch); math rewritten as learning notes and translated to English; MuonClip with QK-Clip, tau = 100, logits above 1000 with vanilla Muon at 9B activated, 53B total, capped then decaying after about 30% of steps; no loss spike over pretraining; WSD schedule, peak 2e-4 for 10T tokens after 500 warm-up steps, cosine to 2e-5 over 5.5T, weight decay 0.1, batch 67M tokens, 4,096 context; annealing 400B tokens at 4k then 60B at 32k, YaRN to 128k; H800 nodes of 8 GPUs and 2 TB RAM, 8x400 Gbps RoCE; 16-way PP with virtual stages, 16-way EP, ZeRO-1; selective recomputation, FP8-E4M3 storage of some activations, CPU offload, no FP8 compute; colocated RL with training and inference engines on the same workers; checkpoint engine broadcasts the full parameter set and each inference worker takes its shard, full update under 30 seconds; partial rollout pauses long trajectories; 3000+ real MCP tools, over 20,000 synthetic tools, simulated execution with state and controlled stochasticity, over 10,000 concurrent sandboxes; self-critique rubric reward with core, prescriptive and human-annotated rubrics, critic updated with on-policy verifiable-reward rollouts; limitations in section 5. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Diagram from '../../../../components/Diagram.astro';
+import Predict from '../../../../components/Predict.astro';
+import Trace from '../../../../components/Trace.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What it is and who runs it
+
+Kimi K2 is Moonshot AI's open-weight mixture-of-experts model: 1.04 trillion parameters in total, 32 billion activated per token, 384 experts of which 8 are active plus one shared expert, and 64 attention heads with MLA. The technical report covers pretraining on 15.5 trillion tokens, post-training with large-scale agentic data synthesis, and a reinforcement-learning system. It is one of the few frontier-scale reports that describes an optimizer change, its failure at scale and the fix, and it is the source of every figure on this page; all of them are Moonshot's own.
+
+The report frames K2's design around token efficiency: with high-quality tokens limited, more learning per token matters more than more tokens. Three of the five components below follow from that.
+
+## The system
+
+<Diagram
+  title="Kimi K2's training system, as the report describes it"
+  nodes={[
+    { id: "data", label: "Pretraining corpus", note: "web, code, math, knowledge" },
+    { id: "rephrase", label: "Rephrasing", note: "knowledge and math rewrites" },
+    { id: "arch", label: "Sparsity choice", note: "384 experts, 8 active" },
+    { id: "pre", label: "Pretraining", note: "15.5T tokens, H800" },
+    { id: "muon", label: "MuonClip", note: "Muon plus QK-Clip, tau 100" },
+    { id: "sft", label: "SFT", note: "synthesised agentic data" },
+    { id: "env", label: "Environments", note: "real sandboxes, synthetic tools" },
+    { id: "rl", label: "Colocated RL", note: "train and infer on one pool" },
+    { id: "ckpt", label: "Checkpoint engine", note: "full update under 30 s" }
+  ]}
+  edges={[
+    { from: "data", to: "rephrase" },
+    { from: "rephrase", to: "pre", label: "tokens" },
+    { from: "arch", to: "pre", label: "model shape" },
+    { from: "muon", to: "pre", label: "updates, clipped heads" },
+    { from: "pre", to: "sft", label: "base model" },
+    { from: "env", to: "sft", label: "trajectories" },
+    { from: "sft", to: "rl" },
+    { from: "env", to: "rl", label: "rollouts, rewards" },
+    { from: "rl", to: "ckpt", label: "new weights" }
+  ]}
+  rows={[["data", "arch"], ["rephrase", "muon"], ["pre"], ["sft", "env"], ["rl", "ckpt"]]}
+/>
+
+MuonClip. The optimizer is Muon with decoupled weight decay of 0.1, an update scaled to match AdamW's RMS, and QK-Clip. Muon was chosen for token efficiency; at a 9B-activated, 53B-total scale it drove a small number of attention heads' maximum logits past 1,000. QK-Clip records each head's largest pre-softmax logit after a step and, for heads above τ = 100, rescales that head's query and key projection weights so the product returns to the threshold. In MLA the head-specific query and key components each take √γ, the head-specific rotary query component takes γ, and the rotary key, shared by all heads, is untouched. The clip changes weights after the update and does not alter the current step's forward or backward pass. In K2's run the logits sat at the cap early, then decayed to a normal range after about 30% of training steps without any change to τ, and the report shows no loss spike over the whole pretraining run.
+
+Rephrasing in pretraining. Instead of repeating high-quality documents for more epochs, K2 rewrites them. Knowledge text is rephrased with prompts for diverse style and perspective, chunk by chunk with autoregressive context to keep long documents coherent, and with fidelity checks against the original. Mathematical text is rewritten in a "learning notes" style, and non-English material is translated into English. The report's evidence is a small ablation on SimpleQA: 23.76 for raw data repeated over 10 epochs, 27.39 for one rephrasing repeated 10 times, 28.94 for ten rephrasings seen once each. The comparison holds compute fixed and varies only how the repetition is spent.
+
+Sparsity scaling law. With the active parameter count fixed, the team varied the total number of experts and found that higher sparsity lowered loss at equal FLOPs. At a validation loss of 1.5, sparsity 48 (8 of 384 experts active) needed 1.69×, 1.39× and 1.15× fewer FLOPs than sparsity 8, 16 and 32. The gains shrink as sparsity rises, and the report chose 48 as its trade-off against infrastructure complexity. The same section reports the attention-head decision: doubling heads from 64 to 128 improved validation loss by about 0.5% to 1.2% but raised inference FLOPs by 83% at 128k context, so K2 kept 64, half of DeepSeek-V3's 128.
+
+Colocated RL with a checkpoint engine. Training and inference engines share the same GPU workers; each releases its GPU memory while the other runs, and the training engine's parameters are offloaded to host memory during rollout. After each training step the new weights have to reach every inference engine. The checkpoint engine has each worker hold a local copy of the parameters, broadcasts the full set across the cluster, and lets each inference engine take only the shard it needs, parameter by parameter in a pipeline to bound memory. The report gives the full update for K2 as under 30 seconds. Long trajectories are handled with partial rollout: unfinished long-tail trajectories are paused and resumed in the next iteration instead of holding back the whole batch.
+
+Real and synthetic environments. Post-training needs tool-use trajectories at volume. The pipeline collects more than 3,000 real MCP tools from GitHub and synthesises more than 20,000 tools, generates agents and tasks over them, and simulates tool execution with a simulator that keeps state and adds controlled stochasticity. For coding and software engineering it uses real execution in sandboxes, with more than 10,000 running concurrently. For tasks without a verifier, a self-critique rubric reward has the model rank its own responses in pairwise comparisons against core, prescriptive and task-specific rubrics; the critic is refreshed during RL with on-policy rollouts from tasks that do have verifiable rewards, so objective signal flows into the subjective judgements.
+
+## One run, start to finish
+
+<Trace
+  title="From the first pretraining step to an RL weight update"
+  note="the report's own sequence; step counts computed from its published batch size"
+  steps={[
+    { actor: "system", text: "Pretraining starts at 4,096-token context: 500 warm-up steps, then a learning rate of 2e-4 for 10T tokens with a 67M-token global batch." },
+    { actor: "system", text: "After every optimizer step, QK-Clip reads each head's maximum logit and rescales query and key weights for heads above 100.", note: "Only a small subset of heads trigger it; it stops firing after about 30% of steps." },
+    { actor: "system", text: "Cosine decay from 2e-4 to 2e-5 over the next 5.5T tokens." },
+    { actor: "system", text: "Annealing: 400B tokens at 4k context, then 60B tokens at 32k; YaRN extends the window to 128k." },
+    { actor: "assistant", text: "SFT on synthesised data, including tool-use trajectories from real MCP tools, synthetic tools and sandboxes." },
+    { actor: "tool", text: "RL rollout: inference engines run on the shared workers while the training engine's parameters sit in host memory.", note: "Unfinished long trajectories pause and resume next iteration." },
+    { actor: "system", text: "Rewards come from verifiers, sandbox execution and the self-critique rubric reward." },
+    { actor: "system", text: "The training engine takes its step; the checkpoint engine broadcasts the new parameters and each inference engine loads its shard.", note: "Under 30 seconds for the full update, by the report." }
+  ]}
+/>
+
+<Predict id="trn-num-k2-steps" question="How many optimizer steps does K2's 15.5T-token pretraining take at a 67M-token global batch, before annealing?" answer={231343} tolerance={500} unit="steps">
+<p>15.5 × 10^12 / 67 × 10^6 ≈ <b>231,343</b> steps: about 149,254 in the constant phase and 82,090 in the cosine phase. QK-Clip was active on some heads for roughly the first 30% of steps, about 69,000. That is the window in which a vanilla-Muon run would have been producing the logit growth the report saw at 53B total.</p>
+</Predict>
+
+## Context strategy
+
+Pretraining runs at 4,096 tokens. Long context arrives late and in two steps: annealing at 32k for 60B tokens, then YaRN to extend to 128k. The head count is the context decision that shows up in the architecture: 64 heads instead of 128 is justified by inference FLOPs at 128k, a serving cost measured at the context length the model is sold for, not a training cost. Partial rollout is the RL side of the same constraint: long agentic trajectories would otherwise set the length of every RL iteration.
+
+## Tools and permission model
+
+The report describes tools as training material, not as a runtime permission system. Tool definitions come from real MCP servers and from synthesis; execution is simulated for most of them and real only inside sandboxes for code. Nothing in the report describes how the sandboxes are isolated, what network access they have, or how the model's tool calls are constrained at serving time. A team using the open weights inherits none of Moonshot's environment, only a model trained against it.
+
+## Cost and latency
+
+The report gives the hardware and the parallelism but not the bill. Pretraining ran on NVIDIA H800 nodes of 8 GPUs with 2 TB of host memory each, connected by 8 × 400 Gbps RoCE, with 16-way pipeline parallelism using virtual stages, 16-way expert parallelism and ZeRO-1 data parallelism. Activation memory was cut three ways: selective recomputation of LayerNorm, SwiGLU, MLA up-projections and MoE down-projections; storage of the inputs to MoE up-projections and SwiGLU in FP8-E4M3 with 1×128 tiles and FP32 scales, without FP8 compute; and offload of all remaining activations to host memory.
+
+<Predict id="trn-num-k2-broadcast" question="Assume the checkpoint engine moves K2's 1.04T parameters in BF16, 2 bytes each, and the full update finishes in exactly 30 seconds. What aggregate rate is that, in GB/s?" answer={69.3} tolerance={0.5} unit="GB/s">
+<p>1.04 × 10^12 × 2 bytes = 2.08 TB; 2.08 × 10^12 / 30 s ≈ <b>69.3 GB/s</b>. The dtype of the broadcast is an assumption here; the report does not state it. The point of the number is the cadence it allows: an RL step that takes minutes can afford a 30-second weight sync, and one that takes seconds cannot, which is why the sync time is published at all.</p>
+</Predict>
+
+The latency figure that matters for RL is that sync, and the one the report gives is an upper bound. GPU hours for pretraining or RL, the size of the cluster, and the share of RL time spent in rollout against training are not given.
+
+## Failure modes
+
+From the report's own account: vanilla Muon's logit explosion at scale, which QK-Clip addresses; and, in its limitations section, excessive token generation on hard reasoning tasks or unclear tool definitions, truncated outputs, incomplete tool calls, performance that drops when tool use is enabled unnecessarily, and weaker one-shot results on building complete software projects than inside an agentic framework.
+
+From the architecture: a clip that bounds logits can mask the reason they grew, and a run that relied on it for 30% of its steps would need to show the clipped heads learned what unclipped heads would have. A colocated design ties rollout and training to the same pool, so a slow tail of long trajectories idles training as well as inference; partial rollout trades that for trajectories generated across two policy versions, a source of off-policy drift the report does not quantify. Simulated tools teach the model the simulator's behaviour, and the gap between simulated and real tool responses is not measured in the report. A rubric reward judged by the model being trained can drift toward its own style; the prescriptive rubrics exist to resist reward hacking, and their effectiveness is asserted rather than measured on this page's source.
+
+## What is not public
+
+The full pretraining data mixture: the four domains are named, their proportions are not. Most ablation detail behind the recipe: the rephrasing ablation is one table on one benchmark, and the sparsity and head-count studies give the chosen points and headline ratios, not the full sweeps. The compute budget: GPU hours, cluster size and the RL schedule's length. The broadcast dtype and topology of the checkpoint engine beyond its shape. How often QK-Clip fired per head and which heads. The RL reward mix and the weighting between verifiable rewards and the rubric reward. How the simulated tools were validated against real ones. None of this should be filled in by inference from DeepSeek-V3, whose architecture K2 resembles; where the reports differ, as on heads and on FP8 compute, they differ by design.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You lead pretraining for a 300B-total MoE starting in six weeks. Your team proposes copying K2's recipe: MuonClip, rephrasing for the scarce domains, and sparsity 48. You can validate two of the three before launch. Which two, and what do you accept unvalidated in writing?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Validate MuonClip and rephrasing; take sparsity on published evidence. The optimizer change has the largest blast radius, a logit explosion that K2 itself hit at 53B total, and rephrasing has the weakest published evidence, one ablation on one benchmark. The sparsity curve is a scaling-law result with diminishing returns past 32, so the risk of a wrong pick is a few percent of FLOPs, not a failed run.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Ranking by cost of being wrong: MuonClip wrong means a divergence or a silent quality loss in some heads, discovered weeks in. Rephrasing wrong means hallucination-prone rewrites or lost facts in exactly the domains where data is scarce. Sparsity wrong means a few percent of FLOPs, recoverable in the next run, but with an infrastructure cost: 384 experts across 16-way expert parallelism is a different all-to-all pattern from a 64-expert model.</p>
+<p>The defensible alternative is to validate sparsity instead of rephrasing, if the cluster's interconnect is weaker than an H800 RoCE fabric, because expert-parallel communication can eat the FLOP savings. I would measure the all-to-all time per step at the target sparsity on one node group before deciding.</p>
+<p>The quantity I choose is the proxy scale: large enough that logit growth appears, which K2 saw at 53B total, so a 2B toy model proves nothing for MuonClip. For rephrasing, the proxy is a domain-specific evaluation with a fidelity check on the rewrites themselves.</p>
+<p>The written acceptance: sparsity 48 taken from K2's curve, with a rollback trigger if expert load imbalance or all-to-all time exceeds a stated share of step time. How this fails: K2's curve was fit with its data and its active-parameter count, and at 300B total the optimum may sit lower.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The proxy shows MuonClip clipping 10% of heads for the whole run, not 30% of steps. Do you launch, and what does that number tell you?</li>
+<li>Your legal team will not approve rewriting licensed books. What do you do with the rephrasing budget, and what do you lose?</li>
+<li>Two senior engineers disagree on colocated RL against a separate inference pool. What would you measure to decide without deciding by rank?</li>
+</ul>
+</Fragment>
+</Depth>
+
+<SelfRate id="lesson:training/numerics/kimi-k2" />

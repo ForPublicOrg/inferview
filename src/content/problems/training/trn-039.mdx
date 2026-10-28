@@ -1,0 +1,97 @@
+---
+id: trn-039
+title: Trace a batch through an MoE layer
+subtitle: routing, expert compute, combine, and when the network eats the saving
+track: training
+module: moe
+type: concept
+difficulty: hard
+seniority: [senior, staff]
+minutes: 25
+core: false
+tags: [mixture-of-experts, expert-parallelism, all-to-all, routing]
+companies:
+  - name: Mistral AI
+    url: https://prachub.com/interview-questions/explain-mixture-of-experts-and-expert-parallelism
+updated: 2026-10-28
+sources:
+  - title: PracHub, Explain mixture of experts and expert parallelism (posted 2026-09-01)
+    url: https://prachub.com/interview-questions/explain-mixture-of-experts-and-expert-parallelism
+    note: "candidate report, unverified: names Mistral AI, software engineer technical screen; asks to trace tokens through routing, expert computation and recombination, with the candidate choosing expert count, top-k, capacity policy and placement; follow-ups on total versus active parameters, the balance loss and when communication cancels the compute saving. The worked answer here is original. Checked 2026-10-28."
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: "671B total, 37B activated; hidden 7168, 256 routed experts plus 1 shared, intermediate 2048, 8 active; at most 4 nodes per token; NVLink 160 GB/s, IB 50 GB/s; cross-node EP computation-to-communication ratio about 1:1; no token dropping. Checked 2026-10-28."
+  - title: Fedus, Zoph and Shazeer, Switch Transformers (arXiv 2101.03961)
+    url: https://arxiv.org/abs/2101.03961
+    note: "expert capacity = tokens per batch / experts x capacity factor; overflowed tokens pass through the residual. Checked 2026-10-28."
+  - title: Austin et al., How to Scale Your Model, Part 4 Transformers and GPUs chapter (JAX scaling book)
+    url: https://jax-ml.github.io/scaling-book/transformers/
+    note: "two AllToAlls per MoE block, before and after; the GPUs chapter gives 9.9e14 bf16 FLOP/s and a 50 GB/s NIC per H100. Checked 2026-10-28."
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "EP only affects MoE layers and does not shard tokens, so it is combined with DP. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="As a candidate report on PracHub describes the screen">
+"Explain a mixture-of-experts transformer and how expert parallelism distributes its work."
+</Callout>
+
+Make it concrete. You are training on 16 GPUs in two nodes of 8, NVLink inside a node and one 50 GB/s NIC per GPU between nodes. Each GPU holds 4,096 tokens of a micro-batch after attention. Choose the number of experts, top-k, the capacity policy and where the experts live; then trace those tokens through one MoE layer and back, say how total and active parameters differ for your choice, and say at what point the communication cancels the compute you saved.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the hidden size and expert FFN size, and whether the dispatch can be sent in a lower precision than the combine.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the profile shows as exposed all-to-all time per step today, if a dense baseline exists.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask whether memory per GPU allows all experts of a layer inside one node.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>The router scores each token against every expert, keeps the top k, and an all-to-all ships each token's hidden state to the GPUs holding those experts. Each GPU runs its experts over what arrived, a second all-to-all returns the outputs, and the home GPU sums them weighted by the gates. Total parameters grow with the number of experts and active ones with k. Communication cancels the saving when the FLOPs each token buys per byte it sends across nodes fall below the GPU's FLOPs per NIC byte and nothing overlaps the exchange.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>Routing.</b> On each GPU, a linear layer gives a score per expert for each of the 4,096 tokens, computed in float32 inside the router. Top-k picks the experts; gate values come from the scores of the chosen experts. Counting assignments per destination GPU gives the send sizes, which are exchanged first because the all-to-all is ragged.</p>
+<p><b>Dispatch.</b> Tokens are permuted so those bound for the same GPU are contiguous, then sent. With a capacity factor, each expert accepts at most (tokens / experts) x k x factor and the rest skip the layer through the residual; dropless kernels accept everything and pay in variable memory.</p>
+<p><b>Expert compute.</b> Each GPU runs its local experts as a grouped matmul over variable-sized groups.</p>
+<p><b>Combine.</b> The reverse all-to-all returns each output to its token's home GPU, which un-permutes, multiplies by the gates and sums the k outputs, then adds the residual. In training, the backward pass repeats both exchanges in reverse.</p>
+<p><b>A choice.</b> 64 experts, top-2, 4 per GPU across both nodes. Doubling expert count at fixed k doubles total parameters and leaves FLOPs per token unchanged; that is the gap between total and active.</p>
+<p><b>When the network wins.</b> Per token, the forward expert FLOPs are 2 x k x expert parameters; the cross-node bytes are the hidden size times bytes per element times the number of remote nodes it reaches, twice (dispatch and combine). For DeepSeek-V3's shapes this works out to about 8,192 FLOPs per byte at the 4-node limit, against about 19,800 FLOPs per NIC byte for an H100-class GPU, so at peak the exchange would take longer than the math, and the report calls cross-node EP about 1:1. Finer experts or smaller k lower the ratio further.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Your 64-expert layout puts half of each token's dispatch on the NIC. The infra lead proposes keeping all 64 experts inside each node and fitting memory by sharding each expert with tensor parallelism. What do you gain and what do you pay?</li>
+<li>Profiling shows the all-to-all exposed for 35% of the step. What would you need to see to decide between overlap work and shrinking EP, given that only one fits before the run?</li>
+<li>Total parameters are 8 times active. Your serving lead says that makes the model cheap to serve. Where is that right and where is it wrong?</li>
+</ul>
+</Fragment>
+</Depth>
+
+**The decision with two defensible answers: where the experts live.**
+
+*In-node placement* (EP8: each GPU holds 8 of the 64 experts, each node holds all 64, and data parallelism runs across nodes) keeps the all-to-all on NVLink, where DeepSeek-V3 reports 160 GB/s against 50 GB/s for InfiniBand. The cost is memory: every node holds every expert, so the expert count is bounded by one node's memory, and the gradient all-reduce across nodes now includes all expert weights.
+
+*Cross-node placement* (EP16 across both nodes) halves the expert memory per GPU and allows twice the experts at the same memory, at the cost of putting roughly half of each token's dispatch on the NIC if routing is uniform over 16 GPUs in 2 nodes. It needs either overlap (scheduling the exchange of one micro-batch against the compute of another) or a routing limit on how many nodes a token may reach; DeepSeek-V3 limits each token to 4 nodes.
+
+**The quantity you choose and defend: k and the capacity policy.** Top-2 with a capacity factor of 1.25 is a common starting point; Switch reports dropped tokens typically under 1% with a working balance loss. Dropless routing removes the quality risk of drops at the cost of variable memory and a worst-case step set by the most loaded GPU. Choose dropless if memory headroom exists, capacity-limited if the cluster is near the memory limit; either is defensible with the drop rate logged per layer.
+
+**The constraint conflict.** Memory pushes experts across nodes; the NIC pushes them back. The micro-batch size sits between them: larger micro-batches amortise the exchange's fixed costs and give the overlap scheduler more work to hide behind, but cost activation memory.
+
+**How the recommended answer fails.** With cross-node EP and uneven routing, the all-to-all finishes when the most loaded receiver finishes. Even if average traffic is overlapped, a hot expert on one GPU turns overlap into a stall for all 16 ranks. Balance (from the router) and placement (from the parallelism plan) are one problem.
+
+## Follow-ups
+
+- *You picked cross-node EP and the overlap schedule is a month of work. The run starts in two weeks. Which do you ship, and what do you accept in writing about the first two weeks' throughput?*
+- *What would you need to see in the first thousand steps to move experts back inside a node?*
+- *An engineer proposes sending dispatch in FP8 and combine in BF16, as DeepSeek-V3 does. What does that buy in your FLOPs-per-byte ratio, and what quality evidence do you ask for first?*
+
+## Common mistakes
+
+- Describing EP as splitting each expert's matmul, which is tensor parallelism.
+- Forgetting the combine exchange, or that training repeats both in the backward pass.
+- Stating total parameters as the cost per token, or active parameters as the serving memory.
+- Comparing FLOPs saved with bytes sent without converting both to time on the actual GPU and NIC.

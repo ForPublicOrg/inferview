@@ -1,114 +1,124 @@
 ---
 id: agt-012
-title: A refund agent that waits for a human
-subtitle: persistence, interrupts and resume
+title: A refund agent that waits two days for a human
+subtitle: persistence, resume, and no double payout
 track: agents
 module: memory-state
 type: design
 difficulty: hard
-seniority: [senior, staff]
-minutes: 35
+seniority: [staff]
+minutes: 45
 core: true
-tags: [langgraph, checkpointing, human-in-the-loop, durable-execution, idempotency]
+tags: [langgraph, checkpointing, human-in-the-loop, interrupts, idempotency, reconciliation]
 companies: []
 updated: 2026-10-28
 sources:
-  - title: techinterview.org, LangChain interview guide
-    url: https://www.techinterview.org/companies/langchain/
-    note: lists "design LangGraph's persistence layer for stateful agents with human-in-the-loop interruption" as a sample prompt
-  - title: ombharatiya, AI system design guide, question bank (Q16)
-    url: https://github.com/ombharatiya/ai-system-design-guide/blob/main/00-interview-prep/01-question-bank.md
-    note: "how do you handle long-running agent tasks (checkpointing, resume)?"
-  - title: LangGraph docs, persistence
-    url: https://docs.langchain.com/oss/python/langgraph/persistence
-    note: checkpointers for thread state, stores for cross-thread memory
-  - title: LangGraph docs, checkpointers
-    url: https://docs.langchain.com/oss/python/langgraph/checkpointers
-    note: checkpoint per super-step, pending writes, durability modes exit, async and sync
-  - title: LangGraph docs, interrupts
+  - title: LangGraph docs, interrupts (checked 2026-10-28)
     url: https://docs.langchain.com/oss/python/langgraph/interrupts
-    note: interrupt() and Command(resume=...); the node re-runs from its start on resume; rules for try/except, ordering and side effects
-  - title: Temporal docs, workflow definition
-    url: https://docs.temporal.io/workflow-definition
-    note: deterministic workflow code; side effects in activities
+    note: "interrupt() pauses and Command(resume=...) supplies its return value on the same thread id; the node restarts from the beginning on resume, so code before the interrupt runs again; side effects before an interrupt should be idempotent or moved to another node; resume values match interrupts strictly by index; do not wrap interrupt() in a bare try/except"
+  - title: LangGraph docs, checkpointers (checked 2026-10-28)
+    url: https://docs.langchain.com/oss/python/langgraph/checkpointers
+    note: "a checkpoint per super-step (START, A, B, END gives 4); durability exit, async or sync, passed per call; replay re-executes nodes after the checkpoint, including API calls"
+  - title: LangGraph docs, persistence (checked 2026-10-28)
+    url: https://docs.langchain.com/oss/python/langgraph/persistence
+    note: "InMemorySaver loses every checkpoint on restart; PostgresSaver for production; checkpoints accumulate and the docs suggest pruning or a retention policy"
+  - title: OpenAI Agents SDK, human in the loop (checked 2026-10-28)
+    url: https://openai.github.io/openai-agents-python/human_in_the_loop/
+    note: "approval permits a tool call to execute; it does not guarantee exactly-once execution; use stable idempotency keys, reconcile with the destination when idempotency is unavailable, prevent concurrent or replayed submissions from resuming the same snapshot twice, and version stored state"
+  - title: Stripe API reference, idempotent requests (checked 2026-10-28)
+    url: https://docs.stripe.com/api/idempotent_requests
+    note: "API v1 may prune keys once they are at least 24 hours old, and a reused key after pruning is a new request; a reused key with different parameters is an error; keys up to 255 characters"
 ---
 import Callout from '../../../components/Callout.astro';
 import Depth from '../../../components/Depth.astro';
 
 ## Question
 
-<Callout kind="interview" label="Interview question">
-"Design the persistence layer for a stateful agent that pauses for human approval and resumes later."
+<Callout kind="interview" label="Design, 45 minutes">
+"Design the persistence for a refund agent that pauses for human approval and resumes days later. No refund is ever paid twice."
 </Callout>
 
-A refund agent reads the order, checks the refund policy with a model call, and pays out. Refunds over $200 need a human to approve them in an internal tool, and approvers sometimes take two days. Workers are redeployed several times a day. Requirements: no refund is ever paid twice, an approval resumes the exact run it belongs to, and the team can see what every paused run is waiting for.
+The agent reads the order, checks the refund against policy with a model call, and pays through the company's payments service. Refunds over $200 need a human to approve them in an internal tool, and approvers sometimes take two days. Workers are redeployed several times a day.
 
-Design the state, the pause, the resume and the failure handling. You can use LangGraph terms or describe your own.
+Operating constraints, a scenario given by the interviewer:
+
+- Three engineers, six weeks to production.
+- The payments service cannot be changed this quarter. It wraps Stripe API v1 refunds, passes an `Idempotency-Key` header and a metadata map through, and exposes `list_refunds(order_id)`, which returns each refund with its metadata.
+- Finance needs, for every refund, who approved which amount and when, kept for seven years.
+- Up to 2,000 refund requests a day, about 15 percent of them over $200.
+
+Write the state, the pause, the resume, the payout and the failure handling. End with a decision memo on where the payout runs, a rollout plan with rollback triggers, and what you give up.
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>Where does the run's state live while a human takes two days, and what key finds it again?</p></details>
-<details class="hint"><summary>Hint 2</summary><p>When a paused node resumes, which lines of it run again?</p></details>
-<details class="hint"><summary>Hint 3</summary><p>Which step has a side effect that must not happen twice, and what makes it safe to retry?</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask how long the payment provider remembers an idempotency key, and how long a failed payout can sit before someone retries it.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the approval tool does when two approvers act on the same request within a second.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask finance whether checkpoint history is acceptable as the audit record, and for how long the platform keeps checkpoints.</p></details>
 
 ## Answer
 
 <Depth>
 <Fragment slot="short">
-<p>Model the run as a graph whose state is persisted at every step by a database-backed checkpointer, keyed by a thread id derived from the refund request. Pause with an interrupt in its own node before the payout, store the pending approval with the thread id, and resume with the approver's decision on the same thread. The payout runs in a separate node with an idempotency key derived from the refund request id, because steps can run more than once. Run the graph with sync durability, so each checkpoint is written before the next step starts.</p>
+<p>The run is a graph whose state a Postgres checkpointer saves at every step, keyed by a thread id equal to the refund request id. An approval node pauses with <code>interrupt()</code> and does nothing before it. The approval tool resumes the thread with <code>Command(resume=decision)</code> only after it wins a compare-and-set on the approval row. The payout is its own node: it re-reads the order, calls the payments service with an idempotency key derived from the request id, and before any retry it reconciles against <code>list_refunds</code>, because Stripe v1 may forget a key once it is 24 hours old and a failed attempt can sit longer than that before anyone retries it. Runs use sync durability; audit rows are written by the application, not read out of checkpoints.</p>
 </Fragment>
 <Fragment slot="long">
-<p>State and keys. Graph state holds the order snapshot, the policy verdict and its reasons, the amount, and the approval decision. Thread id is the refund request id, so a retry of the same request finds the same run. The checkpointer is database-backed (Postgres or similar), never in-memory, because workers restart many times during a two-day wait.</p>
-<p>The pause. An approval node calls interrupt() with a payload describing what the human must decide. The graph saves state and stops; the worker is free. An approvals table indexes paused threads by status, amount and age, which is what the internal tool and the dashboard read.</p>
-<p>Resume. The approver's click invokes the graph with Command(resume=decision) and the same thread id. The decision becomes interrupt()'s return value. The node re-runs from its first line on resume, so the approval node does nothing before interrupt() except read state; in particular it does not pay, notify or write.</p>
-<p>The payout. Its own node, after approval, calling the payment API with an idempotency key built from the thread id and the step name, so a crash after the call and before the checkpoint re-runs the call without paying twice. Model calls (the policy check) are recorded results in state, so a replay does not re-ask the model and get a different answer.</p>
-<p>Durability and failure. Run this graph with sync durability, because a lost checkpoint around the approval or payout means confusion about whether a human approved. Durability is set per invocation, not per node, so the whole run pays for it. A sweeper expires approvals after a deadline and resumes them with a reject decision. Graph code changes need versioning: a thread paused under version 3 of the graph must resume on code that understands version 3's state.</p>
+<p><strong>State and keys.</strong> State holds the order id, an order snapshot, the policy verdict and its reasons, the requested amount, the approval decision and approver, and a schema version. The thread id is the refund request id, so a retried request finds the same run. The checkpointer is Postgres; an in-memory saver loses every checkpoint on the next redeploy.</p>
+<p><strong>The pause.</strong> The approval node returns early for amounts at or under $200. Otherwise it calls <code>interrupt()</code> with the order, the amount and the policy reasons, and nothing else: the node restarts from its first line on resume, so a notification sent before the interrupt is sent again on every resume. The same node also writes no approval row; the row is written by the code that observes the paused run, keyed by thread id, so a re-run cannot create a second one. One interrupt per node, never conditional, because resume values are matched by position.</p>
+<p><strong>The resume.</strong> The approval tool runs <code>UPDATE approvals SET status = 'approved', approver = $1, amount = $2 WHERE thread_id = $3 AND status = 'pending'</code> and resumes the thread only if one row changed. Two approvers clicking at once produce one resume, which is the property the Agents SDK docs ask for: no concurrent or replayed submission resumes the same snapshot twice.</p>
+<p><strong>The payout.</strong> A separate node after approval. It re-reads the order first, because the snapshot is two days old and a chargeback or a manual refund may have happened since. It calls the payments service with <code>Idempotency-Key</code> of <code>refund:</code> followed by the request id. The key does not include the amount: if an approver changes the amount after a failed attempt, Stripe sees the same key with different parameters and returns an error, which goes to a human instead of becoming a second refund. Before any retry of the payout node, it calls <code>list_refunds(order_id)</code> and treats an existing refund carrying this request id in its metadata as success.</p>
+<p><strong>Durability and versions.</strong> Sync durability: each checkpoint is written before the next step starts. The schema version in state lets a run paused under version 3 be migrated or routed to version 3 code on resume; a deploy that changes state shape migrates paused threads before it ships.</p>
+<p><strong>Audit.</strong> The application writes an append-only audit row at the approval compare-and-set and after the payout, with the provider's refund id. Checkpoints are an execution record that the platform will prune; the seven-year record cannot depend on them.</p>
 </Fragment>
 <Fragment slot="followups">
 <ul>
-<li><em>An approver edits the amount before approving. How?</em> The resume value carries the edited amount; the payout node reads it from state, and the idempotency key includes it so an edit after a failed payout is a new payment intent.</li>
-<li><em>How do you test it?</em> Kill the worker before the interrupt, during the wait, after resume and inside the payout, and assert exactly one payment and one audit row each time.</li>
-<li><em>Where does long-term memory fit?</em> Not in the checkpointer. Patterns across customers ("this account has three refunds this month") come from your database or a store, read as a tool.</li>
+<li><em>The payments team says <code>list_refunds</code> is rate-limited and asks you to call it less. Which payouts skip reconciliation, and what risk do you accept in writing?</em></li>
+<li><em>What would you need to see in production to move the payout out of the graph into a plain worker that reads approved rows?</em></li>
+<li><em>A deploy renames a state field while 300 runs are paused. What happens at resume, and what do you run before the deploy?</em></li>
 </ul>
 </Fragment>
 </Depth>
 
-The detail that separates answers is the re-run on resume. LangGraph's docs are explicit that the interrupted node restarts from the beginning when resumed, so code before `interrupt()` executes twice. A design that sends a "waiting for approval" email in the same node, before the interrupt, sends it again on every resume. The documented rules follow: keep side effects before an interrupt idempotent, do not wrap `interrupt()` in a bare `try/except` (it works by raising), and do not reorder or conditionally skip interrupts inside a node, because resume values are matched to interrupts by position.
+### Why approval is not exactly-once
 
-The second detail is that durable execution is at-least-once. Checkpoints record results after a step; a crash inside the payout step, after the payment provider accepted the call, re-runs the step. Only an idempotency key turns that into one payment. Temporal's model is the same idea with different words: workflow code is replayed and must be deterministic, side effects live in activities that may be retried.
+Durable execution is at-least-once per step. A checkpoint records a step's result after the step finishes, so a crash after the payments service accepted the refund and before the checkpoint was written re-runs the payout node. The OpenAI Agents SDK docs say it directly: approval permits a tool call to execute and does not guarantee exactly-once execution. LangGraph's replay documentation says the same about re-executing API calls after a checkpoint. The idempotency key is what turns the re-run into one refund.
 
-A minimal sketch of the graph shape, in LangGraph terms:
+### The numbers you choose
 
-```python
-def approval(state):
-    if state["amount"] <= 200:
-        return {"decision": "auto"}
-    decision = interrupt({"order": state["order_id"], "amount": state["amount"],
-                          "reasons": state["policy_reasons"]})
-    return {"decision": decision}
+**Checkpoint load.** A linear graph of load order, check policy, approval, payout and notify writes a checkpoint for the empty start, the input and each of the five nodes: seven per run, by the docs' count of four for START, A, B, END. At 2,000 requests a day that is 14,000 writes, about 0.16 a second on average. Sync durability costs nothing that matters at this volume; the model call dominates each run's latency. The durability decision is easy here, and it would deserve a measurement at a hundred times the volume.
 
-def payout(state):
-    if state["decision"] in ("auto", "approve"):
-        key = f"refund:{state['request_id']}:{state['amount']}"
-        return {"payment": payments.refund(state["order_id"], state["amount"], idempotency_key=key)}
-    return {"payment": None}
+**The key window against the wait.** Stripe v1 may prune a key once it is at least 24 hours old, and a reused key after pruning is a new request. The approval wait does not matter by itself, because the key is first used when the payout runs, after approval. What matters is the gap between the first payout attempt and a retry. A first attempt that times out on Friday evening, with the run marked failed and retried by an operator on Monday, falls outside the window, and the key no longer protects it. Reconciling before every retry closes that gap. Reconciling only when a retry comes more than 12 hours after the first attempt is a reasonable cheaper rule if the rate limit forces it, provided the attempt time is written before the call; when that write was lost in the same crash, the attempt time is unknown and the retry reconciles.
 
-# graph = builder.compile(checkpointer=PostgresSaver(...))
-# inputs carries request_id, so the node never needs to read the thread id from config
-# graph.invoke(inputs, config={"configurable": {"thread_id": refund_request_id}}, durability="sync")
-# later: graph.invoke(Command(resume="approve"), config={"configurable": {"thread_id": refund_request_id}}, durability="sync")
-```
+**The approval deadline.** I pick 5 days, after which a sweeper resumes the thread with a reject decision and the customer is told the request expired. Reasonable choices run from 3 to 10 days depending on approver staffing; unreasonable is no deadline, which leaves paused threads pinned to old graph versions indefinitely and lets the order snapshot drift for weeks.
+
+**Approval volume.** 15 percent of 2,000 is 300 paused runs a day; at a two-day wait, about 600 are paused at any moment. That is the number of threads a state-shape migration must handle.
+
+### Where the payout runs: two defensible answers
+
+| | Payout as a node in the graph | Graph ends at "proposed"; a plain worker pays from the approved row |
+|---|---|---|
+| What it buys | One run, one history; post-approval steps (the customer message drafted from the approver's note) stay in the same state | The money path has no model, no interrupt semantics and no paused graph versions; it is ordinary outbox code |
+| What it costs | Paused threads pin graph code for days while workers redeploy several times a day; every state change needs a migration plan | Two systems to run and monitor; a second graph run for anything model-driven after approval; the agent's state and the payout state can disagree |
+
+**Decision memo.** Keep the payout in the graph for launch, because the customer message after approval needs the model and the approver's note, and one execution history is easier for three engineers to debug in six weeks. Guard it with the idempotency key, reconciliation before retries, the compare-and-set resume and versioned state. Revisit after the first two state-shape migrations: if either needs a manual fix to paused threads, move the payout to the worker.
+
+**What you give up.** Some latency and a provider read on retries; freedom to change state shape without a migration while runs are paused; and the ability to let an approver edit an amount after a failed payout attempt without a human resolving the key conflict.
+
+**Rollout and rollback triggers.** Weeks 1 to 3: the graph runs in shadow, proposing refunds that people pay by hand, and every proposal is compared with what the person did. Weeks 4 to 6: automatic payouts at or under $200, then the approval path for one support team. A nightly job counts provider refunds per request id. Any count above one moves every payout back to manual until the cause is known. A resume error rate above 1 percent after a deploy rolls the deploy back. Paused threads past the deadline that the sweeper did not close page the on-call.
+
+**The failure mode of this design.** Reconciliation reads `list_refunds`, which sees refunds made through the provider. A refund the support team issues by bank transfer, outside the provider, is invisible to it, and the agent pays again. The re-read of the order in the payout node only helps if the order system records those refunds, so the design depends on one place that records every refund regardless of channel; if that does not exist, the launch plan has to say so and keep large refunds manual.
 
 ## Follow-ups
 
-- *Why not just poll a database flag in a loop?* A sleeping worker holds resources for two days and still loses its place on redeploy; the checkpoint plus interrupt frees the worker and survives restarts.
-- *What does the `"exit"` durability mode do here?* It persists only when the run ends, pauses or errors, so a crash mid-run loses progress. Acceptable for a graph of cheap, short steps; not for one that contains a payout, since the mode applies to the whole run.
-- *How do you show reviewers what the agent did?* Checkpoint history gives every state transition; render it as a timeline next to the approval request.
+- *Why not poll a database flag in a loop instead of interrupting?* A waiting worker holds a slot for two days and still loses its place on the next redeploy; the checkpoint and interrupt free the worker and survive restarts.
+- *Two senior engineers disagree about keeping the payout in the graph. How do you decide without deciding by rank?* Agree in advance on the evidence that settles it: the count of manual fixes to paused threads after migrations, and the count of duplicate-refund alarms, over the first month.
+- *Finance wants the approver to be able to change the amount at any time. What changes in your key and your reconciliation?* An edited amount is a new payment intent with its own key, recorded with the approver; reconciliation sums refunds per order and refuses a payout that would exceed the captured amount.
+- *Your sweeper rejects expired approvals. An approver approves one second after the sweeper's reject.* The compare-and-set makes one of them win; the loser sees a stale-status error in the tool, and the audit row records both attempts.
 
 ## Common mistakes
 
-- An in-memory checkpointer in a design that must survive redeploys.
-- Side effects before `interrupt()` in the same node, which repeat on resume.
-- A new thread id per attempt, so retries start fresh instead of resuming.
-- Generating the idempotency key randomly per attempt, which defeats it.
-- No plan for graph code changing while runs are paused.
+- An in-memory checkpointer in a system that redeploys several times a day.
+- Notifications or row writes before `interrupt()` in the same node, which repeat on every resume.
+- A random idempotency key per attempt, or one that includes the amount, which makes an edited amount look like a new refund.
+- Trusting the idempotency key across a gap longer than the provider keeps keys.
+- Paying from a two-day-old order snapshot without re-reading the order.
+- Treating checkpoint history as the seven-year audit record.

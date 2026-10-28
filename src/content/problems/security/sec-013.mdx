@@ -1,0 +1,140 @@
+---
+id: sec-013
+title: Design a sandboxed cloud IDE
+subtitle: a multi-tenant browser notebook that runs anyone's code
+track: security
+module: sandboxing-secrets
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 50
+core: true
+tags: [isolation, firecracker, gvisor, multi-tenant, egress, notebooks, system-design]
+companies:
+  - name: OpenAI
+    url: https://prachub.com/interview-questions/design-a-sandboxed-cloud-ide
+updated: 2026-10-28
+sources:
+  - title: PracHub, Design a sandboxed cloud IDE (question page, checked 2026-10-28)
+    url: https://prachub.com/interview-questions/design-a-sandboxed-cloud-ide
+    note: "candidate report: PracHub lists it as an OpenAI software engineer onsite system design question (page last updated 2026-04-09, solution section dated 2026-01-22); the page does not name the reporter; asks for an isolated environment per workspace, strong tenant isolation as the primary requirement, reasonable start-up latency, streaming output, file persistence, autoscaling with fair sharing and observability; collaboration optional. The exercise below is original material."
+  - title: Firecracker, specification (checked 2026-10-28)
+    url: https://github.com/firecracker-microvm/firecracker/blob/main/SPECIFICATION.md
+    note: "125 ms or less from InstanceStart to guest user space, measured with the serial console disabled and a minimal kernel and root filesystem on m5d.metal and m6g.metal; VMM memory overhead 5 MiB or less for a 1 vCPU, 128 MiB microVM"
+  - title: Firecracker, design document (checked 2026-10-28)
+    url: https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md
+    note: "start only through the jailer in production; vCPU threads are treated as running malicious code from the start; Firecracker does no network filtering and guest egress must be filtered at the host; token-bucket rate limiters on its block and network devices"
+  - title: Firecracker README (checked 2026-10-28)
+    url: https://github.com/firecracker-microvm/firecracker
+    note: "the VMM creates and runs microVMs through KVM; the tested platforms listed are bare-metal EC2 instances"
+  - title: gVisor documentation (checked 2026-10-28)
+    url: https://gvisor.dev/docs/
+    note: "a per-sandbox application kernel in user space; reduced compatibility and higher per-system-call overhead; system-call-heavy workloads may perform poorly"
+  - title: Claude Code docs, Securely deploying AI agents (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/agent-sdk/secure-deployment
+    note: "vendor-reported gVisor overhead: about 0% CPU-bound, about 2x simple system calls, up to 10 to 200x for file I/O with heavy open and close patterns; a VM with no network interface talking to a host proxy over vsock"
+  - title: Anthropic Engineering, How we contain Claude across products (2026-05-25)
+    url: https://www.anthropic.com/engineering/how-we-contain-claude
+    note: "claude.ai runs code server-side in gVisor containers with ephemeral per-session filesystems; Cowork's allowlisted api.anthropic.com let a planted instruction upload files to an attacker's account; every function reachable through an allowed domain is attack surface"
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"Design a browser-based notebook that runs Python for anyone who signs up: many tenants, each with workspaces, each workspace with files that persist and a kernel that streams output back to the browser. Users install packages from PyPI. Isolation between tenants is the first requirement. Walk me through how a session starts, where code runs, what it can reach, how files persist and what stops one tenant from hurting another."
+</Callout>
+
+The operating constraints, given by the interviewer, are a scenario:
+
+- Five engineers and four months to general availability. Collaboration is out of scope for launch.
+- The security lead says tenant code must never share a kernel with another tenant's code. Product says a new session must be ready to type into within 2 seconds at p95.
+- Usage is bursty: the load test from the private beta shows up to 30 new sessions per second for a few minutes when a large course starts its class, and a cold session (boot plus image) measured 4 seconds on the beta's hardware.
+- The cloud provider offers bare-metal instances, at a higher price per core than the general-purpose ones the beta ran on.
+
+Write the design, choose the numbers you are asked for, and end with a decision memo and a rollout plan with rollback triggers.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask the security lead whether a user-space application kernel such as gVisor's Sentry meets "never share a kernel", and what evidence would change their answer.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the distribution of session start times in the beta, not only the p95, and the share of sessions that run pip install in their first minute.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask which outbound destinations users needed in the beta, from the proxy logs, before you write the egress policy.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>One microVM per session on bare-metal hosts, started through Firecracker's jailer, destroyed at the end and never reused. The VM has no network interface: output streams to the browser over vsock through a host agent and a websocket gateway, and the only route out is a host-side egress proxy that allows package downloads from PyPI and nothing else by default. Files live in object storage per workspace; the host agent, which holds the storage credentials, attaches a workspace disk at start and syncs it back, so nothing inside the VM holds a credential. A warm pool of booted, empty VMs absorbs the bursts, sized from the burst rate and the refill time. I give up the cheaper general-purpose fleet and some start-up headroom for a boundary that meets the security lead's rule without argument.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Session start.</strong> The browser asks the session API, which authenticates the user, checks the tenant's quota and asks the scheduler for a warm VM on a host with capacity. The host agent attaches the workspace disk, injects a per-session token for the kernel channel, and starts the Jupyter kernel. Everything the VM needs to know about the session arrives after the VM is claimed, so a warm VM is identical to every other one.</p>
+<p><strong>Where code runs.</strong> Firecracker microVMs started through the jailer, which sets up the resources that need privileges and drops them before Firecracker runs; Firecracker then loads seccomp filters on each of its threads before any guest code runs. Firecracker's design document treats every vCPU thread as running malicious code from the moment it starts. KVM is the boundary, so the hosts are bare metal.</p>
+<p><strong>Streaming.</strong> Kernel messages go over vsock to the host agent, which forwards them to a websocket gateway. The gateway checks the per-session token on every connection and binds it to the user's session; the token is useless outside that gateway.</p>
+<p><strong>Egress.</strong> Firecracker does no network filtering, so the VM gets no network device of its own. The kernel reaches the outside only through the host proxy over vsock. The default policy allows GET to pypi.org and files.pythonhosted.org and refuses everything else, including the metadata service and every internal range. Workspace owners on paid plans can add domains, which are logged and reviewed. Uploading is not a download: allowing a host is allowing every function it exposes, and that is how an allowlisted domain turned into an upload path in Anthropic's Cowork incident.</p>
+<p><strong>Files.</strong> Each workspace is a disk image in object storage. The host agent pulls it at claim time, attaches it as a block device, and writes it back on idle, on stop and every few minutes. Storage credentials stay on the host.</p>
+<p><strong>Fair sharing.</strong> Per-tenant quotas on concurrent sessions and vCPUs at the scheduler; per-VM CPU and memory limits from the VM size; Firecracker's rate limiters on block and network devices so one VM cannot saturate a host's disk; an idle timeout and a maximum session length.</p>
+<p><strong>Observability.</strong> Per-session start latency broken into claim, attach and kernel start; proxy logs per workspace; host-level CPU per VM, which is also the signal for mining abuse.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Bare-metal hosts plus the warm pool cost three times the gVisor fleet the beta ran on, and finance asks you to cut half the difference. Which half do you cut, the boundary or the pool, and what risk do you accept in writing?</em></li>
+<li><em>What would you need to see in production to move from microVMs to gVisor, or the other way?</em></li>
+<li><em>A university customer wants students to reach a course's private GitLab from their notebooks. What changes in the egress design, and who signs off?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+### The decision with two defensible answers: microVM or gVisor
+
+| | Firecracker microVM per session | gVisor sandbox per session |
+|---|---|---|
+| Boundary | KVM and a guest kernel per session; the host kernel is reached through the VMM, itself confined by the jailer | The Sentry, an application kernel in user space per sandbox; the host kernel is reached only through the Sentry |
+| Meets "never share a kernel" | Yes, without argument | Arguable: no shared guest kernel, but one host kernel behind every Sentry |
+| Hosts | Bare metal, because the VMM needs KVM | The general-purpose instances the beta already uses |
+| Workload cost | Near-native CPU; I/O through virtio devices | Higher per-system-call cost; pip install, heavy on open and close, pays the most (vendor-reported up to 10 to 200 times for such patterns) |
+| Egress | Nothing built in; host proxy over vsock is required | Same need; filter outside the sandbox |
+| Who runs it in production | AWS built it for Lambda and Fargate | Anthropic runs claude.ai's code execution in gVisor containers |
+
+Both are defensible. gVisor is cheaper to run on the existing fleet and gets to launch faster with five engineers; its cost is the security lead's objection, which is a reasonable reading of the requirement, and slower package installs. The microVM meets the rule outright; its cost is bare-metal pricing, a guest image pipeline, and an egress path the team must build. The conflict is cost and schedule against isolation strength. With isolation stated as the first requirement and a security lead who will not sign the gVisor reading, I choose the microVM and pay for it with the warm pool below.
+
+### The number to choose: the warm pool
+
+The burst is 30 sessions per second and a cold start takes 4 seconds, against a 2-second budget, so bursts have to be served from VMs that are already booted. While the pool refills, each second of burst consumes 30 VMs, and a VM started to replace one takes 4 seconds to be ready, so the pool needs at least 30 × 4 = 120 VMs to keep up without anyone waiting on a cold start. I would run 180, which is 1.5 times that, because burst rates move with the size of the next course and the beta measured only a few bursts. That headroom factor is my choice; anything from 1.2 to 2 is reasonable depending on how much the beta under-sampled. A pool sized to the average arrival rate instead of the burst is the unreasonable choice: it is empty within seconds of a class starting. If each warm VM reserves 1 GiB (a scenario figure for the base image with Python loaded), 180 VMs hold 180 GiB of host memory idle at all times. Firecracker's own VMM overhead, 5 MiB or less per microVM under its stated conditions, is small against that; the guest memory is the cost.
+
+Firecracker's specification states 125 ms or less from InstanceStart to guest user space, for a minimal kernel and root filesystem with the serial console off on specific bare-metal instances. The beta's 4 seconds is the image, the Python start-up and the attach, not the VMM. That is where engineering time goes if the pool's memory bill is too high.
+
+### What you give up
+
+The cheaper fleet and the shorter schedule. GPU notebooks are out at launch. Users who want arbitrary outbound access do not get it by default, and some workflows (fetching a dataset from a lab's server) need a support request. Collaboration is not in the design.
+
+### Where this design fails
+
+The warm pool is the weak point. Every warm VM boots from the same image, and if the team moves to snapshot restore for faster starts, everything in memory at snapshot time is identical in every clone: entropy, any generated key, any token. Anything secret must be generated after the claim, and the session token is injected then for that reason. Second, the host agent and the egress proxy are shared by every VM on a host: a parsing bug in either is cross-tenant even though the VMs are not. They need the same review and fuzzing as the boundary. Third, the boundary does nothing for what users do to themselves: a malicious package from PyPI runs with the user's own files and sends what it reads through whatever the egress policy allows.
+
+### Decision memo and rollout plan
+
+**Decision.** One Firecracker microVM per session on bare-metal hosts, no network device in the VM, host-side egress proxy with a PyPI-only default, workspace disks synced by the host agent, a warm pool of 180 per region sized from the burst rate. Revisit gVisor after three months of production data.
+
+**Rollout.** Month 1: host agent, jailer configuration, egress proxy, image pipeline. Month 2: session API and scheduler, warm pool, load test at twice the beta's burst. Month 3: invited tenants. Month 4: general availability.
+
+**Rollback triggers,** any one of which stops new sign-ups:
+
+- Any egress from a VM that did not pass through the proxy, from host flow logs.
+- p95 time to a ready session above 2 seconds for a full burst, two bursts running.
+- Any workspace disk attached to a session of another tenant, from the host agent's audit log.
+- Host memory pressure that evicts warm VMs during a burst.
+
+## Follow-ups
+
+- *The security lead accepts gVisor if you add a second layer. What layer would make both of you comfortable, and what does it cost?*
+- *A tenant runs a crypto miner on free accounts at scale. Which signals do you already have, and what do you change in quotas?*
+- *Two senior engineers disagree about syncing workspace disks every few minutes versus only at stop. How do you decide without deciding by rank?*
+
+## Common mistakes
+
+- Drawing containers per tenant and calling the shared kernel isolation.
+- Giving the VM a network interface and planning to filter in the guest, which the guest controls.
+- Putting storage credentials inside the VM so the kernel can save files.
+- Reusing a VM across sessions after a reset instead of destroying it.
+- Sizing the warm pool from average load, so it empties at the first burst.

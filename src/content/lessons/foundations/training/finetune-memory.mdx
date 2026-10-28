@@ -1,0 +1,122 @@
+---
+title: "Fine-tuning memory: where 16 bytes per parameter come from"
+track: foundations
+module: training
+order: 3
+kind: lesson
+level: senior
+minutes: 14
+summary: Mixed-precision Adam holds 16 bytes of model state per trained parameter before activations, ZeRO shards that cost, LoRA and QLoRA remove most of it, and activations are the part none of them touch.
+prerequisites: [foundations/training/pipeline-map]
+updated: 2026-10-28
+sources:
+  - title: "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models (Rajbhandari et al., 2019)"
+    url: https://arxiv.org/abs/1910.02054
+    note: "section 3.1: fp16 parameters and gradients plus fp32 parameters, momentum and variance, K = 12, 2 + 2 + K = 16 bytes per parameter; stage reductions 4x (Pos), 8x (Pos+g), linear in data-parallel degree (Pos+g+p); Figure 1 example 7.5B parameters, Nd = 64, K = 12; 1.5B GPT-2 at sequence 1K and batch 32 needs about 60 GB of activations, about 8 GB with activation checkpointing; read from the PDF, checked 2026-10-28"
+  - title: "LoRA: Low-Rank Adaptation of Large Language Models (Hu et al., 2021)"
+    url: https://arxiv.org/abs/2106.09685
+    note: "against GPT-3 175B fine-tuned with Adam, 10,000x fewer trainable parameters and 3x less GPU memory; no additional inference latency; checked 2026-10-28"
+  - title: "QLoRA: Efficient Finetuning of Quantized LLMs (Dettmers et al., 2023)"
+    url: https://arxiv.org/abs/2305.14314
+    note: "65B model fine-tuned on a single 48GB GPU while preserving full 16-bit fine-tuning task performance; 4-bit NormalFloat, double quantization of the quantization constants, paged optimizers for memory spikes; checked 2026-10-28"
+  - title: LoRA Without Regret (Schulman and Thinking Machines Lab, 29 September 2025)
+    url: https://thinkingmachines.ai/blog/lora/
+    note: "LoRA matches full fine-tuning on small and medium SFT datasets (Tulu3, OpenThoughts3) and underperforms past its capacity; attention-only rank 256 (0.25B parameters) underperforms MLP-only rank 128 (0.24B) on Llama-3.1-8B; optimal LR about 10x full fine-tuning, fitted multiplier 9.8, about 15x for runs under about 100 steps; less tolerant of large batches, independent of rank; rank 1 matches full fine-tuning for policy-gradient RL; rank-1 LoRA on Llama-3.1-8B is about 3M parameters; slightly more than 2/3 of full fine-tuning FLOPs per pass; checked 2026-10-28"
+  - title: Meta Llama 3.1 8B Instruct, config.json (unsloth mirror of the Meta release)
+    url: https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct/blob/main/config.json
+    note: "hidden 4096, intermediate 14336, 32 layers, 32 query heads and 8 key-value heads of 128, vocab 128256, untied embeddings, bfloat16; checked 2026-10-28"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import FoundationsLoraMemory from '../../../../components/widgets/FoundationsLoraMemory.astro';
+
+## The accounting
+
+Fine-tuning memory has two parts with different scaling laws. Model states (weights, gradients, optimizer state) scale with the number of trained parameters and nothing else. Activations scale with micro-batch size, sequence length and depth, and do not care how many parameters are trainable. Every method in this lesson attacks the first part; only recomputation and smaller micro-batches attack the second.
+
+The ZeRO paper's section 3.1 gives the model-state count for mixed-precision Adam. Forward and backward run on fp16 weights (2 bytes) and produce fp16 gradients (2 bytes). The update needs an fp32 copy of the weights plus Adam's momentum and variance, 4 bytes each, which the paper calls K = 12. The total is 2 + 2 + 12 = 16 bytes per parameter, so its 1.5B GPT-2 example needs 1.5 × 16 = 24 GB before a single activation. With bf16 the byte counts are the same.
+
+Some stacks keep an fp32 gradient accumulation buffer next to the half-precision gradient so that micro-batch gradients sum without precision loss. That adds 4 bytes: 2 + 2 + 4 + 12 = 20. Which of the two your framework does is a configuration fact to check, and it moves an 8B estimate by 32 GB.
+
+For the Llama 3.1 8B config the parameter count follows from the shapes. Attention per layer is 4096 × 4096 for the query and output projections and 4096 × 1024 for key and value (8 key-value heads of 128), 41,943,040 parameters. The MLP is three 4096 × 14336 matrices, 176,160,768. With two 4,096-wide norms a layer is 218,112,000, and 32 layers make 6,979,584,000. The untied input and output embeddings add 2 × 128,256 × 4,096 = 1,050,673,152, and the final norm 4,096: 8,030,261,248 in total.
+
+Full fine-tuning model states are then 8.03B × 16 = 128.5 GB, or 160.6 GB at 20 bytes. Neither fits on one 80 GB GPU.
+
+## Sharding: what ZeRO buys
+
+ZeRO's data-parallel stages partition model states across Nd GPUs instead of replicating them. Stage 1 partitions the optimizer state (the paper reports a 4x reduction at large Nd), stage 2 adds gradients (8x), stage 3 adds the parameters (linear in Nd). The paper's Figure 1 uses 7.5B parameters on 64 GPUs: 7.5 × 16 = 120 GB replicated; stage 1, 4 × 7.5 + 12 × 7.5 / 64 = 31.4 GB per GPU; stage 2, 2 × 7.5 + 14 × 7.5 / 64 = 16.6 GB; stage 3, 16 × 7.5 / 64 = 1.9 GB.
+
+<Predict id="fnd-training-zero2" question="Full fine-tuning of Llama 3.1 8B (8.03B parameters, 16 bytes per parameter) with ZeRO stage 2 across 8 GPUs. How many GB of model states per GPU?" answer={30.1} tolerance={1.5} unit="GB">
+<p>Stage 2 keeps the 2-byte weights replicated and shards gradients and optimizer state: 2 × 8.03 + 14 × 8.03 / 8 = 16.06 + 14.05 = <b>30.1 GB</b>. Stage 1 would be 4 × 8.03 + 12 × 8.03 / 8 = 44.2 GB; stage 3, 16 × 8.03 / 8 = 16.1 GB. On 80 GB GPUs stage 2 leaves about 50 GB for activations and buffers, and stage 3 buys more room at the cost of gathering parameters on every forward and backward pass.</p>
+</Predict>
+
+Sharding moves the cost from memory to the interconnect. The ZeRO paper reports stages 1 and 2 at the same communication volume as plain data parallelism; stage 3 adds parameter traffic, which is cheap on a single node with fast links and noticeable across nodes.
+
+## Activations, the part that does not shrink
+
+The ZeRO paper's own example: the 1.5B GPT-2 at sequence length 1K and batch 32 needs about 60 GB of activations, against 24 GB of model states. Activation checkpointing, which keeps only some layer inputs and recomputes the rest in the backward pass, brings that to about 8 GB, paid for in recomputation.
+
+For the 8B config at sequence 4,096 and micro-batch 1, a lower bound with full checkpointing is the saved layer inputs: 4,096 tokens × 4,096 hidden × 2 bytes × 32 layers = 1.07 GB. A term people miss sits at the end of the network: if the loss is computed on fp32 logits, the logits alone are 4,096 × 128,256 × 4 bytes = 2.1 GB, double that at 8,192 tokens, and the gradient of the logits is the same size again. With a 128K vocabulary the output layer, not the transformer stack, can set the peak.
+
+## LoRA: train a low-rank update, freeze the rest
+
+LoRA leaves each adapted weight W frozen and trains W + BA, with B of shape d_out × r and A of shape r × d_in; B starts at zero so training starts from the base model. Only A and B have gradients and optimizer state. The frozen weights still need storing at 2 bytes each, and activations still flow through every layer, so activation memory is unchanged.
+
+Per layer of the 8B config, adapters on all seven projections add r × (d_in + d_out) each: query and output 8,192 r each, key and value 5,120 r each, gate, up and down 18,432 r each, 81,920 r in total. Over 32 layers that is 2,621,440 r; at rank 1 about 2.6M, which matches the "about 3M" the LoRA Without Regret post gives for this model. At rank 16 it is 41,943,040, 0.52% of the model, and its model states are 41.9M × 16 = 0.67 GB. Add 8.03B × 2 = 16.1 GB of frozen weights and LoRA needs about 16.7 GB of model states instead of 128.5 GB.
+
+QLoRA stores the frozen base in 4-bit NormalFloat, 0.5 bytes per parameter, so 4.0 GB for this model plus quantization constants (which double quantization shrinks), with the adapters kept at higher precision. Paged optimizers absorb short spikes. The paper fine-tuned a 65B model on one 48 GB GPU: 65 × 0.5 = 32.5 GB of 4-bit weights, which leaves about 15 GB for adapters, constants and activations.
+
+<FoundationsLoraMemory />
+
+The LoRA paper's headline, 10,000x fewer trainable parameters and 3x less GPU memory than full fine-tuning of GPT-3 175B with Adam, is the same accounting: trainable parameters shrink by four orders of magnitude, memory by a factor of three, because frozen weights and activations remain.
+
+## What LoRA does not save, and when it loses
+
+Compute. LoRA Without Regret counts slightly more than 2/3 of full fine-tuning's FLOPs per pass, because the backward pass still computes activation gradients through every frozen matrix. A plan that budgets one third of the full fine-tune's GPU hours has confused memory with compute.
+
+Quality conditions. The same post reports LoRA matching full fine-tuning on small and medium instruction and reasoning datasets, with four conditions. Apply it to all layers: attention-only LoRA at rank 256 (0.25B parameters) underperformed MLP-only LoRA at rank 128 (0.24B) on Llama-3.1-8B, so the gap is placement, not parameter count. Raise the learning rate: the optimal rate was about 10x full fine-tuning's (a fitted multiplier of 9.8, about 15x for runs under roughly 100 steps). Keep batches moderate: LoRA lost more than full fine-tuning as batch size grew, regardless of rank. And mind capacity: once the dataset exceeds what the adapter can absorb, LoRA falls behind. For policy-gradient RL even rank 1 matched full fine-tuning, because each episode carries little information.
+
+## The decision
+
+Given a model, hardware and a dataset, the order of questions is:
+
+1. Do the frozen weights fit, at 2 bytes (LoRA) or 0.5 bytes (QLoRA), with room left for activations at the real sequence length? If not, shard or pick a smaller model.
+2. Is the dataset small or medium for the model, and is the goal behaviour rather than new knowledge? Then LoRA on all layers at about 10x the full learning rate is the default; full fine-tuning has to earn its memory.
+3. Is it a large knowledge-heavy dataset, or did LoRA plateau above full fine-tuning on a held-out slice? Then full fine-tuning with ZeRO stage 2 or 3, priced in GPU-hours and interconnect.
+4. Run one training step at the real sequence length and micro-batch before quoting hardware. The estimate is for model states; the step measures the rest.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You have one node of 8 × 80 GB GPUs for two weeks and 300M tokens of domain SFT data for an 8B model (scenario). Full fine-tune or LoRA? Give the memory per GPU and the condition that would change your answer."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Both fit, so memory does not decide. Full fine-tuning with ZeRO stage 2 is 30.1 GB of model states per GPU; LoRA at rank 16 on all layers is about 16.7 GB replicated, and either leaves room for activations at 4K tokens with checkpointing. I would start with LoRA on all layers at about 10x the full learning rate, because it is cheaper per experiment and serves as an adapter, and switch to full fine-tuning if a held-out slice shows LoRA plateauing above it, which 300M tokens makes plausible.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Memory. 16 bytes × 8.03B = 128.5 GB unsharded; ZeRO-2 on 8 GPUs gives 30.1 GB per GPU, ZeRO-3 16.1 GB. LoRA at rank 16: 16.1 GB frozen plus 0.67 GB adapter states. Activations with checkpointing at 4,096 tokens and micro-batch 1: at least 1.07 GB of saved layer inputs plus 2.1 GB of fp32 logits and their gradient.</p>
+<p>The conflict is compute and calendar against capacity. LoRA is about 2/3 of the FLOPs per pass, not a third, so it buys more experiments in two weeks but not an order of magnitude more. 300M tokens is past the small-dataset regime in which LoRA reliably matches full fine-tuning; it may hit capacity. Both answers are defensible: LoRA first (cheaper iterations, adapter swapping, smaller artefact; risk of a capacity plateau) or full fine-tuning first (no capacity question; costs a full-model artefact per experiment and a 16 GB checkpoint per save).</p>
+<p>Failure mode of LoRA-first: the team tunes rank and learning rate for a week, finds the plateau on day 8, and has six days for the full run. The written plan fixes that with a day-3 checkpoint comparison of LoRA against a short full fine-tune on the same held-out slice, and a stated switch rule.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The day-3 comparison shows LoRA 1 point behind on the held-out slice and full fine-tuning twice as slow. Which do you run to completion, and what risk do you accept in writing?</li>
+<li>What would you need to see to drop to QLoRA on a single GPU and free the node?</li>
+<li>Sequence length doubles to 8,192 because of long contracts. Which term in your estimate changes, and by how much?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The 16-byte count assumes plain mixed-precision Adam. 8-bit optimizers shrink the 12-byte term, CPU offload moves it out of GPU memory, and other optimizers keep different state; the structure of the calculation holds, the constant does not.
+
+QLoRA's 0.5 bytes per parameter assumes everything is quantized. If your stack leaves the input and output embeddings in bf16, which is worth checking, the 8B model's 1.05B embedding parameters cost 2.1 GB instead of 0.5 GB.
+
+And allocators fragment. The estimate is a floor; the first training step on the target hardware at the real sequence length is the number to put in the plan.
+
+<SelfRate id="lesson:foundations/training/finetune-memory" />

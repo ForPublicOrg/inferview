@@ -1,0 +1,124 @@
+---
+id: inf-018
+title: A 128K-context assistant on sixteen GPUs
+subtitle: choose a KV compression family, and the accuracy test that would reverse it
+track: inference
+module: inference-anatomy
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 45
+core: false
+tags: [kv-cache, kv-compression, quantization, eviction, long-context, capacity, evals]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: "SnapKV: LLM Knows What You are Looking for Before Generation (Li et al., 2024)"
+    url: https://arxiv.org/abs/2404.14469
+    note: "selects clustered important prompt KV positions per head from an observation window at the end of the prompt; the paper reports 3.6x generation speed and 8.2x memory efficiency at 16K inputs; LongBench runs compress the prompt cache to 1,024, 2,048 and 4,096 positions with a 32-token window. Checked 2026-10-28."
+  - title: "H2O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models (Zhang et al., 2023)"
+    url: https://arxiv.org/abs/2306.14048
+    note: "eviction keeping recent and heavy-hitter tokens; the paper reports up to 29x throughput over DeepSpeed Zero-Inference and Hugging Face Accelerate with 20% heavy hitters. Checked 2026-10-28."
+  - title: "KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache (Liu et al., 2024)"
+    url: https://arxiv.org/abs/2402.02750
+    note: "keys quantised per channel, values per token, 2 bits, tuning-free; the paper reports 2.6x less peak memory including weights and up to 4x larger batch on Llama, Falcon and Mistral. Checked 2026-10-28."
+  - title: "DeepSeek-V3.2 (DeepSeek-AI, 2025), DeepSeek Sparse Attention"
+    url: https://arxiv.org/html/2512.02556
+    note: "a lightning indexer scores preceding tokens and attention reads the top 2,048 KV entries per query; core attention goes from O(L^2) to O(Lk); introduced by continued training with a dense warm-up of 2.1B tokens. Checked 2026-10-28."
+  - title: "Fast Transformer Decoding: One Write-Head is All You Need (Shazeer, 2019)"
+    url: https://arxiv.org/abs/1911.02150
+    note: "multi-query attention shares keys and values across heads to cut decode memory bandwidth, with minor quality loss. Checked 2026-10-28."
+  - title: "GQA (Ainslie et al., 2023)"
+    url: https://arxiv.org/abs/2305.13245
+    note: "uptraining multi-head checkpoints with 5% of original pre-training compute; quality close to multi-head at speed close to MQA. Checked 2026-10-28."
+  - title: "DeepSeek-V2 (DeepSeek-AI, 2024)"
+    url: https://arxiv.org/abs/2405.04434
+    note: "multi-head latent attention; the paper reports a 93.3% smaller KV cache than DeepSeek 67B. Checked 2026-10-28."
+  - title: vLLM docs, Quantized KV cache
+    url: https://docs.vllm.ai/en/latest/features/quantization/quantized_kvcache.html
+    note: "kv_cache_dtype accepts fp8, fp8_e4m3 and fp8_e5m2; per-tensor scales by default; without calibration all scales are 1.0; llm-compressor calibrates scales. Checked 2026-10-28."
+  - title: The Llama 3 Herd of Models (Meta, 2024), Table 3
+    url: https://arxiv.org/html/2407.21783
+    note: "70B: 80 layers, 8 KV heads, dimension 8,192, 64 heads; 128K context after continued pre-training. Checked 2026-10-28."
+  - title: NVIDIA H100 product page
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: "H100 SXM 80 GB; 3,958 FP8 TFLOPS with sparsity, 1,979 dense. Checked 2026-10-28."
+  - title: Scaling Laws for Neural Language Models (Kaplan et al., 2020), equation 2.2
+    url: https://arxiv.org/abs/2001.08361
+    note: "forward FLOPs per token about 2N + 2 n_layer n_ctx d_attn. Checked 2026-10-28."
+  - title: "RULER: What's the Real Context Size of Your Long-Context Language Models? (Hsieh et al., 2024)"
+    url: https://arxiv.org/abs/2404.06654
+    note: "17 models, 13 tasks including multi-hop tracing and aggregation; all claim 32K or more, about half hold satisfactory performance at 32K, despite near-perfect vanilla needle scores. Checked 2026-10-28."
+  - title: "HELMET (Yen et al., 2024)"
+    url: https://arxiv.org/abs/2410.02694
+    note: "seven application-centric categories up to 128K; needle results do not reliably predict downstream performance. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Design round, 45 minutes">
+"We serve a 128K-context assistant and we are out of KV memory at peak. The GPU budget is fixed. Pick a way to shrink the cache, and tell me the result that would make you undo it."
+</Callout>
+
+The case, constructed for this problem:
+
+- The model is Llama 3 70B, the 128K-context release, FP8 weights. Legal and the eval team signed off on this model; changing it means a new review that cannot finish this quarter.
+- The budget is 16 H100 SXM 80 GB GPUs, two nodes, for the quarter. Each node runs one tensor-parallel replica.
+- Users load a document (contracts, codebases, filings) and ask questions about it. At peak, 120 sessions are active. Session context: median 40K tokens, mean 55K, p90 110K, capped at 128K. 60% of sessions ask three or more questions about the same document.
+- Targets: p95 time to first token of 2 s on follow-up questions. Today follow-ups reuse the document's cached KV; when a session is preempted, its document is prefilled again.
+- Two engineers and six weeks.
+
+Design the cache policy: which compression family, with which settings, how sessions are admitted when memory runs out, how you measure accuracy before and after, and the result that reverses the decision. State what you give up and write the rollout with its rollback triggers.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what fraction of follow-up questions depend on a part of the document the first question did not touch.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask which KV cache formats the serving engine supports today without new kernels.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request a labelled set of long-document tasks from real sessions, with their context lengths, before any comparison runs.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>The gap is about two times: peak demand is 120 x 55K = 6.6 million tokens of cache, and the two replicas hold 3.2 million in BF16. Of the four families, architectural changes need a different model, top-k sparse attention needs one trained for it and still stores every token, and eviction chooses what to keep from the first question while 60% of sessions ask more. I would ship calibrated FP8 KV cache, which the engine supports today and which roughly doubles capacity to 6.4 million tokens, with admission control for the last 3.5% of peak. The result that reverses it: on a paired set of our own long-document tasks, FP8 at the 128K bin losing more than 2 points with an interval that excludes zero, or more than 5 on aggregation or follow-up questions. I give up a few percent of peak sessions to queueing and the larger capacity of 2-bit quantisation or eviction.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>The gap, computed.</strong> Llama 3 70B stores 2 x 80 x 8 x 128 x 2 = 327,680 bytes per token in BF16. Per node: 640 GB, minus 70 GB of FP8 weights, minus a reserve I set at 6 GB per GPU, leaves 522 GB, 1.59 million tokens. Both replicas: 3.19 million. Peak demand at the mean length: 6.6 million tokens, 2,163 GB. The cache has to shrink about 2.1 times, or a share of sessions waits.</p>
+<p><strong>Why follow-ups must keep their cache.</strong> Re-prefilling a 110K-token document costs 110,000 x 2 x 70e9 = 1.5e16 FLOPs for the weights plus 2 x 80 x 55,000 x 8,192 FLOPs per token for attention over the average context, 7.9e15 across the document. That is 2.3e16 FLOPs, at least 1.5 s on eight GPUs at 1,979 dense FP8 TFLOPS each, and about 3 s at 50% utilisation. Preempting a long session breaks the 2 s target, so the policy has to fit sessions, not just admit them.</p>
+<p><strong>The four families against this case.</strong></p>
+<ul>
+<li><em>Architectural</em> (multi-query, grouped, latent, hybrid). Fixed at training time: grouped-query uptraining costs about 5% of the original pre-training compute by the GQA paper's account, and the model is already grouped with 8 KV heads. Moving to latent attention or a hybrid means a different model. Ruled out this quarter by the sign-off, not by the arithmetic.</li>
+<li><em>Top-k sparse attention</em> (DeepSeek Sparse Attention). It cuts the attention work per query to the top 2,048 entries, but any earlier token can be selected, so every token's entry stays in memory: it addresses compute at long context, not capacity. It also needs a model trained with its indexer.</li>
+<li><em>Eviction</em> (H2O, SnapKV). The largest saving: SnapKV keeps a fixed number of prompt positions per head, 1,024 to 4,096 in its LongBench runs, chosen by the attention of the last 32 prompt tokens. That window holds the first question. A follow-up about a clause the first question never touched finds it gone, and an aggregation question (every termination clause) needs positions spread over the whole document. Ruled out as the default by the 60% multi-turn share.</li>
+<li><em>Quantisation</em> (FP8, KIVI). FP8 halves the cache and the engine supports it today through <code>kv_cache_dtype</code>. KIVI's 2-bit scheme (keys per channel, values per token) goes further, and its paper reports up to 4 times larger batches, but vLLM's quantised KV cache page lists FP8 formats only, so 2-bit means kernels this team would own.</li>
+</ul>
+<p><strong>The decision: two defensible answers.</strong></p>
+<ul>
+<li><em>Calibrated FP8 KV cache, plus admission control.</em> Capacity 6.37 million tokens, 96.5% of peak demand at the mean length. No new kernels. The cost: the remaining 3.5% of peak waits in an admission queue (new sessions, never preempted follow-ups), and an accuracy risk at length that has to be measured, not assumed.</li>
+<li><em>FP8 plus SnapKV-style eviction for single-question sessions over 64K.</em> Ample capacity with headroom for growth. The cost: an engine change in six weeks, a classifier that guesses which sessions will stay single-question, and wrong answers on the follow-ups it guesses wrong.</li>
+</ul>
+<p>I ship the first. The conflict is cost against recall at length: the fixed budget pushes toward the most aggressive compression, and the multi-turn traffic punishes exactly the family that compresses most. A queue at peak is visible and bounded; an evicted clause produces a fluent wrong answer.</p>
+<p><strong>The accuracy test that would reverse it.</strong> A paired comparison, BF16 cache against FP8, on the same items: 300 tasks per length bin at 32K, 64K and 128K, drawn from real sessions and labelled, in four categories: single-fact lookup, multi-hop across sections, aggregation over the document, and follow-ups that depend on a part of the document an earlier turn did not touch. Not needle retrieval: RULER found almost all models with near-perfect needle scores drop sharply as length grows, and HELMET that needle results do not predict downstream tasks. Thresholds I choose and write down: reverse if the 128K bin drops more than 2 points with the paired 95% interval excluding zero, or any category drops more than 5. Reasonable thresholds run from 1 to 3 points overall, set by the run-to-run noise of the BF16 baseline; a test on short prompts only, or on aggregate accuracy across bins, is not one.</p>
+<p><strong>Rollout and rollback.</strong> Weeks 1 and 2: calibrate FP8 scales with llm-compressor on samples from real long sessions, build the labelled set, run the paired comparison offline. Week 3: one replica serves FP8 to 10% of new sessions; compare thumbs-down rate and follow-up re-ask rate on sessions over 64K against the BF16 replica. Weeks 4 to 6: both replicas, with admission control capping active long sessions at the measured capacity. Rollback triggers: the offline thresholds above; a re-ask rate on 64K+ sessions more than 20% above the BF16 replica's for a week; a preemption rate above 1% of sessions at peak, which means the capacity plan was wrong.</p>
+<p><strong>How this design fails.</strong> FP8 without calibration still runs: vLLM sets every scale to 1.0, so a deployment that skips the calibration step loses accuracy at length with no error anywhere. The calibration set must be long sessions, because short prompts do not exercise the value ranges a 128K context produces. Second, the capacity plan is built on a 55K mean; if contracts grow, or sessions sit idle holding their documents between questions, the 3.5% becomes a much larger queue, and the honest fix then is an idle timeout that drops the document's cache and accepts a slow follow-up, written into the product's terms.</p>
+<p><strong>What I give up, in the decision memo.</strong> A few percent of peak sessions queue. The 2-bit and eviction capacity goes unused this quarter. The accuracy risk at length is accepted on the strength of a 900-item paired test, signed by the eval lead, with the reversal thresholds attached.</p>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Pushback: the paired test costs the two engineers three of their six weeks. Product says ship FP8 now and watch thumbs-down. Which half of the test do you cut, and what risk do you accept in writing?*
+- *Reversal: what would you need to see in production to switch the long single-question sessions to eviction after all?* A measured share of sessions that never ask a second question, high enough to matter, and eviction at that budget within the thresholds on lookup and aggregation tasks for those sessions.
+- *Two staff engineers disagree: one wants KIVI 2-bit next quarter, the other wants the review for a latent-attention model. How do you decide without deciding by rank?* Price each in engineer-weeks and capacity gained, and run the same paired test on both before either ships.
+- *Next quarter the model is retired in 90 days and the replacement uses a hybrid design. What in this plan survives?* The labelled long-document set and the reversal thresholds; the cache arithmetic starts again from the new config.
+
+## Common mistakes
+
+- Choosing eviction by its compression ratio without asking how many sessions ask a second question.
+- Treating top-k sparse attention as a memory saving.
+- Proposing an architectural change for a model that cannot change this quarter.
+- Testing accuracy with needle retrieval, or only at short lengths, or without pairing the items.
+- Turning on FP8 KV cache without calibrated scales.
+- Fitting peak demand by preempting sessions whose follow-ups then pay a full re-prefill.

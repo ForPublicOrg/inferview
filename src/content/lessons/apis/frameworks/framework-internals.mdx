@@ -1,0 +1,166 @@
+---
+title: "What frameworks hide: a chain, router and retriever in plain code"
+track: apis
+module: frameworks
+order: 3
+kind: lesson
+level: senior
+minutes: 14
+summary: A chain, a router, a retriever and a checkpointed tool loop fit in about a hundred lines; writing them shows that the glue is easy and the hard parts are state merging, step limits, re-execution on resume and retries, which is where opaque chains fail.
+prerequisites: [apis/frameworks/framework-playbook]
+updated: 2026-10-28
+sources:
+  - title: LangChain docs, Agents (checked 2026-10-28)
+    url: https://docs.langchain.com/oss/python/langchain/agents
+    note: "an agent is a model calling tools in a loop until the task is complete; create_agent takes model, tools, system_prompt, response_format, middleware, state_schema, context_schema, checkpointer; AgentState messages are append-only; before_model and after_model hooks return state updates; a checkpointer is required for thread_id persistence"
+  - title: LangGraph docs, Graph API (checked 2026-10-28)
+    url: https://docs.langchain.com/oss/python/langgraph/graph-api
+    note: "super-steps and message passing; default reducer overwrites, operator.add appends, add_messages appends and updates by ID; Send and Command; recursion_limit is a top-level config key, not part of configurable; RemainingSteps for routing before the limit; checkpoints at super-step boundaries; a resumed node runs again from its start"
+  - title: langgraph, libs/prebuilt/langgraph/prebuilt/chat_agent_executor.py on main (checked 2026-10-28)
+    url: https://github.com/langchain-ai/langgraph/blob/main/libs/prebuilt/langgraph/prebuilt/chat_agent_executor.py
+    note: "create_react_agent: when remaining_steps is below 2 and the response has tool calls, the agent returns the message 'Sorry, need more steps to process this request.' instead of raising"
+  - title: langchain, libs/langchain_v1/langchain/agents/factory.py on master (checked 2026-10-28)
+    url: https://github.com/langchain-ai/langchain/blob/master/libs/langchain_v1/langchain/agents/factory.py
+    note: "create_agent binds recursion_limit 9_999"
+  - title: "Khattab et al., DSPy: Compiling Declarative Language Model Calls into Self-Improving Pipelines (arXiv 2310.03714, 2023-10-05)"
+    url: https://arxiv.org/abs/2310.03714
+    note: "pipelines as declarative modules whose prompts and demonstrations are compiled against a metric; the abstract reports gains over standard few-shot prompting of over 25 percent for GPT-3.5 and 65 percent for llama2-13b-chat"
+  - title: dspy on PyPI (checked 2026-10-28)
+    url: https://pypi.org/project/dspy/
+    note: "3.4.1 uploaded 2026-10-12"
+  - title: Anthropic, Building effective agents (2024-12-19)
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: "routing classifies an input and directs it to a specialised follow-up; the augmented LLM has retrieval, tools and memory"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Glue and the hard parts
+
+Strip any agent framework to what it must do and four mechanisms remain: render a prompt from state, call a model, dispatch the model's tool calls, and decide whether to loop. A chain is the first two in a fixed order. A router is one model call whose output selects a branch. A retriever is a function from query to documents. All of that is glue, and a team can write it in an afternoon.
+
+The parts that are hard, and where opaque chains fail in production, are elsewhere: how concurrent updates to state merge, what stops the loop, what runs again after a crash or a pause, and which calls the framework makes that your code never asked for. Writing the plain version makes those four visible, which is the point: when a framework run misbehaves, you debug it by knowing what it must be doing underneath.
+
+## The plain version
+
+The listing below is a router, a retriever, a chain and a tool loop with a step cap, a reducer and a checkpoint per step. The model is a parameter, so a scripted fake runs it in a unit test. The documents are invented for the example.
+
+```python
+import json
+import re
+from collections import Counter
+
+DOCS = {
+    "refunds": "Refunds go to the original payment method within 5 business days.",
+    "shipping": "Standard shipping takes 3 to 7 days; express takes 1 to 2 days.",
+    "returns": "Unused items can be returned within 30 days in original packaging.",
+}
+
+def words(text):
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+def retrieve(query, k=1):
+    q = Counter(words(query))
+    scored = sorted(((sum(min(q[w], c) for w, c in Counter(words(d)).items()), name)
+                     for name, d in DOCS.items()), reverse=True)
+    return [name for score, name in scored[:k] if score > 0]
+
+def route(query, model):
+    label = model([{"role": "user", "content": f"Label as policy or chitchat: {query}"}])["text"].strip()
+    return label if label in ("policy", "chitchat") else "chitchat"   # unknown labels fall back
+
+def add_messages(old, new):                 # the reducer: append, never overwrite
+    return old + new
+
+def run_agent(query, model, tools, max_steps=25, checkpoint=None):
+    state = {"messages": [{"role": "user", "content": query}], "steps": 0}
+    while True:
+        if state["steps"] >= max_steps:
+            raise RuntimeError(f"step limit {max_steps} reached")   # fail loudly
+        reply = model(state["messages"])                             # model step
+        state = {"messages": add_messages(state["messages"], [reply]), "steps": state["steps"] + 1}
+        if checkpoint:
+            checkpoint(json.dumps(state))
+        if not reply.get("tool_calls"):
+            return reply["text"], state
+        if state["steps"] >= max_steps:
+            raise RuntimeError(f"step limit {max_steps} reached")
+        results = [{"role": "tool", "id": c["id"], "content": tools[c["name"]](**c["args"])}
+                   for c in reply["tool_calls"]]                     # tool step
+        state = {"messages": add_messages(state["messages"], results), "steps": state["steps"] + 1}
+        if checkpoint:
+            checkpoint(json.dumps(state))
+
+def answer(query, model):
+    if route(query, model) == "chitchat":
+        return model([{"role": "user", "content": f"Reply briefly: {query}"}])["text"]
+    context = "\n".join(f"<doc name='{n}'>{DOCS[n]}</doc>" for n in retrieve(query))
+    text, _ = run_agent(f"{context}\n<question>{query}</question>\nAnswer from the docs only.",
+                        model, tools={})
+    return text
+```
+
+Each line maps to a framework feature. `add_messages` is the reducer that LangGraph's `add_messages` and LangChain's append-only `AgentState.messages` implement, with one difference: LangGraph's version also updates an existing message when a new one carries the same ID, which is how a framework edits history without your code seeing a delete. `max_steps` is the recursion limit. `checkpoint` is the checkpointer, called at the same boundary LangGraph uses: after a step completes, never in the middle of one.
+
+<Predict id="api-steps-per-limit" question="In run_agent, every model call and every batch of tool calls counts as one step, and the run fails when it would take step 26 with max_steps=25. A task needs one tool batch per model call until the final answer. What is the largest number of tool batches a run can complete and still return an answer?" answer={12} tolerance={0}>
+<p><b>12.</b> A run with R tool batches makes R + 1 model calls, so it takes 2R + 1 steps. 2R + 1 ≤ 25 gives R ≤ 12. A thirteenth batch needs 27 steps. LangGraph counts super-steps the same way for a graph with one model node and one tools node, which is why an old default of 25 stopped agents after about a dozen tool rounds, and why middleware nodes that run every iteration shrink that number further.</p>
+</Predict>
+
+## What the frameworks add on top
+
+**LangChain `create_agent`.** The docs describe an agent as "a model calling tools in a loop until a given task is complete" and the plain loop above is that sentence. The framework adds the parameters you would add next: `response_format` for validated structured output, `middleware` with `before_model` and `after_model` hooks that return state updates, `state_schema` for extra fields, `context_schema` for per-run data, and a `checkpointer` that is required for `thread_id` persistence. It also adds a value you did not choose: the compiled agent binds a recursion limit of 9,999, so the step cap that stops a loop is effectively yours to set.
+
+**LangGraph state graphs.** The loop becomes a graph of nodes that run in super-steps. Each node returns a partial update, and a reducer per state key decides how it merges: overwrite by default, append with `operator.add`, append-or-update with `add_messages`. `Send` fans out to one node with different inputs, and `Command` combines a state update with routing. Two behaviours do not appear in the plain loop and cause most surprises. First, nodes in the same super-step that write the same key without a reducer conflict, and a merging reducer cannot be cleared by returning an empty value (the docs point to `Overwrite`). Second, after an interrupt or a retry the affected node runs again from its start, because checkpoints exist only at super-step boundaries. Any side effect before an `interrupt()` call runs twice unless it is idempotent.
+
+**The step limit is set in config, not in state.** `recursion_limit` is a top-level config key. Placed inside `configurable`, it is ignored and the default applies. Graphs can read `RemainingSteps` and route to a fallback before the limit; the deprecated prebuilt `create_react_agent` does exactly that, returning the message "Sorry, need more steps to process this request." when fewer than 2 steps remain and the model still wants tools. That run ends with an ordinary-looking answer and no exception.
+
+**DSPy modules.** DSPy changes what is hidden rather than how much. A module declares an input and output signature, and an optimiser searches for the instructions and demonstrations that maximise a metric on your data, so the final prompt is a compiled artefact rather than a string anyone wrote. The paper reports gains over standard few-shot prompting of over 25 percent with GPT-3.5 and 65 percent with llama2-13b-chat on its tasks. The plain-code equivalent is a prompt template plus an offline search over examples against an eval set. Debugging a DSPy program means reading the compiled prompt and the metric, because a bad metric produces a well-optimised wrong prompt. dspy 3.4.1 was current on PyPI on 28 October 2026.
+
+## Debugging an opaque chain from first principles
+
+When a framework run fails, the plain version tells you which four questions to answer, each with a measurement.
+
+1. **What did the model receive?** Log the rendered request at the HTTP layer, not the template. Framework templates, middleware such as summarisation, and structured-output instructions all change it.
+2. **How many calls did the run make?** Count requests per run against the calls your code makes on purpose. Retries, re-prompts and summarisation show up here first.
+3. **Why did the loop stop?** A final answer, a step cap, a timeout, a guardrail or an error handler that converted an exception into an answer. Log the stop reason with the step count and the configured limit.
+4. **What ran twice?** After any resume, list the side-effecting tool calls in the resumed node and check each for an idempotency key.
+
+<Callout kind="gotcha">
+Fallbacks that turn a limit into an answer hide the limit. The prebuilt agent's "need more steps" message, an error handler that returns a final output, and a wrapper that catches the recursion error and returns the last message all produce a normal-looking response. Count them as a distinct outcome in metrics, never as success.
+</Callout>
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"A LangGraph agent that files refunds sometimes files the same refund twice after a deploy, and only for runs that waited for approval. Tell me what is happening, what you change this week, and what you change this quarter, given that the refund API has no idempotency support."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>A deploy kills runs paused at an approval; on resume the interrupted node runs again from its start, and the refund call sits in that node before or alongside the <code>interrupt()</code>. This week, move the refund into its own node after the approval and record an intent row with a unique key before calling the API, checking it on entry. This quarter, get idempotency support from the refunds team or put a deduplicating proxy in front of the API.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Checkpoints are written at super-step boundaries. A node that calls the refund API and then calls <code>interrupt()</code>, or calls it after resuming in the same node, has no checkpoint between the side effect and the pause, so replay repeats the side effect. Moving the side effect to a node after the approval narrows the window but does not close it: a crash between the API call and the next checkpoint still replays the node.</p>
+<p>Without API idempotency, the team's own intent table is the guard: write the intent with a key derived from the claim and the approval, call the API, mark the intent done. On replay, a done intent skips the call; a pending intent means the outcome is unknown, so reconcile with the refund system before retrying, and page a human if reconciliation fails.</p>
+<p>The cost: an extra write per refund and a reconciliation path that someone owns. The failure mode of the recommendation is the pending state, which needs a refund-system query that can find a refund by the team's key; if the refund system cannot search by it, the guard cannot distinguish a lost call from a completed one.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The refunds team says idempotency support is two quarters away. Do you block approvals during deploys until then, and who accepts the delay?</em></li>
+<li><em>A colleague proposes switching to a workflow engine because it "guarantees exactly once". What do you ask before agreeing?</em></li>
+<li><em>What evidence would make you move this agent off LangGraph rather than fixing node boundaries?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The plain loop omits streaming, parallel tool calls, cancellation, token accounting and provider message formats, and each takes more code than the loop itself. Streaming with tool calls is the one teams most underestimate, because partial tool arguments arrive interleaved with text. The claim is not that frameworks are thin; it is that their behaviour is predictable from a small set of mechanisms.
+
+The framework details here (reducer semantics, where `recursion_limit` lives, `create_agent`'s bound limit, the prebuilt agent's message) were read from documentation and source on 28 October 2026 and move with releases. The four debugging questions do not depend on any of them.
+
+The DSPy figures are the paper's own, on its tasks and models from 2023; they say optimisation can beat hand-written few-shot prompts on those tasks, not that it will on yours.
+
+<SelfRate id="lesson:apis/frameworks/framework-internals" />

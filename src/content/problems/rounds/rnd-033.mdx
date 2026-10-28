@@ -1,0 +1,166 @@
+---
+id: rnd-033
+title: Review a feature-pipeline PR whose tests pass
+subtitle: what breaks in production, and which test would have caught it
+track: rounds
+module: codebase-rounds
+type: critique
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+tags: [pr-review, feature-pipeline, point-in-time, training-serving-skew, nulls, retries, freshness]
+companies:
+  - name: Netflix
+    url: https://prachub.com/interview-experiences/netflix-machine-learning-engineer-interview-experience-ml-fundamentals-plus-a-production-pr-review-rejected
+updated: 2026-10-28
+sources:
+  - title: PracHub, Netflix machine learning engineer interview experience (published 2026-10-10)
+    url: https://prachub.com/interview-experiences/netflix-machine-learning-engineer-interview-experience-ml-fundamentals-plus-a-production-pr-review-rejected
+    note: "candidate report, interview in September 2026 for an applied GenAI org: a 30-minute segment where the interviewer pasted a PR for a feature pipeline whose tests all passed and asked what problems it would cause in production; the discussion moved on to serving the features under different real-time requirements. The report does not say which issues were expected; the PR below is original. Checked 2026-10-28."
+  - title: Feast docs, point-in-time joins
+    url: https://docs.feast.dev/getting-started/concepts/point-in-time-joins
+    note: "for each entity row, Feast looks backward from that row's timestamp, up to the TTL, so the join reproduces the state of features at a past point in time; the TTL is relative to each row's timestamp, not to when the query runs. Checked 2026-10-28."
+checklist:
+  - "Training leak: build() calls engagement_features without as_of, so every label gets features computed at run time from events after its label_ts; fix with a point-in-time computation per label; test: a label whose user has a play after label_ts, asserting the play is excluded"
+  - "Serving crash: a user with no plays in seven days gives an empty frame and iloc[0] raises; test: features_for on a user with no recent events"
+  - "Missing users differ by path: NaN after the left merge in training, an exception (or whatever the caller's fallback fills) in serving; test: one user through both paths gives the same vector"
+  - "Clock: Timestamp.now() is local and naive while ts is naive UTC, so serving hosts outside UTC shift the window; test: the same input under TZ set to a non-UTC zone"
+  - "One unknown title breaks the batch: genre is all NaN for a user who only watched titles missing from the catalog, mode() is empty and [0] fails the whole groupby; test: such a user in the input"
+  - "fillna(0) turns an unknown runtime into zero completion, and a runtime of 0 gives inf, which fillna leaves alone; test: one title with no runtime and one with runtime 0"
+  - "Freshness: lru_cache keeps the catalog that existed when the worker started, so new titles look unknown until a restart, and the first request on each worker downloads the catalog; acceptable if workers restart at least daily and the load moves to start-up, otherwise a TTL the reviewer chooses and defends"
+  - "Retries: the scheduler re-runs a failed day and the batches inserted before the failure are inserted again; write the day's partition atomically or merge on (user_id, day); test: fail after the first batch, re-run, assert one row per user per day"
+  - "Memory: build() loads the whole label range plus 30 days of every user's events into one DataFrame, and the daily job eight days of everyone's; both grow with users and range; process by partition or push the aggregation into the warehouse"
+  - "Names why the tests pass: they patch load_titles, pass as_of explicitly and use one user with known titles, so the default clock, catalog misses, empty input and the serving path never run"
+  - "Judgement call: a window ending at now() in serving is acceptable if training computes the same window at each label_ts with the same code, and the online event store's lag is measured, since plays missing online but present in batch are skew too"
+  - "Picks between point-in-time backfill and training on logged serving features, with the cost of each, and states how the chosen fix fails"
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"Here is a PR for a feature pipeline. CI is green. If this lands, what goes wrong in production, and for each problem, what test would have caught it?"
+</Callout>
+
+The PR is constructed for this problem. It adds four engagement features for a ranking model, computes them in a daily batch job, uses the same function to build the training set and calls it again at request time in the ranking service. Events are stored with `ts` in UTC without a time zone. The scheduler retries a failed daily run up to three times. Read it once as the reviewer, list what breaks and rank it, then choose how long the catalog may be cached and defend the number.
+
+```python
+# features/engagement.py (new)
+from functools import lru_cache
+
+import pandas as pd
+
+WINDOW_DAYS = 7
+
+
+@lru_cache(maxsize=None)
+def load_titles():
+    # title_id, genre, runtime_min
+    return pd.read_parquet("s3://catalog/titles/latest.parquet")
+
+
+def engagement_features(events, as_of=None):
+    """events: user_id, title_id, ts, watch_seconds. Returns one row per user."""
+    as_of = as_of or pd.Timestamp.now()
+    recent = events[events.ts >= as_of - pd.Timedelta(days=WINDOW_DAYS)]
+    joined = recent.merge(load_titles(), on="title_id", how="left")
+    joined["completion"] = joined.watch_seconds / (joined.runtime_min * 60)
+    out = joined.groupby("user_id").agg(
+        watch_hours_7d=("watch_seconds", lambda s: s.sum() / 3600),
+        completion_mean_7d=("completion", "mean"),
+        top_genre_7d=("genre", lambda g: g.mode()[0]),
+        days_since_last=("ts", lambda t: (as_of - t.max()).days),
+    )
+    return out.fillna(0).reset_index()
+```
+
+```python
+# pipelines/training_set.py (changed)
+def build(labels):
+    """labels: user_id, label_ts, clicked. One row per impression."""
+    events = read_events(start=labels.label_ts.min() - pd.Timedelta(days=30),
+                         end=labels.label_ts.max())
+    feats = engagement_features(events)
+    return labels.merge(feats, on="user_id", how="left")
+```
+
+```python
+# pipelines/daily_features.py (new, scheduled daily)
+def run(day):
+    events = read_events(start=day - pd.Timedelta(days=7), end=day + pd.Timedelta(days=1))
+    feats = engagement_features(events, as_of=day + pd.Timedelta(days=1))
+    for batch in chunks(feats, 50_000):
+        feature_table.insert(batch.assign(day=day))
+```
+
+```python
+# serving/ranker.py (changed)
+def features_for(user_id):
+    events = events_store.recent(user_id, days=7)
+    return engagement_features(events).iloc[0].to_dict()
+```
+
+```python
+# tests/test_engagement.py (new)
+TITLES = pd.DataFrame({"title_id": ["t1", "t2"], "genre": ["drama", "drama"], "runtime_min": [60, 60]})
+
+
+def test_engagement_features():
+    events = pd.DataFrame({
+        "user_id": ["u1", "u1", "u1"],
+        "title_id": ["t1", "t2", "t1"],
+        "ts": pd.to_datetime(["2026-09-28 20:00", "2026-09-29 21:00", "2026-09-30 22:00"]),
+        "watch_seconds": [1800, 3600, 1800],
+    })
+    with patch("features.engagement.load_titles", return_value=TITLES):
+        out = engagement_features(events, as_of=pd.Timestamp("2026-10-01"))
+    assert out.watch_hours_7d[0] == 2.0
+    assert out.top_genre_7d[0] == "drama"
+    assert out.days_since_last[0] == 0
+```
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the date range of the labels the next training run will use, and the date the run itself happens.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what share of ranking requests come from users with no plays in the last seven days, and what the service returns for them today.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask how often a title gets plays before its catalog row is complete, and how often the serving workers restart.</p></details>
+
+## Answer
+
+The test passes because it exercises one path: explicit `as_of`, a patched catalog, one user whose titles are all known. Every production failure below lives on a path it skips. Rank them by blast radius.
+
+**1. The training set leaks the future, so offline metrics are wrong.** `build` never passes `as_of`, so it defaults to the moment the job runs. Every label, whatever its `label_ts`, gets features from the seven days before *now*. `read_events` stops at the newest label, so if that label is more than a week old no event falls in the window and every feature is missing; if the labels run up to today, an impression from last month is described by plays from this week, after it happened. The model learns from features it can never have at serving time, and offline metrics look better than production will. The fix is a point-in-time computation per label: the features as of `label_ts`, from events strictly before it, which is what a feature store's point-in-time join does row by row. The test that catches it: one label with a play by the same user one hour after `label_ts`, asserting the play is not counted.
+
+**2. The daily batch fails on one unknown title, and the retry duplicates rows.** A user whose only plays in the window are titles missing from the catalog has an all-NaN `genre`; `mode()` returns an empty series and `[0]` raises inside `agg`, which fails the whole group-by, not one row. The scheduler retries the day; every batch inserted before the failure is inserted again, three times over in the worst case, because `insert` has no key. Fix both: unknown genre becomes an explicit value, and the day is written as one atomic partition overwrite or a merge on `(user_id, day)`. Tests: a user with only unknown titles; a run that fails after the first batch and is re-run, asserting one row per user per day.
+
+**3. Serving breaks for users without recent plays and disagrees with training for everyone near the edges.** An empty frame makes `.iloc[0]` raise, so the cold and lapsed users, the ones the ranker most needs a default for, get an error or the caller's fallback. Training represents the same users as NaN after the left merge, so whatever serving fills in is a value the model never saw. `pd.Timestamp.now()` is local and naive while `ts` is naive UTC, so a serving host outside UTC moves the window by its offset; batch hosts in UTC do not. Tests: `features_for` on a user with no recent plays; the same user through both paths compared field by field; the serving path run with `TZ` set to a non-UTC zone.
+
+**4. Nulls are flattened.** `fillna(0)` makes "runtime unknown" and "watched nothing" the same completion, and `runtime_min == 0` (live events, trailers) gives `inf`, which `fillna` does not touch and which poisons the mean. Test: one title with no runtime and one with runtime 0.
+
+**5. Freshness and latency of the catalog.** `lru_cache` with no size or time bound keeps the catalog the worker saw at start-up for the life of the process, so a new title looks unknown (defect 2's trigger) until a restart, and the first request on each worker downloads the whole catalog file inside a ranking call. You were asked to choose a cache lifetime. Anything from minutes to a day is defensible if it is shorter than the time between a title's catalog row being written and its first plays, and the load moves to start-up and a background refresh. Forever is not. The value is acceptable as written only if workers restart at least daily.
+
+**6. Memory.** `build` reads every user's events for the whole label range plus 30 days into one DataFrame, and the daily job reads eight days of everyone's. Both grow with users and with the range someone picks next quarter. Process by user shard or push the aggregation into the warehouse.
+
+### The decision: how to remove the skew
+
+Two fixes are defensible.
+
+- **Point-in-time backfill in batch.** Keep one function, call it per label with `as_of = label_ts`, or use a point-in-time join. Cost: compute grows with the number of labels rather than users, and batch still sees plays the online event store has not received yet, so lag becomes skew.
+- **Train on logged serving features.** Log the vector the ranker actually used with each impression and train on that. Cost: no skew by construction, but a new feature has no history until logs accumulate, nothing can be backfilled, and a logging bug becomes a training bug.
+
+With a retrain due, backfill is the one that ships: it trains on history today. Add a skew check that recomputes a sample of logged serving vectors in batch and compares them. The failure mode of this choice is that both paths call the same function, so the check finds data skew (lag, time zones, catalog versions) and is blind to a logic error in `engagement_features` itself; the point-in-time unit test has to cover that.
+
+## Follow-ups
+
+- *The point-in-time backfill doubles training compute and the retrain is on Friday. Which two fixes ship before Friday, and what risk do you accept in writing?*
+- *What would you need to see in production to drop the batch path and train only on logged serving features?* Enough weeks of logged vectors to cover the training window, and a measured gap between batch and logged features large enough to move offline metrics.
+- *The product team wants these features fresh within a minute of a play. What changes in the design, and which of your findings get worse?* The window moves to a streaming aggregate keyed by user, catalog lookups move into the stream, and event lag stops being a batch detail and becomes the main source of skew.
+- *A reviewer says the leak is harmless because the model will be evaluated online anyway. How do you answer without deciding by rank?* Compare the offline metric on a point-in-time rebuild of the same labels with the current one; the gap is the size of the leak in the model's own terms.
+
+## Common mistakes
+
+- Reviewing style and naming while the default argument changes the meaning of the training set.
+- Finding the empty-frame crash and missing that one bad title fails the whole batch.
+- Proposing `fillna` with a different constant, which keeps "unknown" and "zero" the same value.
+- Treating the scheduler's retry as a safety net when the write is not idempotent.
+- Listing problems without the test that would have caught each, which was half the question.

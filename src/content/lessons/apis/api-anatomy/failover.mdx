@@ -1,0 +1,200 @@
+---
+title: Failing over between providers without changing behaviour
+track: apis
+module: api-anatomy
+order: 3
+kind: lesson
+level: staff
+minutes: 14
+summary: Cross-provider failover changes tokenisation, tool formats, safety behaviour and the output distribution at once, so the policy is written per route, gated by evals and proven by fault-injection tests.
+prerequisites: [apis/api-anatomy/two-429s]
+updated: 2026-10-28
+sources:
+  - title: LiteLLM docs, proxy reliability (checked 2026-10-28)
+    url: https://docs.litellm.ai/docs/proxy/reliability
+    note: fallbacks for remaining errors such as RateLimitError; context_window_fallbacks; content_policy_fallbacks; default_fallbacks; list order; num_retries per model_name (example 3); allowed_fails (example 3) within cooldown_time (example 30 seconds); request_timeout (example 10 seconds); the page gives examples, not defaults
+  - title: Claude docs, API errors (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/errors
+    note: error types by status; 504 timeout_error and the advice to stream or batch long requests; 529 overloaded_error across all users; thinking blocks from another model and modified thinking blocks
+  - title: OpenAI API docs, rate limits (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/guides/rate-limits
+    note: TPM counts the larger of max_tokens and the estimate; do not retry quota or billing errors; failed requests count toward the limit
+  - title: Claude docs, refusals and fallback (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback
+    note: server-side fallback (beta) triggers only on a classifier decline; rate limit, overload and server errors are returned as-is; a rate-limited fallback model means no fallback attempt; every attempt counts against its own model's limits; sticky routing for about an hour; configure fallback on every request path; instrument refusals separately
+  - title: OpenAI API docs, migrate to the Responses API (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/guides/migrate-to-responses
+    note: function_call items matched by call_id; omitting strict in Responses attempts strict mode, while Chat Completions functions are non-strict by default
+  - title: Claude docs, rate limits (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: cache reads excluded from ITPM on most models; separate buckets per model class
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Failover is a product change
+
+Database failover moves the same queries to a replica that answers them the same way. Model failover moves a request to a system that tokenises it differently, formats tool calls differently, applies a different safety policy and samples from a different output distribution. Each of those changes is a behaviour change the route's owner would normally review. Failover ships all of them at once, during an incident, to whatever traffic happens to be in flight.
+
+The differences that break things, in the order they usually surface:
+
+- **Tool calls.** Claude returns `tool_use` content blocks matched to results by id within a message; OpenAI's Responses API returns `function_call` items matched to `function_call_output` items by `call_id`. Strictness defaults differ as well: omitting `strict` in Responses attempts strict mode, while Chat Completions functions are non-strict by default. A schema that was enforced on one side can be advisory on the other.
+- **Truncation and refusal semantics.** Claude reports `stop_reason` values such as `max_tokens` and `refusal` on an HTTP 200; OpenAI reports `status: "incomplete"` with a reason. A parser written for one treats the other's truncation as a complete answer.
+- **Token counts and limits.** The same prompt tokenises to a different count, so cost, context-window headroom and rate-limit consumption all move. OpenAI counts the larger of `max_tokens` and the estimate toward TPM; Claude counts generated output only. A generous `max_tokens` that was free on one provider consumes limit on the other.
+- **Cache state.** The fallback's prompt cache is cold. On Claude, cache reads are excluded from ITPM on most models, so a route whose input is mostly cache reads on the primary counts all of it on a cold fallback.
+- **Conversation state.** Thinking blocks and tool-use ids from one model are not portable. Even inside one provider, Claude's API drops thinking blocks that the fallback model cannot read; across providers nothing carries over.
+- **Behaviour.** Refusal boundaries, verbosity and formatting differ. A route whose downstream parser or UI was tuned to one model's habits sees errors that no status code reports.
+
+The cache point is worth computing before an incident does it for you. Suppose, as a scenario, a route's input on the primary is 70 percent cache reads. Its counted input is 30 percent of the total. On a cold fallback, all of it counts: 1 / 0.3 ≈ 3.3 times the rate-limit consumption for the same traffic, until the fallback's cache warms.
+
+## Which errors should trigger failover
+
+Retrying and failing over answer different questions. A retry bets that the same deployment will succeed shortly. Failover bets that a different deployment will succeed now and that its answer is acceptable.
+
+| Signal | Retry on the primary | Fail over |
+|---|---|---|
+| 429 with `retry-after` | Yes, if the wait fits the deadline | Only if it does not, and the route is eligible |
+| 429 spend cap (no `retry-after`, `enforced_spend_limit_reached`) | Never | Only to a pre-approved budget; a person decides |
+| 529 `overloaded_error` | Within the retry budget | When the breaker opens |
+| 500 `api_error`, connection reset, first-byte timeout | Once or twice | When the breaker opens |
+| 504 `timeout_error` | No: stream or batch the request | No: the long request times out there too |
+| 400, 401, 403, 404, 413 | Never | Never: the request is wrong |
+| `refusal` (HTTP 200) | Not on the same model | To another model of the same provider; cross-provider only by written policy |
+| Context window exceeded | No | To a larger-window model, if the route allows it |
+
+Anthropic's server-side fallback, in beta, draws the same line from the provider's side: it triggers only on a safety classifier decline, and a rate limit, overload or server error on the requested model is returned to you as-is. Its documentation also states the capacity trap plainly. If the fallback model is rate limited or overloaded, no fallback attempt is made and the refusal comes back; every attempt counts against its own model's limits; "Size the fallback model's rate limits for the refusal volume you expect, or fallbacks degrade to refusals under load." Replace "refusal" with "outage" and the sentence describes cross-provider failover too: the fallback's limits were sized for its normal traffic, and failover sends it the primary's.
+
+## Circuit breakers in a gateway
+
+Most teams put failover in a gateway. LiteLLM's reliability page is a representative configuration surface. `fallbacks` handles the remaining errors, such as `RateLimitError`; `context_window_fallbacks` handles context-window errors; `content_policy_fallbacks` handles content-policy violations; `default_fallbacks` applies when a model group is misconfigured. Fallbacks run in list order. `num_retries` retries each model name, `allowed_fails` and `cooldown_time` take a deployment out of rotation after repeated failures, and `request_timeout` bounds each call. The page shows example values (3 retries, 3 allowed failures within a 30-second cooldown, a 10-second timeout) and documents no defaults, so read your version's code before quoting one.
+
+<Predict id="api-failover-multiplier" question="The SDK keeps its default of 2 retries and calls a gateway with three model groups in its fallback list, each retried with num_retries 3. Assume num_retries 3 means 1 attempt plus 3 retries. How many provider requests can one failing user call cause?" answer={36} unit="requests">
+<p><b>36.</b> Each gateway pass tries 3 groups × 4 attempts = 12 requests, and the SDK makes 3 passes: 3 × 12 = 36. A fallback list multiplies like any other retry layer. Set the SDK to <code>max_retries=0</code> behind a gateway that retries, and keep per-group retries low once a fallback exists, because the fallback is the better use of the time.</p>
+</Predict>
+
+Two settings deserve more care than the defaults get.
+
+**The timeout that triggers failover.** A total-request timeout of 10 seconds on a route whose long answers legitimately take longer fails every long answer over, and the fallback times out on the same answer. Fail over on a first-byte timeout set from the time-to-first-token distribution, and keep the total timeout per route.
+
+**The breaker's view of failure.** A breaker that counts 400s or refusals as deployment failures opens on a bad client deploy or a policy change, and moves healthy traffic to a fallback for no reason. Count only the errors in the failover column above, per deployment.
+
+## Per-route eligibility
+
+Not every route should fail over, and the ones that should do not all fail over to the same place. The policy is a table owned by the route owners, written before the incident:
+
+```python
+import collections
+
+# Per route: the fallbacks that passed this route's eval gate, in order.
+ELIGIBLE = {
+    "support-answer": ["secondary/model-b"],
+    "invoice-extract": [],            # nothing passed the schema eval: fail closed
+}
+FAILOVER_ON = {"overloaded", "server_error", "first_byte_timeout", "spend_cap"}
+
+class Breaker:
+    """Opens after allowed_fails failures inside window; stays open for cooldown."""
+    def __init__(self, clock, allowed_fails=3, window=30.0, cooldown=30.0):
+        self.clock, self.allowed, self.window, self.cooldown = clock, allowed_fails, window, cooldown
+        self.fails, self.open_until = collections.deque(), float("-inf")
+
+    def record_failure(self):
+        now = self.clock()
+        self.fails.append(now)
+        while self.fails and self.fails[0] <= now - self.window:
+            self.fails.popleft()
+        if len(self.fails) > self.allowed:
+            self.open_until, self.fails = now + self.cooldown, collections.deque()
+
+    def is_open(self):
+        return self.clock() < self.open_until
+
+def decide(route, error, breaker, has_tool_state):
+    """Return ('primary',), ('fallback', target) or ('fail', reason)."""
+    targets = ELIGIBLE.get(route, [])
+    if error is None and not breaker.is_open():
+        return ("primary",)
+    if error not in FAILOVER_ON and not breaker.is_open():
+        return ("fail", error)           # 400s, auth, 413: the same request fails anywhere
+    if has_tool_state:
+        return ("fail", "mid-conversation state does not survive a provider switch")
+    if not targets:
+        return ("fail", "no fallback passed this route's eval")
+    return ("fallback", targets[0])
+```
+
+Three properties matter more than the code. Eligibility is per route and empty by default, so a new route fails closed until someone runs its evals. A conversation with tool state stays on its model or fails, because its tool-use ids and thinking blocks do not transfer; a new conversation can start on the fallback. And `spend_cap` is in the failover set only because this table lists pre-approved targets; whether a budget event may move traffic to another provider's bill is a decision someone signs, not a gateway default.
+
+Anthropic's fallback pitfalls list two rules that apply unchanged here. Configure fallback on every request path, including retry handlers, error-recovery branches and background workers, because a handler that re-issues a request without it loses protection on exactly the requests that need it. And make fallback a property of the request rather than ambient state such as a global flag, which can drift and silently leave a path unprotected.
+
+## The eval gate
+
+A fallback is eligible for a route when it passes that route's eval suite at thresholds written before the incident. The gate is a paired comparison against the primary on the same cases, plus checks the primary never needed:
+
+- **Contract:** schema validity, tool-call shape after your adapter, truncation handled under the fallback's semantics.
+- **Quality:** the route's task metric, with the regression the owner accepts stated as a number.
+- **Policy:** refusal rate on in-policy cases, and the cases the primary refuses that the fallback answers. The second list is the one legal reads.
+- **Capacity:** the fallback's rate limits against the primary's peak traffic for the route, with the cold-cache multiplier from the first section applied.
+- **Cost:** cost per request at the fallback's prices and token counts.
+
+The gate re-runs whenever the prompt, the adapter, or either model version changes. A fallback that passed in March and has not been evaluated since is a guess with a config entry.
+
+## The test that proves it
+
+The policy says what happens; a test proves it, and a drill proves it in production. The test is a fake provider scripted with each signal from the trigger table, driven through the real gateway configuration:
+
+```python
+t = [0.0]
+b = Breaker(lambda: t[0])
+assert decide("support-answer", "invalid_request", b, False) == ("fail", "invalid_request")
+assert decide("support-answer", "overloaded", b, False) == ("fallback", "secondary/model-b")
+assert decide("invoice-extract", "overloaded", b, False)[0] == "fail"
+assert decide("support-answer", "overloaded", b, True)[0] == "fail"
+for _ in range(4):
+    b.record_failure()
+assert b.is_open() and decide("support-answer", None, b, False) == ("fallback", "secondary/model-b")
+t[0] = 31.0
+assert not b.is_open() and decide("support-answer", None, b, False) == ("primary",)
+```
+
+Against the real gateway, the same script also asserts request counts (one failing call produces at most the number of provider requests the policy allows, which catches the multiplier above), that the breaker opens on 529s and not on 400s or refusals, and that a mid-stream error after visible output is not silently replayed on another model.
+
+The drill sends a small, fixed share of eligible traffic to the fallback on a schedule. It keeps the fallback's credentials, limits, cache and adapter exercised, and it produces the production comparison the eval gate cannot: real traffic, real latency, real refusal rate.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Scenario: last quarter our primary provider returned 529s for most of an afternoon and every product surface failed. Leadership wants automatic failover to a second provider within a month. Legal says EU customer data may only go to the second provider after a data-processing review that takes six weeks. Write the failover policy and the test that proves it."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>A per-route eligibility table, empty by default; failover on breaker-open from 529s, 5xx and first-byte timeouts only, never on 400s or refusals; EU traffic ineligible for the second provider until the review lands, with a same-provider fallback model or a degraded mode instead. Each eligible route passes its eval gate first, and a fault-injection suite plus a scheduled drill proves the policy.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The constraints conflict: leadership wants coverage in a month, legal blocks the largest fallback for EU data for six weeks. The policy splits by route and by region instead of choosing one.</p>
+<p>Defensible option one: cross-provider failover for non-EU traffic on the routes that pass evals, and for EU traffic a same-provider fallback model on a separate rate-limit bucket. Cost: a provider-wide incident still takes EU routes down, and the same-provider fallback shares the spend cap and possibly the incident.</p>
+<p>Defensible option two: no automatic failover at all in month one; a degraded mode per route (queued answers, cached responses, an honest error) plus a manual switch with a runbook. Cost: a person in the loop during the incident, and minutes of downtime the automatic version would avoid; benefit: no unreviewed behaviour change ships automatically.</p>
+<p>I would ship option one for the two highest-traffic routes that pass the gate and option two for the rest, and write a risk note naming the EU exposure and its owner until the review completes.</p>
+<p>Failure mode of the recommendation: the fallback's rate limits were sized for its own traffic. When the breaker opens, the primary's full load moves at once, and the fallback starts returning 429s; with the cold-cache multiplier it happens sooner. The policy needs a cap on the share of traffic that may fail over, with the remainder taking the degraded mode.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Pushback:</em> evals for every route on the second provider cost more engineering time than the month allows. Which routes ship without a gate, and what do you accept in writing?</li>
+<li><em>Reversal:</em> what would you need to see from the monthly drills to remove cross-provider failover from a route?</li>
+<li><em>Disagreement:</em> the support lead wants failover on refusals because users hate them; the trust and safety lead refuses. How do you decide without deciding by rank?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Some products should not fail over at all. If an answer from a different model is worse than no answer, as with regulated advice or extraction feeding a ledger, the right fallback is a degraded mode, and the engineering goes into making that mode honest and fast.
+
+Same-provider fallback is cheaper to validate than cross-provider and shares more failure domains: the spend cap is organisation-wide, and an incident can hit several models. Count it as partial coverage.
+
+The gateway settings quoted here are examples from LiteLLM's documentation as read on 28 October 2026, and Anthropic's server-side fallback is in beta. Semantics such as what counts as an allowed failure and how cooldown ends change between versions; the fault-injection suite is how you find out which version you are running.
+
+<SelfRate id="lesson:apis/api-anatomy/failover" />

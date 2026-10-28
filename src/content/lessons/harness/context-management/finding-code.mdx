@@ -1,0 +1,166 @@
+---
+title: "Finding code: grep, repo maps and embeddings"
+track: harness
+module: context-management
+order: 6
+kind: lesson
+level: senior
+minutes: 13
+summary: How coding agents locate the code a task touches (agentic lexical search, a ranked repository map, an embeddings index or a retrieval sub-agent), what each costs and goes stale on, and how to measure the choice on your own repository from its git history.
+prerequisites:
+  - harness/context-management/subagents
+updated: 2026-10-28
+sources:
+  - title: Aider docs, Repository map (checked 2026-10-28)
+    url: https://aider.chat/docs/repomap.html
+    note: "map of the most important classes and functions with signatures, sent with each change request; graph ranking over files and dependencies; --map-tokens defaults to 1k tokens; expands when no files are in the chat"
+  - title: Aider source, aider/repomap.py (main branch, last changed 2026-02-11, checked 2026-10-28)
+    url: https://github.com/Aider-AI/aider/blob/main/aider/repomap.py
+    note: "map_tokens=1024 and map_mul_no_files=8, capped at the context window minus 4,096; tags parsed with tree-sitter and cached by file mtime; edge weight multipliers: x10 for an identifier the user mentioned, x10 for snake, kebab or camel case names of 8 or more characters, x0.1 for a leading underscore, x0.1 for names defined in more than 5 files, x50 when the referencing file is in the chat, times the square root of the reference count; personalization 100 / number of files for chat files, mentioned files and paths matching mentioned identifiers; networkx pagerank; binary search on the tag count accepting a token count within 15% of the budget; chat files left out of the map"
+  - title: "Shihipar, Building agents with the Claude Agent SDK (Anthropic, 2025-09-29)"
+    url: https://claude.com/blog/building-agents-with-the-claude-agent-sdk
+    note: semantic search is usually faster than agentic search but less accurate, more difficult to maintain and less transparent; start with agentic search and add semantic search only if you need faster results or more variations
+  - title: "Heule, Jia and Jain, Improving agent with semantic search (Cursor, 2025-11-06)"
+    url: https://cursor.com/en-US/blog/semsearch
+    note: "historical; vendor's own measurement: 12.5% higher average accuracy answering questions (6.5% to 23.5% by model) in offline evaluation; the post names its eval set Cursor Context Bench; online A/B: code retention +0.3%, +2.6% on codebases of 1,000+ files; 2.2% more dissatisfied follow-up requests without semantic search; embedding model trained on agent sessions ranked by an LLM; grep plus semantic search best"
+  - title: Cursor docs, Search (checked 2026-10-28)
+    url: https://cursor.com/docs/agent/tools/search
+    note: Instant Grep builds and queries its index on the local machine; Cursor does not store embeddings of the codebase for search and does not upload file paths or code to build an index; opened matches can still be sent in model requests; an Explore subagent runs in its own context on a faster model
+  - title: "Cognition, SWE-grep and SWE-grep-mini (2025-10-16)"
+    url: https://cognition.com/blog/swe-grep
+    note: more than 60% of the first turn spent retrieving context; up to 8 parallel searches per turn for at most 4 turns; reward and evaluation by weighted F1 and F-beta 0.5, favouring precision
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Four ways to find the code
+
+Every coding task starts with the agent deciding which files matter. Four mechanisms are in production or published as of October 2026, and they differ on when the cost is paid and what goes stale.
+
+**Agentic lexical search.** The model runs grep, ripgrep, find and file reads in a loop, refining its patterns from what each result shows. No build step, nothing to go stale, exact-match semantics. The cost is turns: each round trip is a model request over the whole context.
+
+**A ranked repository map.** Aider parses every file with tree-sitter, builds a graph of which files reference which definitions, ranks it with personalised PageRank toward the files and identifiers in the current conversation, and sends the top of the ranking, fitted to a token budget, with every change request. The cost is a fixed slice of every request's context.
+
+**An embeddings index.** Chunks of code are embedded, and the agent queries by meaning. The cost moves to index build and refresh, and the result is ranked by a similarity score the model and the user cannot inspect.
+
+**A retrieval sub-agent.** A separate agent, sometimes a separate model, does the searching in its own context and returns a short list. The cost is its own requests and the time to rebuild what the parent knew.
+
+A compiler's lexer against a database index is the analogy for the first and third: one scans every time and is always correct about the bytes, the other answers fast from a structure built earlier. The difference is that both are being driven by a model that decides what to look for, so the quality of the query matters as much as the engine.
+
+## What the vendors published, with dates
+
+This is the part of the module that goes stale fastest, so each claim carries its date.
+
+**Anthropic, September 2025.** The Claude Agent SDK post says semantic search is usually faster than agentic search but less accurate, more difficult to maintain and less transparent, and recommends starting with agentic search and adding semantic search only for faster results or more variations.
+
+**Cognition, October 2025.** Its Windsurf and Devin agents spent more than 60% of the first turn retrieving context. The response was not an embeddings index but SWE-grep, a model trained with reinforcement learning to issue up to eight parallel searches per turn for at most four turns, deployed behind a retrieval sub-agent. Its reward and evaluation favour precision (F-beta with beta 0.5), on the argument that polluting the parent's context costs more than missing a file.
+
+**Cursor, November 2025.** Cursor's semantic-search post reported, from its own offline evaluation, 12.5% higher average accuracy answering questions about codebases with semantic search available, ranging from 6.5% to 23.5% by model. Its online A/B test showed code retention up 0.3% overall and 2.6% on codebases of 1,000 or more files, and 2.2% more dissatisfied follow-up requests when semantic search was off. The post concluded that grep and semantic search together worked best.
+
+**Cursor, current docs (checked 28 October 2026).** The search documentation describes Instant Grep, a search engine whose index is built and queried on the user's machine, and says Cursor does not store embeddings of the codebase for search and does not upload file paths or code to build a search index. Broad exploration runs in an Explore sub-agent on a faster model. The docs do not say when or why the embeddings index was dropped, so the November 2025 numbers describe a product that no longer works that way. Cite them as history.
+
+The pattern across the three vendors is that each converged on fast lexical search, made faster by a local index, a trained model or parallel calls, with a sub-agent to keep the results out of the main context.
+
+## How Aider ranks a repository
+
+Aider's map is the one mechanism whose internals are fully public, and its `repomap.py` shows how much judgement sits in the weights. Each file is a node. For each identifier defined in one file and referenced in another, an edge runs from the referencing file to the defining file, with a weight built from multipliers:
+
+- ×10 if the user mentioned the identifier in the conversation.
+- ×10 if it is a snake_case, kebab-case or camelCase name of 8 or more characters (long, specific names).
+- ×0.1 if it starts with an underscore (private).
+- ×0.1 if it is defined in more than 5 files (generic names like `get` or `run`).
+- ×50 if the referencing file is in the chat.
+- times the square root of the number of references, so frequent mentions do not dominate.
+
+PageRank then runs with a personalisation vector that gives extra restart probability to files in the chat, files the user named and files whose path contains an identifier the user mentioned. The ranked definitions are fitted to the budget by binary search on how many to include, accepting a result within 15% of the token target. The default budget is 1,024 tokens; with no files in the chat, it is multiplied by 8, capped at the context window minus 4,096. Files already in the chat are left out of the map, because their full text is already in context.
+
+<Predict id="finding-code-edge-weight" question="What weight does Aider give the edge from the chat file to the defining file?" answer={10000} tolerance={0} unit="">
+<Fragment slot="prompt">
+<p>Using the multipliers above: the user's message mentions <code>parse_config_file</code>. A file in the chat references it 4 times. It is defined in one file and does not start with an underscore.</p>
+</Fragment>
+<p>Mentioned: ×10. Snake case, 17 characters: ×10. Referencing file in the chat: ×50. Square root of 4 references: ×2. So 10 × 10 × 50 × 2 = <b>10,000</b>. An unmentioned short name such as <code>load</code>, referenced 4 times from a file outside the chat, gets 1 × 2 = 2. A five-thousand-fold difference from hand-set constants is the price of a map that fits in 1,024 tokens: it is a strong prior toward what the conversation already names.</p>
+</Predict>
+
+The effect of personalisation is easy to see on a toy graph. The function below is a plain power-iteration PageRank with weighted edges, personalisation and dangling-node mass sent to the personalisation vector, as networkx does when Aider passes both.
+
+```python
+def pagerank(edges, personalization=None, d=0.85, iters=100):
+    """Weighted PageRank by power iteration; edges = {(src, dst): weight}."""
+    nodes = sorted({n for e in edges for n in e})
+    p = personalization or {n: 1 for n in nodes}
+    total = sum(p.get(n, 0) for n in nodes)
+    p = {n: p.get(n, 0) / total for n in nodes}
+    out = {n: sum(w for (s, _), w in edges.items() if s == n) for n in nodes}
+    rank = dict(p)
+    for _ in range(iters):
+        nxt = {n: (1 - d) * p[n] for n in nodes}
+        for (s, t), w in edges.items():
+            nxt[t] += d * rank[s] * w / out[s]
+        dangling = sum(rank[n] for n in nodes if out[n] == 0)
+        for n in nodes:
+            nxt[n] += d * dangling * p[n]
+        rank = nxt
+    return rank
+
+# referencer to definer: billing.py references a long snake_case name in tax.py that the user mentioned (x10, x10);
+# every other edge is a short, unmentioned name; each name is referenced 4 times (sqrt 4 = 2)
+edges = {("api.py", "auth.py"): 2, ("api.py", "util.py"): 2, ("billing.py", "util.py"): 2,
+         ("billing.py", "tax.py"): 100 * 2, ("auth.py", "util.py"): 2, ("cli.py", "api.py"): 2}
+for label, pers in [("no chat files", None), ("billing.py in chat", {"billing.py": 1})]:
+    ranked = sorted(pagerank(edges, pers).items(), key=lambda kv: -kv[1])
+    print(label + ":", ", ".join(f"{f} {r:.3f}" for f, r in ranked))
+# no chat files: util.py 0.307, api.py 0.171, tax.py 0.171, auth.py 0.166, ...
+# billing.py in chat: billing.py 0.541, tax.py 0.455, util.py 0.005, api.py 0.000, ...
+```
+
+Without a chat file, the shared utility module ranks first, which is what a global ranking always does. With `billing.py` in the chat, the map spends its budget on `tax.py` and nothing unrelated. That is the design working. It is also the failure mode: the map cannot surface a file connected to the task by behaviour rather than by name, such as a configuration file that changes what `tax.py` does.
+
+## Measuring it on your repository
+
+Published comparisons use the vendor's tasks, models and harness. The repository's own history gives a better test set for free.
+
+1. Take 50 to 200 recent merged changes. For each, the task text is the issue or the first commit message, and the relevant set is the files the change modified.
+2. Run each candidate retrieval (grep-only agent, repo map, an index, a retrieval sub-agent) from the parent commit, and record which files it surfaces before the first edit.
+3. Score recall of the modified files, precision of what was surfaced (Cognition's F-beta with beta 0.5 if pollution worries you more than misses), turns and wall time to the first relevant file, and tokens added to the parent's context.
+4. Compare paired, task by task, because task difficulty varies far more than the methods do.
+5. Measure freshness separately: how long after a branch switch or a large merge each method returns stale results. Aider's tag cache is keyed by file modification time; an embeddings index is as fresh as its last rebuild.
+
+The modified-files set undercounts what was needed (files read to understand the change but not edited), so treat recall as a floor and spot-check misses by hand.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Agents on your 4-million-line monorepo miss the relevant files often enough that engineers complain. A vendor offers an embeddings index that requires uploading code; security will not allow code to leave the network; the engineering director wants a decision this quarter. What do you do?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Measure before buying: a paired retrieval test on a few hundred past changes from our own history, comparing grep-only, grep with a local lexical index, a repository map and a read-only retrieval sub-agent. All four keep code on the network. I only revisit embeddings, self-hosted, if the measured misses are semantic (the right file shares no names with the task) and the local options cannot close them.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The constraints conflict only if embeddings are the fix, and the 2025 and 2026 record does not establish that: Anthropic recommends starting with agentic search, Cognition answered slow retrieval with a trained lexical-search sub-agent, and Cursor, which published the strongest pro-embedding numbers in November 2025, now documents a local index and no stored embeddings for search.</p>
+<p>So the first deliverable is the miss taxonomy. From the paired test I classify each miss: the file shares identifiers with the task but search did not reach it (a turn or speed problem, fixed by parallel search, a local index or a sub-agent), or it does not share identifiers (a semantic problem, where only an index by meaning or a better task description helps). The quarter's decision follows from the proportions.</p>
+<p>What I give up: a quarter spent measuring instead of shipping, and a self-hosted embeddings option later carries build and refresh costs on a repository this size. The failure mode of my recommendation is that the test set over-represents changes whose files share names with their issues, because those are the ones people describe well, so I sample some by hand from incidents and cross-team changes.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The test shows 70% of misses are semantic. Security still says no upload. What do you build in-network, and what does it cost to keep fresh?</em></li>
+<li><em>Your local index is fast, but recall drops for a week after each large refactor. Do you block agents during reindexing, or accept the misses, and who decides?</em></li>
+<li><em>What result would make you remove the repository map you added?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The vendor numbers here are each vendor's own measurement on its own tasks and harness, and the Cursor figures describe a configuration its current docs no longer describe. None is a controlled comparison across mechanisms.
+
+The lexer and index framing assumes one search per need. Agents run dozens of searches per task, so the latency and token cost of agentic search scale with model speed and turn count, and a faster model can make an index unnecessary or a slower one make it essential.
+
+The git-history test assumes the changed files are the right answer. For tasks where the correct fix is in a different place than the one the human chose, retrieval that finds the better place scores as a miss.
+
+Finally, retrieval is upstream of everything in this module: whatever the agent finds lands in its context and stays there until compaction or the end of the session, which is why the sub-agent and precision arguments keep returning.
+
+<SelfRate id="lesson:harness/context-management/finding-code" />

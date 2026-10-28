@@ -1,0 +1,160 @@
+---
+title: Semantic caching and when it is a correctness bug
+track: apis
+module: context-engineering
+order: 3
+kind: lesson
+level: senior
+minutes: 11
+summary: A semantic cache returns an answer written for a different question, so its similarity threshold is a precision decision priced by the cost of a wrong hit, and its scope decides what it can leak.
+prerequisites: [apis/context-engineering/caching-mechanics]
+updated: 2026-10-28
+sources:
+  - title: Redis docs, LangCache concepts
+    url: https://redis.io/docs/latest/develop/ai/context-engine/langcache/concepts/
+    note: semantic caching gives up the guarantee that a hit is correct; default similarity threshold 0.85 with a recommended starting range of 0.8 to 0.9; up to 5 attributes per service to scope searches and deletes; exact and semantic search strategies; advice to start tight and loosen while spot-checking; vendor documentation; checked 2026-10-28
+  - title: Auditing Prompt Caching in Language Model APIs (Gu, Li, Kuditipudi, Liang, Hashimoto, ICML 2025)
+    url: https://arxiv.org/abs/2502.07776
+    note: cached prompts are processed faster, creating a timing side channel; the paper reports global cache sharing across users in seven API providers, including OpenAI; checked 2026-10-28
+  - title: Claude docs, pricing
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: Opus 5.5 at $4 per million input tokens and $20 per million output tokens, used for the cost of a cache miss; checked 2026-10-28
+  - title: Claude docs, prompt caching
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: caches isolated between organizations and, on the Claude API, by workspace; checked 2026-10-28
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## A cache whose hits can be wrong
+
+A prompt cache reuses computation and still runs the model on the actual request, so its hits are always correct. A semantic cache stores whole responses keyed by an embedding of the request, and on a new request returns the stored response whose key is similar enough. It skips the model, which is the whole saving, and it means a hit is an answer written for a different question.
+
+Redis's LangCache documentation states the trade plainly: semantic caching gives up the guarantee that a cache hit is always correct in exchange for matching paraphrases, and a false-positive match can return a wrong answer. An exact-key cache has a correctness risk of zero from the cache itself; a semantic cache has a tuning knob, the similarity threshold, that trades hit rate against wrong answers. LangCache defaults to 0.85 and recommends starting between 0.8 and 0.9, tightening first and loosening while spot-checking matches.
+
+The threshold is therefore a precision setting with a price on each false positive, and the inputs to choosing it are a labelled set and two costs.
+
+## Why similarity is the wrong key for some questions
+
+A toy bag-of-words cosine shows the shape of the problem. "cancel my subscription" and "do not cancel my subscription" share three words; as vectors of word counts their cosine is 3 / √(3 × 5) = 0.775. Learned embeddings handle negation better than word counts, but the categories that break semantic caches are the ones where a small edit to the text is a large edit to the answer:
+
+- negation and action direction (cancel, do not cancel);
+- entity substitution (the EU refund window against the US one, the Team plan against Enterprise);
+- the asker (my balance, my order);
+- time (current balance against last month's).
+
+The last two are not similarity failures at all. "What is my balance?" from two users is the same text with different correct answers, so any cache keyed on text alone, exact or semantic, returns one user's answer to the other.
+
+## Set the threshold from labelled pairs
+
+Constructed example. A support assistant logs pairs of questions whose embeddings fall near each other; a reviewer labels each pair as answerable by the same response or not. The scores are scenario values, not output from a particular embedding model.
+
+| Similarity | Question A | Question B | Same answer |
+|---|---|---|---|
+| 0.97 | How do I reset my password? | How can I reset my password? | yes |
+| 0.95 | What are your support hours? | When is support open? | yes |
+| 0.94 | Cancel my subscription | Do not cancel my subscription | no |
+| 0.93 | How do I export my data? | How can I download all my data? | yes |
+| 0.91 | Is the Pro plan billed monthly? | Is the Pro plan billed monthly or yearly? | yes |
+| 0.90 | What is the refund window in the US? | What is the refund window in the EU? | no |
+| 0.89 | How do I add a teammate? | How do I invite a colleague? | yes |
+| 0.88 | Does the API support streaming? | Can I stream responses from the API? | yes |
+| 0.86 | What is my current balance? | What was my balance last month? | no |
+| 0.85 | How do I change my email? | How do I update my email address? | yes |
+| 0.83 | Delete my account | Delete my last invoice | no |
+| 0.80 | What does the Team plan cost? | What does the Enterprise plan cost? | no |
+
+<Predict id="ce-semantic-wrong" question="With the threshold at 0.88, what percentage of the cache hits in this table return an answer written for a question with a different answer?" answer={25} tolerance={1} unit="percent">
+Eight pairs score 0.88 or more, and two of them (the cancellation pair at 0.94 and the refund-region pair at 0.90) have different answers: 2 / 8 = 25 percent. At LangCache's default of 0.85 it is 3 of 10, 30 percent. Only at 0.95 does the wrong share reach zero, and there the cache serves 2 of the 7 genuinely equivalent pairs.
+</Predict>
+
+The economics decide how low the wrong share must be. A miss costs one model call; a wrong hit costs whatever the wrong answer causes. Scenario numbers: a call on Opus 5.5 with 3,000 input tokens and 300 output tokens costs 3,000 × $4 / 1,000,000 + 300 × $20 / 1,000,000 = $0.018. A wrong answer that leads to an escalated ticket is put at $5. A hit is worth serving when (1 − *e*) × 0.018 > *e* × 5, where *e* is the wrong-hit rate, so *e* must be below 0.018 / 5.018, about 0.36 percent.
+
+```python
+pairs = [(0.97, True), (0.95, True), (0.94, False), (0.93, True), (0.91, True), (0.90, False),
+         (0.89, True), (0.88, True), (0.86, False), (0.85, True), (0.83, False), (0.80, False)]
+
+def sweep(pairs, thresholds):
+    same_total = sum(1 for _, same in pairs if same)
+    for t in thresholds:
+        hits = [same for sim, same in pairs if sim >= t]
+        wrong = hits.count(False)
+        print(f"{t:.2f}  hits {len(hits):2d}  wrong {wrong}  "
+              f"wrong share {wrong / len(hits):.0%}  same pairs served {hits.count(True)}/{same_total}")
+
+sweep(pairs, [0.95, 0.90, 0.88, 0.85])
+
+call_cost = 3_000 * 4.00 / 1e6 + 300 * 20.00 / 1e6   # Opus 5.5: 3,000 input, 300 output tokens
+wrong_cost = 5.00                                     # scenario: one escalated support ticket
+max_wrong_rate = call_cost / (call_cost + wrong_cost)
+print(f"call ${call_cost:.3f}, break-even wrong-hit rate {max_wrong_rate:.2%}, "
+      f"labelled hits needed with zero wrong {3 / max_wrong_rate:.0f}")
+# 0.95  hits  2  wrong 0  wrong share 0%  same pairs served 2/7
+# 0.90  hits  6  wrong 2  wrong share 33%  same pairs served 4/7
+# 0.88  hits  8  wrong 2  wrong share 25%  same pairs served 6/7
+# 0.85  hits 10  wrong 3  wrong share 30%  same pairs served 7/7
+# call $0.018, break-even wrong-hit rate 0.36%, labelled hits needed with zero wrong 836
+```
+
+The last line is the uncomfortable one. Twelve pairs cannot show a wrong-hit rate below 0.36 percent. With zero wrong hits observed in *n* labelled hits, the 95 percent upper bound on the rate is about 3/*n*, so demonstrating 0.36 percent takes about 836 labelled hits at the chosen threshold with none wrong. A team that cannot label that many cannot claim the cache is net positive for this product; it can only claim it for question classes cheap enough to be wrong about.
+
+## Scope does more than the threshold
+
+Look at which pairs were wrong. The cancellation and deletion pairs are actions, not questions, and should never reach a response cache. The balance pair is personalised. The refund and plan pairs are entity substitutions that a key component would separate. Filtering what may be cached and scoping the key removes every wrong hit in the table without touching the threshold.
+
+The scope of an entry is everything the answer depends on besides the question text:
+
+| Key component | Why |
+|---|---|
+| Tenant | Two customers' documentation can give different answers to the same question |
+| Permission set (a hash of the ACL groups used in retrieval), or the user for personalised answers | An answer built from documents a user cannot read must not reach them |
+| Region or locale, product or plan when the question names one | Entity substitution is the commonest false positive |
+| Model id, prompt template version, source-data version | An answer is stale once any input that produced it changes |
+
+Keying on the permission set rather than the user keeps sharing among users with identical access while making a cross-permission hit impossible by construction. LangCache's attributes (up to five per service) are this mechanism: tags attached to entries that scope later searches and deletes, so a tenant's entries can also be purged when its documents change.
+
+The leak a semantic cache must never allow is an answer generated from one principal's data or permissions returned to another. That is a security property, and it belongs in the cache key, where it holds whatever the threshold is, not in the threshold, where it holds only statistically.
+
+Timing leaks too. Gu and colleagues showed that cached prompts are measurably faster and reported global prompt-cache sharing across users at seven API providers, including OpenAI, which lets one user detect what another sent. A semantic cache shared across tenants has the same channel in a stronger form: a fast response reveals that someone asked something similar, and a wrong hit hands over the stored answer itself. Claude's prompt caches are isolated by organisation and, on the Claude API, by workspace; a semantic cache built in-house gets only the isolation its key gives it.
+
+## Where it is safe
+
+Semantic caching fits questions whose answer depends on nothing but the question and slowly changing public content: product FAQs, documentation lookups, policy text, scoped by tenant, locale and content version, with a lifetime shorter than the content's update cycle. It is a bug for personalised, permissioned, time-sensitive or action-taking requests, and the safe design routes those around the cache by intent before any similarity lookup. LangCache's own guidance draws the same line: a support FAQ bot can run a looser threshold than a bot answering account-specific financial questions.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+Support leadership wants a semantic cache in front of the help assistant this month to cut model spend by a third. Answers are generated from tenant documentation plus the user's plan and region, and two enterprise tenants have contractual data-isolation clauses. What do you build, and what do you refuse to promise?
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>A response cache only for an allow-listed set of informational intents, keyed by tenant, plan, region, prompt version and documentation version, with a threshold set from labelled pairs per intent and a lifetime tied to documentation releases. Action and account intents bypass it. I refuse to promise the one-third saving before measuring which share of traffic falls in cacheable intents, and I refuse any cross-tenant sharing.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Start with traffic, not thresholds. Classify a week of requests by intent and measure the share that is informational and does not depend on the account. That share is the ceiling on the saving; if it is 40 percent and the hit rate inside it is half, the cache saves about a fifth of calls, short of the target, and leadership hears that before the build.</p>
+<p>Key design: tenant, plan, region and both versions in the key, so isolation clauses hold by construction. Entries for the two enterprise tenants live in their own namespace and are purged with their documentation updates.</p>
+<p>Threshold: label a few hundred near-duplicate pairs per high-volume intent, sweep thresholds, and choose the lowest one whose observed wrong-hit rate is below the break-even (call cost over call cost plus wrong-answer cost). Where the labelling budget cannot show that, the intent stays uncached.</p>
+<p>The decision with two defensible answers is the cache's fallback when classification is uncertain: bypass (safe, smaller saving) or serve with a lower-confidence flag (bigger saving, wrong answers reach users). I choose bypass for the first quarter and write the cost of that choice in the decision memo.</p>
+<p>Failure mode of the plan: the intent classifier misroutes an account question as informational, and the scoped key still serves a plan-level answer to an account-level question. A sampled audit of hits, labelled weekly, is the control, with a rollback trigger on the wrong-hit rate.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Labelling costs more than the cache saves in its first quarter. Which half do you cut?</em> Label only the top intents by volume, cache only those, and accept in writing that the long tail stays uncached.</li>
+<li><em>A product manager argues the threshold should be loosened to 0.8 because users rarely complain. What do you need to see?</em> Labelled wrong-hit rates at 0.8 from the audit sample, since complaint rate measures how many users noticed, not how many were wrong.</li>
+<li><em>What would make you remove the cache entirely?</em> An audited wrong-hit rate above break-even that tightening cannot fix without dropping the hit rate below the cost of running the cache and its labelling.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The labelled table here is constructed, and its scores come from no particular embedding model. Real thresholds are specific to the embedding model, the domain and the phrasing of a product's users; a threshold tuned on one embedding model does not transfer to another.
+
+The cost model treats a wrong answer as a fixed cost. Some wrong answers cost nothing (the user rephrases) and some are unbounded (an isolation breach under contract). Where the cost is unbounded the break-even rate is zero, and the only acceptable design is one where the leak is impossible by key construction.
+
+A semantic cache also freezes answers. When the underlying documentation changes, every entry derived from it is wrong until it expires or is purged, which is why the content version belongs in the key.
+
+<SelfRate id="lesson:apis/context-engineering/semantic-cache" />

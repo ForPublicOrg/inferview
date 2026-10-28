@@ -1,0 +1,170 @@
+---
+title: Quality regressions with no model change
+track: inference
+module: operating
+order: 3
+kind: lesson
+level: staff
+minutes: 14
+summary: Anthropic's September 2025 postmortem traces a month of degraded answers to a routing error, a runtime misconfiguration and a compiler bug in approximate top-k, none of which changed weights or prompts; catching that class needs exact checks and probes sliced by the serving topology, because global evals average the damage away.
+prerequisites: [inference/operating/load-testing]
+updated: 2026-10-28
+sources:
+  - title: Anthropic Engineering, A postmortem of three recent issues (2025-09-17)
+    url: https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues
+    note: "Claude served on AWS Trainium, NVIDIA GPUs and Google TPUs with the aim of equal quality; validation relies on benchmarks, safety evaluations and performance metrics, with spot checks and canary groups; routing error from Aug 5 (0.8% of Sonnet 4 requests), load balancing change Aug 29, worst hour Aug 31 at 16%, about 30% of Claude Code users with at least one misrouted message, sticky routing, Bedrock peak 0.18% from Aug 12, Vertex below 0.0004% Aug 27 to Sep 16, fix deployed Sep 4 and rolled out by Sep 16 (first party, Vertex) and Sep 18 (Bedrock); TPU misconfiguration Aug 25 producing Thai or Chinese characters and syntax errors, Opus 4.1 and Opus 4 Aug 25 to 28, Sonnet 4 Aug 25 to Sep 2, rolled back Sep 2, detection tests for unexpected character outputs added to deployment; approximate top-k miscompilation exposed by an August sampling change (the post dates it Aug 25 and Aug 26 in different places), December 2024 workaround for dropping the most probable token, bf16 versus fp32 and xla_allow_excess_precision defaulting to true, wrong results only for certain batch sizes and model configurations, behaviour changed with unrelated operations and debugging tools, Haiku 3.5 rolled back Sep 4 and Opus 3 Sep 12, switch to exact top-k with a minor efficiency cost; why detection was slow; continuous evaluations on true production systems, tooling to debug feedback without sacrificing privacy, /bug and thumbs down. Checked 2026-10-28."
+  - title: Thinking Machines Lab, Defeating Nondeterminism in LLM Inference (Horace He, 2025-09-10)
+    url: https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+    note: "Lack of batch invariance as the main cause of endpoint nondeterminism; 1,000 temperature-0 completions from Qwen3-235B-A22B-Instruct-2507 gave 80 unique outputs, identical for the first 102 tokens; batch-invariant kernels made all 1,000 identical; Qwen3-8B run of 1,000 sequences took 26 s by default, 55 s deterministic unoptimised, 42 s with the improved attention kernel. Checked 2026-10-28."
+  - title: vLLM source, vllm/v1/metrics/loggers.py (main)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/v1/metrics/loggers.py
+    note: "vllm:corrupted_requests counts requests with NaNs in logits, registered only when VLLM_COMPUTE_NANS_IN_LOGITS is set. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The function users call includes the serving path
+
+A model's weights are one input to the function a user calls. The router that picks a server, the server's configuration, the sampling code and the compiler that lowered it are the others, and any of them can change the output distribution while the weights, the prompts and the release notes stay the same. Anthropic's postmortem of 17 September 2025 is a detailed public account of one such incident. Claude runs on AWS Trainium, NVIDIA GPUs and Google TPUs, and the post states the aim that users "should get the same quality responses regardless of which platform serves their request". Between early August and mid-September 2025, three unrelated infrastructure bugs broke that, and the post is explicit that none came from reducing quality under load: "We never reduce model quality due to demand, time of day, or server load."
+
+The ordinary release process ran: benchmarks, safety evaluations, performance metrics, spot checks and small canary groups. All three bugs passed it, and why they passed is the design input for this lesson.
+
+## Three bugs, three layers
+
+| Date (2025) | Event, as the post reports it |
+|---|---|
+| Aug 5 | Some Sonnet 4 requests misrouted to servers configured for the upcoming 1M-token context window: 0.8% of requests |
+| Aug 25 | TPU misconfiguration deployed; output corruption on Opus 4.1 and Opus 4 until Aug 28, Sonnet 4 until Sep 2 |
+| Aug 25 or 26 | Sampling change exposes a latent approximate top-k bug in the XLA:TPU compiler (the post gives both dates) |
+| Aug 29 | Routine load-balancing change sends more short-context requests to the 1M-context servers; negative reports spike |
+| Aug 31 | Worst hour: 16% of Sonnet 4 requests misrouted |
+| Sep 2 | Corruption change rolled back |
+| Sep 4 | Routing fix deployed; Haiku 3.5 top-k rollback |
+| Sep 12 | Opus 3 top-k rollback |
+| Sep 16 to 18 | Routing fix complete on first-party and Vertex (Sep 16), Bedrock (Sep 18) |
+
+**The routing error lives in the control plane.** Every server worked; some requests went to servers configured for a different context length. Routing was sticky, so "subsequent follow-ups were likely to be served by the same incorrect server", and the post reports that about 30% of Claude Code users who made requests in the period had at least one message misrouted. Per-request and per-user rates differ by more than an order of magnitude even without stickiness: at an independent 0.8% per request, a user who makes 45 requests has a 1 − 0.992^45 = 30% chance of at least one hit. That is not a reconstruction of the post's figure, which stickiness and the 16% peak shaped; it shows why a per-request rate under 1% is not small for active users.
+
+**The corruption lives in the runtime configuration.** A misconfiguration on the first-party API's TPU servers caused a performance optimisation to sometimes give high probability to tokens that should rarely appear: Thai or Chinese characters in answers to English prompts, and code with obvious syntax errors. Third-party platforms were not affected. This bug produced outputs that an exact check, with no judge model, can flag: a script the prompt does not use, or code that does not parse.
+
+**The miscompilation lives in the numerics, and it depended on load.** In December 2024 Anthropic found its TPU implementation "would occasionally drop the most probable token" at temperature 0 and deployed a workaround. The cause was a precision mismatch: probabilities computed in bf16, a vector processor that is fp32-native, and an XLA flag, `xla_allow_excess_precision`, that defaults to true and lets the compiler promote some operations to fp32, so operations disagreed about which token ranked highest. The August sampling rewrite fixed the precision issue and removed the workaround, which exposed a second bug in approximate top-k: "This approximation sometimes returned completely wrong results, but only for certain batch sizes and model configurations." Its behaviour "changed depending on unrelated factors such as what operations ran before or after it, and whether debugging tools were enabled". The fix was exact top-k with some operations standardised on fp32, at what the post calls "the minor efficiency impact".
+
+The third bug is the one that defeats test environments. A kernel that is wrong only at some batch sizes is correct in a single-request reproduction, correct in a debugger, and wrong in production at the batch sizes that load produces.
+
+## Why detection took weeks
+
+The post gives four reasons. Each is a requirement on the instruments.
+
+**Models recover from isolated mistakes.** The post says the evaluations "simply didn't capture the degradation users were reporting", in part because Claude "often recovers well from isolated mistakes". A sampled bad token in a long answer rarely flips an end-task score. Instruments that score whole tasks will miss token-level corruption; instruments that check properties of every output (script, syntax, exact answers) will not.
+
+**Global averages dilute.** A pool that receives 0.8% of traffic can be badly broken and move a fleet-wide metric by almost nothing. With a scenario probe suite that fails 2% of the time on healthy servers and 10% on the broken pool, the fleet-wide failure rate becomes 0.992 × 2% + 0.008 × 10% = 2.064%. For a two-sided test at 5% significance and 80% power, n per arm is (1.96 + 0.84)² × (p₁q₁ + p₂q₂) / (p₂ − p₁)². Detecting 2.000% against 2.064% needs about 763,000 probes per arm; detecting 2% against 10% on the pool itself needs about 134. The damage is visible only in the slice that holds it.
+
+**Privacy limits what engineers can read.** Anthropic's controls restrict engineers' access to interactions that users have not submitted as feedback, which made reports hard to reproduce. Probes are traffic the operator owns, so they can be read, replayed and diffed without that restriction.
+
+**Overlapping bugs look like noise.** The three bugs produced different symptoms on different platforms at different rates. When reports spiked on 29 August, the post says, "we didn't immediately make the connection" to the load-balancing change. A feedback rate is a time series; without change events drawn on the same axis, nobody lines up the spike with the deploy.
+
+## The instruments
+
+The post lists what Anthropic changed: evaluations run "continuously on true production systems to catch issues such as the context window load balancing error", tooling to debug feedback "without sacrificing user privacy", unexpected-character detection in deployment, and exact top-k. The internals of those evaluations are not public. What each bug needed can be derived from how it failed.
+
+| Bug | Instrument that sees it | Why that one |
+|---|---|---|
+| Routing to the wrong context configuration | Probes addressed to every pool, scored per pool; an audit that each request's context class matches the configuration of the server that served it | The servers were healthy; only the mapping was wrong, and only a sliced metric or a config assertion sees a mapping |
+| Rare tokens given high probability | Exact output checks on probes and on sampled production outputs: script against prompt, parse for code, exact answers | Token-level damage that task scores absorb, cheap to check deterministically |
+| Approximate top-k wrong at some batch sizes | A differential test of the sampler on recorded logits, approximate against exact, swept over batch sizes and model configurations; probes that run inside real production batches | The defect depends on batch shape, so it must be tested at the shapes production uses |
+
+The differential sampler test sidesteps a problem that output-level diffing cannot. Inference endpoints are not deterministic under load: Thinking Machines sampled 1,000 temperature-0 completions of one prompt from Qwen3-235B and got 80 distinct outputs, all identical for the first 102 tokens, and traced the variation to kernels whose numerics change with batch size. A probe that compares production output with a stored reference will alarm on that variation. Comparing top-k indices on fixed logits has an exact right answer, so any mismatch is a bug.
+
+vLLM's `vllm:corrupted_requests` counter, enabled by `VLLM_COMPUTE_NANS_IN_LOGITS`, counts requests with NaNs in their logits; it catches arithmetic that fails loudly, not a plausible distribution with the wrong winner, which is what both of Anthropic's numeric bugs produced.
+
+<Predict id="inf-operating-probe-coverage" question="Probes enter through the normal router and land on pools in proportion to traffic. One misconfigured pool receives 0.8% of requests. How many probes must you send to have a 95% chance that at least one lands on it?" answer={373} tolerance={5} unit="probes">
+<p>The chance that n probes all miss is 0.992^n. Setting it to 0.05 gives n = ln 0.05 / ln 0.992 = 2.996 / 0.00803 = <b>373 probes</b>. That is to land one probe, not to detect anything; with a probe that fails half the time on a broken pool, a confident signal needs several times as many. Probes addressed to each pool have no coverage gap; only probes sent through the router test the routing itself.</p>
+</Predict>
+
+The checks are short; the pools and verdicts below are a scenario.
+
+```python
+import ast, unicodedata
+from collections import Counter
+
+def scripts(s):
+    return {unicodedata.name(ch, "?").split(" ")[0] for ch in s if ch.isalpha()}
+
+def check(probe, text):
+    """Exact checks that need no judge: expected answer, parseable code, no foreign script."""
+    if scripts(text) - scripts(probe["prompt"]) - {"LATIN"}:
+        return "foreign_script"
+    if probe.get("python"):
+        try:
+            ast.parse(text)
+        except SyntaxError:
+            return "syntax"
+    if "answer" in probe and probe["answer"] not in text:
+        return "wrong_answer"
+    return "ok"
+
+def failing_pools(results, min_n=100, ratio=3.0):
+    """results: (pool, verdict). Flag pools whose failure rate is ratio x the rest of the fleet."""
+    n, bad = Counter(), Counter()
+    for pool, verdict in results:
+        n[pool] += 1
+        bad[pool] += verdict != "ok"
+    flagged = []
+    for pool in n:
+        rest_n, rest_bad = sum(n.values()) - n[pool], sum(bad.values()) - bad[pool]
+        rest_rate = max(rest_bad / rest_n, 1 / rest_n)
+        if n[pool] >= min_n and bad[pool] / n[pool] > ratio * rest_rate:
+            flagged.append((pool, bad[pool], n[pool]))
+    return flagged
+
+probe = {"prompt": "Write a Python function that returns the sum of a list.", "python": True}
+print(check(probe, "def total(xs):\n    return sum(xs)"))              # ok
+print(check(probe, "def total(xs):\n    return sum(xs) สวัสดี"))        # foreign_script
+print(check(probe, "def total(xs)\n    return sum(xs)"))               # syntax
+
+results = [("tpu-a", "ok")] * 196 + [("tpu-a", "syntax")] * 4 \
+        + [("tpu-b", "ok")] * 180 + [("tpu-b", "foreign_script")] * 20 \
+        + [("gpu-a", "ok")] * 197 + [("gpu-a", "wrong_answer")] * 3
+print(failing_pools(results))                                           # [('tpu-b', 20, 200)]
+```
+
+Each pool is compared with the rest of the fleet rather than a fixed threshold, so a probe suite that gets harder does not page anyone, and a pool that diverges does. The foreign-script check assumes English probes; a multilingual suite carries the expected scripts on each probe.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You serve one model on two hardware platforms. Support tickets about worse answers have doubled this week, offline evals are flat, engineers cannot read user conversations, and there is a release freeze from Friday. What do you do in the next 48 hours, and what do you build after?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Treat flat evals as evidence that the cause is in the serving path, not the model. In 48 hours: put every change from the last month (routing, config, kernels, compiler, engine) on the same time axis as the ticket rate, send probes with exact checks to every pool on both platforms directly rather than through the router, and roll back any change whose pool diverges. After: continuous sliced probes in production, a differential sampler test in the release pipeline, and change events annotated on the feedback dashboard. The cost is probe traffic and a slower release pipeline.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Privacy means I cannot read the conversations behind the tickets, so I need traffic I own. Probes go to each pool, platform and model configuration directly, with checks that need no judge: script, parse, exact answers. A pool that fails three times as often as the rest of the fleet is a lead; a platform-wide difference points at kernels or compilers rather than routing.</p>
+<p>In parallel I would correlate the ticket rate with the change log by hour. Drawing the two on one chart is cheap, and it is the connection the 29 August spike lacked.</p>
+<p>If one change lines up and its pool diverges, roll it back before Friday even without a root cause; if nothing lines up, roll back the newest numerics-affecting change on the platform with the higher probe failure rate, and say in writing that it is a bet.</p>
+<p>After the freeze: probes on production at real batch sizes, per-slice alerting, a sampler and top-k differential test across batch sizes before any kernel or compiler upgrade, and a feedback tool that lets a user attach a conversation with consent. The failure mode of this design is that probes test only what they check; a content-dependent regression on long agentic tasks would still pass.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Exact top-k costs throughput, and finance asks you to keep the approximate kernel with a probe watching it. What do you decide, and what risk do you write down?</em> Keep exact top-k on any configuration where the differential test has ever disagreed; offer approximate only for configurations with a recorded clean sweep, and write down that the sweep covers the batch sizes tested, not the ones tomorrow's traffic produces.</li>
+<li><em>Two senior engineers disagree: one wants every probe through the router, the other wants every probe addressed to a pool. How do you decide without deciding by rank?</em> They test different things; compute the probe count each needs to see a pool at the smallest traffic share you care about, and run both at the rates that arithmetic gives.</li>
+<li><em>What would you need to see to stop running probes on a platform?</em> Nothing on that platform changing: no engine, compiler, kernel, routing or configuration change for the period the probes cover. In practice that never holds, so the question becomes how often, not whether.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The account comes from one provider's postmortem. The routing design, the configuration that corrupted output, and the evaluations Anthropic built afterwards are described in outline only, and nothing here should be read as how they work inside.
+
+Exact checks find loud failures. A routing error to a server with a different context configuration, or a sampler that picks the second-best token, can produce fluent answers that pass every script and syntax check and are simply worse. For those, probe tasks with verifiable answers at the length and difficulty of real use are the instrument, and they are expensive to build and noisy to score.
+
+Probes are not users. A synthetic suite covers the prompts someone thought to write, at the lengths they chose, and production batch shapes only if the probes share batches with real traffic. Sliced probing finds a bad pool; it does not find a bad interaction between one customer's prompt pattern and one kernel.
+
+Everything here assumes the operator controls the serving stack. A team calling a hosted API sees the same class of incident as a change in its own eval scores with no change of model string; its instruments are the same probes and exact checks, run against the provider, and its remedy is the provider's status page and a second provider.
+
+<SelfRate id="lesson:inference/operating/quality-incidents" />

@@ -1,0 +1,108 @@
+---
+title: "FlashAttention 1 to 3: exact attention bounded by memory traffic"
+track: foundations
+module: attention
+order: 3
+kind: paper
+level: senior
+minutes: 10
+summary: FlashAttention computes exact attention with more arithmetic than the standard kernel and wins by never writing the score matrix to GPU memory; versions 2 and 3 are about keeping the tensor cores busy on A100 and then H100.
+prerequisites: [foundations/attention/attention-mechanics]
+updated: 2026-10-28
+sources:
+  - title: "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness (Dao, Fu, Ermon, Rudra and Ré, 2022)"
+    url: https://arxiv.org/abs/2205.14135
+    note: tiling and recomputation; fewer HBM accesses than standard attention; the paper reports 15% end-to-end speedup on BERT-large at 512 against the MLPerf 1.1 training record, 3x on GPT-2 at 1K, 2.4x on Long-Range Arena at 1K to 4K, and 61.4% on Path-X at 16K and 63.1% on Path-256 at 64K
+  - title: "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning (Dao, 2023)"
+    url: https://arxiv.org/abs/2307.08691
+    note: the paper reports the first version at 25 to 40% of the theoretical maximum FLOPs/s, version 2 about 2x faster at 50 to 73% on A100, and 225 TFLOPs/s per A100 training GPT-style models end to end (72% model FLOPs utilisation)
+  - title: "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision (Shah, Bikshandi, Zhang, Thakkar, Ramani and Dao, 2024)"
+    url: https://arxiv.org/abs/2407.08608
+    note: the paper reports FlashAttention-2 at 35% utilisation on H100; 1.5 to 2.0x speedup; FP16 up to 740 TFLOPs/s (75% utilisation); FP8 close to 1.2 PFLOPs/s; 2.6x lower numerical error than a baseline FP8 attention
+  - title: Online normalizer calculation for softmax (Milakov and Gimelshein, 2018)
+    url: https://arxiv.org/abs/1805.02867
+    note: the one-pass running maximum and normaliser the tiling depends on
+  - title: Dao-AILab/flash-attention README (checked 2026-10-28)
+    url: https://github.com/Dao-AILab/flash-attention
+    note: causal alignment bottom-right from 2.1; flash_attn_with_kvcache for inference from 2.2; sliding window from 2.3; paged KV cache from 2.5
+  - title: Flash-Decoding for long-context inference (Dao, Haziza, Massa and Sizov, 2023)
+    url: https://crfm.stanford.edu/2023/10/12/flashdecoding.html
+    note: splits the cache along the sequence for decode; the post reports up to 8x faster generation for very long sequences on CodeLlama 34B and attention up to 50x faster than FlashAttention at batch size 1 on A100
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The problem the paper solves
+
+The standard attention kernel is three kernels: a matrix multiply that writes the n × n scores to high-bandwidth memory (HBM), a softmax that reads them and writes the weights, and a second multiply that reads the weights and V. Each intermediate is the full score matrix, so at long sequence lengths the kernel spends its time moving that matrix between HBM and the chip, and its memory footprint grows with n² per head.
+
+<Predict id="score-matrix" question="Standard attention at n = 8,192 tokens, 32 heads, fp16 scores. How many GiB does the score matrix take for one layer of one sequence?" answer={4} tolerance={0.3} unit="GiB">
+<p>8,192 × 8,192 × 2 bytes = 128 MiB per head. Times 32 heads = <b>4 GiB</b>, written and read back at least once per layer, for scores that exist only to be normalised and multiplied by V. Training keeps them for the backward pass as well.</p>
+</Predict>
+
+Approximate attention methods, sparse or low-rank, attacked the arithmetic. The FlashAttention paper's argument is that arithmetic was not the bottleneck: on GPUs at these sizes, attention is bound by memory traffic, and a kernel that reduces traffic can be exact and faster at once.
+
+## The mechanism in engineering terms
+
+It is a blocked algorithm, like a tiled matrix multiply or an external sort that streams runs through a buffer that fits in fast memory. The fast memory is on-chip SRAM; the slow one is HBM.
+
+**Tiling.** Load a block of queries into SRAM. Stream blocks of keys and values past it. For each key block, compute the block of scores, update each query row's running maximum, running normaliser and unnormalised output with the online softmax rule from the mechanics lesson, and discard the scores. After the last key block, divide by the normaliser and write the output once. The n × n matrix never exists in HBM; the extra memory is the per-row maximum and normaliser, linear in n.
+
+**Recomputation.** The backward pass needs the attention weights. Instead of storing them, the kernel stores the per-row statistics and recomputes each block of scores from Q and K when the backward pass reaches it. That is more arithmetic than reading a stored matrix, and less time, because reading the matrix from HBM was the expensive part.
+
+**IO accounting.** The paper's analysis counts HBM accesses rather than FLOPs and shows that the tiled kernel needs fewer of them than the standard one for realistic head dimensions and SRAM sizes. That change of unit is the paper's lasting contribution: an attention kernel is judged by bytes moved per useful FLOP.
+
+The result is exact attention: the same function, computed with a different summation order, so outputs match the standard kernel to rounding, not bitwise.
+
+## The numbers, with their conditions
+
+The first paper's headline results are training speedups on its own benchmarks: 15% end to end on BERT-large at sequence length 512 against the MLPerf 1.1 training record, 3 times on GPT-2 at 1K, and 2.4 times on Long-Range Arena at 1K to 4K. Its capability result matters more for this module: because memory became linear, it trained the first transformers to reach better-than-chance accuracy on Path-X at 16K (61.4%) and Path-256 at 64K (63.1%).
+
+FlashAttention-2 kept the algorithm and rearranged the work. The paper reports the first version at 25 to 40% of the A100's theoretical peak FLOPs/s and the second at 50 to 73%, about twice as fast, by cutting non-matmul operations, parallelising a single head across thread blocks along the sequence, and splitting work between warps to reduce shared-memory traffic. Training GPT-style models end to end it reports 225 TFLOPs/s per A100, 72% model FLOPs utilisation.
+
+FlashAttention-3 targets H100, where the paper reports FlashAttention-2 reaching only 35% utilisation. It uses the asynchrony of Hopper's tensor cores and memory-copy engine through warp specialisation, overlaps the softmax of one block with the matrix multiply of the next, and adds FP8 with block quantisation and incoherent processing. Reported: 1.5 to 2.0 times faster, FP16 up to 740 TFLOPs/s (75% utilisation), FP8 close to 1.2 PFLOPs/s, and 2.6 times lower numerical error than a baseline FP8 attention. Each figure is the authors' measurement on their kernels and GPUs.
+
+## What changed in practice
+
+Attention cost became an IO question. Before, long-context cost discussions started from O(n²) memory and treated attention as the reason long sequences were infeasible; after, the score matrix dropped out of the memory plan and the questions became how close a kernel runs to peak and how much KV cache a GPU holds. The quadratic arithmetic did not go away: a 64K-token prefill still does 4 times the attention work of a 32K one.
+
+The library became the place where serving semantics are decided. The README records the changes engineers depend on: from version 2.1 the causal mask is aligned bottom-right when query and key lengths differ, the alignment chunked prefill and speculative verification need; 2.2 added an inference entry point that updates a KV cache in place; 2.3 added sliding-window attention; 2.5 added a paged KV cache. A pinned version is a pinned set of semantics.
+
+Decode needed its own answer. FlashAttention parallelises over batch, heads and query blocks; a decode step has one query per sequence, so at small batch and long context most of the GPU sits idle. Flash-Decoding splits the cache along the sequence, computes partial states in parallel and merges them with the same log-sum-exp rescaling. Its authors report up to 8 times faster generation for very long sequences on CodeLlama 34B, and the attention itself up to 50 times faster than FlashAttention at batch size 1 on A100.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+Your training run moves from A100s to H100s next month, and the platform team proposes FlashAttention-3 in FP8 to cut the cost of the run. The evaluation lead objects that FP8 attention changes the numerics of a model that already passed its safety review. The run starts in four weeks. What do you decide?
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>FlashAttention-3 in FP16 or BF16 now, FP8 only after a matched comparison. The FP16 kernel is exact attention with a new summation order, so it changes numerics no more than any kernel upgrade, and the paper reports 1.5 to 2.0 times over FlashAttention-2 on H100. FP8 is a precision change, and the paper's 2.6 times lower error is against a baseline FP8 attention, not against BF16, so it is not evidence that the reviewed model is unchanged.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Separate the two changes. Moving from FlashAttention-2 to 3 at the same precision is a kernel change: exact attention, different reduction order, outputs within rounding. The safety review does not depend on bitwise identity, or every GPU change would invalidate it. Moving to FP8 is a numerics change. The paper's error claim compares its FP8 kernel with another FP8 kernel; whether FP8 attention changes model behaviour relative to BF16 is not something the paper settles for your model.</p>
+<p>Two answers are defensible. BF16 kernel now: most of the speedup on the attention part, no new review. Cost: the FP8 saving forgone for this run. FP8 now with a short matched run first: train the same configuration for a fixed number of steps in BF16 and FP8, compare loss curves and the evaluation suite at that checkpoint. Cost: a week of GPU time and the risk that the comparison is inconclusive at that scale.</p>
+<p>The constraint conflict is the start date against a review the evaluation lead owns. I would start in BF16 with FlashAttention-3 and run the FP8 comparison alongside, switching only at a checkpoint boundary with the evaluation lead's sign-off.</p>
+<p>Failure mode of that plan: attention is only part of a training step, so the speedup on the attention kernel overstates the saving on the run. Measure the end-to-end step time before promising finance a number.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Finance wants the FP8 saving on this run, and the comparison costs a week. Which half of the evaluation suite do you run at the comparison checkpoint, and what risk do you accept in writing?</em></li>
+<li><em>What result from the matched run would make you switch to FP8 mid-run, and what would make you abandon it?</em></li>
+<li><em>Someone says FlashAttention is an approximation, so the review should have covered it already. What do you answer, and what in the kernel would make them right?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+"Exact" means the same mathematical function. Summation order differs from the standard kernel and between FlashAttention versions, and FP8 variants change precision, so "exact" never means bitwise reproducible across kernels.
+
+The speedups are attention-kernel or training-run figures on the authors' hardware. At short sequence lengths attention is a small share of a step, and the end-to-end gain shrinks with it.
+
+The memory saving is in the scores, not in the KV cache. A decode server's long-context memory problem is unchanged by FlashAttention; it is solved, or not, by the attention layout and the cache's precision and paging.
+
+<SelfRate id="lesson:foundations/attention/flashattention" />

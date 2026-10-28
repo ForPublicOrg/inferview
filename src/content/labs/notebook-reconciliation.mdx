@@ -1,0 +1,748 @@
+---
+title: "Notebook data round: receipt reconciliation"
+track: rounds
+module: take-home-debug
+kind: lab
+minutes: 100
+summary: Grow one notebook over five steps that loads a year of receipts and card transactions, matches them one to one, measures the matcher on a labelled sample with intervals, adds tolerant rules that lift recall without giving up precision, and reports why every remaining receipt is unmatched.
+updated: 2026-10-28
+sources:
+  - title: aced.io, Ramp AI engineer interview (candidate report)
+    url: https://www.aced.io/experiences/ramp-ai-engineer-interview-13abb1
+    note: "Candidate report listing a receipt-reconciliation task and a round that turned out to be data analysis in a Google Colab notebook rather than the expected CodeSignal format; relative dates only (interview about three months before the report). The data, steps and generator in this lab are original. Checked 2026-10-28."
+steps:
+  - title: Load receipts and transactions
+    brief: "The starter holds make_books, a seeded generator of a year of expense receipts and card transactions with known answers: gold maps each receipt id to the transaction it documents or to None, and cases records how each receipt was made. Write the loaders. Amounts become whole cents as ints parsed from the string, because int(float(\"0.29\") * 100) is 28 and a total one cent off breaks every exact match downstream. Receipts carry two date forms. The card ledger shows spend as negative; credits are not spend and go to rejects with a reason, as do unreadable scans, so every input row is either loaded or rejected. The hidden tests load about 90,000 rows within a time limit."
+    starter: |
+      import csv
+      import io
+      import random
+      import re
+      from datetime import date, datetime, timedelta
+
+      # Synthetic books for the lab. The merchants are invented, and the rates and shares below are this generator's own
+      # settings, not measurements of anyone's spend.
+      MERCHANTS = [
+          ("Kettle Coffee", "SQ *KETTLE COFFEE", "food"),
+          ("Joe's Pizza", "TST* JOES PIZZA 0412", "food"),
+          ("Greenleaf Salads", "GREENLEAF SALADS 112 NEW YORK", "food"),
+          ("Tarta Bakery", "SQ *TARTA BAKERY", "food"),
+          ("Nopal Kitchen", "TST* NOPAL KITCHEN", "food"),
+          ("RideCo", "RIDECO *TRIP HELP.RIDECO.COM", "travel"),
+          ("Hopper Cabs", "HOPPER *RIDE SAT 4PM", "travel"),
+          ("Northwind Air", "NORTHWIND AIR 0062384751", "travel"),
+          ("Hotel Lumen", "HOTEL LUMEN PARIS", "travel"),
+          ("Rentwise Cars", "RENTWISE RENT-A-CAR 0311", "travel"),
+          ("Shopmart", "SHOPMART MKTP US*2K41X0", "goods"),
+          ("Paperclip Supply", "PAPERCLIP SUPPLY 00123", "goods"),
+          ("Desk Depot", "DESK DEPOT #2231", "goods"),
+          ("Volt Electronics", "VOLT ELECTRONICS 00004211", "goods"),
+          ("Cowork Hub", "COWORK HUB 8842 SAN FRANCISCO", "goods"),
+          ("Codehost", "CODEHOST, INC.", "goods"),
+      ]
+      FX_USD_PER_EUR = 1.10   # the generator's rate; a real ledger takes the card network's rate for the posting day
+
+
+      def _money(cents, rng, style):
+          whole, frac = divmod(cents, 100)
+          if style == 0:
+              return f"${whole:,}.{frac:02d}"
+          if style == 1 and frac % 10 == 0:
+              return f"{whole}.{frac // 10}"
+          return f"{whole}.{frac:02d}"
+
+
+      def make_books(n=1000, seed=0, start=date(2026, 1, 1)):
+          """Return (receipts_csv, transactions_csv, gold, cases) for n receipts.
+
+          gold maps every receipt id to the id of the card transaction it documents, or None. cases maps every receipt id
+          to how it was generated: exact, tip, fx, personal (no card transaction), duplicate (a second upload) or unreadable.
+          """
+          rng = random.Random(seed)
+          receipts, txns, gold, cases = [], [], {}, {}
+
+          def receipt(rid, day, cents, currency, name):
+              style = rng.randrange(3)
+              when = day.isoformat() if rng.random() < 0.7 else day.strftime("%m/%d/%Y")
+              return [rid, when, _money(cents, rng, style), currency, name]
+
+          for i in range(n):
+              name, desc, kind = MERCHANTS[rng.randrange(len(MERCHANTS))]
+              day = start + timedelta(days=rng.randrange(365))
+              cents = max(150, round(rng.lognormvariate(3.3, 1.0) * 100))
+              rid = f"r{i:06d}"
+              currency, charged, case = "USD", cents, "exact"
+              roll = rng.random()
+              if kind == "food" and roll < 0.6:
+                  charged, case = cents + round(cents * rng.choice([0.15, 0.18, 0.20, 0.22, 0.25])), "tip"
+              elif kind == "travel" and roll < 0.35:
+                  currency, case = "EUR", "fx"
+                  charged = round(cents * FX_USD_PER_EUR * (1 + rng.uniform(0.0, 0.03)))
+              if rng.random() < 0.05:
+                  case = "personal"
+              receipts.append(receipt(rid, day, cents, currency, name))
+              cases[rid] = case
+              gold[rid] = None
+              if case != "personal":
+                  txns.append([None, day + timedelta(days=rng.randrange(5)), charged, desc, rid])
+                  if rng.random() < 0.04:
+                      dup = f"r{n + i:06d}"
+                      receipts.append(receipt(dup, day, cents, currency, name))
+                      cases[dup], gold[dup] = "duplicate", None
+          for _ in range(n // 5):
+              name, desc, kind = MERCHANTS[rng.randrange(len(MERCHANTS))]
+              txns.append([None, start + timedelta(days=rng.randrange(368)), max(150, round(rng.lognormvariate(3.3, 1.0) * 100)), desc, None])
+          for _ in range(n // 25):
+              # Same amount, same day, another merchant: two coffees, two rides.
+              src = txns[rng.randrange(len(txns))]
+              other = MERCHANTS[rng.randrange(len(MERCHANTS))][1]
+              if other != src[3]:
+                  txns.append([None, src[1], src[2], other, None])
+          for _ in range(max(1, n // 100)):
+              name, desc, kind = MERCHANTS[rng.randrange(len(MERCHANTS))]
+              txns.append([None, start + timedelta(days=rng.randrange(365)), -round(rng.lognormvariate(3.0, 0.8) * 100), desc, None])
+          for k in range(max(1, n // 200)):
+              rid = f"x{k:05d}"
+              receipts.append([rid, start.isoformat(), "", "USD", "unreadable scan"])
+              cases[rid], gold[rid] = "unreadable", None
+          rng.shuffle(txns)
+          rng.shuffle(receipts)
+          out_t = io.StringIO()
+          w = csv.writer(out_t, lineterminator="\n")
+          w.writerow(["id", "posted", "amount", "description"])
+          for j, t in enumerate(txns):
+              tid = f"t{j:06d}"
+              if t[4] is not None:
+                  gold[t[4]] = tid
+              amount = -t[2]
+              sign = "-" if amount < 0 else ""
+              w.writerow([tid, t[1].isoformat(), f"{sign}{abs(amount) // 100}.{abs(amount) % 100:02d}", t[3]])
+          out_r = io.StringIO()
+          w = csv.writer(out_r, lineterminator="\n")
+          w.writerow(["id", "date", "total", "currency", "merchant"])
+          w.writerows(receipts)
+          return out_r.getvalue(), out_t.getvalue(), gold, cases
+
+
+      def parse_cents(text):
+          """"$1,234.50", "42.5" or "-0.29" to whole cents as an int. Raise ValueError for anything else."""
+          raise NotImplementedError
+
+
+      def parse_day(text):
+          """"2026-03-04" or the US form "03/04/2026" to a datetime.date. Raise ValueError for anything else."""
+          raise NotImplementedError
+
+
+      def load(receipts_csv, transactions_csv):
+          """Return (receipts, txns, rejects).
+
+          receipts: {"id", "date", "cents", "currency", "merchant"}, cents positive.
+          txns: card spend only, {"id", "posted", "cents", "descriptor"}, cents positive (the ledger shows spend as negative).
+          rejects: (source, id, reason) for every row left out, source "receipts" or "transactions".
+          """
+          raise NotImplementedError
+    tests: |
+      assert parse_cents("$1,234.50") == 123450
+      assert parse_cents("42.5") == 4250
+      assert parse_cents("-0.29") == -29
+      assert parse_day("03/04/2026") == date(2026, 3, 4) and parse_day("2026-03-04") == date(2026, 3, 4)
+      R, T, G, C = make_books(300, seed=1)
+      receipts, txns, rejects = load(R, T)
+      assert all(type(r["cents"]) is int and r["cents"] > 0 for r in receipts)
+      assert all(type(t["cents"]) is int and t["cents"] > 0 for t in txns)
+      assert len(receipts) + sum(1 for s, _, _ in rejects if s == "receipts") == len(R.splitlines()) - 1, "every receipt row is loaded or rejected"
+      assert {i for s, i, _ in rejects if s == "receipts"} == {r for r, c in C.items() if c == "unreadable"}
+    hidden: |
+      _hx_bad = ["", "abc", "1.234", "1.2.3", "$", "12,34.00", "--5", "1e3"]
+      _hx_raised = 0
+      for _hx_s in _hx_bad:
+          try:
+              parse_cents(_hx_s)
+          except ValueError:
+              _hx_raised += 1
+      assert _hx_raised == len(_hx_bad)
+      import decimal as _hx_dec, random as _hx_rnd
+      _hx_r = _hx_rnd.Random(5)
+      _hx_vals = [f"{_hx_r.randrange(0, 100000)}.{_hx_r.randrange(100):02d}" for _ in range(5000)]
+      assert all(parse_cents(v) == int(_hx_dec.Decimal(v) * 100) for v in _hx_vals)
+      assert parse_cents("$12,345,678.09") == 1234567809 and parse_cents("0.1") == 10
+      _hx_R, _hx_T, _hx_G, _hx_C = make_books(800, seed=11)
+      _hx_rc, _hx_tx, _hx_rj = load(_hx_R, _hx_T)
+      assert len(_hx_tx) + sum(1 for s, _, _ in _hx_rj if s == "transactions") == len(_hx_T.splitlines()) - 1
+      assert {t["id"] for t in _hx_tx} >= {t for t in _hx_G.values() if t}, "every documented spend is loaded"
+      assert all(isinstance(r["date"], date) and r["currency"] in ("USD", "EUR") for r in _hx_rc)
+      _hx_R2, _hx_T2, _, _ = make_books(40000, seed=2)
+      import time as _hx_time
+      _hx_t0 = _hx_time.perf_counter()
+      _hx_out = load(_hx_R2, _hx_T2)
+      assert _hx_time.perf_counter() - _hx_t0 < 3.0, "about 90,000 rows: one pass, no per-row regex compile"
+    solution: |
+      import csv
+      import io
+      import random
+      import re
+      from datetime import date, datetime, timedelta
+
+      # Synthetic books for the lab. The merchants are invented, and the rates and shares below are this generator's own
+      # settings, not measurements of anyone's spend.
+      MERCHANTS = [
+          ("Kettle Coffee", "SQ *KETTLE COFFEE", "food"),
+          ("Joe's Pizza", "TST* JOES PIZZA 0412", "food"),
+          ("Greenleaf Salads", "GREENLEAF SALADS 112 NEW YORK", "food"),
+          ("Tarta Bakery", "SQ *TARTA BAKERY", "food"),
+          ("Nopal Kitchen", "TST* NOPAL KITCHEN", "food"),
+          ("RideCo", "RIDECO *TRIP HELP.RIDECO.COM", "travel"),
+          ("Hopper Cabs", "HOPPER *RIDE SAT 4PM", "travel"),
+          ("Northwind Air", "NORTHWIND AIR 0062384751", "travel"),
+          ("Hotel Lumen", "HOTEL LUMEN PARIS", "travel"),
+          ("Rentwise Cars", "RENTWISE RENT-A-CAR 0311", "travel"),
+          ("Shopmart", "SHOPMART MKTP US*2K41X0", "goods"),
+          ("Paperclip Supply", "PAPERCLIP SUPPLY 00123", "goods"),
+          ("Desk Depot", "DESK DEPOT #2231", "goods"),
+          ("Volt Electronics", "VOLT ELECTRONICS 00004211", "goods"),
+          ("Cowork Hub", "COWORK HUB 8842 SAN FRANCISCO", "goods"),
+          ("Codehost", "CODEHOST, INC.", "goods"),
+      ]
+      FX_USD_PER_EUR = 1.10   # the generator's rate; a real ledger takes the card network's rate for the posting day
+
+
+      def _money(cents, rng, style):
+          whole, frac = divmod(cents, 100)
+          if style == 0:
+              return f"${whole:,}.{frac:02d}"
+          if style == 1 and frac % 10 == 0:
+              return f"{whole}.{frac // 10}"
+          return f"{whole}.{frac:02d}"
+
+
+      def make_books(n=1000, seed=0, start=date(2026, 1, 1)):
+          """Return (receipts_csv, transactions_csv, gold, cases) for n receipts.
+
+          gold maps every receipt id to the id of the card transaction it documents, or None. cases maps every receipt id
+          to how it was generated: exact, tip, fx, personal (no card transaction), duplicate (a second upload) or unreadable.
+          """
+          rng = random.Random(seed)
+          receipts, txns, gold, cases = [], [], {}, {}
+
+          def receipt(rid, day, cents, currency, name):
+              style = rng.randrange(3)
+              when = day.isoformat() if rng.random() < 0.7 else day.strftime("%m/%d/%Y")
+              return [rid, when, _money(cents, rng, style), currency, name]
+
+          for i in range(n):
+              name, desc, kind = MERCHANTS[rng.randrange(len(MERCHANTS))]
+              day = start + timedelta(days=rng.randrange(365))
+              cents = max(150, round(rng.lognormvariate(3.3, 1.0) * 100))
+              rid = f"r{i:06d}"
+              currency, charged, case = "USD", cents, "exact"
+              roll = rng.random()
+              if kind == "food" and roll < 0.6:
+                  charged, case = cents + round(cents * rng.choice([0.15, 0.18, 0.20, 0.22, 0.25])), "tip"
+              elif kind == "travel" and roll < 0.35:
+                  currency, case = "EUR", "fx"
+                  charged = round(cents * FX_USD_PER_EUR * (1 + rng.uniform(0.0, 0.03)))
+              if rng.random() < 0.05:
+                  case = "personal"
+              receipts.append(receipt(rid, day, cents, currency, name))
+              cases[rid] = case
+              gold[rid] = None
+              if case != "personal":
+                  txns.append([None, day + timedelta(days=rng.randrange(5)), charged, desc, rid])
+                  if rng.random() < 0.04:
+                      dup = f"r{n + i:06d}"
+                      receipts.append(receipt(dup, day, cents, currency, name))
+                      cases[dup], gold[dup] = "duplicate", None
+          for _ in range(n // 5):
+              name, desc, kind = MERCHANTS[rng.randrange(len(MERCHANTS))]
+              txns.append([None, start + timedelta(days=rng.randrange(368)), max(150, round(rng.lognormvariate(3.3, 1.0) * 100)), desc, None])
+          for _ in range(n // 25):
+              # Same amount, same day, another merchant: two coffees, two rides.
+              src = txns[rng.randrange(len(txns))]
+              other = MERCHANTS[rng.randrange(len(MERCHANTS))][1]
+              if other != src[3]:
+                  txns.append([None, src[1], src[2], other, None])
+          for _ in range(max(1, n // 100)):
+              name, desc, kind = MERCHANTS[rng.randrange(len(MERCHANTS))]
+              txns.append([None, start + timedelta(days=rng.randrange(365)), -round(rng.lognormvariate(3.0, 0.8) * 100), desc, None])
+          for k in range(max(1, n // 200)):
+              rid = f"x{k:05d}"
+              receipts.append([rid, start.isoformat(), "", "USD", "unreadable scan"])
+              cases[rid], gold[rid] = "unreadable", None
+          rng.shuffle(txns)
+          rng.shuffle(receipts)
+          out_t = io.StringIO()
+          w = csv.writer(out_t, lineterminator="\n")
+          w.writerow(["id", "posted", "amount", "description"])
+          for j, t in enumerate(txns):
+              tid = f"t{j:06d}"
+              if t[4] is not None:
+                  gold[t[4]] = tid
+              amount = -t[2]
+              sign = "-" if amount < 0 else ""
+              w.writerow([tid, t[1].isoformat(), f"{sign}{abs(amount) // 100}.{abs(amount) % 100:02d}", t[3]])
+          out_r = io.StringIO()
+          w = csv.writer(out_r, lineterminator="\n")
+          w.writerow(["id", "date", "total", "currency", "merchant"])
+          w.writerows(receipts)
+          return out_r.getvalue(), out_t.getvalue(), gold, cases
+
+
+      _MONEY = re.compile(r"-?\d{1,3}(,\d{3})+(\.\d{1,2})?|-?\d+(\.\d{1,2})?")
+
+
+      def parse_cents(text):
+          s = str(text).strip().replace("$", "", 1)
+          if not _MONEY.fullmatch(s):
+              raise ValueError(f"not an amount: {text!r}")
+          neg = s.startswith("-")
+          whole, _, frac = s.lstrip("-").replace(",", "").partition(".")
+          cents = int(whole) * 100 + int((frac + "00")[:2])
+          return -cents if neg else cents
+
+
+      def parse_day(text):
+          s = str(text).strip()
+          for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+              try:
+                  return datetime.strptime(s, fmt).date()
+              except ValueError:
+                  pass
+          raise ValueError(f"not a date: {text!r}")
+
+
+      def load(receipts_csv, transactions_csv):
+          receipts, txns, rejects = [], [], []
+          for row in csv.DictReader(io.StringIO(receipts_csv)):
+              try:
+                  cents = parse_cents(row["total"])
+                  if cents <= 0:
+                      raise ValueError("not a positive total")
+                  receipts.append({"id": row["id"], "date": parse_day(row["date"]), "cents": cents,
+                                   "currency": row["currency"].strip().upper(), "merchant": row["merchant"].strip()})
+              except ValueError as e:
+                  rejects.append(("receipts", row["id"], str(e)))
+          for row in csv.DictReader(io.StringIO(transactions_csv)):
+              try:
+                  cents = parse_cents(row["amount"])
+                  posted = parse_day(row["posted"])
+              except ValueError as e:
+                  rejects.append(("transactions", row["id"], str(e)))
+                  continue
+              if cents >= 0:
+                  rejects.append(("transactions", row["id"], "credit"))
+                  continue
+              txns.append({"id": row["id"], "posted": posted, "cents": -cents, "descriptor": row["description"].strip()})
+          return receipts, txns, rejects
+  - title: Match by amount and date
+    brief: "match_exact is the first pass a notebook usually starts from: a USD receipt, the same cents, and a transaction posted 0 to window_days days after the receipt date. Two rules make it more than a join. Each transaction documents at most one receipt, and the matching is maximum: when two coffees of the same price fall in overlapping windows, giving the first receipt the charge the second one needed throws away a match that was available. Which maximum matching you return, and so which of two equal coffees gets which charge, is your call; the tests check the invariants, not one assignment. The merchant is left out on purpose here, and step 3 measures what that costs. The hidden tests match about 20,800 receipts against 23,800 transactions within a time limit, where comparing every pair is about 490 million comparisons."
+    starter: |
+      def match_exact(receipts, txns, window_days):
+          """Return {receipt_id: txn_id}.
+
+          A pair qualifies when the receipt is in USD, the cents are equal, and the transaction posted 0 to window_days
+          days after the receipt date. Each transaction documents at most one receipt. The matching must be maximum: no
+          other assignment under the same rule matches more receipts. Which maximum matching you return is your call.
+          """
+          raise NotImplementedError
+    tests: |
+      d = date(2026, 5, 1)
+      rs = [{"id": "a", "date": d, "cents": 500, "currency": "USD", "merchant": "Kettle Coffee"},
+            {"id": "b", "date": d + timedelta(days=2), "cents": 500, "currency": "USD", "merchant": "Kettle Coffee"},
+            {"id": "c", "date": d, "cents": 900, "currency": "EUR", "merchant": "Hotel Lumen"}]
+      ts = [{"id": "t1", "posted": d + timedelta(days=2), "cents": 500, "descriptor": "SQ *KETTLE COFFEE"},
+            {"id": "t2", "posted": d + timedelta(days=5), "cents": 500, "descriptor": "SQ *KETTLE COFFEE"},
+            {"id": "t3", "posted": d, "cents": 900, "descriptor": "HOTEL LUMEN PARIS"}]
+      assert match_exact(rs, ts, 3) == {"a": "t1", "b": "t2"}, "a takes t1 so that b can still take t2; EUR receipts never match exactly"
+      R, T, G, C = make_books(2000, seed=4)
+      receipts, txns, _ = load(R, T)
+      m = match_exact(receipts, txns, 4)
+      assert len(set(m.values())) == len(m), "one transaction per receipt"
+      rby, tby = {r["id"]: r for r in receipts}, {t["id"]: t for t in txns}
+      assert all(rby[r]["cents"] == tby[t]["cents"] and 0 <= (tby[t]["posted"] - rby[r]["date"]).days <= 4 for r, t in m.items())
+    hidden: |
+      import random as _hx_rnd, time as _hx_time
+      def _hx_max(rs, ts, w):
+          adj = {r["id"]: [t["id"] for t in ts if r["currency"] == "USD" and t["cents"] == r["cents"] and 0 <= (t["posted"] - r["date"]).days <= w] for r in rs}
+          owner = {}
+          def aug(r, seen):
+              for t in adj[r]:
+                  if t not in seen:
+                      seen.add(t)
+                      if t not in owner or aug(owner[t], seen):
+                          owner[t] = r
+                          return True
+              return False
+          return sum(aug(r, set()) for r in adj)
+      def _hx_case(seed):
+          g = _hx_rnd.Random(seed)
+          d0 = date(2026, 1, 1)
+          rs = [{"id": f"r{i}", "date": d0 + timedelta(days=g.randrange(12)), "cents": g.choice([500, 700]), "currency": g.choice(["USD"] * 5 + ["EUR"]), "merchant": "x"} for i in range(g.randrange(1, 12))]
+          ts = [{"id": f"t{i}", "posted": d0 + timedelta(days=g.randrange(15)), "cents": g.choice([500, 700]), "descriptor": "x"} for i in range(g.randrange(1, 12))]
+          return rs, ts, g.randrange(0, 5)
+      _hx_ok = True
+      for _hx_s in range(400):
+          _hx_rs, _hx_ts, _hx_w = _hx_case(_hx_s)
+          _hx_m = match_exact(_hx_rs, _hx_ts, _hx_w)
+          _hx_rb, _hx_tb = {r["id"]: r for r in _hx_rs}, {t["id"]: t for t in _hx_ts}
+          _hx_ok &= len(set(_hx_m.values())) == len(_hx_m)
+          _hx_ok &= all(_hx_rb[r]["currency"] == "USD" and _hx_rb[r]["cents"] == _hx_tb[t]["cents"] and 0 <= (_hx_tb[t]["posted"] - _hx_rb[r]["date"]).days <= _hx_w for r, t in _hx_m.items())
+          _hx_ok &= len(_hx_m) == _hx_max(_hx_rs, _hx_ts, _hx_w)
+      assert _hx_ok
+      _hx_R, _hx_T, _, _ = make_books(20000, seed=9)
+      _hx_rc, _hx_tx, _ = load(_hx_R, _hx_T)
+      _hx_t0 = _hx_time.perf_counter()
+      _hx_m = match_exact(_hx_rc, _hx_tx, 4)
+      assert _hx_time.perf_counter() - _hx_t0 < 3.0, "20,000 by 24,000 rows: comparing every pair is 480 million comparisons"
+      assert len(_hx_m) > 10000
+    solution: |
+      from collections import defaultdict
+
+
+      def match_exact(receipts, txns, window_days):
+          by_amount = defaultdict(list)
+          for t in txns:
+              by_amount[t["cents"]].append((t["posted"], t["id"]))
+          wanted = defaultdict(list)
+          for r in receipts:
+              if r["currency"] == "USD":
+                  wanted[r["cents"]].append((r["date"], r["id"]))
+          span = timedelta(days=window_days)
+          out = {}
+          for cents, rs in wanted.items():
+              ts = sorted(by_amount.get(cents, ()))
+              p = 0
+              # Every window has the same length, so taking receipts by date and giving each the earliest unused
+              # transaction inside its window is maximum. A transaction posted before this receipt's date is also before
+              # every later receipt's date, so the pointer never moves back.
+              for day, rid in sorted(rs):
+                  while p < len(ts) and ts[p][0] < day:
+                      p += 1
+                  if p < len(ts) and ts[p][0] <= day + span:
+                      out[rid] = ts[p][1]
+                      p += 1
+          return out
+  - title: Measure precision and recall of the matcher
+    brief: "Nobody labels a year of receipts, so a matcher's numbers come from a labelled sample. score counts only the receipts in gold. A receipt matched to the wrong transaction counts twice, as a false positive and a false negative, and a receipt matched when gold says it has no transaction (a personal-card purchase, a second upload) is a false positive. wilson gives the interval to report next to each rate, because the first question about a rate from a 300-receipt sample is how much 300 receipts can say. label_sample draws the sample from the ids reproducibly, whatever order they arrive in. On generated books of 3,000 receipts (seed 4) the reference match_exact scores precision 0.975 and recall 0.684 against the full gold."
+    starter: |
+      def score(pred, gold):
+          """pred: {receipt_id: txn_id} from a matcher. gold: {receipt_id: txn_id or None} for the labelled receipts.
+
+          Only receipts in gold count. Return {"tp", "fp", "fn", "precision", "recall"}; precision or recall is None when
+          its denominator is 0.
+          """
+          raise NotImplementedError
+
+
+      def wilson(k, n, z=1.96):
+          """Wilson score interval (low, high) for k successes in n trials; (0.0, 1.0) when n is 0."""
+          raise NotImplementedError
+
+
+      def label_sample(receipt_ids, size, seed=0):
+          """The receipts a reviewer labels by hand: size ids drawn without replacement, the same for the same seed."""
+          raise NotImplementedError
+    tests: |
+      gold = {"a": "t1", "b": "t2", "c": None, "d": "t4"}
+      pred = {"a": "t1", "b": "t9", "c": "t3", "e": "t5"}
+      s = score(pred, gold)
+      assert (s["tp"], s["fp"], s["fn"]) == (1, 2, 2), "b is a false positive and a false negative; e is not labelled"
+      assert abs(s["precision"] - 1 / 3) < 1e-12 and abs(s["recall"] - 1 / 3) < 1e-12
+      lo, hi = wilson(8, 10)
+      assert abs(lo - 0.4902) < 1e-3 and abs(hi - 0.9433) < 1e-3
+      assert label_sample(["r1", "r2", "r3", "r4"], 2, seed=3) == label_sample(["r4", "r3", "r2", "r1"], 2, seed=3)
+    hidden: |
+      import random as _hx_rnd
+      _hx_g = {f"r{i}": (f"t{i}" if i % 4 else None) for i in range(200)}
+      _hx_s = score({r: t for r, t in _hx_g.items() if t}, _hx_g)
+      assert _hx_s["precision"] == 1.0 and _hx_s["recall"] == 1.0 and _hx_s["fp"] == 0
+      _hx_s = score({}, _hx_g)
+      assert _hx_s["precision"] is None and _hx_s["recall"] == 0.0 and _hx_s["fn"] == 150
+      assert score({}, {"r1": None})["recall"] is None
+      _hx_s = score({r: "zz" for r in _hx_g}, _hx_g)
+      assert _hx_s["fp"] == 200 and _hx_s["fn"] == 150 and _hx_s["tp"] == 0
+      _hx_s = score({"q1": "t1", "q2": "t2"}, _hx_g)
+      assert _hx_s["fp"] == 0 and _hx_s["tp"] == 0, "receipts outside the labelled sample do not count"
+      _hx_r = _hx_rnd.Random(8)
+      _hx_ok = True
+      for _ in range(500):
+          _hx_n = _hx_r.randrange(1, 400)
+          _hx_k = _hx_r.randrange(0, _hx_n + 1)
+          _hx_lo, _hx_hi = wilson(_hx_k, _hx_n)
+          _hx_lo2, _hx_hi2 = wilson(_hx_n - _hx_k, _hx_n)
+          _hx_ok &= 0.0 <= _hx_lo <= _hx_k / _hx_n + 1e-12 and _hx_k / _hx_n - 1e-12 <= _hx_hi <= 1.0
+          _hx_ok &= abs(_hx_lo - (1 - _hx_hi2)) < 1e-9
+      assert _hx_ok
+      assert wilson(0, 0) == (0.0, 1.0)
+      assert (wilson(90, 100)[1] - wilson(90, 100)[0]) > (wilson(900, 1000)[1] - wilson(900, 1000)[0])
+      assert wilson(0, 50)[0] == 0.0 and wilson(0, 50)[1] > 0.0
+      _hx_ids = [f"r{i}" for i in range(1000)]
+      _hx_a = label_sample(_hx_ids, 300, seed=1)
+      assert len(set(_hx_a)) == 300 and set(_hx_a) <= set(_hx_ids) and _hx_a == label_sample(list(reversed(_hx_ids)), 300, seed=1)
+    solution: |
+      import math
+
+
+      def score(pred, gold):
+          tp = fp = fn = 0
+          for rid, truth in gold.items():
+              guess = pred.get(rid)
+              if guess is not None and guess == truth:
+                  tp += 1
+                  continue
+              if guess is not None:
+                  fp += 1          # matched to the wrong transaction, or matched when nothing should be
+              if truth is not None:
+                  fn += 1          # a wrong match also misses the right one
+          return {"tp": tp, "fp": fp, "fn": fn,
+                  "precision": tp / (tp + fp) if tp + fp else None,
+                  "recall": tp / (tp + fn) if tp + fn else None}
+
+
+      def wilson(k, n, z=1.96):
+          if n == 0:
+              return (0.0, 1.0)
+          p = k / n
+          centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+          half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+          # The bounds are exactly 0 and 1 at k = 0 and k = n; rounding would otherwise leave them a hair inside.
+          low = 0.0 if k == 0 else max(0.0, centre - half)
+          high = 1.0 if k == n else min(1.0, centre + half)
+          return (low, high)
+
+
+      def label_sample(receipt_ids, size, seed=0):
+          return random.Random(seed).sample(sorted(receipt_ids), size)
+  - title: Improve with a learned or fuzzy match
+    brief: "Print twenty receipts that gold matches and match_exact does not, next to the transactions gold names; the patterns you see are the rules this step adds. Write merchant_similar, amount_fits and match_fuzzy: one transaction per receipt, every pair inside the window and passing both functions. The tolerances are yours to choose and defend. A wider amount band raises recall and lets a receipt take a neighbour's charge, and that cost grows with how many charges share a merchant and a week: the reference solution scores precision 0.978 on 3,000 generated receipts and 0.901 on 20,000 (seed 9 for both) with the same rules. The tests require recall at least 0.2 above match_exact's and precision of at least 0.95 on 3,000 receipts; the hidden tests also run 20,000 within a time limit, so narrow the candidates by day and amount before comparing merchant strings."
+    starter: |
+      def merchant_similar(receipt_merchant, descriptor):
+          """True when a card descriptor plausibly names the receipt's merchant."""
+          raise NotImplementedError
+
+
+      def amount_fits(receipt, txn, fx=FX_USD_PER_EUR):
+          """True when the transaction's cents are a plausible charge for the receipt's total."""
+          raise NotImplementedError
+
+
+      def match_fuzzy(receipts, txns, window_days, fx=FX_USD_PER_EUR):
+          """Return {receipt_id: txn_id}, one transaction per receipt, from the rules you found."""
+          raise NotImplementedError
+    tests: |
+      assert merchant_similar("Kettle Coffee", "SQ *KETTLE COFFEE")
+      assert merchant_similar("Joe's Pizza", "TST* JOES PIZZA 0412")
+      assert not merchant_similar("Kettle Coffee", "TST* JOES PIZZA 0412")
+      r = {"id": "a", "date": date(2026, 5, 1), "cents": 2000, "currency": "USD", "merchant": "Nopal Kitchen"}
+      assert amount_fits(r, {"id": "t", "posted": date(2026, 5, 2), "cents": 2400, "descriptor": "TST* NOPAL KITCHEN"}), "a 20% tip"
+      assert not amount_fits(r, {"id": "t", "posted": date(2026, 5, 2), "cents": 1900, "descriptor": "TST* NOPAL KITCHEN"})
+      R, T, G, C = make_books(3000, seed=4)
+      receipts, txns, _ = load(R, T)
+      exact, fuzzy = score(match_exact(receipts, txns, 4), G), score(match_fuzzy(receipts, txns, 4), G)
+      assert fuzzy["recall"] >= exact["recall"] + 0.2, (exact["recall"], fuzzy["recall"])
+      assert fuzzy["precision"] >= 0.95, fuzzy["precision"]
+    hidden: |
+      import time as _hx_time
+      assert merchant_similar("Hotel Lumen", "HOTEL LUMEN PARIS") and merchant_similar("RideCo", "RIDECO *TRIP HELP.RIDECO.COM")
+      assert merchant_similar("Cowork Hub", "COWORK HUB 8842 SAN FRANCISCO") and not merchant_similar("Tarta Bakery", "SQ *KETTLE COFFEE")
+      assert not merchant_similar("Desk Depot", "PAPERCLIP SUPPLY 00123") and not merchant_similar("Codehost", "SHOPMART MKTP US*2K41X0")
+      _hx_e = {"id": "e", "date": date(2026, 5, 1), "cents": 10000, "currency": "EUR", "merchant": "Hotel Lumen"}
+      assert amount_fits(_hx_e, {"id": "t", "posted": date(2026, 5, 1), "cents": 11200, "descriptor": "HOTEL LUMEN PARIS"}, fx=1.10)
+      assert not amount_fits(_hx_e, {"id": "t", "posted": date(2026, 5, 1), "cents": 10000, "descriptor": "HOTEL LUMEN PARIS"}, fx=1.10)
+      for _hx_seed in (7, 21):
+          _hx_R, _hx_T, _hx_G, _ = make_books(3000, seed=_hx_seed)
+          _hx_rc, _hx_tx, _ = load(_hx_R, _hx_T)
+          _hx_m = match_fuzzy(_hx_rc, _hx_tx, 4)
+          _hx_s = score(_hx_m, _hx_G)
+          _hx_rb, _hx_tb = {r["id"]: r for r in _hx_rc}, {t["id"]: t for t in _hx_tx}
+          assert _hx_s["precision"] >= 0.95 and _hx_s["recall"] >= 0.95
+          assert len(set(_hx_m.values())) == len(_hx_m)
+          assert all(0 <= (_hx_tb[t]["posted"] - _hx_rb[r]["date"]).days <= 4 and amount_fits(_hx_rb[r], _hx_tb[t]) and merchant_similar(_hx_rb[r]["merchant"], _hx_tb[t]["descriptor"]) for r, t in _hx_m.items())
+      _hx_R, _hx_T, _hx_G, _ = make_books(20000, seed=9)
+      _hx_rc, _hx_tx, _ = load(_hx_R, _hx_T)
+      _hx_t0 = _hx_time.perf_counter()
+      _hx_m = match_fuzzy(_hx_rc, _hx_tx, 4)
+      assert _hx_time.perf_counter() - _hx_t0 < 4.0, "block candidates by day and amount before comparing merchants"
+      assert score(_hx_m, _hx_G)["recall"] >= 0.85
+    solution: |
+      import bisect
+      from functools import lru_cache
+
+      _NOISE = {"sq", "tst", "inc", "com", "help", "mktp", "us", "the"}
+      TIP_MAX = 0.30        # a tip can push the charge up to 30% over the receipt total
+      FX_FEE_MAX = 0.04     # a foreign charge can land up to 4% over the converted total
+
+
+      @lru_cache(maxsize=None)
+      def _tokens(text):
+          words = re.findall(r"[a-z0-9]+", text.lower().replace("'", ""))
+          return frozenset(w for w in words if not any(ch.isdigit() for ch in w) and w not in _NOISE and len(w) > 1)
+
+
+      def merchant_similar(receipt_merchant, descriptor):
+          mine = _tokens(receipt_merchant)
+          return bool(mine) and len(mine & _tokens(descriptor)) * 2 >= len(mine)
+
+
+      def _bounds(receipt, fx):
+          c = receipt["cents"]
+          if receipt["currency"] == "USD":
+              return c, int(c * (1 + TIP_MAX))
+          if receipt["currency"] == "EUR":
+              return int(c * fx * 0.995), int(c * fx * (1 + FX_FEE_MAX)) + 1
+          return None
+
+
+      def amount_fits(receipt, txn, fx=FX_USD_PER_EUR):
+          b = _bounds(receipt, fx)
+          return b is not None and b[0] <= txn["cents"] <= b[1]
+
+
+      def match_fuzzy(receipts, txns, window_days, fx=FX_USD_PER_EUR):
+          by_day = defaultdict(list)
+          for t in txns:
+              by_day[t["posted"]].append((t["cents"], t["id"], t))
+          for v in by_day.values():
+              v.sort(key=lambda x: (x[0], x[1]))
+          edges = []
+          for r in receipts:
+              b = _bounds(r, fx)
+              if b is None:
+                  continue
+              for k in range(window_days + 1):
+                  day = by_day.get(r["date"] + timedelta(days=k))
+                  if not day:
+                      continue
+                  i = bisect.bisect_left(day, (b[0],))
+                  while i < len(day) and day[i][0] <= b[1]:
+                      t = day[i][2]
+                      if merchant_similar(r["merchant"], t["descriptor"]):
+                          exact = r["currency"] == "USD" and t["cents"] == r["cents"]
+                          edges.append((0 if exact else 1, k, abs(t["cents"] - r["cents"]), r["id"], t["id"]))
+                      i += 1
+          # Most certain pairs first: exact amounts, then the shortest posting delay, then the smallest gap.
+          edges.sort()
+          out, used = {}, set()
+          for _, _, _, rid, tid in edges:
+              if rid not in out and tid not in used:
+                  out[rid] = tid
+                  used.add(tid)
+          return out
+  - title: Report what remains unmatched
+    brief: "The deliverable of a reconciliation is the list of what is left and why, since that list is what finance acts on. explain_unmatched gives every unmatched receipt one reason, the first that applies in the order of REASONS, using your amount_fits and merchant_similar, and summary turns the reasons into the table for the write-up. Run it on match_exact's output first: most unmatched receipts land in missed, which is the case for step 4 in one table. On match_fuzzy's output, second uploads land in already_matched, and personal-card purchases, which have no card transaction at all, rarely land in no_transaction: with the reference rules on 3,000 generated receipts (seed 4), 100 of the 143 land in merchant_mismatch, because a tip band wide enough for real tips lets another merchant's charge fit on amount. Read a bucket by hand before you report what it means."
+    starter: |
+      REASONS = ("missed", "already_matched", "merchant_mismatch", "amount_mismatch", "no_transaction")
+
+
+      def explain_unmatched(receipts, txns, matches, window_days, fx=FX_USD_PER_EUR):
+          """One reason from REASONS for every receipt that is not a key of matches, looking at transactions posted 0 to
+          window_days days after its date. Take the first reason in this order that applies:
+
+          missed             a transaction that is not in matches fits on amount and merchant
+          already_matched    a transaction fits on amount and merchant, but every such transaction is in matches
+          merchant_mismatch  a transaction fits on amount, none of those on merchant
+          amount_mismatch    a transaction fits on merchant, none of those on amount
+          no_transaction     nothing in the window fits on amount or merchant
+          """
+          raise NotImplementedError
+
+
+      def summary(explanations):
+          """[(reason, count)] for the reasons that occur, most frequent first, ties in REASONS order."""
+          raise NotImplementedError
+    tests: |
+      d = date(2026, 6, 1)
+      def rec(i, cents, merchant, cur="USD"):
+          return {"id": i, "date": d, "cents": cents, "currency": cur, "merchant": merchant}
+      def txn(i, days, cents, desc):
+          return {"id": i, "posted": d + timedelta(days=days), "cents": cents, "descriptor": desc}
+      rs = [rec("dup1", 1200, "Kettle Coffee"), rec("dup2", 1200, "Kettle Coffee"), rec("other", 3100, "Desk Depot"),
+            rec("price", 5000, "Codehost"), rec("none", 9900, "Hotel Lumen", "EUR"), rec("late", 4200, "Tarta Bakery")]
+      ts = [txn("t1", 1, 1200, "SQ *KETTLE COFFEE"), txn("t2", 2, 3100, "PAPERCLIP SUPPLY 00123"),
+            txn("t3", 0, 7900, "CODEHOST, INC."), txn("t4", 9, 4200, "SQ *TARTA BAKERY")]
+      why = explain_unmatched(rs, ts, {"dup1": "t1"}, 4)
+      assert why == {"dup2": "already_matched", "other": "merchant_mismatch", "price": "amount_mismatch", "none": "no_transaction", "late": "no_transaction"}, why
+      assert explain_unmatched(rs[:2], ts[:1], {}, 4) == {"dup1": "missed", "dup2": "missed"}
+      assert summary(why) == [("no_transaction", 2), ("already_matched", 1), ("merchant_mismatch", 1), ("amount_mismatch", 1)]
+    hidden: |
+      import time as _hx_time
+      _hx_R, _hx_T, _hx_G, _hx_C = make_books(600, seed=3)
+      _hx_rc, _hx_tx, _ = load(_hx_R, _hx_T)
+      _hx_ok = True
+      for _hx_m in (match_fuzzy(_hx_rc, _hx_tx, 4), match_exact(_hx_rc, _hx_tx, 4), {}):
+          _hx_why = explain_unmatched(_hx_rc, _hx_tx, _hx_m, 4)
+          _hx_ok &= set(_hx_why) == {r["id"] for r in _hx_rc} - set(_hx_m) and set(_hx_why.values()) <= set(REASONS)
+          _hx_used = set(_hx_m.values())
+          for _hx_r in _hx_rc:
+              if _hx_r["id"] not in _hx_why:
+                  continue
+              _hx_win = [t for t in _hx_tx if 0 <= (t["posted"] - _hx_r["date"]).days <= 4]
+              _hx_a = [t for t in _hx_win if amount_fits(_hx_r, t)]
+              _hx_mm = [t for t in _hx_win if merchant_similar(_hx_r["merchant"], t["descriptor"])]
+              _hx_both = [t for t in _hx_a if t in _hx_mm]
+              _hx_expect = ("missed" if any(t["id"] not in _hx_used for t in _hx_both) else "already_matched" if _hx_both
+                            else "merchant_mismatch" if _hx_a else "amount_mismatch" if _hx_mm else "no_transaction")
+              _hx_ok &= _hx_why[_hx_r["id"]] == _hx_expect
+      assert _hx_ok
+      _hx_s = summary({"a": "missed", "b": "no_transaction", "c": "missed", "d": "already_matched", "e": "no_transaction"})
+      assert _hx_s == [("missed", 2), ("no_transaction", 2), ("already_matched", 1)]
+      assert summary({}) == []
+      _hx_R, _hx_T, _, _ = make_books(20000, seed=9)
+      _hx_rc, _hx_tx, _ = load(_hx_R, _hx_T)
+      _hx_m = match_fuzzy(_hx_rc, _hx_tx, 4)
+      _hx_t0 = _hx_time.perf_counter()
+      _hx_why = explain_unmatched(_hx_rc, _hx_tx, _hx_m, 4)
+      assert _hx_time.perf_counter() - _hx_t0 < 4.0, "index transactions by day once"
+      assert len(_hx_why) == len(_hx_rc) - len(_hx_m)
+    solution: |
+      from collections import Counter
+
+      REASONS = ("missed", "already_matched", "merchant_mismatch", "amount_mismatch", "no_transaction")
+
+
+      def explain_unmatched(receipts, txns, matches, window_days, fx=FX_USD_PER_EUR):
+          by_day = defaultdict(list)
+          for t in txns:
+              by_day[t["posted"]].append(t)
+          taken = set(matches.values())
+          out = {}
+          for r in receipts:
+              if r["id"] in matches:
+                  continue
+              on_amount = on_merchant = both_free = both_taken = False
+              for k in range(window_days + 1):
+                  for t in by_day.get(r["date"] + timedelta(days=k), ()):
+                      a = amount_fits(r, t, fx)
+                      m = merchant_similar(r["merchant"], t["descriptor"])
+                      on_amount |= a
+                      on_merchant |= m
+                      if a and m:
+                          if t["id"] in taken:
+                              both_taken = True
+                          else:
+                              both_free = True
+              if both_free:
+                  out[r["id"]] = "missed"
+              elif both_taken:
+                  out[r["id"]] = "already_matched"
+              elif on_amount:
+                  out[r["id"]] = "merchant_mismatch"
+              elif on_merchant:
+                  out[r["id"]] = "amount_mismatch"
+              else:
+                  out[r["id"]] = "no_transaction"
+          return out
+
+
+      def summary(explanations):
+          counts = Counter(explanations.values())
+          return sorted(counts.items(), key=lambda kv: (-kv[1], REASONS.index(kv[0])))
+---
+
+This lab rebuilds the task one candidate reported at Ramp, receipt reconciliation done as data analysis in a notebook, as one program with known answers. Nothing here comes from that round except the shape of the task. Each step adds functions to the same file and runs its tests against everything written so far, so step 5 calls the loader from step 1 and the matchers from steps 2 and 4.
+
+The data comes from `make_books` in the starter: a seeded generator of receipts and card transactions with invented merchants and its own settings for tips, foreign-currency charges, posting delays, personal-card receipts, second uploads, same-day charges of the same amount at another merchant, credits and unreadable scans. Because it is seeded, every run gives the same books, and because it records the answer for every receipt, a matcher can be scored exactly, which a real ledger never allows. The tests check invariants (every row accounted for, one transaction per receipt, every pair inside its window, intervals that contain their rate) and quality floors on generated books, never one particular assignment.
+
+Steps 1 and 2 load the books and match them exactly. Step 3 measures the matcher the way a notebook round has to, on a labelled sample with intervals. Step 4 adds the rules the misses point to and pays for them in precision. Step 5 is the part a reviewer reads first: what is still unmatched, and why.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

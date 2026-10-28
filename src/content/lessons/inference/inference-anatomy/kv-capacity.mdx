@@ -1,0 +1,182 @@
+---
+title: "KV cache capacity: bytes per token by model, and what fits"
+track: inference
+module: inference-anatomy
+order: 2
+kind: lesson
+level: senior
+minutes: 15
+summary: KV bytes per token come from four numbers in a model's config, the memory left after weights divided by that figure is the number of cached tokens a replica holds, and a traffic mix weighted by how long each request stays resident turns it into a GPU count.
+prerequisites: [inference/inference-anatomy/roofline-serving]
+updated: 2026-10-28
+sources:
+  - title: The Llama 3 Herd of Models (Meta, 2024), Table 3
+    url: https://arxiv.org/html/2407.21783
+    note: "Layers 32, 80, 126; attention heads 32, 64, 128; 8 key/value heads for 8B, 70B and 405B; GQA with 8 KV heads to improve inference speed and reduce the KV cache during decoding."
+  - title: Qwen3-32B config.json
+    url: https://huggingface.co/Qwen/Qwen3-32B/raw/main/config.json
+    note: "64 layers, hidden_size 5120, 64 attention heads, 8 KV heads, head_dim 128, max_position_embeddings 40960, rope_scaling null. Checked 2026-10-28."
+  - title: gpt-oss-120b config.json
+    url: https://huggingface.co/openai/gpt-oss-120b/raw/main/config.json
+    note: "36 layers alternating sliding-window (128 tokens) and full attention, 64 query heads, 8 KV heads, head_dim 64, 128 experts with 4 active, max 131,072 positions. Checked 2026-10-28."
+  - title: gpt-oss-120b model card
+    url: https://huggingface.co/openai/gpt-oss-120b
+    note: "117B parameters with 5.1B active; MXFP4 on the MoE weights; fits a single 80 GB GPU. Checked 2026-10-28."
+  - title: DeepSeek-V3 config.json
+    url: https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json
+    note: "61 layers, 128 attention heads, num_key_value_heads 128, kv_lora_rank 512, qk_rope_head_dim 64, qk_nope_head_dim 128, v_head_dim 128, FP8 e4m3 weights in 128x128 blocks. Checked 2026-10-28."
+  - title: "DeepSeek-V2 (DeepSeek-AI, 2024), Table 1"
+    url: https://arxiv.org/html/2405.04434
+    note: "KV cache elements per token: MHA 2 n_h d_h l, GQA 2 n_g d_h l, MQA 2 d_h l, MLA (d_c + d_h^R) l; MLA equals GQA with 2.25 groups in DeepSeek-V2's setting."
+  - title: "Efficient Memory Management for Large Language Model Serving with PagedAttention (Kwon et al., SOSP 2023)"
+    url: https://arxiv.org/abs/2309.06180
+    note: "OPT-13B needs 800 KB per token (2 x 5120 x 40 x 2) and up to 1.6 GB per 2,048-token request; existing systems used only 20.4% to 38.2% of KV memory for token states; default block size 16; FCFS with the latest requests preempted first, all-or-nothing per sequence, recovered by swapping or recomputation."
+  - title: vLLM engine arguments (latest docs)
+    url: https://docs.vllm.ai/en/latest/configuration/engine_args.html
+    note: "--gpu-memory-utilization default 0.92; --kv-cache-memory-bytes sets the KV size per GPU, inferred when unset; --kv-cache-dtype auto uses the model dtype, with fp8 and fp8_ds_mla among the choices. Checked 2026-10-28."
+  - title: vLLM design docs, Metrics
+    url: https://docs.vllm.ai/en/latest/design/metrics.html
+    note: "vllm:kv_cache_usage_perc, vllm:num_requests_waiting, vllm:prefix_cache_queries and vllm:prefix_cache_hits. Checked 2026-10-28."
+  - title: NVIDIA H100 product page
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: "H100 SXM 80 GB, 3.35 TB/s. Checked 2026-10-28."
+  - title: NVIDIA H200 product page
+    url: https://www.nvidia.com/en-us/data-center/h200/
+    note: "141 GB, 4.8 TB/s. Checked 2026-10-28."
+  - title: NVIDIA DGX B200 product page
+    url: https://www.nvidia.com/en-us/data-center/dgx-b200/
+    note: "8 GPUs, 1,440 GB and 64 TB/s in total, so 180 GB and 8 TB/s per GPU, the widget's B200 figures. Checked 2026-10-28."
+  - title: llama.cpp, tools/quantize README
+    url: https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md
+    note: "Q4_K_M at 4.8944 bits per weight for Llama-3.1-8B, the widget's 4-bit option. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import InferenceKvCalc from '../../../../components/widgets/InferenceKvCalc.astro';
+
+## Capacity is cached tokens, not requests
+
+A replica's concurrency limit is a token count: the memory left after weights and runtime overhead, divided by KV bytes per token. Requests only enter when you divide that token count by how many tokens a request holds while it is resident, and that divisor is where most sizing errors come from. This lesson computes bytes per token from published configs, turns memory into a token budget, and then sizes a deployment from a traffic mix.
+
+## Bytes per token from the config
+
+For standard attention, every layer caches one key and one value vector per KV head for every token:
+
+`bytes per token = 2 × layers × kv_heads × head_dim × bytes_per_element`
+
+The DeepSeek-V2 paper tabulates the element counts by attention type: 2·n_h·d_h·l for multi-head, 2·n_g·d_h·l for grouped-query with n_g KV groups, 2·d_h·l for multi-query, and (d_c + d_h^R)·l for multi-head latent attention, which caches one compressed latent of width d_c plus one positional key of width d_h^R per layer. Read each term from `config.json`, because three of the models below break a naive reading of it.
+
+**Qwen3-32B** sets `head_dim: 128` explicitly. Dividing `hidden_size` 5120 by 64 heads would suggest 80, and a calculator that derives head_dim gets 2 × 64 × 8 × 80 × 2 = 163,840 bytes instead of 262,144, under-sizing the cache by 37.5%.
+
+**gpt-oss-120b** has 36 layers that alternate sliding-window attention with a 128-token window and full attention, 8 KV heads and head_dim 64. Counting every layer as full gives 2 × 36 × 8 × 64 × 2 = 73,728 bytes per token. Only the 18 full layers grow with context, 36,864 bytes per token, while the 18 sliding layers hold at most 128 tokens each. At 131,072 tokens that is 36,864 × (131,072 + 128) = 4.84 GB per sequence in BF16, half of the 9.66 GB the naive formula gives. You get the half only if the engine allocates sliding layers by window; check that for your engine version before counting on it.
+
+**DeepSeek-V3** lists `num_key_value_heads: 128`, and plugging it in with its head dimensions gives 61 × 128 × (192 + 128) × 2 = 4,997,120 bytes per token for decompressed keys and values. An MLA-aware engine caches the latent instead: `kv_lora_rank` 512 plus `qk_rope_head_dim` 64 per layer, 61 × 576 × 2 = 70,272 bytes in BF16. The config-driven number is 71 times too large.
+
+<Predict id="inf-kv-llama70-128k" question="Llama 3 70B (80 layers, 8 KV heads, head_dim 128), BF16 cache: how many GB does one 131,072-token sequence hold?" answer={42.9} tolerance={1} unit="GB">
+<p>2 × 80 × 8 × 128 × 2 = 327,680 bytes per token, times 131,072 tokens = <b>42.9 GB</b> for one sequence, more than half an H100. DeepSeek-V3 at the same length holds 70,272 × 131,072 = 9.2 GB, and gpt-oss-120b, with sliding layers allocated by window, 4.84 GB.</p>
+</Predict>
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Model</th><th>Attention</th><th>Terms from the config or paper</th><th>Bytes per token, BF16</th><th>131,072-token sequence</th></tr></thead>
+<tbody>
+<tr><td>Llama 3 8B</td><td>GQA, 32 query / 8 KV heads</td><td>32 layers, head_dim 128</td><td>131,072</td><td>17.2 GB</td></tr>
+<tr><td>Qwen3-32B</td><td>GQA, 64 / 8</td><td>64 layers, head_dim 128</td><td>262,144</td><td>context limit 40,960 in config</td></tr>
+<tr><td>Llama 3 70B</td><td>GQA, 64 / 8</td><td>80 layers, head_dim 128</td><td>327,680</td><td>42.9 GB</td></tr>
+<tr><td>Llama 3 405B</td><td>GQA, 128 / 8</td><td>126 layers, head_dim 128</td><td>516,096</td><td>67.6 GB</td></tr>
+<tr><td>gpt-oss-120b</td><td>GQA 64 / 8, half the layers sliding (128)</td><td>18 full layers, head_dim 64</td><td>36,864 growing, plus 4.7 MB of window</td><td>4.84 GB</td></tr>
+<tr><td>DeepSeek-V3</td><td>MLA</td><td>61 layers, latent 512 + RoPE key 64</td><td>70,272</td><td>9.2 GB</td></tr>
+</tbody>
+</table>
+</div>
+
+For scale, the vLLM paper computes 800 KB per token for OPT-13B, 2 × 5,120 × 40 × 2 bytes with full multi-head attention, so one 2,048-token request held up to 1.6 GB. Llama 3 70B, five times larger, holds 40% of that per token because 64 query heads share 8 KV heads.
+
+## From memory to a token budget
+
+The budget per replica is GPU memory times the fraction the engine may use, minus weights, minus activations, CUDA graphs and other runtime overhead. vLLM's `--gpu-memory-utilization` defaults to 0.92 in the current docs, and the engine profiles a forward pass at startup and logs the KV size it allocated; `--kv-cache-memory-bytes` fixes the size directly. The overhead depends on the engine, the batch limits and the model, so read it from the startup log rather than estimating it.
+
+Before overhead, Llama 3 70B with FP8 weights (about 70 GB) on two H100s at tensor parallel 2 has 2 × 80 × 0.92 − 70 = 77.2 GB, which is 77.2e9 / 327,680 = 235,596 tokens. On four H100s it has 224.4 GB, 684,814 tokens; on eight, 518.8 GB. Every replica pays for its own copy of the weights, so two TP2 replicas hold 154.4 GB of cache where one TP4 replica on the same four GPUs holds 224.4 GB.
+
+Tensor parallelism splits KV heads across GPUs, which is why the per-replica budget is the right unit. It stops working when the tensor-parallel degree exceeds the KV head count: with 8 KV heads at tensor parallel 16, each GPU still needs at least one head, so heads are duplicated and cache per token grows.
+
+<InferenceKvCalc />
+
+The calculator counts the whole of each GPU's memory and puts every sequence at full context, so it shows the upper bound for one shape of traffic. Select Llama 3 70B on two H100s with FP8 weights and a 32,768-token context, and watch where the bar turns red as the slider moves; then switch the KV cache to FP8.
+
+## Sizing from a traffic mix
+
+Requests do not all sit at full context, and the ones that stay longest are the long ones. A request occupies cache from admission until its last token, a period roughly proportional to its output length at a given inter-token latency, and during decode its resident size grows from its prompt length P to P + output o, averaging P + o/2. The mix of requests resident at any moment is therefore weighted by output length, not by arrival share.
+
+Take a scenario mix: 60% of requests with a 2,000-token prompt and 500 output tokens, 30% at 8,000 and 1,000, 10% at 32,000 and 2,000.
+
+<Predict id="inf-kv-mix-resident" question="For that mix, what is the average resident size, in tokens, of a sequence in the cache at a random moment? Weight each class by arrival share times output length, and use P + o/2 as its size." answer={12281} tolerance={600} unit="tokens">
+<p>Weights p × o: 0.6 × 500 = 300, 0.3 × 1,000 = 300, 0.1 × 2,000 = 200, total 800. Sizes P + o/2: 2,250, 8,500 and 33,000. (300 × 2,250 + 300 × 8,500 + 200 × 33,000) / 800 = 9,825,000 / 800 = <b>12,281 tokens</b>. Averaging by arrival share instead gives 0.6 × 2,250 + 0.3 × 8,500 + 0.1 × 33,000 = 7,200, which under-sizes the cache by 41%.</p>
+</Predict>
+
+Add arrival rate and latency. At 2 requests per second and 30 ms per output token (scenario values), the number resident is 2 × 0.03 × 800 = 48 sequences, holding 48 × 12,281 = 589,500 tokens. In BF16 that is 589,500 × 327,680 = 193.2 GB of cache; in FP8, 96.6 GB.
+
+With BF16 cache, one TP4 replica's 224.4 GB holds it at 86% before overhead, while TP2 replicas need 193.2 / 77.2 = 2.5 of them, so three, on six GPUs. With FP8 cache two TP2 replicas suffice, 96.6 / 154.4 = 63%. The sum covers mean load; the 32,000-token class alone puts a 34,000-token, 11.1 GB sequence on one replica at its peak, and bursts add sequences, so size for the arrival rate at your busiest interval and keep headroom for the largest request class.
+
+Paging makes these sums close to real. Before PagedAttention, serving systems reserved contiguous space for each request's maximum length, and the vLLM paper measured only 20.4% to 38.2% of KV memory holding token states. With 16-token blocks, the default in the paper, a sequence wastes at most 15 tokens, 4.9 MB for Llama 3 70B in BF16.
+
+When the cache does fill, the engine does not fail the request. The paper's scheduler serves first-come first-served, preempts the latest arrivals first, evicts a sequence's blocks all or nothing, and restores them by swapping or recomputation. Under-sizing therefore shows up as `vllm:kv_cache_usage_perc` near 1, a rising `vllm:num_requests_waiting` and recomputed prefills, which look like latency regressions rather than capacity errors.
+
+## The sizing in code
+
+```python
+def kv_per_token(layers, kv_heads, head_dim, elem_bytes=2):
+    return 2 * layers * kv_heads * head_dim * elem_bytes
+
+def resident_tokens(mix, rate, itl_s):
+    """mix: (share, prompt, output) per class; returns (sequences, tokens) resident."""
+    seqs = rate * itl_s * sum(p * o for p, P, o in mix)
+    toks = rate * itl_s * sum(p * o * (P + o / 2) for p, P, o in mix)
+    return seqs, toks
+
+def replica_budget(gpus, gpu_bytes, weight_bytes, util=0.92, overhead=0.0):
+    return gpus * gpu_bytes * util - weight_bytes - overhead
+
+mix = [(0.6, 2_000, 500), (0.3, 8_000, 1_000), (0.1, 32_000, 2_000)]
+seqs, toks = resident_tokens(mix, rate=2.0, itl_s=0.030)
+need = toks * kv_per_token(80, 8, 128)                    # Llama 3 70B, BF16 cache
+print(seqs, toks, need / 1e9)                             # 48.0 589500.0 193.16736
+print(replica_budget(4, 80e9, 70e9) / 1e9)                # 224.4, before measured overhead
+```
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"The 70B assistant above runs on eight H100s as two TP4 replicas. Product wants the long class raised from 32,000-token prompts to 96,000 in three weeks, at the same traffic. The budget is fixed at these eight GPUs. What do you change, and what do you give up?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>The long class's resident size goes from 33,000 to 97,000 tokens, which lifts the mix average to 28,281 and the resident cache to 1,357,500 tokens: 444.8 GB in BF16 against 448.8 GB across both replicas before overhead. That does not fit. Two changes do: an FP8 KV cache, which halves it to 222.4 GB, or one TP8 replica with 518.8 GB. I would ship FP8 KV if it passes an accuracy check at 96K and keep two replicas.</p>
+</Fragment>
+<Fragment slot="long">
+<p>FP8 KV keeps two replicas, so a node failure halves capacity rather than ending service, and it raises the decode bandwidth ceiling at long context. What it costs is an accuracy risk that grows with length, so the check must use long-context tasks at 64K to 96K from our own traffic, not needle tests, compared against the BF16 cache on the same prompts.</p>
+<p>A single TP8 replica keeps BF16 accuracy and fits 444.8 GB in 518.8 GB at 86%, before overhead, which is too tight to absorb a burst of long requests, and it removes redundancy. A third option is admission control: cap concurrent long requests per replica and queue the rest, which keeps BF16 and two replicas at the cost of TTFT for the long class.</p>
+<p>I would write the decision down as FP8 KV behind a flag with the long-context eval as the gate, the per-class concurrency cap as the fallback if the eval fails, and a rollback trigger on long-class task accuracy and on preemption rate.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The FP8 KV eval shows a 3-point drop on 96K document questions and none below 32K. Product says ship it; who signs off, and what do you write in the risk note?</em></li>
+<li><em>Your sizing assumed 30 ms per token. Under the larger cache, ITL rises to 40 ms; what happens to resident tokens, and does the plan still fit?</em></li>
+<li><em>Two engineers disagree: one wants TP8 for accuracy, one wants two replicas for availability. How do you decide without deciding by rank?</em></li>
+<li><em>What would you need to see in production in the first two weeks to reverse the FP8 decision?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The resident-size model assumes requests stream out at a steady inter-token latency and ignores time spent queued and in prefill, when a request already holds its prompt's cache. Long prompts make that time significant, so measure resident tokens from `vllm:kv_cache_usage_perc` against arrival rate once there is traffic, and use the model only to size the first deployment.
+
+Shared prefixes change the arithmetic. With prefix caching, a system prompt or a document that many requests share is stored once and referenced by each; a 6,000-token shared prefix across 48 resident requests is 6,000 tokens of cache, not 288,000. `vllm:prefix_cache_hits` over `vllm:prefix_cache_queries` gives the hit rate to discount by.
+
+The formula covers dense attention, MLA and sliding windows, and engines implement each differently. FP8 KV cache formats carry scales, MLA latents have their own FP8 variant (`fp8_ds_mla` in vLLM's options), and hybrid models with linear-attention or state-space layers keep a fixed-size state per sequence that does not grow with tokens. Take bytes per token from the engine's startup log for the exact model and version, and use the formula to check that number rather than replace it.
+
+<SelfRate id="lesson:inference/inference-anatomy/kv-capacity" />

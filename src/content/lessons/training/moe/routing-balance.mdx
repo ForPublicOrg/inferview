@@ -1,0 +1,174 @@
+---
+title: Routing, capacity and load balance
+track: training
+module: moe
+order: 1
+kind: lesson
+level: senior
+minutes: 14
+summary: How a top-k router assigns tokens to experts, why fixed expert capacity drops tokens when the router is skewed, and how auxiliary losses, DeepSeek-V3's selection bias and Qwen3's global-batch loss keep the load even.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Fedus, Zoph and Shazeer, Switch Transformers (JMLR 2022, arXiv 2101.03961)
+    url: https://arxiv.org/abs/2101.03961
+    note: top-1 routing; expert capacity = tokens per batch / experts x capacity factor; overflowed tokens skip the layer through the residual; dropped tokens typically under 1%; balance loss alpha x N x sum f_i P_i with f not differentiable and P differentiable; alpha 10^-2 after a sweep from 10^-1 to 10^-5; router input cast to float32 inside the router only; initialization scale reduced from 1.0 by a factor of 10; No-Token-Left-Behind rerouting gave no empirical benefit. Checked 2026-10-28.
+  - title: Dai et al., DeepSeekMoE (arXiv 2401.06066)
+    url: https://arxiv.org/abs/2401.06066
+    note: fine-grained segmentation into mN experts with mK active; K_s isolated shared experts; the paper reports DeepSeekMoE 16B comparable to LLaMA2 7B with about 40% of the computation. Checked 2026-10-28.
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: sigmoid affinities normalised over the selected experts; per-expert bias used only for top-K selection, moved by gamma per step against overload; gamma 0.001 for the first 14.3T tokens and 0 for the last 500B; sequence-wise balance loss alpha 0.0001; no token dropping in training or inference; 1 shared and 256 routed experts, 8 active; validation loss 2.258 (sequence-wise loss), 2.253 (loss-free), 2.253 (batch-wise loss) at 1B and 2.085, 2.080, 2.080 at 3B; redundant experts at inference for domain shift; stronger expert specialisation in the loss-free model. Checked 2026-10-28.
+  - title: Qwen Team, Qwen3 Technical Report (arXiv 2505.09388)
+    url: https://arxiv.org/html/2505.09388
+    note: Qwen3-235B-A22B and Qwen3-30B-A3B use 128 experts with 8 active; the MoE design excludes shared experts, unlike Qwen2.5-MoE; global-batch load balancing loss (Qiu et al., 2025) to encourage expert specialization. Checked 2026-10-28.
+  - title: PracHub, Make a hard MoE router differentiable (posted 2025-07-15)
+    url: https://prachub.com/interview-questions/make-a-hard-moe-router-differentiable
+    note: candidate report naming Citadel, machine learning engineer technical screen; asks for at least two ways to train a hard router with gradient descent, with auxiliary losses, temperature schedules and collapse regularisation. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The router is a scheduler with a feedback loop
+
+An MoE layer replaces one feed-forward block with N expert blocks and a router. For each token the router produces one score per expert, keeps the top k, runs those k experts, and adds their outputs weighted by gate values derived from the scores. Total parameters grow with N; work per token grows with k. Everything in this lesson follows from two properties of that scheduler that a load balancer in front of a server pool does not have.
+
+First, the scores are learned from the same loss as the experts. An expert that receives more tokens receives more gradient, gets better at those tokens, and earns higher scores for them next step. Left alone, the router concentrates traffic. Second, on accelerators the per-expert batch is usually a fixed-size buffer, so concentration does not just slow one expert down: tokens that do not fit are skipped.
+
+## Capacity and dropped tokens
+
+The Switch Transformer paper fixes each expert's buffer as
+
+expert capacity = (tokens per batch / number of experts) x capacity factor
+
+With top-k routing there are k assignments per token, so the even share per expert is k x T / N. A capacity factor above 1.0 adds headroom. A token routed to a full expert is not processed by that layer: its representation passes to the next layer through the residual connection. Switch reports dropped tokens typically under 1% in its runs, with its balance loss at a high enough coefficient, and that higher capacity factors cost compute and memory on the padding that balanced batches leave empty.
+
+Here is what skew does to those buffers. Take a toy router over 8 experts with top-2, where two experts start with a small score advantage. On a batch of 1,024 tokens (2,048 assignments, an even share of 256), the code further down measures loads of 956, 948, 17, 25, 29, 23, 29 and 21.
+
+<Predict id="trn-moe-drops" question="With a capacity factor of 1.25, how many of the 2,048 assignments in that batch are dropped?" answer={1264} tolerance={0} unit="assignments">
+<p>Capacity is 1,024 x 2 / 8 x 1.25 = 320 per expert. The two hot experts overflow by 956 - 320 = 636 and 948 - 320 = 628, so <b>1,264</b> assignments, 62% of the batch, skip their expert. The six cold experts hold 144 assignments in 1,920 slots. Raising the capacity factor to 3.0 would fit the hot experts' load but would reserve 768 slots for each of the eight experts, most of them padding.</p>
+</Predict>
+
+Two decisions hide in that formula. Capacity is per device group, so the T that matters is the tokens one group sees, and small micro-batches make imbalance noisier. And dropping is a policy, not a law: Switch tried rerouting overflowed tokens to their second choice (No-Token-Left-Behind) and found no empirical benefit, while DeepSeek-V3 drops no tokens at all in training or inference and has to keep load even by other means.
+
+## The auxiliary balance loss
+
+The standard fix adds a loss that is smallest when load is uniform. For each MoE layer, Switch computes
+
+aux = alpha x N x (sum over experts of f_i x P_i)
+
+where f_i is the fraction of tokens dispatched to expert i and P_i is the fraction of router probability assigned to expert i, both over the batch. Under uniform routing both vectors are 1/N, the sum is N x (1/N)^2 = 1/N, and the loss is alpha. If two of eight experts take all tokens equally and hold all the probability equally, the sum is 2 x 0.5 x 0.5 = 0.5 and the loss is 8 x 0.5 x alpha = 4 alpha.
+
+The gradient path is the part worth reading twice. f_i comes from an argmax and has no gradient. P_i is a mean of softmax outputs and does. The loss works because f acts as a weight on P: the experts that already receive the most tokens get their probability pushed down hardest. Any refactor that computes P from detached or no-grad tensors keeps the logged value and deletes the pressure; the loss curve still shows a number, and it climbs while nothing pushes back.
+
+The coefficient is a trade. Switch swept alpha from 10^-1 to 10^-5 and used 10^-2, large enough to balance quickly and small enough not to disturb the language-modelling loss. Too large and the router is pushed toward uniform assignment regardless of which expert fits the token, which works against specialisation. That interference is the motivation for the two newer schemes below.
+
+Switch also names two stabilisers that are cheap and often lost when a codebase moves to bf16 everywhere: cast the router's input to float32 inside the router function only, so the softmax is computed in full precision while the dispatch and combine tensors go back to bf16 before any communication; and shrink the weight initialisation scale by a factor of 10.
+
+## Bias-based balancing in DeepSeek-V3
+
+DeepSeek-V3 removes the auxiliary loss as the main balancer. Each expert gets a bias b_i that is added to its affinity score only when choosing the top K. The gate value that scales the expert's output still comes from the original sigmoid affinity, normalised over the selected experts. After each step, the bias of every overloaded expert drops by gamma and the bias of every underloaded expert rises by gamma. The report sets gamma to 0.001 for the first 14.3T training tokens and to 0 for the last 500B, freezing the routing offsets at the end. A sequence-wise balance loss remains, with alpha of 0.0001, to stop any single sequence from piling onto a few experts.
+
+In systems terms this is a controller outside the gradient. The loss never sees the bias, so balance stops competing with language modelling for the router's parameters; the bias steers selection, and the scores keep meaning "how well does this expert fit". The controller is a fixed-step integrator on the sign of the load error: bounded per step, simple to reason about, and slow when the initial skew is large.
+
+```python
+import math, random
+
+def route(scores, bias, k):
+    """Pick k experts per token by score + bias; gate with the raw scores."""
+    picks = []
+    for s in scores:
+        top = sorted(range(len(s)), key=lambda i: s[i] + bias[i], reverse=True)[:k]
+        total = sum(s[i] for i in top)
+        picks.append({i: s[i] / total for i in top})
+    return picks
+
+def loads(picks, n):
+    load = [0] * n
+    for p in picks:
+        for i in p:
+            load[i] += 1
+    return load
+
+def update_bias(bias, load, gamma):
+    mean = sum(load) / len(load)
+    return [b - gamma if l > mean else b + gamma if l < mean else b
+            for b, l in zip(bias, load)]
+
+random.seed(0)
+n, k, gamma = 8, 2, 0.001
+skew = [0.3, 0.3] + [0.0] * (n - 2)          # two experts the router already favours
+def batch(t=1024):
+    return [[1 / (1 + math.exp(-(random.gauss(0, 1) * 0.1 + skew[i]))) for i in range(n)]
+            for _ in range(t)]
+
+bias = [0.0] * n
+print("step 0  ", loads(route(batch(), bias, k), n))
+for step in range(1, 401):
+    bias = update_bias(bias, loads(route(batch(), bias, k), n), gamma)
+    if step in (100, 400):
+        print("step", step, loads(route(batch(), bias, k), n))
+```
+
+On Python 3.12 this prints loads of [956, 948, 17, 25, 29, 23, 29, 21] at step 0, [239, 273, 263, 267, 217, 280, 237, 272] at step 100 and [256, 255, 262, 228, 263, 265, 240, 279] at step 400. The final biases are about -0.033 on the two favoured experts and +0.041 on the rest. The scores never changed; only the selection did.
+
+<Predict id="trn-moe-bias-steps" question="In the toy, the favoured experts' sigmoid scores average 0.574 and the others 0.500. With gamma = 0.001, every overloaded bias falling and every underloaded bias rising each step, about how many steps until the biases close the gap between the two groups?" answer={37} tolerance={2} unit="steps">
+<p>The gap is 0.574 - 0.500 = 0.074. Each step moves the two groups 0.001 apart in opposite directions, closing 0.002 per step, so about 0.074 / 0.002 = <b>37 steps</b>. The printed loads at step 100 are already within 16% of the even share of 256. A router with a gap ten times larger needs ten times as many steps at the same gamma, which is the argument for a larger gamma early and zero at the end.</p>
+</Predict>
+
+The ablation in the report compares three balancing scopes on small models. At 1B parameters, validation loss is 2.258 with a sequence-wise auxiliary loss, 2.253 with the bias method and 2.253 with a batch-wise auxiliary loss; at 3B it is 2.085, 2.080 and 2.080. The gain tracks the scope of balance, not the removal of the loss: balancing over the batch matches the bias method. The report names the cost of batch-wise balance plainly. A single sequence or a small batch can still be imbalanced, which DeepSeek handles by guaranteeing large micro-batches through its parallelism layout, and inference traffic can shift domain, which it handles with redundant copies of hot experts.
+
+## Shared experts or not: DeepSeekMoE and Qwen3
+
+DeepSeekMoE made two architectural moves that DeepSeek-V3 keeps: split each expert into m smaller ones and activate m times as many (fine-grained segmentation, more combinations at the same FLOPs), and isolate K_s shared experts that every token passes through, so common knowledge is not duplicated across routed experts. DeepSeek-V3 has 1 shared and 256 routed experts per MoE layer with 8 routed active. The DeepSeekMoE paper reports its 16B model comparable to LLaMA2 7B at about 40% of the computation.
+
+Qwen3 went the other way on one axis. Its MoE models use 128 experts with 8 active and exclude shared experts, unlike Qwen2.5-MoE, and adopt the global-batch load balancing loss of Qiu et al. (2025) to encourage specialisation. The global-batch loss is the batch-wise scope from the DeepSeek ablation, computed across data-parallel ranks rather than within a micro-batch. Two published designs at similar scale disagree on shared experts, so the choice is not settled by the public evidence. A shared expert is a fixed per-token cost and a guaranteed dense path; dropping it gives that compute back to routed experts, which must then either learn the common features redundantly or specialise less.
+
+## Making a hard router trainable
+
+Top-k selection is discrete, so the router gets gradient only through the gate values of the experts it selected: the output is the sum of g_i(x) x E_i(x) over the chosen experts, and the derivative with respect to score i exists only for those k. Unselected experts get no signal about whether they would have done better, and the auxiliary loss's P term is the only path that reaches every logit.
+
+Four families change that. A straight-through estimator uses the hard top-k in the forward pass and a softmax's gradient in the backward pass: cheap and biased. Gumbel-softmax samples a relaxed selection with a temperature annealed toward hard routing; it explores, but needs either all experts computed while the temperature is high or a hard sample with a straight-through backward. Dense softmax relaxations compute every expert early in training, which defeats sparsity at scale. REINFORCE treats routing as a policy: unbiased, high variance, and in need of a baseline.
+
+The published large MoE models discussed here train with gate-weighted top-k plus a balance mechanism, and the balancer supplies the exploration that keeps cold experts receiving tokens. That is a defensible default, not a theorem.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Our 64-expert, top-2 model drops 4% of tokens at capacity factor 1.25, and the quality team blames the balance loss at alpha 0.01 for weak specialisation. The next run starts in two weeks on the same cluster, memory leaves no room for a higher capacity factor, and there is no time for an ablation at full scale. What do you change, and what do you watch?"**
+</Callout>
+
+<p class="tiny">The model and its numbers are a scenario.</p>
+
+<Depth>
+<Fragment slot="short">
+<p>Move balance out of the loss: add a per-expert selection bias updated against load, cut alpha by two orders of magnitude to a sequence-wise backstop, and keep capacity at 1.25 with drops logged per layer. Run a short small-scale ablation of sequence-wise loss, batch-wise loss and bias on the same data before committing. Watch per-layer drop rate and max-over-mean load, not the averaged aux value.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The constraints conflict: lowering alpha alone raises drops, raising capacity is ruled out by memory, and the deadline rules out a full-scale ablation. A bias controller decouples the two goals, since it changes selection without competing for the router's gradient, and the DeepSeek-V3 ablation shows the bias and a batch-wise loss both beating a sequence-wise loss at 1B and 3B.</p>
+<p>Choose gamma so the controller closes the observed skew within a few hundred steps: a score lead of about 0.1 closes in about 50 steps at gamma 0.001. Schedule it to zero before the end so routing is stable while the learning rate decays. Keep a small sequence-wise loss, because the bias balances the batch, not each sequence.</p>
+<p>The alternative is a batch-wise auxiliary loss computed across data-parallel ranks, the Qwen3 choice. It changes only the reduction scope and adds no new state, at the cost of an all-reduce of per-expert statistics per step and a remaining coupling between balance and loss.</p>
+<p>How this fails: the bias balances the counts the controller sees. If micro-batches are small, per-micro-batch load still spikes and drops continue. Drops also hide in layer averages, so log the worst layer.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The bias run is balanced but downstream evals drop on code. What do you measure to tell whether balancing is pushing code tokens away from the experts that fit them?</li>
+<li>The infra lead wants to stop dropping tokens entirely, as DeepSeek-V3 does. What does that cost in memory and in worst-case step time, and what would you need to see to agree?</li>
+<li>Two weeks in, drops are under 0.5% in every layer except the last two, which sit at 6%. Do you raise gamma for those layers, raise their capacity alone, or accept it, and who signs off?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Balanced counts are not balanced time. Experts with equal token counts can still finish at different times if padding or kernel efficiency differ, and the slowest expert-parallel rank sets the step. Measure step time per rank, not only counts.
+
+The fixed-capacity model assumes static shapes. Grouped-GEMM and dropless kernels process variable per-expert batches, so overflow becomes a memory and tail-latency problem instead of a quality problem; balancing still matters, for a different reason.
+
+Balance is a training-time property. Inference traffic is a different distribution, which is why DeepSeek-V3 deploys redundant copies of hot experts at serving time instead of trusting the training balance.
+
+A perfectly uniform router is not the goal either. The DeepSeek-V3 report shows its loss-free model with stronger expert specialisation by domain than the auxiliary-loss baseline. If a balancing change makes every expert look the same on every domain, it has traded specialisation for counts.
+
+<SelfRate id="lesson:training/moe/routing-balance" />

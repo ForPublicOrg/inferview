@@ -1,0 +1,1131 @@
+---
+title: Build a mini durable workflow engine
+track: workflows
+module: durable-execution
+kind: lab
+minutes: 150
+summary: Grow one journal-based workflow engine over eight steps, from saved step results to replay checks, retries, idempotent payments, approvals, budgets and a crash sweep that proves each external effect happens once.
+updated: 2026-10-28
+sources:
+  - title: Temporal docs, Workflow Definition
+    url: https://docs.temporal.io/workflow-definition
+    note: workflow code is replayed and must emit the same commands in the same order; the model for steps 2 and 3
+  - title: Inngest docs, how functions are executed
+    url: https://www.inngest.com/docs/learn/how-functions-are-executed
+    note: the handler is replayed and completed steps return saved results, looked up by a hash of the step id; the model for step 2
+  - title: DBOS docs, workflow tutorial
+    url: https://docs.dbos.dev/python/tutorials/workflow-tutorial
+    note: steps are tried at least once and never re-executed after they complete; DBOSStepNondeterminismError when one execution of a workflow records different results for the same step (checked 2026-10-28)
+  - title: LangGraph docs, interrupts
+    url: https://docs.langchain.com/oss/python/langgraph/interrupts
+    note: the value passed to Command(resume=...) becomes the return value of interrupt(); the model for step 6
+  - title: Stripe API reference, idempotent requests
+    url: https://docs.stripe.com/api/idempotent_requests
+    note: a retried key returns the saved response; keys up to 255 characters; avoid sensitive data in keys; the model for the fake provider in step 5
+steps:
+  - title: A journal of step results
+    brief: |
+      The journal is the only part of a run that survives a crash. Record each step's result under its name, as JSON text, in the order the steps ran. Refuse anything that is not JSON when it is recorded (sets, objects, NaN), not later when a replay reads it back, and refuse a name that is already recorded. record returns the value a later read would return, so a tuple comes back as a list and an integer dict key as a string. lookup returns (True, value) or (False, None), so a recorded None is not mistaken for a missing step, and a value handed out must not let the caller change what is stored.
+    starter: |
+      import json
+
+
+      class Journal:
+          """The durable half of a run: step results in the order they were recorded, kept as JSON text.
+          In these tests the Journal object survives a crash; everything else is rebuilt."""
+
+          def __init__(self):
+              raise NotImplementedError
+
+          def record(self, name, result):
+              """Store result under name and return what a later read would return."""
+              raise NotImplementedError
+
+          def lookup(self, name):
+              """Return (True, value) for a recorded name, else (False, None)."""
+              raise NotImplementedError
+
+          def names(self):
+              """Recorded names, oldest first."""
+              raise NotImplementedError
+
+          def __len__(self):
+              raise NotImplementedError
+    tests: |
+      def raises(exc, fn, *args):
+          try:
+              fn(*args)
+          except exc:
+              return True
+          return False
+
+      j = Journal()
+      assert j.record("fetch", {"id": 7, "tags": ("a", "b")}) == {"id": 7, "tags": ["a", "b"]}, "record returns the JSON round trip: tuples come back as lists"
+      assert j.lookup("fetch") == (True, {"id": 7, "tags": ["a", "b"]})
+      assert j.lookup("missing") == (False, None)
+      assert raises(TypeError, j.record, "bad", {1, 2}), "a set is not JSON: refuse it when it is recorded, not when it is read back"
+      assert raises(ValueError, j.record, "fetch", 1), "a step name is recorded once"
+      assert len(j) == 1 and j.names() == ["fetch"], "a refused record leaves nothing behind"
+    hidden: |
+      _j = Journal()
+      assert _j.record("keys", {1: "a"}) == {"1": "a"}
+      assert raises(ValueError, _j.record, "nan", float("nan"))
+      _j.record("none", None)
+      assert _j.lookup("none") == (True, None)
+      _v = _j.lookup("keys")[1]
+      _v["1"] = "changed"
+      assert _j.lookup("keys") == (True, {"1": "a"})
+      _j.record("z", 1)
+      _j.record("a", 2)
+      assert _j.names() == ["keys", "none", "z", "a"] and len(_j) == 4
+    solution: |
+      import json
+
+
+      class Journal:
+          def __init__(self):
+              self.entries = []   # [name, json_text], oldest first
+              self.index = {}     # name -> position in entries
+
+          def record(self, name, result):
+              if name in self.index:
+                  raise ValueError(f"step {name!r} is already recorded")
+              text = json.dumps(result, allow_nan=False)   # TypeError for sets and objects, ValueError for NaN
+              self.index[name] = len(self.entries)
+              self.entries.append([name, text])
+              return json.loads(text)
+
+          def lookup(self, name):
+              if name not in self.index:
+                  return False, None
+              return True, json.loads(self.entries[self.index[name]][1])
+
+          def names(self):
+              return [name for name, _ in self.entries]
+
+          def __len__(self):
+              return len(self.entries)
+  - title: Replay from the top
+    brief: |
+      A run is the workflow function called with a Run object. run.step(name, fn, *args) returns the journalled result when the name is recorded, and otherwise calls fn, records the result and returns the recorded value. After a crash, execute calls the workflow again from the first line with the same journal, so finished steps return their saved results and only the unfinished one runs. Return the recorded value even on the first run: code that sees a tuple the first time and a list on replay behaves differently on the two paths. Crash derives from BaseException in this lab so that `except Exception` in workflow code cannot swallow a simulated process death. Accept extra keyword options in Run and execute; later steps add them.
+    starter: |
+      class Crash(BaseException):
+          """Process death in these tests. It derives from BaseException so `except Exception` cannot swallow it."""
+
+
+      class Run:
+          """One execution attempt of a workflow. Rebuilt after every crash; only the journal survives."""
+
+          def __init__(self, run_id, journal, **options):
+              raise NotImplementedError
+
+          def step(self, name, fn, *args):
+              """Return the journalled result for name, or call fn(*args), journal the result and return it."""
+              raise NotImplementedError
+
+
+      def execute(workflow, run_id, journal, **options):
+          """Run workflow(run) from the top and return what it returns."""
+          raise NotImplementedError
+    tests: |
+      calls = []
+
+      def fetch(order_id):
+          calls.append(("fetch", order_id))
+          return {"order": order_id, "lines": (1, 2)}
+
+      def price(order):
+          calls.append(("price", order["order"]))
+          return len(order["lines"]) * 500
+
+      def workflow(run):
+          order = run.step("fetch", fetch, "A-1")
+          return run.step("price", price, order)
+
+      journal = Journal()
+      assert execute(workflow, "run-1", journal) == 1000
+      assert execute(workflow, "run-1", journal) == 1000 and len(calls) == 2, "a replay returns saved results and calls nothing"
+
+      state = {"die": True}
+
+      def fragile(order):
+          if state["die"]:
+              state["die"] = False
+              raise Crash("killed between steps")
+          return price(order)
+
+      def crashy(run):
+          order = run.step("fetch", fetch, "B-2")
+          return run.step("price", fragile, order)
+
+      calls.clear()
+      journal = Journal()
+      try:
+          execute(crashy, "run-2", journal)
+      except Crash:
+          pass
+      assert execute(crashy, "run-2", journal) == 1000
+      assert calls == [("fetch", "B-2"), ("price", "B-2")], "after a crash only the unfinished step runs again"
+    hidden: |
+      _seen = []
+
+      def _shape(run):
+          v = run.step("v", lambda: {"t": (1, 2), 3: "x"})
+          _seen.append(v)
+          return v
+
+      _jj = Journal()
+      execute(_shape, "r", _jj)
+      execute(_shape, "r", _jj)
+      assert _seen[0] == _seen[1] == {"t": [1, 2], "3": "x"}
+
+      _n = [0]
+
+      def _counter():
+          _n[0] += 1
+          return _n[0]
+
+      def _twice(run):
+          return [run.step("a", _counter), run.step("b", _counter)]
+
+      _jk = Journal()
+      assert execute(_twice, "r", _jk) == [1, 2]
+      _n[0] = 100
+      assert execute(_twice, "r", _jk) == [1, 2] and _n[0] == 100
+      assert execute(_twice, "other", Journal()) == [101, 102]
+    solution: |
+      class Crash(BaseException):
+          """Process death in these tests. It derives from BaseException so `except Exception` cannot swallow it."""
+
+
+      class Run:
+          def __init__(self, run_id, journal, **options):
+              self.run_id = run_id
+              self.journal = journal
+              self.options = options
+
+          def step(self, name, fn, *args):
+              found, value = self.journal.lookup(name)
+              if found:
+                  return value
+              # Return the round-tripped value even on the first run, so the code sees the same types on replay.
+              return self.journal.record(name, fn(*args))
+
+
+      def execute(workflow, run_id, journal, **options):
+          return workflow(Run(run_id, journal, **options))
+  - title: Catch non-determinism
+    brief: |
+      Looking results up by name lets a reordered workflow replay without complaint and pair results with the wrong code. Match steps by position instead: the k-th step call must have the k-th recorded name, or raise NonDeterminismError naming both, before the step's function runs. Calls past the end of the journal are new steps and run normally, which is why a run that crashed before a step can pick up a changed version of that step. If the workflow returns while recorded steps are left unconsumed, a step was removed: raise as well. This is the check that fails a Temporal deploy that swaps a timer and an activity. Later steps redefine Run as a subclass of the previous one, so keep the matching in a helper they can call.
+    starter: |
+      class NonDeterminismError(Exception):
+          """The code asked for a different step sequence than the one the journal recorded."""
+
+
+      class Run(Run):
+          def __init__(self, run_id, journal, **options):
+              super().__init__(run_id, journal, **options)
+              raise NotImplementedError
+
+          def step(self, name, fn, *args):
+              raise NotImplementedError
+
+
+      def execute(workflow, run_id, journal, **options):
+          raise NotImplementedError
+    tests: |
+      effects = []
+
+      def act(label):
+          effects.append(label)
+          return label
+
+      def v1(run):
+          a = run.step("classify", act, "classify")
+          b = run.step("wait-window", act, "wait-window")
+          return [a, b, run.step("draft", act, "draft")]
+
+      def v2_swapped(run):
+          a = run.step("classify", act, "classify")
+          b = run.step("fetch-updates", act, "fetch-updates")
+          return [a, b, run.step("draft", act, "draft")]
+
+      def error_of(workflow, journal):
+          try:
+              execute(workflow, "run-1", journal)
+          except NonDeterminismError as e:
+              return str(e)
+          return None
+
+      journal = Journal()
+      execute(v1, "run-1", journal)
+      effects.clear()
+      message = error_of(v2_swapped, journal)
+      assert message is not None, "a different step at a recorded position is a non-determinism error"
+      assert "wait-window" in message and "fetch-updates" in message, f"name both steps: {message}"
+      assert effects == [], "the mismatched step does not run"
+
+      def v3_appended(run):
+          out = v1(run)
+          return out + [run.step("notify", act, "notify")]
+
+      effects.clear()
+      assert execute(v3_appended, "run-1", journal) == ["classify", "wait-window", "draft", "notify"]
+      assert effects == ["notify"], "a step added after the recorded ones runs normally"
+    hidden: |
+      def _v1_short(run):
+          return [run.step("classify", act, "classify"), run.step("wait-window", act, "wait-window")]
+
+      _j = Journal()
+      execute(v1, "r", _j)
+      assert error_of(_v1_short, _j) is not None
+
+      _k = Journal()
+      execute(_v1_short, "r", _k)
+      effects.clear()
+      assert execute(v1, "r", _k) == ["classify", "wait-window", "draft"] and effects == ["draft"]
+
+      _m = Journal()
+      _flag = {"die": True}
+
+      def _dies(label):
+          if _flag["die"]:
+              _flag["die"] = False
+              raise Crash("x")
+          return act(label)
+
+      def _old(run):
+          a = run.step("classify", act, "classify")
+          return [a, run.step("wait-window", _dies, "wait-window"), run.step("draft", act, "draft")]
+
+      try:
+          execute(_old, "r", _m)
+      except Crash:
+          pass
+      effects.clear()
+      assert execute(v2_swapped, "r", _m) == ["classify", "fetch-updates", "draft"] and effects == ["fetch-updates", "draft"]
+
+      def _renamed(run):
+          return [run.step("classify-v2", act, "c")]
+
+      assert error_of(_renamed, _m) is not None
+    solution: |
+      class NonDeterminismError(Exception):
+          """The code asked for a different step sequence than the one the journal recorded."""
+
+
+      class Run(Run):
+          def __init__(self, run_id, journal, **options):
+              super().__init__(run_id, journal, **options)
+              self.position = 0
+              self.recorded = journal.names()
+
+          def step(self, name, fn, *args):
+              return self._next(name, lambda: fn(*args))
+
+          def _next(self, name, produce):
+              """Match the next step against the journal by position; run produce() only past the journal's end."""
+              if self.position < len(self.recorded):
+                  expected = self.recorded[self.position]
+                  if expected != name:
+                      raise NonDeterminismError(
+                          f"step {self.position + 1}: the journal has {expected!r}, the code asked for {name!r}")
+                  self.position += 1
+                  return self.journal.lookup(name)[1]
+              value = self.journal.record(name, produce())
+              self.recorded.append(name)
+              self.position += 1
+              return value
+
+
+      def execute(workflow, run_id, journal, **options):
+          run = Run(run_id, journal, **options)
+          result = workflow(run)
+          if run.position < len(run.recorded):
+              raise NonDeterminismError(
+                  f"the code finished at step {run.position}, the journal still has {run.recorded[run.position]!r}")
+          return result
+  - title: Retries with a policy
+    brief: |
+      run.step takes retry=RetryPolicy(...). A failed attempt waits delay(attempt) seconds through the injected sleep and tries again, up to max_attempts; the delay starts at initial_interval, multiplies by backoff and is capped at max_interval, and jitter takes off up to that fraction using the injected random. Exception types in non_retryable are raised on the first failure, as is Crash, which is not an Exception. Only a success is journalled, and a replay of a journalled step never retries or sleeps. With no policy a step gets one attempt. Clock and random are injected so the tests can assert the exact waits.
+    starter: |
+      class RetryPolicy:
+          def __init__(self, max_attempts=3, initial_interval=1.0, backoff=2.0, max_interval=60.0, jitter=0.0,
+                       non_retryable=()):
+              raise NotImplementedError
+
+          def delay(self, attempt, rand):
+              """Seconds to wait after failed attempt number `attempt` (1-based); rand() returns a float in [0, 1)."""
+              raise NotImplementedError
+
+
+      class Run(Run):
+          def __init__(self, run_id, journal, sleep=None, random=None, **options):
+              super().__init__(run_id, journal, **options)
+              raise NotImplementedError
+
+          def step(self, name, fn, *args, retry=None):
+              raise NotImplementedError
+    tests: |
+      class RateLimited(Exception):
+          pass
+
+      class BadRequest(Exception):
+          pass
+
+      def flaky(failures, exc):
+          state = {"left": failures, "calls": 0}
+          def call():
+              state["calls"] += 1
+              if state["left"]:
+                  state["left"] -= 1
+                  raise exc("try again")
+              return "ok"
+          return call, state
+
+      slept = []
+      call, state = flaky(2, RateLimited)
+      policy = RetryPolicy(max_attempts=4, initial_interval=1.0, backoff=2.0)
+      wf = lambda run: run.step("model", call, retry=policy)
+      journal = Journal()
+      assert execute(wf, "r1", journal, sleep=slept.append) == "ok"
+      assert state["calls"] == 3 and slept == [1.0, 2.0], f"two failures, two waits: {slept}"
+      assert execute(wf, "r1", journal, sleep=slept.append) == "ok" and state["calls"] == 3, "a replay does not retry anything"
+
+      call, state = flaky(5, BadRequest)
+      policy = RetryPolicy(max_attempts=4, non_retryable=(BadRequest,))
+      journal = Journal()
+      try:
+          execute(lambda run: run.step("model", call, retry=policy), "r2", journal)
+          outcome = "returned"
+      except BadRequest:
+          outcome = "raised"
+      assert outcome == "raised" and state["calls"] == 1, "a non-retryable error is raised on the first attempt"
+      assert len(journal) == 0, "a failed step is not journalled"
+
+      assert RetryPolicy(initial_interval=1, backoff=2, max_interval=5, jitter=0.5).delay(4, lambda: 0.5) == 3.75, "cap at 5 s, then take off jitter x rand"
+    hidden: |
+      _call, _state = flaky(10, RateLimited)
+      _slept = []
+      try:
+          execute(lambda run: run.step("m", _call, retry=RetryPolicy(max_attempts=3)), "h1", Journal(), sleep=_slept.append)
+          _out = "returned"
+      except RateLimited:
+          _out = "raised"
+      assert _out == "raised" and _state["calls"] == 3 and len(_slept) == 2
+
+      _call, _state = flaky(1, RateLimited)
+      try:
+          execute(lambda run: run.step("m", _call), "h2", Journal())
+          _out = "returned"
+      except RateLimited:
+          _out = "raised"
+      assert _out == "raised" and _state["calls"] == 1
+
+      _p = RetryPolicy(max_attempts=9, initial_interval=0.5, backoff=3.0, max_interval=20.0)
+      _d = [_p.delay(a, lambda: 0.9) for a in range(1, 9)]
+      assert _d == sorted(_d) and max(_d) == 20.0 and _d[0] == 0.5
+
+      _pj = RetryPolicy(initial_interval=8.0, jitter=1.0)
+      assert all(0.0 < _pj.delay(1, lambda r=r: r) <= 8.0 for r in (0.0, 0.3, 0.999))
+
+      _dead = {"n": 0}
+
+      def _dies():
+          _dead["n"] += 1
+          raise Crash("x")
+
+      try:
+          execute(lambda run: run.step("m", _dies, retry=RetryPolicy(max_attempts=5)), "h3", Journal())
+      except Crash:
+          pass
+      assert _dead["n"] == 1
+
+      _rolls = iter([0.25, 0.75])
+      _slept2 = []
+      _call, _state = flaky(2, RateLimited)
+      execute(lambda run: run.step("m", _call, retry=RetryPolicy(max_attempts=3, initial_interval=4.0, jitter=0.5)), "h4",
+              Journal(), sleep=_slept2.append, random=lambda: next(_rolls))
+      assert _slept2 == [3.5, 5.0]
+
+      _bad = 0
+      for _kw in ({"max_attempts": 0}, {"jitter": 1.5}):
+          try:
+              RetryPolicy(**_kw)
+          except ValueError:
+              _bad += 1
+      assert _bad == 2
+    solution: |
+      class RetryPolicy:
+          def __init__(self, max_attempts=3, initial_interval=1.0, backoff=2.0, max_interval=60.0, jitter=0.0,
+                       non_retryable=()):
+              if max_attempts < 1:
+                  raise ValueError("max_attempts is at least 1")
+              if not 0.0 <= jitter <= 1.0:
+                  raise ValueError("jitter is a fraction between 0 and 1")
+              self.max_attempts = max_attempts
+              self.initial_interval = initial_interval
+              self.backoff = backoff
+              self.max_interval = max_interval
+              self.jitter = jitter
+              self.non_retryable = tuple(non_retryable)
+
+          def delay(self, attempt, rand):
+              base = min(self.max_interval, self.initial_interval * self.backoff ** (attempt - 1))
+              return base * (1.0 - self.jitter * rand())
+
+
+      ONE_ATTEMPT = RetryPolicy(max_attempts=1)
+
+
+      class Run(Run):
+          def __init__(self, run_id, journal, sleep=None, random=None, **options):
+              super().__init__(run_id, journal, **options)
+              self.sleep = sleep or (lambda seconds: None)
+              self.random = random or (lambda: 0.0)
+
+          def step(self, name, fn, *args, retry=None):
+              return self._next(name, lambda: self._attempt(fn, args, retry or ONE_ATTEMPT))
+
+          def _attempt(self, fn, args, policy):
+              attempt = 1
+              while True:
+                  try:
+                      return fn(*args)
+                  except policy.non_retryable:
+                      raise
+                  except Exception:   # Crash is a BaseException, so process death is never retried here
+                      if attempt >= policy.max_attempts:
+                          raise
+                      self.sleep(policy.delay(attempt, self.random))
+                      attempt += 1
+  - title: Idempotency keys for external effects
+    brief: |
+      Retries and replays mean a step can run more than once; the journal only helps once the result is written, and the crash that matters comes between the provider charging and the journal write. run.effect(name, fn, *args, retry=None) calls fn(*args, idempotency_key=key) where run.key(name) depends only on the run id and the step name, so every attempt and every re-run sends the same key and the deduplicating provider returns the first charge. Different runs or different steps must never share a key, even when ids contain separators such as "/". Keep keys at most 255 characters and free of the raw run id, which in production is often a customer or order identifier. FakePayments is the provider; the starter gives it to you.
+    starter: |
+      import hashlib
+
+
+      class Timeout(Exception):
+          """The provider did not answer in time. The charge may or may not have happened."""
+
+
+      class FakePayments:
+          """A deterministic stand-in for a payment API that deduplicates by idempotency key.
+          lose_responses: the next n calls apply the charge, then raise Timeout (the response is lost).
+          fail_before:    the next n calls raise Timeout without charging."""
+
+          def __init__(self, lose_responses=0, fail_before=0):
+              self.charges = {}   # idempotency key -> {"id", "amount"}
+              self.keys_seen = []
+              self.lose_responses = lose_responses
+              self.fail_before = fail_before
+
+          def charge(self, amount, idempotency_key):
+              self.keys_seen.append(idempotency_key)
+              if self.fail_before:
+                  self.fail_before -= 1
+                  raise Timeout("connection reset before the request was read")
+              if idempotency_key in self.charges:
+                  saved = self.charges[idempotency_key]
+                  if saved["amount"] != amount:
+                      raise ValueError("idempotency key reused with different parameters")
+                  return dict(saved)
+              self.charges[idempotency_key] = {"id": f"ch_{len(self.charges) + 1}", "amount": amount}
+              if self.lose_responses:
+                  self.lose_responses -= 1
+                  raise Timeout("read timed out after the charge was applied")
+              return dict(self.charges[idempotency_key])
+
+          def count(self):
+              return len(self.charges)
+
+
+      class Run(Run):
+          def key(self, name):
+              """An idempotency key for step `name` of this run."""
+              raise NotImplementedError
+
+          def effect(self, name, fn, *args, retry=None):
+              """Like step, but calls fn(*args, idempotency_key=...)."""
+              raise NotImplementedError
+    tests: |
+      retry = RetryPolicy(max_attempts=3)
+
+      pay = FakePayments(lose_responses=1)
+      wf = lambda run: run.effect("charge", pay.charge, 500, retry=retry)
+      result = execute(wf, "order-9", Journal())
+      assert pay.count() == 1 and result["amount"] == 500, "a lost response plus a retry is still one charge"
+      assert len(set(pay.keys_seen)) == 1, "every attempt of one step sends the same key"
+
+      pay = FakePayments()
+
+      def charge_then_die(amount, idempotency_key):
+          pay.charge(amount, idempotency_key=idempotency_key)
+          raise Crash("killed after the provider charged, before the journal write")
+
+      journal = Journal()
+      try:
+          execute(lambda run: run.effect("charge", charge_then_die, 700), "order-10", journal)
+      except Crash:
+          pass
+      assert execute(lambda run: run.effect("charge", pay.charge, 700), "order-10", journal)["amount"] == 700
+      assert pay.count() == 1, "the re-run after a crash sends the same key, so the provider returns the first charge"
+
+      pay = FakePayments()
+      execute(lambda run: [run.effect("deposit", pay.charge, 100), run.effect("balance", pay.charge, 100)], "order-11", Journal())
+      execute(lambda run: run.effect("deposit", pay.charge, 100), "order-12", Journal())
+      assert pay.count() == 3, "different steps and different runs are different charges"
+    hidden: |
+      _r1 = Run("a/b", Journal())
+      _r2 = Run("a", Journal())
+      assert _r1.key("c") != _r2.key("b/c")
+      assert Run("a", Journal()).key("x") == Run("a", Journal()).key("x")
+      assert len(Run("r" * 300, Journal()).key("s" * 1000)) <= 255
+      assert "order-77" not in Run("order-77", Journal()).key("charge")
+
+      _pay = FakePayments(fail_before=2)
+      execute(lambda run: run.effect("c", _pay.charge, 5, retry=RetryPolicy(max_attempts=3)), "h", Journal())
+      assert _pay.count() == 1 and len(_pay.keys_seen) == 3 and len(set(_pay.keys_seen)) == 1
+
+      _pay = FakePayments(lose_responses=5)
+      try:
+          execute(lambda run: run.effect("c", _pay.charge, 5, retry=RetryPolicy(max_attempts=2)), "h2", Journal())
+      except Timeout:
+          pass
+      assert _pay.count() == 1
+    solution: |
+      import hashlib
+
+
+      class Timeout(Exception):
+          """The provider did not answer in time. The charge may or may not have happened."""
+
+
+      class FakePayments:
+          """A deterministic stand-in for a payment API that deduplicates by idempotency key.
+          lose_responses: the next n calls apply the charge, then raise Timeout (the response is lost).
+          fail_before:    the next n calls raise Timeout without charging."""
+
+          def __init__(self, lose_responses=0, fail_before=0):
+              self.charges = {}   # idempotency key -> {"id", "amount"}
+              self.keys_seen = []
+              self.lose_responses = lose_responses
+              self.fail_before = fail_before
+
+          def charge(self, amount, idempotency_key):
+              self.keys_seen.append(idempotency_key)
+              if self.fail_before:
+                  self.fail_before -= 1
+                  raise Timeout("connection reset before the request was read")
+              if idempotency_key in self.charges:
+                  saved = self.charges[idempotency_key]
+                  if saved["amount"] != amount:
+                      raise ValueError("idempotency key reused with different parameters")
+                  return dict(saved)
+              self.charges[idempotency_key] = {"id": f"ch_{len(self.charges) + 1}", "amount": amount}
+              if self.lose_responses:
+                  self.lose_responses -= 1
+                  raise Timeout("read timed out after the charge was applied")
+              return dict(self.charges[idempotency_key])
+
+          def count(self):
+              return len(self.charges)
+
+
+      class Run(Run):
+          def key(self, name):
+              # JSON keeps ("a/b", "c") and ("a", "b/c") apart; the hash keeps the key short and free of the raw ids.
+              raw = json.dumps([self.run_id, name])
+              return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+          def effect(self, name, fn, *args, retry=None):
+              key = self.key(name)
+              return self.step(name, lambda: fn(*args, idempotency_key=key), retry=retry)
+  - title: Wait for an approval, with a timeout
+    brief: |
+      run.wait_for(name, timeout) parks the run until a signal named name arrives or the deadline passes. The deadline is clock() plus timeout, read once and journalled the first time the wait is reached, so every later drive compares against the same number. When the run is driven again, a signal present in signals wins, even past the deadline; otherwise the deadline is compared with the injected clock; otherwise the run parks again with nothing journalled. The outcome, {"timed_out": bool, "value": ...}, is journalled, so a signal that arrives after the timeout branch was taken changes nothing. drive returns ("done", result) or ("waiting", name). Steps before the wait run once however often the run is driven.
+    starter: |
+      class Suspended(BaseException):
+          """Raised to park a run until a signal arrives or its deadline passes."""
+
+          def __init__(self, name):
+              super().__init__(name)
+              self.name = name
+
+
+      class Run(Run):
+          def __init__(self, run_id, journal, clock=None, signals=None, **options):
+              super().__init__(run_id, journal, **options)
+              raise NotImplementedError
+
+          def wait_for(self, name, timeout):
+              """Return {"timed_out": False, "value": v} once signal `name` arrives, or {"timed_out": True, "value": None}
+              once the deadline has passed; otherwise park the run."""
+              raise NotImplementedError
+
+
+      def drive(workflow, run_id, journal, **options):
+          """Return ("done", result) or ("waiting", signal_name)."""
+          raise NotImplementedError
+    tests: |
+      sent = []
+
+      def send(kind, amount):
+          sent.append(kind)
+          return kind
+
+      def refund_flow(run):
+          amount = run.step("assess", lambda: 4200)
+          answer = run.wait_for("approval", timeout=3600)
+          if answer["timed_out"]:
+              return run.step("escalate", send, "escalated", amount)
+          if answer["value"]["approved"]:
+              return run.step("pay", send, "paid", amount)
+          return run.step("decline", send, "declined", amount)
+
+      now = [1000.0]
+      clock = lambda: now[0]
+      journal = Journal()
+      assert drive(refund_flow, "r1", journal, clock=clock) == ("waiting", "approval")
+      now[0] = 2000.0
+      assert drive(refund_flow, "r1", journal, clock=clock) == ("waiting", "approval"), "still waiting before the deadline"
+      assert drive(refund_flow, "r1", journal, clock=clock, signals={"approval": {"approved": True}}) == ("done", "paid")
+      assert sent == ["paid"]
+
+      sent.clear()
+      now[0] = 0.0
+      journal = Journal()
+      drive(refund_flow, "r2", journal, clock=clock)
+      now[0] = 3599.0
+      assert drive(refund_flow, "r2", journal, clock=clock)[0] == "waiting", "the deadline is set when the wait starts, not on each drive"
+      now[0] = 3600.0
+      assert drive(refund_flow, "r2", journal, clock=clock) == ("done", "escalated")
+      late = drive(refund_flow, "r2", journal, clock=clock, signals={"approval": {"approved": True}})
+      assert late == ("done", "escalated") and sent == ["escalated"], "once the timeout branch is journalled, a late signal changes nothing"
+    hidden: |
+      _now = [0.0]
+      _reads = [0]
+
+      def _clock():
+          _reads[0] += 1
+          return _now[0]
+
+      _j = Journal()
+      drive(refund_flow, "h1", _j, clock=_clock)
+      _now[0] = 10_000.0
+      assert drive(refund_flow, "h1", _j, clock=_clock, signals={"approval": {"approved": False}}) == ("done", "declined")
+      _reads[0] = 0
+      assert drive(refund_flow, "h1", _j, clock=_clock) == ("done", "declined") and _reads[0] == 0
+
+      _runs = [0]
+
+      def _counted(run):
+          _runs[0] += 1
+          run.step("before", lambda: 1)
+          return run.wait_for("ok", 10)["value"]
+
+      _j2 = Journal()
+      _now[0] = 0.0
+      for _ in range(3):
+          drive(_counted, "h2", _j2, clock=lambda: _now[0])
+      assert _runs[0] == 3 and len(_j2) == 2
+      assert drive(_counted, "h2", _j2, clock=lambda: _now[0], signals={"ok": [1, 2]}) == ("done", [1, 2])
+
+      def _two_waits(run):
+          a = run.wait_for("first", 5)
+          b = run.wait_for("second", 5)
+          return [a["timed_out"], b["timed_out"]]
+
+      _j3 = Journal()
+      _t = [0.0]
+      assert drive(_two_waits, "h3", _j3, clock=lambda: _t[0], signals={"first": 1}) == ("waiting", "second")
+      _t[0] = 4.0
+      assert drive(_two_waits, "h3", _j3, clock=lambda: _t[0], signals={"first": 1})[0] == "waiting"
+      _t[0] = 5.0
+      assert drive(_two_waits, "h3", _j3, clock=lambda: _t[0]) == ("done", [False, True])
+    solution: |
+      class Suspended(BaseException):
+          """Raised to park a run until a signal arrives or its deadline passes."""
+
+          def __init__(self, name):
+              super().__init__(name)
+              self.name = name
+
+
+      class Run(Run):
+          def __init__(self, run_id, journal, clock=None, signals=None, **options):
+              super().__init__(run_id, journal, **options)
+              self.clock = clock or (lambda: 0.0)
+              self.signals = signals or {}
+
+          def wait_for(self, name, timeout):
+              # The deadline is a clock read, so it is journalled once; every later drive compares against the same number.
+              deadline = self.step(name + ":deadline", lambda: self.clock() + timeout)
+
+              def resolve():
+                  if name in self.signals:
+                      return {"timed_out": False, "value": self.signals[name]}
+                  if self.clock() >= deadline:
+                      return {"timed_out": True, "value": None}
+                  raise Suspended(name)   # nothing is journalled, so the next drive asks again
+
+              return self._next(name, resolve)
+
+
+      def drive(workflow, run_id, journal, **options):
+          try:
+              return ("done", execute(workflow, run_id, journal, **options))
+          except Suspended as parked:
+              return ("waiting", parked.name)
+  - title: A token and cost budget
+    brief: |
+      run.model(name, model, prompt, max_tokens) is a journalled step around model.complete. With a Budget, cap max_tokens at max_output_tokens_per_step, and before a new call compute its worst case (the prompt's tokens plus the capped output, priced per million tokens); if the cost spent so far plus that worst case exceeds max_usd, raise BudgetExceeded and call nothing. Spent cost is rebuilt from the journalled usage on every drive, so a crash never refills the budget and replayed calls cost nothing new. drive now also returns ("stopped", reason). ScriptedModel is a deterministic stand-in: replies come from a script and a token is a word, so the tests can count calls and tokens without asserting any text.
+    starter: |
+      class ScriptedModel:
+          """A deterministic stand-in for a model API: replies come from a script, in order.
+          A token is a whitespace-separated word, so counts are exact and the same on every run."""
+
+          def __init__(self, replies):
+              self.replies = list(replies)
+              self.calls = []
+
+          def count_tokens(self, text):
+              return len(text.split())
+
+          def complete(self, prompt, max_tokens):
+              self.calls.append({"prompt": prompt, "max_tokens": max_tokens})
+              words = self.replies.pop(0).split()[:max_tokens]
+              return {"text": " ".join(words), "input_tokens": self.count_tokens(prompt), "output_tokens": len(words)}
+
+
+      class BudgetExceeded(Exception):
+          pass
+
+
+      class Budget:
+          def __init__(self, max_output_tokens_per_step, max_usd, usd_per_mtok_in, usd_per_mtok_out):
+              self.max_output_tokens_per_step = max_output_tokens_per_step
+              self.max_usd = max_usd
+              self.usd_per_mtok_in = usd_per_mtok_in
+              self.usd_per_mtok_out = usd_per_mtok_out
+
+          def cost(self, input_tokens, output_tokens):
+              return (input_tokens * self.usd_per_mtok_in + output_tokens * self.usd_per_mtok_out) / 1_000_000
+
+
+      class Run(Run):
+          def __init__(self, run_id, journal, budget=None, **options):
+              super().__init__(run_id, journal, **options)
+              raise NotImplementedError
+
+          def model(self, name, model, prompt, max_tokens):
+              """Call model.complete as a journalled step inside the budget; raise BudgetExceeded instead of overrunning it."""
+              raise NotImplementedError
+
+
+      def drive(workflow, run_id, journal, **options):
+          """Return ("done", result), ("waiting", signal_name) or ("stopped", reason)."""
+          raise NotImplementedError
+    tests: |
+      PROMPT = "context " * 1000   # 1,000 tokens for ScriptedModel
+      REPLY = "step " * 50         # 50 tokens
+
+      def agent_for(llm):
+          def agent(run):
+              for turn in range(10):
+                  reply = run.model(f"turn-{turn}", llm, PROMPT, max_tokens=4000)
+                  if reply["text"].startswith("DONE"):
+                      return turn
+              return "gave up"
+          return agent
+
+      # Illustrative prices for the test, not any provider's list price: $3 per million input tokens, $15 per million output.
+      budget = Budget(max_output_tokens_per_step=200, max_usd=0.015, usd_per_mtok_in=3.0, usd_per_mtok_out=15.0)
+
+      llm = ScriptedModel([REPLY] * 10)
+      status, reason = drive(agent_for(llm), "a1", Journal(), budget=budget)
+      assert status == "stopped", "the run stops on the budget instead of finishing the loop"
+      assert all(c["max_tokens"] == 200 for c in llm.calls), "each call is capped at the per-step output limit"
+      # Worst case per call: 1,000 x $3/M + 200 x $15/M = $0.006. Actual per call: 1,000 x $3/M + 50 x $15/M = $0.00375.
+      # After three calls $0.01125 is spent, and a fourth could reach $0.01725, over $0.015, so it is refused.
+      assert len(llm.calls) == 3, f"three calls fit under the worst-case check: {len(llm.calls)}"
+      spent = sum(budget.cost(1000, 50) for _ in llm.calls)
+      assert spent <= budget.max_usd
+
+      llm = ScriptedModel([REPLY] * 10)
+      journal = Journal()
+      state = {"die_after": 2}
+
+      def crashing_agent(run):
+          for turn in range(10):
+              run.model(f"turn-{turn}", llm, PROMPT, max_tokens=4000)
+              if turn + 1 == state["die_after"]:
+                  state["die_after"] = None
+                  raise Crash("killed after two calls")
+
+      try:
+          drive(crashing_agent, "a2", journal, budget=budget)
+      except Crash:
+          pass
+      assert drive(crashing_agent, "a2", journal, budget=budget)[0] == "stopped"
+      assert len(llm.calls) == 3, "a crash does not refill the budget: journalled calls still count"
+    hidden: |
+      _llm = ScriptedModel([REPLY] * 3 + ["DONE now"])
+      assert drive(agent_for(_llm), "h1", Journal()) == ("done", 3)
+      assert [c["max_tokens"] for c in _llm.calls] == [4000] * 4
+
+      _llm = ScriptedModel([REPLY] * 10)
+      _j = Journal()
+      assert drive(agent_for(_llm), "h2", _j, budget=budget)[0] == "stopped"
+      assert len(_j) == 3 and len(_llm.calls) == 3
+      assert drive(agent_for(_llm), "h2", _j, budget=budget)[0] == "stopped" and len(_llm.calls) == 3
+
+      _bigger = Budget(max_output_tokens_per_step=200, max_usd=0.02, usd_per_mtok_in=3.0, usd_per_mtok_out=15.0)
+      assert drive(agent_for(_llm), "h2", _j, budget=_bigger)[0] == "stopped" and len(_llm.calls) == 4
+
+      _tight = Budget(max_output_tokens_per_step=200, max_usd=0.005, usd_per_mtok_in=3.0, usd_per_mtok_out=15.0)
+      _llm = ScriptedModel([REPLY] * 10)
+      _j = Journal()
+      assert drive(agent_for(_llm), "h3", _j, budget=_tight)[0] == "stopped" and _llm.calls == [] and len(_j) == 0
+
+      _cheap = Budget(max_output_tokens_per_step=10, max_usd=1.0, usd_per_mtok_in=3.0, usd_per_mtok_out=15.0)
+      _llm = ScriptedModel([REPLY] * 10)
+      _j = Journal()
+      drive(agent_for(_llm), "h4", _j, budget=_cheap)
+      assert all(_j.lookup(n)[1]["output_tokens"] <= 10 for n in _j.names())
+    solution: |
+      class ScriptedModel:
+          """A deterministic stand-in for a model API: replies come from a script, in order.
+          A token is a whitespace-separated word, so counts are exact and the same on every run."""
+
+          def __init__(self, replies):
+              self.replies = list(replies)
+              self.calls = []
+
+          def count_tokens(self, text):
+              return len(text.split())
+
+          def complete(self, prompt, max_tokens):
+              self.calls.append({"prompt": prompt, "max_tokens": max_tokens})
+              words = self.replies.pop(0).split()[:max_tokens]
+              return {"text": " ".join(words), "input_tokens": self.count_tokens(prompt), "output_tokens": len(words)}
+
+
+      class BudgetExceeded(Exception):
+          pass
+
+
+      class Budget:
+          def __init__(self, max_output_tokens_per_step, max_usd, usd_per_mtok_in, usd_per_mtok_out):
+              self.max_output_tokens_per_step = max_output_tokens_per_step
+              self.max_usd = max_usd
+              self.usd_per_mtok_in = usd_per_mtok_in
+              self.usd_per_mtok_out = usd_per_mtok_out
+
+          def cost(self, input_tokens, output_tokens):
+              return (input_tokens * self.usd_per_mtok_in + output_tokens * self.usd_per_mtok_out) / 1_000_000
+
+
+      class Run(Run):
+          def __init__(self, run_id, journal, budget=None, **options):
+              super().__init__(run_id, journal, **options)
+              self.budget = budget
+              self.spent = 0.0   # rebuilt from journalled usage on every drive, so a crash never refills the budget
+
+          def model(self, name, model, prompt, max_tokens):
+              b = self.budget
+              if b is not None:
+                  max_tokens = min(max_tokens, b.max_output_tokens_per_step)
+              replaying = self.position < len(self.recorded)
+              if b is not None and not replaying:
+                  worst = b.cost(model.count_tokens(prompt), max_tokens)
+                  if self.spent + worst > b.max_usd + 1e-12:
+                      raise BudgetExceeded(
+                          f"{name}: worst case ${worst:.6f} on top of ${self.spent:.6f} spent exceeds ${b.max_usd:.6f}")
+              reply = self._next(name, lambda: model.complete(prompt, max_tokens))
+              if b is not None:
+                  self.spent += b.cost(reply["input_tokens"], reply["output_tokens"])
+              return reply
+
+
+      def drive(workflow, run_id, journal, **options):
+          try:
+              return ("done", execute(workflow, run_id, journal, **options))
+          except Suspended as parked:
+              return ("waiting", parked.name)
+          except BudgetExceeded as stop:
+              return ("stopped", str(stop))
+  - title: Crash at every boundary
+    brief: |
+      The last step is the test tool that would have caught the bugs above. A boundary is the instant just before or just after a journal write, or just before or just after the provider applies a charge. crash_sweep runs the workflow once to count the boundaries, then for each boundary k starts again with a fresh journal and provider, raises Crash at boundary k, and re-drives with the same journal and provider until the run stops crashing. It returns one (k, status, payments) entry per boundary, so a test can assert that every crash point ends with exactly one charge per charge step. Run it against a workflow with a per-attempt key or a charge outside any step and it finds the duplicate.
+    starter: |
+      class Boundaries:
+          """Counts boundaries and raises Crash at boundary number crash_at (1-based); None never crashes."""
+
+          def __init__(self, crash_at=None):
+              raise NotImplementedError
+
+          def hit(self):
+              raise NotImplementedError
+
+
+      class CrashingJournal(Journal):
+          """A Journal with a boundary just before and just after every write."""
+
+          def __init__(self, boundaries):
+              raise NotImplementedError
+
+
+      class CrashingPayments(FakePayments):
+          """FakePayments with a boundary just before the call and just after the provider applies it."""
+
+          def __init__(self, boundaries, **kwargs):
+              raise NotImplementedError
+
+
+      def crash_sweep(workflow_for, run_id="run-1", max_drives=20, **options):
+          """workflow_for(payments) returns a workflow. Count the boundaries of a clean run; then, for every boundary k,
+          start again with a fresh journal and provider, crash at k, and re-drive until the run is no longer crashing.
+          Return [(k, status, payments), ...], one entry per boundary."""
+          raise NotImplementedError
+    tests: |
+      def checkout_for(pay):
+          def checkout(run):
+              total = run.step("quote", lambda: 1200)
+              run.effect("charge-card", pay.charge, total, retry=RetryPolicy(max_attempts=3))
+              run.effect("charge-fee", pay.charge, 30, retry=RetryPolicy(max_attempts=3))
+              return "ok"
+          return checkout
+
+      results = crash_sweep(checkout_for)
+      # A clean run has 3 journal writes (2 boundaries each) and 2 provider calls (2 boundaries each): 10 boundaries.
+      assert [k for k, _, _ in results] == list(range(1, 11)), f"one entry per boundary: {[k for k, _, _ in results]}"
+      assert all(status == ("done", "ok") for _, status, _ in results)
+      assert all(pay.count() == 2 for _, _, pay in results), "every crash point ends with exactly one charge per charge step"
+
+      attempt = {"n": 0}
+
+      def naive_for(pay):
+          def naive(run):
+              total = run.step("quote", lambda: 1200)
+              attempt["n"] += 1
+              key = f"{run.run_id}-{attempt['n']}"   # a new key on every drive
+              run.step("charge-card", lambda: pay.charge(total, idempotency_key=key))
+              return "ok"
+          return naive
+
+      doubled = [k for k, _, pay in crash_sweep(naive_for) if pay.count() != 1]
+      assert doubled, "the sweep finds the crash point where a per-attempt key charges twice"
+    hidden: |
+      def _outside_for(pay):
+          def _outside(run):
+              run.step("quote", lambda: 1)
+              pay.charge(5, idempotency_key=f"x-{len(pay.keys_seen)}")
+              run.step("after", lambda: 2)
+              return "ok"
+          return _outside
+
+      assert any(p.count() > 1 for _, _, p in crash_sweep(_outside_for))
+
+      _a = [(k, s, p.count()) for k, s, p in crash_sweep(checkout_for, run_id="same")]
+      _b = [(k, s, p.count()) for k, s, p in crash_sweep(checkout_for, run_id="same")]
+      assert _a == _b and len(_a) == 10
+
+      def _approval_for(pay):
+          def _approval(run):
+              run.step("assess", lambda: 1)
+              answer = run.wait_for("ok", 60)
+              if answer["timed_out"]:
+                  return "escalated"
+              run.effect("pay", pay.charge, 99)
+              return "paid"
+          return _approval
+
+      _r = crash_sweep(_approval_for, signals={"ok": True})
+      assert len(_r) == 10 and all(s == ("done", "paid") and p.count() == 1 for _, s, p in _r)
+
+      _b0 = Boundaries()
+      for _ in range(5):
+          _b0.hit()
+      assert _b0.count == 5
+
+      _hits = Boundaries(crash_at=2)
+      _hits.hit()
+      try:
+          _hits.hit()
+          _crashed = False
+      except Crash:
+          _crashed = True
+      _hits.hit()
+      assert _crashed and _hits.count == 3
+    solution: |
+      class Boundaries:
+          """Counts boundaries and raises Crash at boundary number crash_at (1-based); None never crashes."""
+
+          def __init__(self, crash_at=None):
+              self.count = 0
+              self.crash_at = crash_at
+
+          def hit(self):
+              self.count += 1
+              if self.count == self.crash_at:
+                  raise Crash(f"injected at boundary {self.count}")
+
+
+      class CrashingJournal(Journal):
+          """A Journal with a boundary just before and just after every write."""
+
+          def __init__(self, boundaries):
+              super().__init__()
+              self.boundaries = boundaries
+
+          def record(self, name, result):
+              self.boundaries.hit()
+              value = super().record(name, result)
+              self.boundaries.hit()
+              return value
+
+
+      class CrashingPayments(FakePayments):
+          """FakePayments with a boundary just before the call and just after the provider applies it."""
+
+          def __init__(self, boundaries, **kwargs):
+              super().__init__(**kwargs)
+              self.boundaries = boundaries
+
+          def charge(self, amount, idempotency_key):
+              self.boundaries.hit()
+              out = super().charge(amount, idempotency_key)
+              self.boundaries.hit()
+              return out
+
+
+      def crash_sweep(workflow_for, run_id="run-1", max_drives=20, **options):
+          clean = Boundaries()
+          drive(workflow_for(CrashingPayments(clean)), run_id, CrashingJournal(clean), **options)
+          results = []
+          for k in range(1, clean.count + 1):
+              b = Boundaries(crash_at=k)
+              pay, journal = CrashingPayments(b), CrashingJournal(b)
+              for _ in range(max_drives):
+                  try:
+                      status = drive(workflow_for(pay), run_id, journal, **options)
+                      break
+                  except Crash:
+                      continue   # the process restarts; only the journal and the provider's state survive
+              else:
+                  raise RuntimeError(f"boundary {k}: still crashing after {max_drives} drives")
+              results.append((k, status, pay))
+          return results
+---
+
+This lab builds the engine behind the durable-execution lessons as one program. Each step adds to the same file and runs its own tests against everything you have written so far, so step 8 drives the journal from step 1, the retries from step 4 and the keys from step 5.
+
+The design is the journal-and-replay model that Temporal, Inngest and DBOS share in different forms: the workflow function runs from the top on every resume, steps that finished return their saved results, and anything that touches the outside world needs a key, because a step can run more than once. Steps 1 to 3 build that core and the check that rejects code whose step sequence no longer matches its history. Steps 4 to 7 add what a model-driven workflow needs: retries that tell transient errors from permanent ones, idempotent payments, a human approval with a timeout, and a spend limit that a crash cannot reset.
+
+Time, randomness and the model are injected or scripted, so every test is deterministic and asserts behaviour (calls made, keys sent, budgets respected), never model text. Step 8 turns the tests on the engine itself: it crashes a run at every boundary and counts the side effects.
+
+The engine keeps the journal in memory. A real one writes each entry durably before returning, which is where most of its cost goes; the lab skips that so the interesting failures stay visible.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

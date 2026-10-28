@@ -1,0 +1,163 @@
+---
+title: SWE-agent and the agent-computer interface
+track: harness
+module: harness-anatomy
+order: 4
+kind: paper
+level: senior
+minutes: 13
+summary: SWE-agent showed with one model held fixed that tool shape (capped search, a 100-line viewer, a linter-guarded edit, collapsed history) moved SWE-bench Lite results by several points, and its ablation table is the template for testing any harness change.
+prerequisites: [harness/harness-anatomy/model-plus-harness]
+updated: 2026-10-28
+sources:
+  - title: "Yang et al., SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering (arXiv 2405.15793)"
+    url: https://arxiv.org/abs/2405.15793
+    note: abstract (12.5% pass@1 on SWE-bench, far above the previous non-interactive state of the art); Table 1 gives 12.47% for GPT-4 Turbo on the full test set against 3.79% for the best RAG baseline (Claude 3 Opus)
+  - title: SWE-agent paper, HTML version 3
+    url: https://arxiv.org/html/2405.15793v3
+    note: search capped at 50 results; 100-line viewer; linter-guarded edit; observations before the last 5 collapsed; $4 per-instance budget; Table 1 (Lite 18.00%, shell-only 11.00%, RAG 2.67%); Table 3 ablations; six-run pass@k (Table 10); failure-mode shares
+  - title: mini-swe-agent README
+    url: https://github.com/SWE-agent/mini-swe-agent
+    note: the same team's 2025 to 2026 position that much of SWE-agent's tool interface is no longer needed as models improved. Checked 2026-10-28.
+  - title: Claude Code docs, Connect Claude Code to tools via MCP
+    url: https://code.claude.com/docs/en/mcp
+    note: a warning when MCP tool output exceeds 10,000 tokens, a 25,000-token default limit, results over 50,000 characters saved to a file. Checked 2026-10-28.
+  - title: "Xia et al., Agentless: Demystifying LLM-based Software Engineering Agents (arXiv 2407.01489)"
+    url: https://arxiv.org/abs/2407.01489
+    note: manual classification of problematic SWE-bench Lite issues; the filtered SWE-bench Lite-S subset of 249 problems
+  - title: OpenAI, Harness engineering, leveraging Codex in an agent-first world (2026-02-11)
+    url: https://openai.com/index/harness-engineering/
+    note: custom lint error messages written to carry remediation instructions into the agent's context
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The problem the paper took on
+
+In early 2024 the baseline for an LLM fixing a GitHub issue was either retrieval plus one-shot patch generation, or an agent dropped into a Linux shell. The SWE-agent paper (arXiv, May 2024, from the team behind SWE-bench) argued that the shell is a human interface and that a language model is a different kind of user, with different failure modes. It named the layer between model and computer the agent-computer interface (ACI) and treated it as a design surface: same model, different commands, different results.
+
+The failure modes it documents are concrete. Chains of `cd`, `ls` and `cat` waste turns. `grep` and `find` on a general term flood the context with irrelevant lines and vary in output format with their flags. `sed` edits are silent: the model gets no confirmation of what the file now looks like, and a multi-line edit through redirection rewrites the whole file. The most common spiral was an edit that introduced a syntax error followed by repeated attempts to edit the same region.
+
+## The mechanism, in engineering terms
+
+SWE-agent replaces the raw shell with a small command set that behaves like a well-designed CLI for a non-human caller.
+
+Search. `find_file`, `search_file` and `search_dir` return at most 50 results. Past that, the command returns no results and tells the model to write a more specific query, a hard page-size limit with an error instead of a truncated page.
+
+Viewing. A file viewer shows at most 100 lines at a time with line numbers, the file's total length and how many lines sit above and below the window; `scroll_up`, `scroll_down` and `goto` move it. The model never has to recompute `sed -n` ranges.
+
+Editing. One `edit` command replaces a line range and shows the updated window. A linter runs on the result, and the edit only applies if it introduces no major errors; otherwise the model gets the error and a snippet of the file before and after.
+
+History. Observations older than the last five are collapsed to one line each, so the structure of the trajectory stays visible while old output stops consuming context. A command that prints nothing returns an explicit "ran successfully and did not produce any output" message.
+
+Budget. Each task instance had a $4 cost cap; on hitting it, whatever edits existed were submitted. The paper notes the cap corresponds to roughly 30 to 40 turns.
+
+The three tools that matter most fit in a few dozen lines:
+
+```python
+from pathlib import Path
+
+MAX_RESULTS, WINDOW = 50, 100
+
+
+def search_dir(term, root="."):
+    counts = {}
+    for path in Path(root).rglob("*.py"):
+        n = path.read_text(errors="ignore").count(term)
+        if n:
+            counts[path] = n
+    if sum(counts.values()) > MAX_RESULTS:
+        return f"More than {MAX_RESULTS} matches for {term!r}. Use a more specific term."
+    return "\n".join(f"{p} ({n} matches)" for p, n in counts.items()) or f"No matches for {term!r}."
+
+
+def view(path, first_line=1):
+    lines = Path(path).read_text().splitlines()
+    start = max(0, first_line - 1)
+    shown = "\n".join(f"{start + i + 1}:{text}" for i, text in enumerate(lines[start:start + WINDOW]))
+    below = max(0, len(lines) - start - WINDOW)
+    return f"[File: {path} ({len(lines)} lines total)]\n({start} more lines above)\n{shown}\n({below} more lines below)"
+
+
+def edit(path, start, end, replacement):
+    lines = Path(path).read_text().splitlines(keepends=True)
+    candidate = "".join(lines[:start - 1]) + replacement + "".join(lines[end:])
+    try:
+        compile(candidate, str(path), "exec")   # the paper used a linter; compile() is the minimum
+    except SyntaxError as err:
+        return f"Edit rejected, file unchanged. Line {err.lineno}: {err.msg}"
+    Path(path).write_text(candidate)
+    return view(path, max(1, start - 5))
+```
+
+An edit that opens a parenthesis and never closes it comes back as `Edit rejected, file unchanged. Line 2: '(' was never closed`, and the file on disk is untouched. The guard turns a cascading failure into one wasted turn.
+
+## The numbers
+
+The paper reports results with GPT-4 Turbo (`gpt-4-1106-preview`) and Claude 3 Opus. On the full SWE-bench test set of 2,294 tasks, SWE-agent with GPT-4 Turbo resolved 12.47% (286 tasks), against 3.79% for the best non-interactive retrieval baseline (Claude 3 Opus with RAG). On SWE-bench Lite (300 tasks) it resolved 18.00% (54 tasks); the shell-only agent with the same model resolved 11.00%, and GPT-4 Turbo with retrieval 2.67%. Claude 3 Opus in SWE-agent resolved 13.00% of Lite. Average cost per resolved Lite instance was $1.67 with GPT-4 Turbo.
+
+The ablations hold the model fixed and change one part of the interface on Lite:
+
+| Change from the full interface (18.0%) | Resolved | Change |
+|---|---|---|
+| Edit without the linter guard | 15.0% | 3.0 points lower |
+| No edit command (sed and redirection only) | 10.3% | 7.7 points lower |
+| Iterative search (results one at a time) | 12.0% | 6.0 points lower |
+| No search commands at all | 15.7% | 2.3 points lower |
+| 30-line viewer window | 14.3% | 3.7 points lower |
+| Whole-file viewer | 12.7% | 5.3 points lower |
+| Full history instead of last five observations | 15.0% | 3.0 points lower |
+| No demonstration trajectory in the prompt | 16.3% | 1.7 points lower |
+
+Two rows are counter-intuitive and carry the paper's argument. Iterative search, modelled on how an IDE steps through matches, did worse than having no search tool: the model stepped through every match until it ran out of budget or context. And both a smaller and a larger viewer window hurt, which says the right amount of context per observation is a tuning parameter, not "as much as fits".
+
+Before reading any of those deltas as real, check the noise. The paper ran its main configuration six times on Lite.
+
+<Predict id="hrn-sweagent-passk" question="Six runs of the same configuration on the 300 Lite tasks averaged 17.94% resolved, and pass@6 (solved in at least one of the six runs) was 32.67%. How many distinct tasks were solved by at least one run?" answer={98} tolerance={1} unit="tasks">
+<p>300 × 0.3267 = <b>98 tasks</b>, against about 54 in any single run. Individual runs ranged from 17.33% to 18.67%, a spread of 4 tasks. The aggregate is stable, but which tasks get solved changes a lot from run to run. The ablation deltas of 1.7 to 7.7 points are 5 to 23 tasks; the smallest of them is close to the run-to-run spread, and each ablation was run once.</p>
+</Predict>
+
+The failure analysis points the same way. Of unresolved GPT-4 Turbo trajectories, 52.0% were incorrect or overly specific implementations and 23.4% were cascading failed edits. The interface can remove the second category; the first is the model's.
+
+## What changed in practice
+
+Every production harness in this track carries some SWE-agent descendant. Editing moved from shell redirection to dedicated edit tools that return the result. Large outputs are capped before they reach context: Claude Code warns when an MCP tool returns more than 10,000 tokens, limits output to 25,000 tokens by default and saves text results over 50,000 characters to a file. Old observations are summarised by compaction instead of collapsed to a line. And the linter guard became a general pattern of mechanical checks whose messages are written for the agent: OpenAI's harness team writes its custom lint errors to carry the fix.
+
+The same team that wrote SWE-agent later argued the opposite direction for capable models. The mini-swe-agent README says that SWE-agent emphasised tools and special interfaces in 2024, and that a year later much of it is not needed to build a useful agent; mini-swe-agent uses bash and nothing else. Both positions can hold at once. Interface design mattered a great deal for GPT-4 Turbo, and how much of it still matters for a 2026 model is an empirical question you can answer with the paper's own method.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your team wants to replace the agent's custom search and edit tools with plain bash to cut maintenance, before a model upgrade lands next month. You have budget for about 30 benchmark runs on your internal task set. How do you decide, and what do you report?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Treat it as an ablation with the model fixed, twice: once on the current model and once on the new one, because a tool that mattered for the old model may not matter for the new. Spend the runs on repeated trials of four cells (current tools and bash-only, on each model), compare against the run-to-run spread, and report per-category results, not one aggregate. Remove the custom tools only on the new model and only if the bash-only cell is within the spread and cheaper per resolved task.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Thirty runs across four cells gives about seven per cell. That is enough to see a difference larger than the spread SWE-agent measured, which was a few tasks out of 300, and not enough for a small one. Say so up front, and decide the threshold before the runs.</p>
+<p>Instrument the trajectories, not only the outcome: turns per task, tokens per task, edit retries on the same region, and how often a search returns more than the cap. SWE-agent's failure breakdown separates interface failures (cascading edits) from model failures (wrong fixes); the same split tells you whether removing a tool shifted failures between categories.</p>
+<p>Cost per resolved task is the second number. The paper's own iterative-search result shows a tool can cost more than it saves by burning budget. Bash-only might resolve the same tasks with fewer tokens, or more.</p>
+<p>What you give up: with the custom edit tool removed, edits lose their syntax guard, so keep a mechanical check somewhere, as a post-edit hook or a linter the agent runs, and say which.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Bash-only is two points lower on the new model but halves maintenance and runs anywhere bash exists. Do you ship it, and what do you put in the risk note?</li>
+<li>Your seven runs per cell overlap heavily. A senior engineer wants to ship on the trend; another wants more runs. How do you decide without deciding by rank?</li>
+<li>What production signal, after removing the custom tools, would make you put the edit guard back?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The numbers are from 2024 models on SWE-bench Lite, a 300-task subset of real Python repositories, with pass@1 from single runs except the main configuration. They describe interface sensitivity for that model generation. The direction of each ablation is the durable part; the magnitudes are not transferable to current models.
+
+The benchmark is also a moving object. The Agentless paper later found problematic issues in SWE-bench Lite and built a filtered 249-task subset, and resolution rates on any public benchmark mix model capability, harness design and possible exposure of the repositories in training data.
+
+Finally, an ACI optimised for one model can become a constraint for a stronger one. A 50-result search cap and a 100-line window are small for models with far larger context windows and better long-context use, and a fixed command vocabulary can block approaches the model would otherwise find. The lesson that survives is the method: hold the model fixed, change one interface element, run more than once.
+
+<SelfRate id="lesson:harness/harness-anatomy/swe-agent" />

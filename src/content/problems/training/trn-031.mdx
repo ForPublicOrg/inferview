@@ -1,0 +1,89 @@
+---
+id: trn-031
+title: Restart and quarantine for a 2,048-GPU run
+subtitle: spares, shrinking, and a batch size research will not change
+track: training
+module: reliability
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 45
+core: false
+tags: [elastic-training, reliability, checkpointing, bad-nodes, design]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: TorchTitan (arXiv 2410.06511), sections 2 and 2.3
+    url: https://arxiv.org/abs/2410.06511
+    note: "Elastic scaling through composable parallelism; DCP with DTensor matches stored shards to the current parallelism at load; asynchronous DCP; flight recorder for stuck or crashed jobs. The paper reports. Checked 2026-10-28."
+  - title: PyTorch 2.14 docs, Distributed Checkpoint
+    url: https://docs.pytorch.org/docs/2.14/distributed.checkpoint.html
+    note: "Load-time resharding lets a checkpoint saved in one topology load into another; every rank must request the same keys or the load can hang. Checked 2026-10-28."
+  - title: The Llama 3 Herd of Models (Meta, arXiv 2407.21783), section 3.3.4
+    url: https://arxiv.org/html/2407.21783
+    note: "419 unexpected interruptions in 54 days on up to 16K H100 GPUs; about 78% attributed to confirmed or suspected hardware; three significant manual interventions; flight recorder dumps on watchdog timeout. The paper reports. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Design how our next run restarts after a failure and what happens to the node that caused it. Hardware will fail; I want the run to keep going without someone awake."
+</Callout>
+
+The run (scenario):
+
+- 2,048 H100s as 256 nodes of eight, plus 4 spare nodes in the same reservation. TP 8 inside each node, FSDP across the 256 nodes.
+- A global batch of 2,048 sequences, 8 per data-parallel rank. The research lead will not change the global batch: their ablations were run at exactly this size.
+- The cluster scheduler is the company's existing one and cannot be modified; you can submit, cancel and resubmit jobs with an explicit node list, and you can label nodes.
+- Your team is three engineers with six weeks before launch. Repairs by the hardware vendor take about three days per node.
+- Checkpoints use PyTorch Distributed Checkpoint with asynchronous saves.
+
+Design the restart path and the quarantine policy. Say what you give up, and write the rollout plan with the triggers that would make you change it.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how many unexpected failures a day a job of this size should expect, and how many nodes are in repair at any moment as a result.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask the research lead whether "the same global batch" means the same number of sequences or the same number of tokens per optimizer step, and how the loss is normalized.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask the operations team what share of past failures named a node and what share were timeouts with no clear culprit.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Hot spares first, elastic shrink as the fallback. At the Llama 3 per-GPU rate this run sees about one unexpected failure a day, and with three-day repairs about three nodes are out at any time, so four spares cover the average and not a storm. A failure that names a node swaps in a spare at the same layout, so the batch is unchanged. When spares run out, the job restarts on 255 nodes from a resharded checkpoint with the global batch held exactly by uneven per-rank batches and token-count loss normalization. Nodes go to quarantine, return only after a burn-in and a pair test against a known-good node, and go to the vendor after a second strike.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>Sizing.</b> 419 unexpected interruptions in 54 days on up to 16,384 GPUs is 419 / 54 / 8 = 0.97 a day at 2,048 GPUs, assuming the same per-GPU rate. If each failure sends one node to a three-day repair, the average number in repair is 0.97 × 3 = 2.9 nodes. Four spares cover that with one node of headroom; a bad batch of hardware that fails three nodes in a day does not fit.</p>
+<p><b>The decision: spares or shrink.</b> Two defensible designs. <i>Hot spares</i> keep the layout fixed: same 256 data-parallel ranks, same per-rank batch, bitwise-comparable restores, and no new code path in the training loop. The cost is 32 idle GPUs, 32 / 2,080 = 1.5% of the reservation, and a hard stop when spares run out. <i>Elastic shrink</i> restarts on whatever is healthy, loading the checkpoint into the smaller layout through DCP's load-time resharding. It wastes no GPUs, but on 255 ranks the global batch of 2,048 does not divide evenly (2,048 / 255 = 8.03), so either eight ranks take 9 sequences and the loss is normalized by the global token count, or the global batch changes, which the research lead has ruled out. That is new code in the loss path, a new restore path to test, and throughput that drops with each lost node. With three engineers and six weeks, I build spares as the main path and the shrink path as a tested fallback, not the other way round.</p>
+<p><b>Restart path, on the existing scheduler.</b> A supervisor process outside the job watches it. On exit or watchdog timeout it collects the flight recorder dumps, attributes the failure if it can (a dead host, a GPU or memory error, or one rank that never entered the stuck collective), labels that node quarantined, and resubmits on the 256 healthy nodes with the most recent checkpoint whose upload completed. Unattributed failures restart on the same nodes once; a second unattributed failure within six hours triggers a group search over the suspect set using spares as known-good partners, as in the bad-nodes lesson. Every restore asserts that the optimizer state is present for every trainable parameter, and the supervisor refuses to resume if it is not.</p>
+<p><b>Quarantine policy.</b> A quarantined node returns only after a single-node burn-in (GPU and memory stress) and a two-node collective test paired with a known-good node, passed twice. A node quarantined twice in seven days goes to the vendor and does not come back without a part replacement. Nodes are never returned to the job directly by the scheduler.</p>
+<p><b>What I give up.</b> 1.5% of the reservation in idle spares, slower adaptation to storms than a fully elastic design, and more than three-day repairs mean a long storm will run on the shrink path, which has had less production time than the main path.</p>
+<p><b>Failure mode of this design.</b> Correlated failures: a firmware or cable fault that takes out a rack fails several nodes at once, exhausts the spares in one event, and pushes the job onto the less-tested shrink path at the worst moment. The mitigation is to rehearse the shrink path in week five on a real reservation, and to spread spares across racks so one rack failure cannot take the spares with it.</p>
+<p><b>Rollout plan.</b> Week 1 to 2: supervisor, attribution and quarantine labels, tested by killing processes on a 16-node job. Week 3 to 4: restore assertions and the fork test in CI. Week 5: shrink path, rehearsed by removing a node from a 64-node job and comparing loss against the unshrunk run over 500 steps. Week 6: game day on the full reservation. Triggers to change course: more than two shrink events in the first two weeks (ask for more spares or a shorter repair contract); any restore that fails the optimizer-state assertion (stop and fix before resuming); unattributed failures above half of all failures (invest in attribution before anything else).</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Finance says 1.5% idle is too much and wants the spares cut to one node. You think that turns every second failure into a shrink. Which risk do you accept in writing, and who signs it?</em></li>
+<li><em>What would you need to see after a month to drop the spares and make elastic shrink the main path?</em> Several shrink events whose loss curves match the unshrunk trajectory within the run's step-to-step noise, and no restore failures on the shrink path.</li>
+<li><em>Two senior engineers disagree: one wants nodes back in the job after one clean burn-in, the other after two. How do you decide without deciding by rank?</em> Use the quarantine log: the rate at which nodes returned after one burn-in fail again within a week, against the capacity cost of a second burn-in.</li>
+</ul>
+</Fragment>
+</Depth>
+
+The design in one artefact, as the decision memo would state it: main path hot spares, fallback elastic shrink with exact global batch, quarantine on attribution with a two-strike vendor rule, every restore asserted, and three named triggers that reopen the decision.
+
+## Follow-ups
+
+- *The vendor's repair time doubles to six days. Recompute the expected number of nodes in repair and say what changes.*
+- *Research asks for a mid-run change from 2,048 to 4,096 sequences per batch. Which parts of your restart design depend on the batch size?*
+- *The scheduler team offers to add native node replacement next quarter. What would you remove from your supervisor, and what would you keep?*
+
+## Common mistakes
+
+- Designing a fully elastic system without asking whether the global batch may change.
+- Returning failed nodes to the job without a test, so one bad host causes many interruptions.
+- Sizing spares from the average failure rate and ignoring correlated failures.
+- Treating every watchdog timeout as attributable to the rank that reported it.
+- Leaving restore verification to the first real failure.

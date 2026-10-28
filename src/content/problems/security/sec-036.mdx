@@ -1,0 +1,413 @@
+---
+id: sec-036
+title: An import allowlist for pickled model files
+subtitle: read the opcodes, never run them
+track: security
+module: supply-chain
+type: code
+difficulty: hard
+seniority: [senior, staff]
+minutes: 45
+core: false
+tags: [pickle, pickletools, model-artefacts, scanners, allowlists]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Hugging Face Hub docs, Pickle scanning (checked 2026-10-28)
+    url: https://huggingface.co/docs/hub/security-pickle
+    note: "the Hub's pickle import scan extracts the imports in every pickled file with pickletools.genops, without executing code; the threatening opcodes are GLOBAL, STACK_GLOBAL and REDUCE; the scan is not 100% foolproof and its safe and unsafe import lists are maintained best-effort; the page proposes a .gitignore-like allowlist of imports with entries such as numpy.*"
+  - title: ReversingLabs, Malicious ML models discovered on Hugging Face platform (2025-02-06)
+    url: https://www.reversinglabs.com/blog/rl-identifies-malware-ml-model-hosted-on-hugging-face
+    note: "nullifAI: two models compressed with 7z rather than zip; the payload sits at the beginning of the pickle stream and the stream breaks shortly after it runs; Picklescan, a denylist scanner, reported an error on RL's broken test file but not the dangerous functions before it; Hugging Face changed Picklescan to flag threats in broken files"
+  - title: Python docs, pickle, Restricting Globals (checked 2026-10-28)
+    url: https://docs.python.org/3/library/pickle.html
+    note: "Unpickler.find_class is called whenever a global is requested; never unpickle data that could have come from an untrusted source"
+  - title: Python docs, pickletools (checked 2026-10-28)
+    url: https://docs.python.org/3/library/pickletools.html
+    note: "genops yields (opcode, arg, pos) triples; the pickle can be bytes or a file-like object"
+  - title: CPython 3.12 Lib/pickle.py (checked 2026-10-28 against Python 3.12.6)
+    url: https://github.com/python/cpython/blob/3.12/Lib/pickle.py
+    note: "find_class resolves a dotted name by walking attributes from the module when the stream's protocol is 4 or later; STACK_GLOBAL requires two str items; INST calls find_class"
+  - title: Serialization semantics, PyTorch 2.14 documentation (checked 2026-10-28)
+    url: https://docs.pytorch.org/docs/2.14/notes/serialization.html
+    note: "torch.save writes an uncompressed ZIP64 archive; data.pkl holds the pickled object and data/ the storages"
+code:
+  starter: |
+    import io
+    import pickletools
+    import zipfile
+
+
+    def scan(data, allowed):
+        """Decide whether a model file may be loaded, by reading its pickle opcodes without unpickling.
+
+        data:    the file's bytes. Either raw pickle data, possibly several pickles back to back, or a zip
+                 archive in the layout torch.save writes, whose members ending in ".pkl" are pickles.
+        allowed: a set of (module, name) pairs the loader may import, such as ("collections", "OrderedDict").
+
+        Return {"ok": bool, "imports": [...], "errors": [...]}:
+          imports: (where, offset, module, name) for every import the unpickler would make, in file order;
+                   where is "" for raw data or the zip member's name, offset is the opcode's position in it.
+          errors:  (where, offset, message) for anything that stops the file from being read with certainty.
+          ok:      True only when there are no errors and every import is in allowed.
+        """
+        raise NotImplementedError
+  tests: |
+    import pickle
+    from collections import OrderedDict
+
+    ALLOW = {("collections", "OrderedDict"), ("torch._utils", "_rebuild_tensor_v2")}
+
+    benign = pickle.dumps(OrderedDict(w=[0.5, 0.25], b=[0.0]), protocol=4)
+    r = scan(benign, ALLOW)
+    assert r["ok"], r
+    assert [(m, n) for _, _, m, n in r["imports"]] == [("collections", "OrderedDict")], r["imports"]
+
+    classic = b"cos\nsystem\n(S'id'\ntR."
+    r = scan(classic, ALLOW)
+    assert not r["ok"], "os.system is not on the allowlist"
+    assert r["imports"] == [("", 0, "os", "system")], r["imports"]
+
+    stacked = b"\x80\x04\x8c\x02os\x8c\x06system\x93\x8c\x02id\x85R."
+    r = scan(stacked, ALLOW)
+    assert not r["ok"]
+    assert [(m, n) for _, _, m, n in r["imports"]] == [("os", "system")], "STACK_GLOBAL takes its names from the stack"
+    assert all(stacked[off:off + 1] == b"\x93" for _, off, _, _ in r["imports"]), "the offset points at the importing opcode"
+  hidden: |
+    import io as _io
+    import pickle as _pickle
+    import random as _random
+    import sys as _sys
+    import time as _time
+    import types as _types
+    import zipfile as _zipfile
+    from collections import OrderedDict as _OD
+
+    _ALLOW = {("collections", "OrderedDict"), ("vendorlib.tensors", "rebuild")}
+
+
+    def _stub():
+        pkg = _sys.modules.get("vendorlib") or _types.ModuleType("vendorlib")
+        mod = _sys.modules.get("vendorlib.tensors") or _types.ModuleType("vendorlib.tensors")
+
+        def rebuild(key, shape):
+            return ("tensor", key, shape)
+        rebuild.__module__, rebuild.__qualname__ = "vendorlib.tensors", "rebuild"
+        mod.rebuild = rebuild
+
+        class Layer:
+            pass
+        Layer.__module__, Layer.__qualname__ = "vendorlib.tensors", "Layer"
+        mod.Layer = Layer
+        pkg.tensors = mod
+        _sys.modules["vendorlib"], _sys.modules["vendorlib.tensors"] = pkg, mod
+        return mod
+
+
+    _MOD = _stub()
+
+
+    class _T:
+        def __init__(self, key, shape):
+            self.key, self.shape = key, shape
+
+        def __reduce__(self):
+            return (_MOD.rebuild, (self.key, self.shape))
+
+
+    def _model(n, protocol):
+        sd = _OD(("layers.%d.weight" % i, _T("storage%d" % i, (64, 64))) for i in range(n))
+        return _pickle.dumps(sd, protocol=protocol)
+
+
+    def _pairs(r):
+        return [(m, n) for _, _, m, n in r["imports"]]
+
+
+    _payload = b"\x80\x02cos\nsystem\nq\x00X\x02\x00\x00\x00idq\x01\x85q\x02Rq\x03"
+    _broken = _payload + b"X\xff\xff\x00\x00."
+    _r = scan(_broken, _ALLOW)
+    assert not _r["ok"] and _r["errors"] and ("os", "system") in _pairs(_r)
+    assert not scan(_payload + b"\xff.", _ALLOW)["ok"]
+    assert not scan(_payload, _ALLOW)["ok"]
+    assert not scan(_model(5, 4)[:-1], _ALLOW)["ok"]
+
+    _far = b"\x80\x04\x8c\x02os\x94\x8c\x06system\x9400(" + b"K\x01" * 5000 + b"1" + b"h\x00h\x01\x93\x8c\x02id\x85R."
+    _r = scan(_far, _ALLOW)
+    assert not _r["ok"] and ("os", "system") in _pairs(_r)
+
+    assert not scan(b"\x80\x04\x8c\x0bcollections\x8c\x0bOrderedDict\x93)R2\x93)R.", _ALLOW)["ok"]
+
+    _r = scan(b"(S'id'\nios\nsystem\n.", _ALLOW)
+    assert not _r["ok"] and _pairs(_r) == [("os", "system")]
+
+    assert not scan(b"\x80\x02\x82\x01)R.", _ALLOW)["ok"]
+
+    _first = _model(3, 4)
+    _r = scan(_first + b"\x80\x02cposix\nsystem\nX\x02\x00\x00\x00id\x85R.", _ALLOW)
+    assert not _r["ok"] and any(o >= len(_first) and (m, n) == ("posix", "system") for _, o, m, n in _r["imports"])
+
+    assert not scan(b"", _ALLOW)["ok"]
+
+
+    def _zip(members):
+        b = _io.BytesIO()
+        with _zipfile.ZipFile(b, "w") as z:
+            for name, data in members.items():
+                z.writestr(name, data)
+        return b.getvalue()
+
+
+    assert scan(_zip({"archive/data.pkl": _model(10, 2), "archive/data/0": b"\x00" * 4096, "archive/version": b"3\n"}), _ALLOW)["ok"]
+    _r = scan(_zip({"archive/data.pkl": _broken, "archive/version": b"3\n"}), _ALLOW)
+    assert not _r["ok"] and any(w == "archive/data.pkl" and (m, n) == ("os", "system") for w, _, m, n in _r["imports"])
+
+    assert all(scan(_model(50, p), _ALLOW)["ok"] for p in range(6))
+    assert all(set(_pairs(scan(_model(50, p), _ALLOW))) <= _ALLOW for p in range(2, 6))
+
+
+    class _Recorder(_pickle.Unpickler):
+        def __init__(self, f):
+            super().__init__(f)
+            self.calls = []
+
+        def find_class(self, module, name):
+            self.calls.append((module, name))
+            return super().find_class(module, name)
+
+
+    def _rand_obj(rng, depth=0):
+        k = rng.randrange(9 if depth < 3 else 5)
+        if k == 0: return rng.randrange(-10**6, 10**6)
+        if k == 1: return "s%d" % rng.randrange(50)
+        if k == 2: return bytes(rng.randrange(256) for _ in range(rng.randrange(4)))
+        if k == 3: return _T("k%d" % rng.randrange(9), (rng.randrange(4),))
+        if k == 4:
+            o = _MOD.Layer()
+            o.size = rng.randrange(9)
+            return o
+        if k == 5: return [_rand_obj(rng, depth + 1) for _ in range(rng.randrange(4))]
+        if k == 6: return {"k%d" % i: _rand_obj(rng, depth + 1) for i in range(rng.randrange(4))}
+        if k == 7: return _OD((str(i), _rand_obj(rng, depth + 1)) for i in range(rng.randrange(3)))
+        return frozenset(range(rng.randrange(3)))
+
+
+    def _differential(seed, n):
+        rng = _random.Random(seed)
+        for _ in range(n):
+            data = _pickle.dumps(_rand_obj(rng), protocol=rng.randrange(6))
+            rec = _Recorder(_io.BytesIO(data))
+            rec.load()
+            r = scan(data, set(rec.calls))
+            if _pairs(r) != rec.calls or not r["ok"] or r["errors"]:
+                return False
+            if rec.calls and scan(data, set(rec.calls) - {rec.calls[0]})["ok"]:
+                return False
+        return True
+
+
+    assert _differential(7, 300)
+
+
+    def _offsets_ok(seed, n):
+        rng = _random.Random(seed)
+        for _ in range(n):
+            data = _pickle.dumps(_rand_obj(rng), protocol=rng.randrange(6))
+            if any(data[o:o + 1] not in (b"c", b"\x93", b"i") for _, o, _, _ in scan(data, set())["imports"]):
+                return False
+        return True
+
+
+    assert _offsets_ok(8, 200)
+
+    _shard = b"".join(_pickle.dumps(_OD(id=i, text="x" * 500), protocol=4) for i in range(20000))
+
+
+    def _timed():
+        t = _time.perf_counter()
+        r = scan(_shard, _ALLOW)
+        return r["ok"] and len(r["imports"]) == 20000, _time.perf_counter() - t
+
+
+    _ok, _secs = _timed()
+    assert _ok and _secs < 3.0
+  solution: |
+    import io
+    import pickletools
+    import zipfile
+
+    _MARK = object()
+    _STRINGS = {"STRING", "BINSTRING", "SHORT_BINSTRING", "UNICODE", "BINUNICODE", "SHORT_BINUNICODE", "BINUNICODE8"}
+    _PUTS = {"PUT", "BINPUT", "LONG_BINPUT"}
+    _GETS = {"GET", "BINGET", "LONG_BINGET"}
+    _EXTS = {"EXT1", "EXT2", "EXT4"}
+
+
+    class _Lit(str):
+        """A string the stream pushed itself, so STACK_GLOBAL can name it."""
+
+
+    # (items popped below a MARK, pops down to a MARK?, items pushed) per opcode, from pickletools' own metadata.
+    _EFFECT = {}
+    for _op in pickletools.opcodes:
+        _before = [s.name for s in _op.stack_before]
+        if "mark" in _before:
+            _EFFECT[_op.name] = (_before.index("mark"), True, len(_op.stack_after))
+        else:
+            _EFFECT[_op.name] = (len(_before), False, len(_op.stack_after))
+
+
+    def _scan_stream(f, where, imports, errors):
+        """Scan the pickle that starts at f's position. Returns False when the stream breaks."""
+        stack, memo = [], {}
+        try:
+            for op, arg, pos in pickletools.genops(f):
+                name = op.name
+                if name in _STRINGS:
+                    stack.append(_Lit(arg))
+                    continue
+                if name == "MARK":
+                    stack.append(_MARK)
+                    continue
+                if name == "MEMOIZE" or name in _PUTS:
+                    if not stack or stack[-1] is _MARK:
+                        raise ValueError(name + " with nothing to store")
+                    memo[len(memo) if name == "MEMOIZE" else arg] = stack[-1]
+                    continue
+                if name in _GETS:
+                    if arg not in memo:
+                        raise ValueError("memo slot %r read before it was stored" % (arg,))
+                    stack.append(memo[arg])
+                    continue
+                if name == "DUP":
+                    if not stack:
+                        raise ValueError("DUP on an empty stack")
+                    stack.append(stack[-1])
+                    continue
+                if name == "STACK_GLOBAL":
+                    if len(stack) < 2:
+                        raise ValueError("STACK_GLOBAL with fewer than two items")
+                    qual, module = stack.pop(), stack.pop()
+                    if type(module) is _Lit and type(qual) is _Lit:
+                        imports.append((where, pos, str(module), str(qual)))
+                    else:
+                        errors.append((where, pos, "STACK_GLOBAL whose names are not literals in the stream"))
+                    stack.append(None)
+                    continue
+                if name in ("GLOBAL", "INST"):
+                    module, _, qual = arg.partition(" ")
+                    imports.append((where, pos, module, qual))
+                elif name in _EXTS:
+                    errors.append((where, pos, "extension code %r resolves in the loading process, not the file" % (arg,)))
+                before, to_mark, after = _EFFECT[name]
+                if to_mark:
+                    k = len(stack) - 1
+                    while k >= 0 and stack[k] is not _MARK:
+                        k -= 1
+                    if k < 0:
+                        raise ValueError(name + " without a MARK")
+                    del stack[k:]
+                if before:
+                    if len(stack) < before or any(x is _MARK for x in stack[-before:]):
+                        raise ValueError(name + " pops past the stack")
+                    del stack[-before:]
+                stack.extend([None] * after)
+        except Exception as e:  # genops raises on unknown opcodes and truncation; argument decoding can fail too
+            errors.append((where, f.tell(), "broken stream: %s" % (e,)))
+            return False
+        return True
+
+
+    def _scan_pickles(data, where, imports, errors):
+        if not data:
+            errors.append((where, 0, "empty: no pickle stream"))
+            return
+        f = io.BytesIO(data)   # one buffer for the whole file: slicing off each stream would copy the rest every time
+        while f.tell() < len(data):
+            if not _scan_stream(f, where, imports, errors):
+                return
+
+
+    def scan(data, allowed):
+        imports, errors = [], []
+        if data[:4] == b"PK\x03\x04":
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as z:
+                    for info in z.infolist():
+                        if info.filename.endswith(".pkl"):
+                            _scan_pickles(z.read(info), info.filename, imports, errors)
+            except Exception as e:
+                errors.append(("", 0, "unreadable archive: %s" % (e,)))
+        else:
+            _scan_pickles(data, "", imports, errors)
+        blocked = any((m, n) not in allowed for _, _, m, n in imports)
+        return {"ok": not errors and not blocked, "imports": imports, "errors": errors}
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Coding, 45 minutes">
+Your model registry mirrors files from public hubs and accepts uploads from internal teams. Before any service may load a file, a scanner reads its pickles and decides whether every import is one a weights file needs. Write <code>scan</code> to the contract in the starter: an allowlist, not a denylist, and a file the scanner cannot read with certainty is never ok.
+</Callout>
+
+Hugging Face's Hub runs a pickle import scan on every upload with `pickletools.genops` and says plainly that it is not foolproof and that its lists of safe and unsafe imports are best-effort. Picklescan, the open-source scanner, works from a denylist of dangerous functions. In February 2025 ReversingLabs described two models on the Hub whose pickle stream broke shortly after the payload ran; on their broken test file, Picklescan reported the error and not the dangerous import before it.
+
+Part of the policy is yours: which zip members to treat as pickles, what to report when a `STACK_GLOBAL` takes names the stream computed rather than wrote, whether one broken member stops the scan of the others, and how to word an error. The tests check invariants. The imports you report match, in order, the ones a real `Unpickler` asks `find_class` for on random objects at every protocol; removing any reported import from the allowlist makes the file fail; a broken, truncated or empty file never passes; and every offset points at an importing opcode.
+
+One constraint is not in the visible tests. Some files in the registry are dataset shards written with one `pickle.dump` per record: 20,000 pickles back to back, about 11 MB. The scanner runs on every upload and has 3 seconds for such a shard in the browser.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which loaders in your fleet read past the first <code>STOP</code>, and what each of them does with the bytes that follow.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request benign files at every pickle protocol the registry holds, plus the files Picklescan has missed, and ask which of them a real unpickler finishes reading.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Time your scanner on a file of 20,000 small pickles, then on 40,000, and compare the two numbers.</p></details>
+
+## Answer
+
+The reference solution simulates the unpickler's stack without running anything, reports every import it can name, and turns everything it cannot name into an error.
+
+**Three opcodes import.** `GLOBAL` carries the module and name in its argument, and so does `INST`, the protocol-0 opcode that many scanners skip; the unpickler calls `find_class` for both. `STACK_GLOBAL` pops the name and the module from the stack. Those strings can be pushed anywhere earlier, stored in the memo with `MEMOIZE` or `BINPUT`, and fetched back with `BINGET` just before the import, so looking at the two opcodes before `STACK_GLOBAL` is not enough. The `EXT1`, `EXT2` and `EXT4` opcodes import through the copyreg extension registry of the loading process, which the file cannot show, so they are errors.
+
+**A stack that only knows about strings.** The scanner tracks one fact per stack slot: whether it holds a string the stream pushed itself. Every other opcode's effect comes from `pickletools`' own `stack_before` and `stack_after` metadata, so the simulation covers all opcodes without a table written by hand.
+
+```python
+qual, module = stack.pop(), stack.pop()
+if type(module) is _Lit and type(qual) is _Lit:     # both pushed as literals, possibly via the memo
+    imports.append((where, pos, str(module), str(qual)))
+else:                                               # computed names: the scanner cannot say what is imported
+    errors.append((where, pos, "STACK_GLOBAL whose names are not literals in the stream"))
+```
+
+**Broken streams keep their findings.** `genops` raises on an unknown opcode or a truncated argument, and the stack simulation raises on an underflow or a memo read before a write. The scanner catches both, records the error with its offset, and keeps every import it found before the break. A nullifAI-style file therefore reports `os.system` and an error, and is not ok on either count.
+
+**Every pickle in the file, in one buffer.** After `STOP`, `genops` leaves the file position on the next byte, so a single `io.BytesIO` scans pickle after pickle with offsets that are already positions in the file. A scanner that slices off each pickle and starts again copies the remainder of the file every time. At 20,000 records of about 570 bytes, that copies roughly 20,000 × 11 MB / 2 ≈ 110 GB; the reference scanned the shard in about 0.3 seconds in CPython 3.12, and the slicing version took about 24 seconds on the same machine (measured 2026-10-28).
+
+**Zip archives.** `torch.save` writes an uncompressed ZIP64 archive whose object graph is `data.pkl`; the storages under `data/` are raw bytes. The reference scans every member whose name ends in `.pkl`. A stricter choice scans every member that begins with a pickle protocol byte, at the cost of false errors on raw storages that happen to start with `0x80`.
+
+**The quantity to choose: a size limit.** Torch writes members uncompressed, so a member whose compressed size is smaller than its size did not come from `torch.save` unchanged. Reasonable limits are a cap on uncompressed size at the registry's largest legitimate shard, and refusing compressed `.pkl` members outright. A cap far above the largest model only protects the scanner from a zip bomb late.
+
+**The decision with two defensible answers: how wide the allowlist is.**
+
+- **A short global list** (the torch rebuild functions, storage types, `collections.OrderedDict`) passes plain state dicts and rejects everything else. Each entry is a function the unpickler will call with arguments the attacker chooses, so fewer entries means less code to trust. The cost lands on teams whose checkpoints pickle a config dataclass or an optimizer object: their uploads fail and someone has to convert or re-save them.
+- **Per-publisher lists**, extended when a known team's files need a class, pass more files. The cost is that every entry is reviewed as code that runs on untrusted input, and a list that grows by request is a list nobody can audit. CVE-2025-32434 was a bypass of PyTorch's own restricted unpickler: an allowlist written by the framework's maintainers still had a path to code execution.
+
+The conflict is coverage of legitimate files against what the scanner vouches for. The reference keeps the list short and routes rejected files to conversion: a worker with no network and no credentials loads the file once and writes safetensors, and services only ever load the safetensors output.
+
+**Where this fails.** The scanner and the loader are two parsers of the same bytes, and any disagreement between them is an evasion. The nullifAI files were one such disagreement: the loader acted on opcodes that the scanner threw away with the error. Archives are another place to look, since Python's `zipfile` and the loader's own archive reader are separate implementations; an archive the two read differently is rejected, not scanned. And a pass means only that every import is on the list. The allowlisted functions still run with the file's arguments, which is why a pass is a filter in front of a safe format, not a reason to keep loading pickles.
+
+## Follow-ups
+
+- *What changes to run this in the registry's ingestion path?* Stream members from object storage into `genops` instead of reading files into memory, scan with the same zip reader the loaders use or reject archives that two readers parse differently, record the scanner and allowlist versions with each verdict, and rescan the registry whenever the allowlist changes.
+- *Your allowlist rejects a fifth of internal uploads because trainers pickle their config dataclass with the weights. Product wants the dataclass added. What do you add, and what risk do you accept in writing?*
+- *What would you need to see across the fleet before you retired the scanner and accepted only safetensors?*
+- *A researcher sends a file that passes your scanner and still runs code under `torch.load`. Where do you look first: the scanner, the allowlist or the loader?*
+
+## Common mistakes
+
+- Working from a denylist of dangerous names. `os.system`, `posix.system`, `subprocess.Popen`, `builtins.eval` and every function that calls them are an open set.
+- Resolving `STACK_GLOBAL` from the two opcodes before it, which misses names fetched from the memo.
+- Skipping `INST`, which imports in protocol 0.
+- Returning an error for a broken stream but dropping the imports found before the break.
+- Allowing a wildcard such as `numpy.*` to match dotted names, which the unpickler resolves by walking attributes under protocol 4 and later.
+- Scanning only the first pickle in a file.

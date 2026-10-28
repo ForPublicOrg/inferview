@@ -1,0 +1,146 @@
+---
+id: hrn-034
+title: The issue-fixing agent that runs while nobody watches
+subtitle: flags, allowlist, budget, a Stop check and the branch rules
+track: harness
+module: verification
+type: workflow
+difficulty: hard
+seniority: [staff]
+minutes: 40
+core: true
+tags: [headless, ci, permissions, budgets, stop-hooks, branch-protection, coding-agents]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Claude Code docs, Best practices (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/best-practices
+    note: "the single most useful line in CLAUDE.md is the command that runs the check; a Stop hook that exits 2 sends Claude back with stderr as the reason; five questions before a run goes unattended (what done looks like, can it check its own work, what it may touch, what stops it, who signs off); claude -p with --bare, --allowedTools, --permission-mode dontAsk and --max-turns for scripts"
+  - title: Claude Code docs, Run Claude Code programmatically (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/headless
+    note: "--bare skips auto-discovery of hooks, skills, plugins, MCP servers, auto memory and CLAUDE.md, and is recommended for CI; without --bare a -p session runs the hooks in the project's .claude/settings.json and connects its .mcp.json servers even in a folder never trusted; --output-format json reports total_cost_usd as a client-side estimate; the space in Bash(git diff *) matters for prefix matching"
+  - title: Claude Code docs, CLI reference (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/cli-reference
+    note: "--max-budget-usd stops the run once estimated spend reaches the amount, print mode only, and spend can pass the cap; --max-turns exits with an error at the limit and has no default; --settings overrides the same keys in settings files for the session"
+  - title: Claude Agent SDK docs, How the agent loop works (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/agent-sdk/agent-loop
+    note: "result subtypes success, error_max_turns and error_max_budget_usd, each carrying total_cost_usd and num_turns; spend is compared with the cap after each response arrives, so it can pass the cap by up to one response plus running subagents"
+  - title: Claude Code docs, Hooks reference, Stop (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/hooks
+    note: "stop_hook_active is true when Claude is already continuing because of a stop hook; after stop hooks have continued the turn eight times in a row, Claude Code overrides the next block and ends the turn, and the count resets each time Claude calls a tool; CLAUDE_CODE_STOP_HOOK_BLOCK_CAP raises it"
+  - title: Claude Code docs, Configure permissions (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/permissions
+    note: "a Bash rule matches the command text and is not a security boundary around the program (sh -c and absolute paths are not matched); Read and Edit deny rules do not apply to a script that opens files itself; under --bare the project's env block in its settings files still applies"
+  - title: GitHub Docs, About protected branches (checked 2026-10-28)
+    url: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches
+    note: "required reviews, code owner review, dismiss stale approvals, approval of the most recent reviewable push by someone other than the pusher, required status checks with an expected source app (with any source, anyone with write permission can set the status), restrict who can push, do not allow bypassing"
+checklist:
+  - "Runs claude -p with --bare and passes the prompt, the project guidance and the settings file explicitly, so nothing the repository or an issue author supplies (hooks, .mcp.json servers, skills) runs in the job"
+  - "Keeps the settings file and the Stop hook script outside the agent's workspace, so the agent cannot edit the check that judges it"
+  - "Writes an exact allowlist with --permission-mode dontAsk, leaves git push out of it, and says that Bash rules match command text and are not the containment"
+  - "Names the containment: an ephemeral runner with no deploy or cloud secrets and egress limited to the model API and the package mirror"
+  - "Chooses a per-run --max-budget-usd and --max-turns from the pilot's distribution, leaves headroom because spend can pass the cap, and adds a daily spend stop computed from the monthly budget"
+  - "Puts a fast check in a Stop hook that writes failures to stderr and exits 2, and states what each choice of check (fast subset or full suite) costs per blocked stop"
+  - "Treats the session's own end as unproven: the wrapper reruns the checks after exit, because the eight-continuation cap or a limit can end a run with the check still red"
+  - "Lets only a wrapper push to agent/* branches, and protects main with required checks from a named source app, code owner review, and approval of the latest push by someone other than the pusher"
+  - "Triggers runs from a label only maintainers can apply and treats issue text as untrusted input to a run that holds nothing worth stealing"
+  - "Parses --output-format json for subtype, num_turns and total_cost_usd, and records each run's outcome against what a human later merged or reverted"
+  - "Writes a rollout with draft PRs first and named rollback triggers"
+  - "States what is given up, such as issues the allowlist cannot fix and the review time each agent PR still costs"
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Workflow round, 40 minutes">
+Engineering wants Claude Code to pick up issues that a maintainer labels <code>agent-fix</code>, fix them in CI with nobody watching, and open a pull request. Design the job: the command line, what the agent may do, what stops it, how it knows it is done, what happens to its branch, and how you roll it out.
+</Callout>
+
+The scenario's facts, invented for this problem:
+
+- A Python service in one GitHub repository. The issue tracker is public, so anyone can write an issue body; only maintainers can apply labels.
+- About 15 labelled issues per working day once the job is live.
+- A pilot of 40 interactive sessions on past issues cost a median of $1.10 per run, a 90th percentile of $3.40 and a maximum of $9.80, with a median of 22 turns and a 90th percentile of 48.
+- The full test suite takes 6 minutes on a CI runner; a marked fast subset takes 40 seconds.
+
+Operating constraints:
+
+- The platform team owns `ci.yml` and will not restructure it this quarter; you may add one workflow file.
+- Security: the agent's job must never see deploy or cloud credentials, and nothing it produces reaches production without a human approval.
+- Finance has given the agent $1,500 a month in API spend.
+- Two engineers, four weeks.
+
+Choose the per-run spend cap and turn cap, and defend both.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which files in the repository Claude Code reads at startup in a non-interactive run, and who can change them.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the pilot's cost distribution per run, not the mean, and how often a run would have hit each candidate cap.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the agent's token can do on GitHub besides pushing a branch.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>A wrapper script runs <code>claude --bare -p</code> on an ephemeral runner that holds no secrets except the model API key. Everything the run needs comes in through flags: the prompt, the project guidance with <code>--append-system-prompt-file</code>, and a <code>--settings</code> file that holds the Stop hook, both kept outside the workspace. The allowlist names exact commands under <code>--permission-mode dontAsk</code> and leaves out <code>git push</code>. A $5 budget cap, a 60-turn cap and a daily spend stop bound the cost. The Stop hook runs lint and the fast subset and sends the agent back on failure; the wrapper reruns the checks after the session ends, because the session ending proves nothing. Only the wrapper pushes, and only to <code>agent/&#42;</code>, where branch protection requires CI from a named app and a code owner's approval of the latest push.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>The command line</strong>, printed in full below, uses <code>--bare</code> for two reasons. Without it, a <code>-p</code> run executes the hooks in the repository's <code>.claude/settings.json</code> and connects its <code>.mcp.json</code> servers with no trust prompt, so whoever last changed those files decides what runs in your job. And it makes the run identical on every runner. The cost is that bare mode also skips <code>CLAUDE.md</code>, so the guidance that file carries has to be passed in explicitly, or the agent works without the project's test command and conventions. The guidance, the settings and the hook script are copied from the default branch into <code>$RUNNER_TEMP</code> before the checkout the agent works in, so an edit the agent makes in the workspace cannot change the check that judges it. One gap stays: the docs say a project's <code>env</code> block in its settings files still applies under <code>--bare</code>, so <code>.claude/</code> is a code-owned path.</p>
+<p><strong>The allowlist is legibility, not containment.</strong> Bash rules match the command text after Claude Code splits compound commands; they do not stop <code>sh -c</code> or an absolute path, and <code>pytest</code> executes whatever Python sits in a <code>conftest.py</code>. The containment is the runner: an ephemeral VM, no cloud or deploy credentials, a model API key scoped to this job, and egress limited to the API and the internal package mirror. The space in <code>Bash(pytest &#42;)</code> is deliberate, since without it the rule also matches other commands whose names start with <code>pytest</code>. <code>git push</code> is absent because the wrapper pushes after it has checked the result.</p>
+<p><strong>The caps, computed.</strong> The pilot's 90th percentile is $3.40 and spend can pass the cap by up to one response, so $5 leaves room for the top tenth of normal runs to finish and still stops the $9.80 run at about half its cost. At 15 runs a day over 21 working days, 315 runs a month, the worst case with every run at the cap is 315 × $5 = $1,575, just over the $1,500 budget. So the wrapper also sums <code>total_cost_usd</code> from each day's results and stops starting runs past $1,500 / 21 ≈ $71 a day; unfinished labels wait for the next day. The turn cap of 60 sits above the pilot's 90th percentile of 48; turns are the cap that catches a loop of cheap calls the dollar cap would let run for a long time. Reasonable choices put the dollar cap between about the 90th percentile and twice it, $3.50 to $7; a cap at the median fails half the issues that would have succeeded, and no cap at all leaves the daily stop as the only bound, with one bad run able to spend a day's budget.</p>
+<p><strong>The Stop check, and the decision with two defensible answers.</strong> The hook script runs <code>ruff check</code> and the fast subset, prints failures to stderr and exits 2, which sends the agent back with the output as the reason. The alternative is the full suite in the hook. Fast subset: a blocked stop costs 40 seconds, and regressions outside the subset surface only in CI after the push, which costs a CI round and a human look. Full suite: nothing reaches a PR red, and every blocked stop costs 6 minutes of runner time while the session waits. If a run is blocked twice on average (an assumption: the pilot ran without a hook), the full suite costs 15 × 2 × 6 minutes = 3 hours of runner time a day against 15 × 2 × 40 seconds = 20 minutes for the subset. I choose the fast subset and let CI run the full suite, because CI has to run anyway and it is the check the agent cannot touch. If more than about one agent PR in five fails CI outside the subset, move the suite into the hook.</p>
+<p><strong>The session's end is a claim, not a result.</strong> After eight consecutive continuations with no tool call, Claude Code overrides the next block and ends the turn; a budget or turn limit ends the run with whatever is in the workspace. So the wrapper reads <code>subtype</code> from <code>result.json</code> and reruns lint and the fast subset itself. It pushes to <code>agent/issue-$ISSUE</code> and opens a draft PR only when the subtype is <code>success</code> and its own rerun is green; otherwise it comments on the issue with the subtype, turns and cost, and removes the label.</p>
+<p><strong>Branch rules.</strong> The wrapper's GitHub App token can push only to <code>agent/&#42;</code>. On <code>main</code>: pull requests required; required status checks with GitHub Actions selected as the expected source, because with "any source" anyone with write permission, including an agent's token, can post a green status; code owner review on <code>.github/</code>, <code>.claude/</code> and <code>tests/</code>; approval of the most recent reviewable push by someone other than the pusher; stale approvals dismissed; no bypass for administrators.</p>
+<p><strong>Prompt injection.</strong> The issue body is untrusted text written by anyone. The label gate means a maintainer chose to spend money on it, not that its content is safe. The defence is that the run holds nothing worth stealing and can produce only a branch a human reviews.</p>
+<p><strong>What you give up.</strong> Issues that need a command outside the allowlist, a network call or a secret fail by design and go back to people. Every agent PR still costs a code owner's review, and nothing merges at night. Spend over $71 a day waits a day.</p>
+<p><strong>Failure mode of this design.</strong> Green is not correct. A fix that makes the fast subset pass by changing a test, or that handles the reported input and breaks an unreported one, arrives as a tidy PR with passing checks, and a reviewer who sees thirty of these a week starts approving on the checks. The defences are the code-owner rule on <code>tests/</code> and a measured number: the share of merged agent PRs reverted or patched within 14 days, compared with human PRs over the same period.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Why not <code>bypassPermissions</code> on an isolated runner, as the SDK docs suggest for CI?</em> On a runner with no secrets it is defensible, and it removes the allowlist's maintenance. I keep <code>dontAsk</code> with an allowlist because a denied call shows up in the result, which tells me what the agent tried to do; with bypass, the only record is what it did.</li>
+<li><em>The fast subset passes in the hook and the full suite fails in CI on 30% of agent PRs. What changes?</em> Move the full suite into the hook or widen the subset to the modules the diff touches, and raise the budget cap to pay for the longer stops; measure the change in PRs that reach review green.</li>
+<li><em>Should the wrapper re-invoke the agent with the CI failure log?</em> Once, with the log trimmed to the failing tests and the remaining daily budget checked first; a second failure goes to a human, because two failed attempts on the same issue predict a third.</li>
+</ul>
+</Fragment>
+</Depth>
+
+### The command line
+
+```bash
+claude --bare -p "$(cat "$RUNNER_TEMP/agent/prompt.md") Issue #$ISSUE: $(cat "$RUNNER_TEMP/issue.txt")" \
+  --append-system-prompt-file "$RUNNER_TEMP/agent/guidance.md" \
+  --settings "$RUNNER_TEMP/agent/settings.json" \
+  --allowedTools "Read,Edit,Bash(pytest *),Bash(ruff check *),Bash(git diff *),Bash(git status *),Bash(git add *),Bash(git commit *)" \
+  --disallowedTools "WebFetch,WebSearch" \
+  --permission-mode dontAsk \
+  --max-budget-usd 5 --max-turns 60 \
+  --output-format json > "$RUNNER_TEMP/result.json"
+```
+
+The Stop hook in `$RUNNER_TEMP/agent/settings.json` runs `"$RUNNER_TEMP/agent/stop-check.sh"`, which runs `ruff check` and `pytest -q -m fast` with their output sent to stderr and exits 2 on any failure.
+
+### The written artefact
+
+The rollout plan, filed with the security review.
+
+- **Weeks 1 and 2:** the job runs on every labelled issue and opens draft PRs that nobody may merge. For each, a maintainer records whether they would have merged it, fixed it or closed it.
+- **Week 3 on:** draft PRs become reviewable; merges need a code owner.
+- **Rollback to drafts only:** any push by the agent's token outside `agent/*`; any run whose `total_cost_usd` exceeds twice the cap; more than two merged agent PRs in a month reverted for a regression; a CI job that ran with a credential other than the model API key.
+- **Stop the job:** a change to `.claude/` or `.github/` merged from an agent branch, whoever approved it.
+
+## Follow-ups
+
+- *Your verification (hook, wrapper rerun, full CI, code owner review) costs more runner time and reviewer time than the fixes save. Which layer do you cut, and what risk do you accept in writing?*
+- *What would you need to see in three months of results to let agent PRs that touch only documentation merge without a human approval?*
+- *Two senior engineers disagree: one wants the agent's tests counted toward the merge gate, the other wants only tests that existed on main before the PR. How do you decide without deciding by rank?*
+- *Finance halves the budget next month. Do you lower the per-run cap, the daily stop or the number of labelled issues, and which issues stop getting fixed?*
+
+## Common mistakes
+
+- Running `claude -p` without `--bare` in a repository whose `.claude/settings.json` and `.mcp.json` anyone with a merged PR can change.
+- Keeping the Stop hook script in the workspace, where the agent can edit it to exit 0.
+- Treating `Bash(...)` allow rules as a sandbox, or giving the run the CI's usual secrets because the allowlist looks narrow.
+- Setting the budget cap at the mean of the pilot, or from a round number, without checking it against the distribution and the monthly budget.
+- Pushing whatever the session left when it ended, without checking the result subtype and rerunning the checks outside the agent.
+- Accepting a required status check from any source, so a token with write access can post the green status itself.

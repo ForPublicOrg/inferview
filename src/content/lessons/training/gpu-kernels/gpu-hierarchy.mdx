@@ -1,0 +1,167 @@
+---
+title: The GPU as a memory hierarchy
+track: training
+module: gpu-kernels
+order: 1
+kind: lesson
+level: senior
+minutes: 12
+summary: Where an H100 keeps data, from registers to HBM, how much of each level there is, and how to explain a slow kernel from where its operands live.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: NVIDIA Technical Blog, NVIDIA Hopper Architecture In-Depth
+    url: https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/
+    note: "144 SMs on the full GH100, 132 on H100 SXM5; 256 KB combined L1 and shared memory per SM, shared memory configurable up to 228 KB; 256 KB register file per SM (33,792 KB per GPU); 50 MB L2 (60 MB on the full die); warps of 32, at most 64 warps, 2,048 threads and 32 blocks per SM; TMA from a copy descriptor, 1D to 5D, issued by one thread; clusters of up to 16 blocks co-scheduled within a GPC; distributed shared memory about 7x faster than global memory (NVIDIA's own figure); preliminary figures of 3,000 GB/s and 1,000 dense BF16 TFLOPS. Checked 2026-10-28."
+  - title: NVIDIA H100 product page
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: "H100 SXM: 1,979 BF16 Tensor Core TFLOPS footnoted 'With sparsity', 67 FP32 TFLOPS, 80 GB, 3.35 TB/s, up to 700 W configurable, NVLink 900 GB/s. H100 NVL: 1,671 BF16 TFLOPS with sparsity, 94 GB, 3.9 TB/s. Checked 2026-10-28."
+  - title: NVIDIA HGX platform page
+    url: https://www.nvidia.com/en-us/data-center/hgx/
+    note: "HGX B200 and B300 (8 GPUs): 36 PFLOPS FP16/BF16, with the note that the specification is sparse and dense is half. No per-GPU memory bandwidth on the page. Checked 2026-10-28."
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "132 SMs with 128 cores each, 16,896 cores; blocks of 512 or 1,024 threads go to one SM; coalescing a naive matmul raised memory throughput about 10x; a shared-memory tiled kernel reached about 6.6 TFLOPS. Checked 2026-10-28."
+  - title: How to Scale Your Model, All About Rooflines
+    url: https://jax-ml.github.io/scaling-book/roofline/
+    note: "uses 9.89e14 dense BF16 FLOPs/s and 3.35e12 bytes/s for the H100 SXM, a critical intensity of about 295, and notes the spec-sheet 1.979e15 is with sparsity. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision this lesson supports
+
+Scenario: a profile of one training step shows a normalisation kernel at 0.2 ms and the matmul after it at 2.2 ms, and someone proposes a custom matmul. Before anyone writes CUDA, the question is where each kernel's operands live while it runs and how fast that level can feed the arithmetic units. A kernel is slow because it waits on a level of the hierarchy, because it does not keep enough requests in flight to hide that wait, or because the launch costs more than the work. All three are visible from the sizes below and two divisions.
+
+## The levels, with sizes
+
+The numbers are for the H100 SXM. NVIDIA's architecture blog gives the per-SM figures; the product page gives the shipped bandwidth and the FLOPs table.
+
+| Level | Size | Who shares it |
+|---|---|---|
+| Registers | 256 KB per SM, 33,792 KB across the GPU | one thread |
+| Shared memory and L1 | 256 KB combined per SM, shared memory configurable up to 228 KB | one thread block, or a cluster through distributed shared memory |
+| L2 | 50 MB | every SM |
+| HBM3 | 80 GB at 3.35 TB/s | the device |
+| NVLink | 900 GB/s total over 18 links | other GPUs |
+
+The H100 SXM enables 132 of the 144 SMs on the full GH100 die, and its L2 is 50 MB of the die's 60 MB. Two consequences of the table are easy to miss. First, the register file is the largest on-chip store after L2: 132 × 256 KB = 33,792 KB of registers against 132 × 228 KB = 30,096 KB of shared memory at its largest configuration. Second, HBM is 80 GB / 50 MB = 1,600 times the size of L2, so any tensor larger than a few tens of megabytes is read from HBM every time a kernel touches it, unless the kernel that produced it and the kernel that consumes it are the same kernel.
+
+<Predict id="trn-gk-hbm-sweep" question="How long does an H100 SXM need to read all 80 GB of its HBM once, at the 3.35 TB/s on the product page? Answer in milliseconds." answer={23.9} tolerance={0.5} unit="ms">
+<p>80 × 10<sup>9</sup> bytes / 3.35 × 10<sup>12</sup> bytes per second = 0.0239 s, so <b>about 23.9 ms</b>. That is the floor for any step that touches every byte of the device's memory once: an optimizer step over a shard that fills the card cannot finish faster, however many FLOPs are available.</p>
+</Predict>
+
+## Warps, blocks and occupancy
+
+A kernel launches a grid of thread blocks. Each block runs on one SM and stays there; the Ultra-Scale Playbook gives 512 or 1,024 threads as typical block sizes. Inside the SM, threads execute in warps of 32, and the SM holds at most 64 warps (2,048 threads) and 32 blocks at once. Occupancy is resident warps over 64.
+
+The SM is closer to a hardware thread scheduler with a fixed budget than to a CPU core. When a warp issues a load that goes to HBM, the scheduler issues instructions from another resident warp instead of stalling. More resident warps means more loads in flight and more latency hidden, up to the point where bandwidth or arithmetic saturates. Residency is limited by whichever budget runs out first:
+
+- registers: 256 KB per SM is 65,536 registers of 32 bits, divided by registers per thread;
+- shared memory: at most 228 KB per SM, divided by shared memory per block;
+- the hard caps of 2,048 threads and 32 blocks per SM.
+
+<Predict id="trn-gk-occupancy" question="A kernel uses 128 registers per thread and no shared memory. Ignoring allocation granularity, what occupancy can one H100 SM reach, in percent of its 64 warps?" answer={25} tolerance={0} unit="%">
+<p>65,536 registers / 128 per thread = 512 threads = 16 warps. 16 / 64 = <b>25%</b>. At 64 registers per thread the same arithmetic gives 1,024 threads and 50%; at 32 registers per thread the register file no longer limits and the 2,048-thread cap does. The real allocator rounds register allocations up in fixed units, so the measured figure can be lower.</p>
+</Predict>
+
+The calculation in code, for checking a launch configuration against the budgets:
+
+```python
+REGS_PER_SM, SMEM_PER_SM, MAX_WARPS, MAX_BLOCKS = 65_536, 228 * 1024, 64, 32
+
+def occupancy(threads_per_block, regs_per_thread, smem_per_block):
+    warps_per_block = -(-threads_per_block // 32)
+    limits = {
+        "registers": REGS_PER_SM // (regs_per_thread * threads_per_block),
+        "shared memory": SMEM_PER_SM // smem_per_block if smem_per_block else MAX_BLOCKS,
+        "warps": MAX_WARPS // warps_per_block,
+        "blocks": MAX_BLOCKS,
+    }
+    blocks = min(limits.values())
+    limiter = min(limits, key=limits.get)
+    return blocks * warps_per_block / MAX_WARPS, limiter
+
+print(occupancy(256, 160, 120 * 1024))   # (0.125, 'registers'); shared memory also allows only 1 block
+print(occupancy(256, 64, 120 * 1024))    # (0.125, 'shared memory'); cutting registers alone changes nothing
+```
+
+The second line is the case that matters in practice: the limit is a minimum, and lowering a resource that is not binding buys nothing.
+
+## Reuse is the whole game: tiling
+
+A matmul is fast because each operand byte fetched from HBM is used many times while it sits in shared memory and registers. Take a block that computes a square T × T tile of the output in BF16. For each slab of K along the inner dimension it loads a T × K tile of A and a K × T tile of B, 4TK bytes, and does 2T²K FLOPs. Its intensity against the level it loads from is 2T²K / 4TK = T/2 FLOPs per byte, independent of K.
+
+At T = 128 that is 64 FLOPs per byte. The H100's ratio of dense BF16 throughput to HBM bandwidth is 9.89 × 10<sup>14</sup> / 3.35 × 10<sup>12</sup> ≈ 295 FLOPs per byte, so a 128 × 128 tile that fetched every slab from HBM would be bandwidth-bound by a factor of more than four. It is not, in practice, because neighbouring blocks read the same rows of A and columns of B, and the second read hits the 50 MB L2. The order in which blocks are scheduled, which decides whether neighbours are resident at the same time, is therefore part of the kernel's performance.
+
+Larger tiles raise T/2 but cost on-chip space. The FP32 accumulators for a 128 × 128 output tile are 128 × 128 × 4 = 65,536 bytes, a quarter of one SM's register file, before any operand staging. With two 128 × 64 BF16 operand tiles per pipeline stage (16 KB each) and four stages in flight, shared memory use is 4 × 32 KB = 128 KB, which fits in 228 KB once and leaves no room for a second block. A kernel built this way runs at low occupancy on purpose: it hides latency with a deep, asynchronous copy pipeline rather than with many warps.
+
+How far a straightforward kernel is from that is measured in the Ultra-Scale Playbook. Fixing the thread-to-index mapping of a naive matmul so that a warp's loads are coalesced raised memory throughput about tenfold. Adding shared-memory tiling then reached about 6.6 TFLOPS. Against 989 dense TFLOPS that is 6.6 / 989 = 0.67% of peak. The distance between a correct tiled kernel and a library kernel is why the first answer to "should we write a matmul" is almost always no.
+
+## What Hopper added
+
+Two Hopper features change how kernels move data, and both show up in profiles.
+
+The Tensor Memory Accelerator (TMA) copies tiles between global and shared memory from a copy descriptor that holds tensor dimensions and block coordinates, for tensors of one to five dimensions. A single thread issues the copy and it completes asynchronously, so the other threads spend no instructions on address arithmetic and can compute on the previous tile. This is the mechanism behind the low-occupancy, deep-pipeline design above.
+
+Thread block clusters group up to 16 blocks that are guaranteed to be co-scheduled on SMs within one GPC. Blocks in a cluster can load, store and run atomics on each other's shared memory, which NVIDIA reports as about 7x faster than exchanging data through global memory. That adds a level between shared memory and L2: data loaded once by one SM can be read by its cluster neighbours without a round trip to L2.
+
+## The spec-sheet numbers, with their conditions
+
+The H100 product page lists BF16 at 1,979 TFLOPS with an asterisk that reads "With sparsity". That figure assumes 2:4 structured sparsity in one operand. Dense BF16 is half, 989.5 TFLOPS, which the scaling book rounds to 9.89 × 10<sup>14</sup>. Every MFU, roofline or step-time estimate for dense training uses 989. A planning document that divides model FLOPs by 1,979 overstates throughput by exactly two and shows an MFU that looks suspiciously low once real step times arrive.
+
+Three more traps of the same kind:
+
+- The Hopper architecture blog predates the product and lists 1,000 dense BF16 TFLOPS and 3,000 GB/s as preliminary. The shipped H100 SXM is listed at 3.35 TB/s. Use the product page for bandwidth.
+- The H100 NVL is a different part: 94 GB, 3.9 TB/s and 1,671 BF16 TFLOPS with sparsity, so 835.5 dense. Its compute-to-bandwidth ratio is 835.5 / 3.9 ≈ 214 FLOPs per byte, not 295, and an op that is compute-bound on one SKU can be bandwidth-bound on the other.
+- The non-tensor FP32 rate on the H100 SXM is 67 TFLOPS. Pointwise ops, reductions and most of a norm run on these units, not on the tensor cores, so their ratio to bandwidth is 67 / 3.35 = 20 FLOPs per byte.
+
+The same footnote carries to Blackwell. NVIDIA's HGX page lists 36 PFLOPS of FP16 and BF16 for an eight-GPU HGX B200 board and says the specification is sparse and dense is half: 18 PFLOPS per board, 2.25 PFLOPS per GPU. The page gives no per-GPU memory bandwidth, so the B200's critical intensity cannot be computed from it.
+
+## Explaining a slow kernel from where its data sits
+
+The procedure for a kernel that takes longer than expected:
+
+1. Count the minimum bytes it must move to and from HBM and the FLOPs it must do. Divide by 3.35 TB/s and by the right peak (989 TFLOPS for BF16 tensor-core work, 67 TFLOPS for FP32 vector work). The larger of the two is the floor.
+2. If the measured time is near the bandwidth floor, the kernel is fine and the fix is to move fewer bytes: fuse it into its producer or consumer, or keep the data in a narrower format.
+3. If it is far above both floors and the tensor is large, look at access pattern and latency hiding: uncoalesced loads, occupancy limited by registers or shared memory with no asynchronous pipeline to compensate, or a last wave of blocks that fills only part of the 132 SMs.
+4. If it is far above both floors and the tensor is small, the time is launch and framework overhead, and the fix is fewer launches, not a faster kernel.
+
+Applied to the opening scenario: the next lesson works through a 2.2 × 10<sup>12</sup>-FLOP projection whose compute floor is 2.2 ms, so a matmul measured at 2.2 ms has nothing left to give; a normalisation over the same activations has a bandwidth floor of a few hundredths of a millisecond, so its 0.2 ms is where time is being lost.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"A custom fused kernel for a new attention variant runs at 12.5% occupancy: 256-thread blocks, 160 registers per thread, 120 KB of shared memory per block. A colleague wants to force 64 registers per thread before the training run starts on Friday. Do you approve it?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>No, not as stated. Registers allow one block per SM (256 × 160 = 40,960 of 65,536) and so does shared memory (two blocks would need 240 KB of 228 KB), so a 64-register cap leaves occupancy at 12.5% while forcing spills to local memory, which is backed by HBM. Ask first whether occupancy is the problem at all: if the stall reasons are memory waits and the kernel has no asynchronous pipeline, cut shared memory per block below 114 KB together with registers; if it already pipelines its copies, low occupancy is by design.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Work out the binding limit before changing anything. Registers: 256 threads × 160 = 40,960 per block, so one block fits in 65,536 and two do not. Shared memory: 120 KB per block, one fits in 228 KB and two do not. Both bind at one block, eight warps, 12.5%. A 64-register cap makes registers allow four blocks, but shared memory still allows one, so occupancy does not move.</p>
+<p>The cost is real: the compiler meets a register cap by spilling to local memory, which lives in the HBM-backed address space and goes through L1 and L2. A kernel that was waiting on memory gets more memory traffic.</p>
+<p>Two defensible paths, each with a cost. Shrink the tile so shared memory drops under 114 KB and registers under 128 per thread, which allows two blocks: occupancy doubles, but intensity scales with tile edge, so the kernel moves more bytes per FLOP. Or keep one block and deepen the asynchronous copy pipeline so the eight warps always have the next tile arriving: occupancy unchanged, more engineering, and it only helps if the stalls are load latency rather than bandwidth.</p>
+<p>The deadline sets the default: with a run starting Friday, ship the current kernel if it is correct, measure stall reasons on the real shapes, and change one thing at a time after launch. The failure mode of that choice is a kernel at a fraction of its achievable speed burning GPU-hours for the length of the run; size it as the kernel's share of step time times the run's GPU-hours before deciding the run cannot wait.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The stall breakdown shows most cycles waiting on shared-memory instruction queues, not HBM. Which of the two paths does that rule out, and why?</li>
+<li>The kernel is 4% of step time on a run with a fixed GPU-hour budget. What speedup justifies delaying the start by a week, computed from those two numbers and the run length?</li>
+<li>What profile would make you reverse the decision and accept the register cap after all?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The per-level sizes are exact, but the throughput figures are peaks. A board configured below its 700 W limit runs at lower clocks, and sustained tensor-core throughput on real shapes sits below 989. Use the peaks as floors on time, never as predictions of it.
+
+Occupancy arithmetic here ignores allocation granularity and per-block reservations, so treat the result as an upper bound and read achieved occupancy from a profiler. It also assumes one kernel per SM; kernels running concurrently on separate streams share the same budgets.
+
+The model also stops at one GPU. Once a tensor has to cross NVLink at 900 GB/s, which is 900 / 3,350 = 0.27 of HBM bandwidth, the slowest level is outside the card, and the same reasoning has to be redone with communication bytes, which is the subject of the distributed training module.
+
+<SelfRate id="lesson:training/gpu-kernels/gpu-hierarchy" />

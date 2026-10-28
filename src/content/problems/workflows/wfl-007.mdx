@@ -1,0 +1,114 @@
+---
+id: wfl-007
+title: Review this refine loop
+subtitle: an evaluator-optimiser that grades itself
+track: workflows
+module: patterns
+type: critique
+difficulty: medium
+seniority: [senior, staff]
+minutes: 20
+tags: [evaluator-optimiser, llm-as-judge, budgets, retries, code-review]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Anthropic, Building effective agents (2024-12-19)
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: evaluator-optimiser fits when evaluation criteria are clear and refinement adds measurable value; stopping conditions such as a maximum number of iterations; checked 2026-10-28
+  - title: Panickssery, Bowman and Feng, LLM Evaluators Recognize and Favor Their Own Generations (2024)
+    url: https://arxiv.org/abs/2404.13076
+    note: evaluators score their own outputs higher than outputs human annotators rate as equal; self-recognition correlates linearly with self-preference after fine-tuning
+  - title: Huang et al., Large Language Models Cannot Self-Correct Reasoning Yet (ICLR 2024)
+    url: https://arxiv.org/abs/2310.01798
+    note: without external feedback, models struggle to correct their own reasoning and performance sometimes drops after self-correction
+checklist:
+  - The loop has no iteration cap and no token or cost budget, so a draft the critic never approves runs until something external stops it
+  - The approval check is a substring match on the upper-cased verdict, so "NOT APPROVED" or any mention of "approved" ends the loop with failing copy
+  - The critic prompt names "our style guide" but never includes it, so the critic grades against criteria it invents
+  - The critic is the same model reading the generator's own conversation, so it sees the drafting instructions and its own earlier drafts and is prone to favouring them
+  - The bare except with continue turns a persistent error into a tight loop of failing calls with no backoff
+  - History grows by a draft and a verdict every round, so input tokens grow quadratically until the request overflows the context window, which the except clause then retries forever
+  - An exception after the draft is appended leaves the history ending on an assistant turn, so the next round regenerates from an inconsistent conversation
+  - With temperature 0 and no change detection, a generator that cannot satisfy the critic repeats the same draft; the loop also returns the last draft rather than the best one
+  - Rules a program can check (length limits, banned words, the required legal line) are left to the model instead of being enforced in code first
+  - "Judgement call: the same model as critic is acceptable if the critic gets its own prompt with the full style guide, sees only the brief and the draft, and its verdicts are checked against human labels on a sample"
+  - No per-round record of drafts, verdicts and tokens, so nobody can measure whether refinement improves anything
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Code review">
+"This shipped last sprint to write product release copy. Review it as if it were your team's pull request: list every problem and rank them."
+</Callout>
+
+```python
+GEN_MODEL = "large-model-2026-05"
+CRITIC_MODEL = GEN_MODEL  # same model keeps the voice consistent
+
+
+def refine(brief: str) -> str:
+    history = [{"role": "user", "content": f"Write release copy for: {brief}"}]
+    draft = ""
+    while True:
+        try:
+            draft = call(GEN_MODEL, history, temperature=0)
+            history.append({"role": "assistant", "content": draft})
+            verdict = call(
+                CRITIC_MODEL,
+                history + [{
+                    "role": "user",
+                    "content": "Review the copy above against our style guide. "
+                               "Reply APPROVED if it meets every rule, otherwise list the problems.",
+                }],
+                temperature=0,
+            )
+            if "APPROVED" in verdict.upper():
+                return draft
+            history.append({"role": "user", "content": f"Fix these problems: {verdict}"})
+        except Exception as e:
+            log.warning("refine step failed: %s", e)
+            continue
+```
+
+The style guide is a two-page document: a 90-character limit for headlines, a list of banned words, a required legal line for features in beta, and guidance on tone. Most runs return in two or three rounds. Last week one run returned copy with a banned word, and one request was still retrying when someone killed the worker.
+
+List the flaws before you open the checklist.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Request the critic's verdict text from the run that returned copy with a banned word.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the error the provider returned on the run that was killed, and the request's input token count on its last successful round.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the critic is shown, word for word, when it is asked to apply the style guide.</p></details>
+
+## Answer
+
+The two incidents point at the two flaws a first read misses. The banned word got through because the approval check is `"APPROVED" in verdict.upper()`: a verdict that says "Not approved: uses a banned word" contains the string, so the loop returns the failing draft. And the critic was never shown the banned words in the first place: the prompt mentions "our style guide" and includes none of it, so the critic judged against what it guessed a style guide says. The killed worker is the other pair: history grows every round, a hard brief eventually overflows the context window, and the bare `except ... continue` retries the overflowing request forever with no backoff, no cap and no budget.
+
+Ranked by harm:
+
+1. **The approval parse.** Silent wrong output on a path that looks healthy. Fix: ask the critic for structured output (`{"approved": bool, "violations": [...]}`) and gate on the boolean, with a schema check.
+2. **The missing style guide.** The critic cannot apply rules it cannot see. Put the guide in the critic's prompt and move the mechanical rules into code: headline length, banned words and the legal line are string checks that run before any model call and cannot be argued with.
+3. **No stopping condition.** Cap rounds (three or four, from the observed two or three), cap tokens per run, and return the best draft so far with a `needs_review` flag when the cap is hit, rather than raising or looping.
+4. **The except clause.** Catch the errors you can retry (rate limits, timeouts) with backoff and a retry cap, and fail fast on the ones you cannot (context length, invalid request). Append to history only after both calls succeed, so a failure cannot leave the conversation ending on an assistant turn.
+5. **Growing history.** The critic does not need the conversation, and the generator needs only the brief, its last draft and the latest violations. Rebuilding each request from those keeps input size flat.
+6. **The critic grading itself.** Evaluators favour their own outputs, and a model reviewing its own reasoning without external feedback often does not improve it. Here the critic also reads the drafting conversation. A separate rubric prompt that sees only the brief and the draft, with deterministic checks doing the hard rules, removes most of the risk; a different model family as critic removes more, at the cost of a second provider.
+7. **No progress detection.** At temperature 0, an unchanged draft means the loop is stuck; stop on an identical draft and keep the best-scoring one rather than the last.
+8. **No record.** Log each round's draft, verdict, violations and tokens, so you can measure whether round two beats round one at all.
+
+The judgement call: keeping the same model as critic is acceptable if the critic gets its own prompt with the full guide, sees only the brief and the draft, and its verdicts agree with a human-labelled sample at a rate you have decided in advance is enough. Without that calibration, the loop's pass rate measures the model's agreement with itself.
+
+A failure mode of the fixed version: once hard rules move into code, the model critic is left with tone, the vaguest criterion, and it will approve or reject inconsistently. Measure its agreement with the human labels on tone separately; if it is low, drop the model critic and send capped-out drafts to a human editor instead.
+
+## Follow-ups
+
+- *Pushback: structured outputs and a second prompt add latency to a loop users already find slow. Which change do you skip, and what risk do you accept?* Keep the code checks and the boolean gate, which cost nothing in latency; drop the model critic for tone if its measured agreement with editors is low, and accept that tone is reviewed by people on capped-out drafts only.
+- *How would you show refinement is worth its cost?* Score first-round and final drafts on the same human-labelled set; if the final is not measurably better, ship one generation plus the code checks.
+- *Reversal: what would make you remove the loop entirely?* If, after the hard rules move into code, the share of drafts the critic sends back is small and editors rate first drafts the same as refined ones, the loop is paying for nothing.
+
+## Common mistakes
+
+- Reviewing the prompt wording and missing the substring check.
+- Not noticing that the style guide is named but never sent.
+- Adding a round cap but leaving the bare except, which still loops on a non-retryable error.
+- Proposing a stronger critic model before moving checkable rules into code.

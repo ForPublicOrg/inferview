@@ -1,0 +1,168 @@
+---
+title: Retries, rate limits and the two kinds of 429
+track: apis
+module: api-anatomy
+order: 2
+kind: lesson
+level: senior
+minutes: 14
+summary: A rate-limit 429 clears by waiting and a spend-cap 429 does not, and the client stack decides which one becomes a retry storm by where it puts its single retry layer.
+prerequisites: [apis/api-anatomy/stream-contract]
+updated: 2026-10-28
+sources:
+  - title: Claude docs, rate limits (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: token bucket with continuous replenishment; workspace rate limits under organisation limits; Message Batches API rate limits separate from the Messages API; 60 RPM may be enforced as 1 request per second; RPM, ITPM and OTPM per model class and tier (Start, Build and Scale rows for Opus 5.5, Sonnet 5.5 and Haiku 5.5); cache reads excluded from ITPM except on Haiku 3.5; the 2,000,000 ITPM and 80 percent example; OTPM ignores max_tokens; monthly spend caps of $500, $1,000 and $200,000; spend-cap 429 without retry-after and with error_code enforced_spend_limit_reached; a spend limit you set returns 400; acceleration limits
+  - title: Claude docs, API errors (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/errors
+    note: error types by status; 529 overloaded_error under high traffic across all users; the SDK retries twice by default with exponential backoff and honours retry-after; max_retries setting
+  - title: OpenAI API docs, rate limits (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/guides/rate-limits
+    note: the maximum of max_tokens and the estimate counts toward TPM; Retry-After as a minimum plus a small random delay; limit attempts and total retry time; do not retry quota or billing errors; unsuccessful requests count toward the per-minute limit
+  - title: Exponential Backoff And Jitter (Marc Brooker, AWS Architecture Blog, 2015, updated 2023)
+    url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+    note: with 100 contending clients jitter cut the call count by more than half; Full and Equal Jitter similar in calls, Equal much slower to finish; Decorrelated more calls than Full but slightly faster; work still grows with N squared
+  - title: Timeouts, retries and backoff with jitter (Marc Brooker, Amazon Builders' Library)
+    url: https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter
+    note: five layers retrying three times each multiply load by 243; retry at a single point in the stack; a local token bucket limits retries; timeouts from an acceptable false-timeout rate such as 0.1 percent and the matching percentile; side effects need idempotency
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import ApisRetryStorm from '../../../../components/widgets/ApisRetryStorm.astro';
+
+## The decision: one retry layer, and what the others do
+
+A model call usually crosses three layers that each know how to retry: the provider SDK, a gateway or shared client, and whatever runs the job. Every one of them ships with retries on or is easy to turn on. The design decision is which single layer retries on each path, and what every other layer does instead: pass the error through with its `retry-after`, fail fast, fail over, or re-queue the whole job much later. The rest of this lesson is the inputs to that decision.
+
+## What the buckets count
+
+Claude enforces three limits per model class: requests per minute (RPM), input tokens per minute (ITPM) and output tokens per minute (OTPM). They are token buckets that refill continuously, and the docs warn that a 60 RPM limit may be enforced as one request per second, so a burst can be rejected while the minute's total is well under the limit.
+
+| Tier (standard limits) | RPM | ITPM | OTPM | Monthly spend cap |
+|---|---|---|---|---|
+| Start | 1,000 | 2,000,000 | 400,000 | $500 |
+| Build | 5,000 | 5,000,000 | 1,000,000 | $1,000 |
+| Scale | 10,000 | 10,000,000 | 2,000,000 | $200,000 |
+
+The rows are the same for Claude Opus 5.5, Sonnet 5.5 and Haiku 5.5 on 28 October 2026, and each of those models has its own bucket. Some older rows are shared: Opus 4.8, 4.7, 4.6 and 4.5 draw from one combined Opus 4.x limit. Moving traffic between two models with separate buckets adds capacity; moving it between two models in a combined row adds none.
+
+Two counting rules decide how much traffic fits.
+
+**Cache reads are excluded from ITPM on most Claude models.** `input_tokens` (after the last cache breakpoint) and `cache_creation_input_tokens` count; `cache_read_input_tokens` do not, except on Claude Haiku 3.5. The docs' own example: at 2,000,000 ITPM and an 80 percent cache hit rate, 10,000,000 total input tokens per minute fit.
+
+<Predict id="api-cache-itpm" question="Build tier, 5,000,000 ITPM. You measure that 60 percent of input tokens are cache reads and the rest are uncached input or cache writes. How many million total input tokens per minute fit before the input bucket empties?" answer={12.5} tolerance={0.1} unit="million tokens">
+<p><b>12.5 million.</b> Only the uncached 40 percent counts, so 5,000,000 / 0.4 = 12,500,000. The same arithmetic runs backwards in an incident: a prompt deploy that changes the cached prefix drops the hit rate toward zero, and the ITPM ceiling for the same traffic falls by the same factor of 2.5 with no change in request volume.</p>
+</Predict>
+
+**Output is counted as it is generated.** OTPM counts tokens actually produced, and `max_tokens` does not factor in, so a generous `max_tokens` costs nothing against the limit. OpenAI counts differently, and engineers porting a client across get this wrong in both directions:
+
+| | Claude | OpenAI |
+|---|---|---|
+| Token limits | ITPM and OTPM separately | TPM (plus RPM, RPD, TPD, IPM) |
+| `max_tokens` against the limit | No; generated tokens only | The larger of `max_tokens` and the estimate |
+| Cache reads | Excluded from ITPM on most models | Not stated on the rate-limits page |
+| Failed requests | Not stated for rate limits generally | Count toward the per-minute limit |
+| Wait hint | `retry-after`, `anthropic-ratelimit-*` | `Retry-After`, `x-ratelimit-*` |
+
+OpenAI's statement that unsuccessful requests count matters for retries: on that provider, a client retrying into a 429 spends the capacity it is waiting for. Claude's docs add a third 429 source with no bucket at all: acceleration limits, which can return 429 when an organisation's usage rises sharply. The documented mitigation is to ramp traffic gradually, which is a scheduler change, not a retry change.
+
+## Two kinds of 429, and a 400 that belongs with them
+
+A Claude 429 always has error type `rate_limit_error`. What it means depends on the headers and the body.
+
+- **Rate limit.** The response carries `retry-after` in seconds, and the docs say earlier retries will fail. Waiting is correct.
+- **Spend cap.** Each tier has a monthly cap. Once it is reached, usage pauses until 00:00 UTC on the first day of the next month unless the organisation moves to a higher tier. The 429 has no `retry-after` header, and `error.details.error_code` is `enforced_spend_limit_reached`. The docs state that retrying, including the SDK's automatic retries, fails until access resumes. Every retry policy keyed on status code alone retries it.
+- **A spend limit you set yourself** below the tier cap returns 400 `invalid_request_error`, with a message that starts `You have reached your specified API usage limits`. A classifier that treats every 400 as a caller bug pages the wrong team for a budget event.
+
+A 529 `overloaded_error` is the other neighbour: capacity is short across all users, not your organisation's limit. It is retryable, but repeated 529s are a reason to shed load or fail over, which the next lesson covers. OpenAI's guide draws the same line for its errors: do not retry quota, billing or other errors that need someone to act.
+
+```python
+def classify(status, headers, body):
+    """Map a Claude error response to what the single retry layer does with it."""
+    details = ((body or {}).get("error") or {}).get("details") or {}
+    if status == 429 and details.get("error_code") == "enforced_spend_limit_reached":
+        return "stop", "spend cap: alert the budget owner; no retry clears it"
+    if status == 429:
+        return "retry", float(headers.get("retry-after", 0))   # wait at least this long
+    if status in (500, 529) or status is None:                # None: connection reset
+        return "retry", 0.0
+    if status == 400 and "specified" in (body or {}).get("error", {}).get("message", ""):
+        return "stop", "self-imposed spend limit: a budget event, not a bad request"
+    return "stop", "the same request fails again"              # 400, 401, 403, 404, 413
+```
+
+The docs list no `retry-after` on the spend-cap 429 and say nothing about 429s that lack both the header and the error code, so this sketch backs off on those; whether a missing header without the code should count against an alert threshold is a policy you write down. A 504 `timeout_error` falls into the last branch on purpose: the documented fix for a long request is to stream it or move it to the Message Batches API, and a retry repeats the timeout.
+
+## Retries multiply
+
+The Claude SDK retries transient failures twice by default with exponential backoff, honouring `retry-after` when present, and `max_retries` changes or disables it. That default is the first multiplier in the stack.
+
+<Predict id="api-stacked-retries" question="A worker wraps the SDK call in its own loop of 3 attempts and leaves the SDK default alone. How many HTTP requests can one failing call send?" answer={9} unit="requests">
+<p><b>Nine.</b> The SDK makes 1 attempt plus 2 retries, 3 requests, and the loop runs the SDK call 3 times: 3 × 3 = 9. Put a job runner that retries the whole job 3 times above it and the provider sees up to 27 requests for one document. Brooker's Builders' Library article makes the same point for a five-layer stack: three tries at each layer is 3<sup>5</sup> = 243 times the load on the bottom layer, "making it unlikely to ever recover".</p>
+</Predict>
+
+The second multiplier is synchronisation. Workers that failed in the same millisecond and wait the same delay come back in the same millisecond. Exponential backoff spreads the waves apart in time without shrinking them; jitter breaks the alignment.
+
+<ApisRetryStorm />
+
+Switch from "Retry at once" to "Exponential" with 100 clients: the same waves arrive later and further apart, and the same clients give up. "Full jitter" spreads the retries across the window. Brooker's 2015 simulation of contending clients reports the same shape at larger scale: with 100 clients, adding jitter cut the number of calls by more than half; Full and Equal Jitter made roughly the same number of calls, but Equal took much longer to finish; Decorrelated Jitter made more calls than Full and finished slightly sooner. Jitter does not change how work grows with the number of contending clients. It removes the alignment, not the shortage.
+
+## Placing the layer
+
+Three layers can own retries, and each knows something the others do not.
+
+| Layer | Knows | Does not know |
+|---|---|---|
+| Client library at the call site | The caller's deadline; whether the operation has side effects; the user waiting | Traffic from other processes; the global budget |
+| Gateway | All traffic to the provider; one place to enforce a retry budget and a breaker | The caller's deadline, unless propagated; whether a retry is safe |
+| Job runner | That the work can wait minutes; the job's idempotency key | Anything about the individual call |
+
+Two placements are defensible. **Retries in the client library**, with gateway retries off: the layer that knows the deadline and the side effects decides, at the cost of a retry budget that is per process rather than global, and N teams' configurations to keep consistent. **Retries in the gateway**, with every SDK at `max_retries=0`: one budget and one breaker see all traffic, at the cost of propagating deadlines and idempotency keys through a header, and of a gateway that holds connections open while it waits. Either way, the job runner does not retry calls. It re-queues a failed job after a delay measured in minutes, keyed so a re-run does not repeat side effects.
+
+The layers that do not retry still have work: pass `retry-after` and the error class through unchanged, stop at the spend cap, and fail fast when the deadline left is shorter than the wait the server asked for.
+
+Three settings finish the policy.
+
+**A retry budget.** Brooker describes a local token bucket that lets every call retry while tokens last and then limits retries to a fixed rate. He gives no ratio, so the number is yours: a budget of retries as a share of recent first attempts, plus a small floor so a quiet service can still retry. Write the ratio down, because during a provider incident it decides how much extra load you send.
+
+**Timeouts from a percentile.** The same article picks an acceptable false-timeout rate, such as 0.1 percent, and sets the timeout at the matching latency percentile, p99.9. A model call's total latency scales with output length, so one number cannot serve every route. Use a first-byte timeout from the time-to-first-token distribution, and a total timeout per route from that route's output-length distribution.
+
+**Idempotency before retries.** Brooker's rule is that APIs with side effects are not safe to retry unless they provide idempotency. A model call with no tools only costs money when repeated. A tool call that refunds, emails or writes does not, so its key is derived from the conversation and the tool-use id, and the tool returns the earlier result when it sees the key again.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Chat and a nightly enrichment batch share one organisation on the Build tier. When the batch starts at 21:00, chat starts returning 429s and its p99 doubles. Product wants chat untouched; the data team's batch has to finish by 06:00. You have a week. Where do the limits and the retries live?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Separate the workloads before tuning retries. Either give each its own workspace with a rate limit, so the batch cannot drain chat's bucket, or move the batch to the Message Batches API, which has its own rate limits. Then one retry layer per path: chat retries in its client with a deadline and a budget; the batch never retries calls, it re-submits failed items.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The symptom is two workloads in one token bucket, and retries make it worse: the batch's retries consume the capacity chat is waiting for. Retry tuning alone cannot fix contention.</p>
+<p>Option one is workspace limits. The docs let an organisation set lower rate limits per workspace, and organisation limits still apply when workspace limits add up to more. Cap the batch workspace below the organisation's ITPM and chat keeps the rest. The cost is idle headroom: at 03:00 chat is quiet and the batch is still capped.</p>
+<p>Option two is the Message Batches API. Its rate limits are separate from the Messages API limits, so the batch stops competing per minute; the cost is that results arrive asynchronously, so the pipeline changes from a worker pool to submit-and-poll, and the 06:00 deadline now depends on queue processing time you do not control.</p>
+<p>Option three, a client-side scheduler that admits batch calls only when the <code>remaining</code> headers show headroom, gets the best utilisation and is the most code to own. In a week I would ship workspace limits, sized from the batch's measured tokens per item and the six-hour window, and plan the Batches API move with a measured completion-time distribution before trusting it with the deadline.</p>
+<p>Failure mode: a workspace cap sized from today's cache hit rate breaks the night a prompt change empties the cache, because the same items then count several times more input tokens against the cap and the batch misses 06:00 without any error.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Pushback:</em> the cap leaves chat with headroom it does not use from 01:00 to 06:00 while the batch runs late. Which do you give up, utilisation or isolation, and who signs it?</li>
+<li><em>Reversal:</em> what would the Batches API completion times need to look like for two weeks before you move the batch off the Messages API entirely?</li>
+<li><em>Operating:</em> the batch hits the organisation's spend cap at 04:00. What does chat do for the rest of the month?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Limits, header names and caps here were read on 28 October 2026 and change by tier and model. Organisations with little usage history can sit in an Evaluation tier below these numbers, and workspace limits can sit below the organisation's, with `anthropic-ratelimit-tokens-*` headers reporting whichever limit is most restrictive. Read the headers, not this table.
+
+The retry simulator has one server with fixed capacity. A provider short of capacity for minutes returns 529 to everyone, and no retry policy helps; the answer is a fallback model or a degraded feature. Jitter fixes alignment, not a shortage.
+
+A single retry layer assumes you control the stack. When a vendor component retries internally and cannot be configured, count it as a layer, and budget the layer you do control against the multiplier you cannot remove.
+
+<SelfRate id="lesson:apis/api-anatomy/two-429s" />

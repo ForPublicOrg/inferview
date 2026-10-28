@@ -1,0 +1,158 @@
+---
+title: "Optimizers: AdamW, decoupled decay and Muon"
+track: training
+module: numerics
+order: 4
+kind: lesson
+level: senior
+minutes: 14
+summary: Why an L2 penalty under Adam is not weight decay, how decay compounds with the learning-rate schedule, and what Muon changes, with the conditions under which its reported gain holds.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Loshchilov and Hutter, Decoupled Weight Decay Regularization (ICLR 2019, arXiv 1711.05101)
+    url: https://arxiv.org/abs/1711.05101
+    note: "L2 regularization and weight decay are equivalent for SGD when decay is scaled by the learning rate, not for adaptive methods such as Adam; decoupling the decay from the gradient-based update restores weight decay, lets the optimal decay factor be chosen independently of the learning rate, and improves Adam's generalization. Checked 2026-10-28."
+  - title: PyTorch 2.14, torch.optim.AdamW
+    url: https://docs.pytorch.org/docs/2.14/generated/torch.optim.AdamW.html
+    note: "Decay step theta_t = theta_{t-1} - gamma * lambda * theta_{t-1}, with gamma the learning rate; defaults lr 1e-3, betas (0.9, 0.999), eps 1e-8, weight_decay 1e-2; the decay does not accumulate in the moment estimates. Checked 2026-10-28."
+  - title: PracHub, Explain Adam, AdamW and decoupled weight decay (posted 2026-09-01)
+    url: https://prachub.com/interview-questions/explain-adam-adamw-and-decoupled-weight-decay
+    note: "Candidate report via a question bank: Mistral AI, Software Engineer, technical screen; asks why an L2 penalty differs from decoupled decay under Adam, when they coincide, and how decay interacts with the learning-rate schedule. Checked 2026-10-28."
+  - title: Liu et al. (Moonshot AI), Muon is Scalable for LLM Training (arXiv 2502.16982, 2025-02-24)
+    url: https://arxiv.org/html/2502.16982
+    note: "Momentum 0.95 with a Nesterov-style variant; Newton-Schulz orthogonalization with 5 iterations and coefficients 3.4445, -4.7750, 2.0315; update 0.2 * O_t * sqrt(max(A, B)) plus decoupled decay; a full-rank [A, B] matrix's orthogonalized update has RMS sqrt(1 / max(A, B)); AdamW update RMS usually 0.2 to 0.4, so 0.2 lets Muon reuse AdamW's learning rate and decay; without decay, weight and layer-output RMS grew in an 800M-parameter, 100B-token run, potentially beyond bf16's high-precision range; AdamW kept for RMSNorm, LM head and embeddings; one momentum buffer against AdamW's two; Newton-Schulz plus communication about 1% to 3% of forward-backward time; about 2x computational efficiency over AdamW under compute-optimal training, about 52% of the training FLOPs; Moonlight 3B/16B MoE on 5.7T tokens; Muon SFT on an AdamW-pretrained model showed no significant advantage. Checked 2026-10-28."
+  - title: OLMo Team, 2 OLMo 2 Furious (arXiv 2501.00656)
+    url: https://arxiv.org/html/2501.00656
+    note: "AdamW epsilon lowered from 10^-5 to 10^-8, giving a lower, more stable early gradient norm. Checked 2026-10-28."
+  - title: Kimi Team, Kimi K2 technical report (arXiv 2507.20534)
+    url: https://arxiv.org/html/2507.20534
+    note: "MuonClip: Muon with weight decay, Adam-RMS matching and QK-Clip; peak learning rate 2e-4 constant for 10T tokens after warm-up, then cosine decay to 2e-5 over 5.5T tokens; weight decay 0.1; global batch 67M tokens; attention logits above 1000 with vanilla Muon at 9B activated, 53B total. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The mechanism
+
+Adam divides each parameter's step by the square root of a running average of its squared gradients. That per-parameter normalisation is the point of Adam, and it is also why adding λθ/2 to the loss, an L2 penalty, does not do what weight decay does. The penalty's gradient λθ enters the same numerator and the same running averages as the data gradient, and is divided by the same denominator. A parameter with a large gradient history gets a large denominator and very little decay; a parameter with small gradients gets a small denominator and a decay far stronger than λ. Loshchilov and Hutter showed the two are equivalent for SGD, where nothing divides the gradient, and not for adaptive methods. AdamW moves the decay out of the gradient and applies it to the weights directly.
+
+## The update, both ways
+
+Adam with an L2 penalty, per parameter, with g the data gradient:
+
+```text
+g'  = g + λθ
+m   = β1·m + (1 − β1)·g'
+v   = β2·v + (1 − β2)·g'²
+θ  -= lr · m̂ / (√v̂ + ε)          m̂, v̂ bias-corrected
+```
+
+AdamW, as PyTorch implements it:
+
+```text
+θ  -= lr · λ · θ                  decay, outside the moments
+m   = β1·m + (1 − β1)·g
+v   = β2·v + (1 − β2)·g²
+θ  -= lr · m̂ / (√v̂ + ε)
+```
+
+PyTorch's documentation says it directly: AdamW's decay does not accumulate in the moment estimates. Its defaults are a learning rate of 10^−3, betas (0.9, 0.999), ε of 10^−8 and a weight decay of 10^−2.
+
+## The difference in numbers
+
+The simulation below runs both for 2,000 steps from θ = 1 with a learning rate of 10^−3 and λ = 0.01, on a gradient that alternates sign every step with a fixed magnitude, so the data gradient averages to zero and any net movement is decay.
+
+```python
+import math
+
+def run(mode, gscale, steps=2000, lr=1e-3, lam=0.01, b1=0.9, b2=0.999, eps=1e-8):
+    th, m, v = 1.0, 0.0, 0.0
+    for t in range(1, steps + 1):
+        g = gscale * (1 if t % 2 else -1)
+        if mode == "l2":
+            g += lam * th
+        m = b1 * m + (1 - b1) * g
+        v = b2 * v + (1 - b2) * g * g
+        th -= lr * (m / (1 - b1 ** t)) / (math.sqrt(v / (1 - b2 ** t)) + eps)
+        if mode == "adamw":
+            th -= lr * lam * th
+    return th
+```
+
+| Gradient magnitude | θ after 2,000 steps, L2 under Adam | θ after 2,000 steps, AdamW |
+|---|---|---|
+| 10 | 0.9962 | 0.9785 |
+| 1 | 0.9785 | 0.9785 |
+| 0.1 | 0.818 | 0.9785 |
+| 0.001 | 0.0231 | 0.9785 |
+
+AdamW shrinks every parameter by the same factor, (1 − 10^−5)^2000 ≈ 0.98. The L2 version matches it only where the gradient magnitude happens to be 1. A parameter with gradients of size 0.001 is driven to 2% of its value, because its denominator is set by the penalty itself and each step removes close to a full learning rate. That is the regularisation Adam with L2 actually applies: strongest on the parameters the data says least about, weakest on the ones with large gradients, which are often the ones that most need it.
+
+## Decay and the schedule
+
+PyTorch's decay step is lr × λ × θ, so the product of learning rate and decay sets the shrink per step. Over a run, the fraction of a weight that decay alone would leave is the product of (1 − lr_t·λ) over all steps, close to exp(−λ·Σ lr_t). The learning-rate schedule is therefore also a decay schedule.
+
+<Predict id="trn-num-opt-decay" question="Kimi K2 held a learning rate of 2e-4 for its first 10T tokens with weight decay 0.1 and a global batch of 67M tokens. Ignoring gradients, what fraction of a weight's value survives decay alone over that constant phase?" answer={0.05} tolerance={0.003} unit="">
+<p>Steps: 10 × 10^12 / 67 × 10^6 ≈ 149,254. Shrink per step: 2 × 10^−4 × 0.1 = 2 × 10^−5. Survival: (1 − 2 × 10^−5)^149,254 ≈ exp(−2.985) ≈ <b>0.05</b>. A weight the gradients do not defend loses 95% of its value. In the following 5.5T tokens of cosine decay from 2 × 10^−4 to 2 × 10^−5, the average learning rate is 1.1 × 10^−4 over about 82,090 steps, so survival is exp(−0.903) ≈ 0.41: the same λ regularises much less once the learning rate falls.</p>
+</Predict>
+
+Three consequences. Retuning the peak learning rate in PyTorch's AdamW retunes decay with it, so a learning-rate sweep with λ fixed is a sweep over both. Extending a run's constant phase strengthens decay in proportion to the extra steps. And decay acts most strongly where the schedule is high, which is early, when the weights the decay is meant to restrain have not yet grown.
+
+## Muon
+
+Muon, as Moonshot's team scaled it, treats each weight matrix as a matrix. It keeps one momentum buffer per matrix, with momentum 0.95 in a Nesterov-style variant, and replaces the momentum by an approximately orthogonal matrix with the same singular vectors: five Newton-Schulz iterations with coefficients 3.4445, −4.7750 and 2.0315 push every singular value toward one. The step direction keeps the momentum's geometry and drops its scale differences between directions.
+
+Two additions made it work at scale, per the Moonlight paper. First, weight decay in the decoupled form: without it, in an 800M-parameter model trained on 100B tokens, weight and layer-output RMS kept growing, potentially past the range where bf16 keeps its precision, and Muon's early advantage disappeared. Second, update scaling. The orthogonalized update of a full-rank A × B matrix has RMS √(1 / max(A, B)), which depends on the matrix's shape, so the paper multiplies it by 0.2·√max(A, B).
+
+<Predict id="trn-num-opt-rms" question="Using the paper's lemma, what is the RMS of the orthogonalized update for a full-rank 1024 x 4096 weight matrix, before the 0.2 x sqrt(max(A, B)) scaling?" answer={0.015625} tolerance={0.0001} unit="">
+<p>√(1 / 4096) = 1/64 = <b>0.015625</b>. Multiplying by 0.2 × √4096 = 12.8 gives an update RMS of 0.2 for this matrix and for every other shape. The paper picked 0.2 because AdamW's update RMS is usually 0.2 to 0.4 in its observations, and 0.2 and 0.4 performed alike in its sweep. Matching the RMS is what lets Muon reuse an AdamW learning rate and decay without a new sweep.</p>
+</Predict>
+
+The paper keeps AdamW for parameters that are not matrices in the relevant sense: RMSNorm gains, the LM head and the embeddings. A Muon run is therefore a two-optimizer run, with two sets of hyperparameters.
+
+What the paper reports. Its scaling-law experiments put Muon at about twice AdamW's computational efficiency under compute-optimal training, or about 52% of the training FLOPs for the same loss; the 3B-activated, 16B-total Moonlight MoE trained on 5.7T tokens with it. Its optimizer state is one buffer against AdamW's two. Newton-Schulz and the extra communication of a distributed implementation, which has to gather a full matrix to orthogonalize it, took about 1% to 3% of forward-backward time in the authors' cluster.
+
+What it cost Kimi K2. Moving to Muon at a 9B-activated, 53B-total scale produced attention logits above 1,000, and K2 shipped with QK-Clip as part of the optimizer, called MuonClip. The previous lesson covers the mechanism. The pattern generalises: an optimizer change moves weight-norm and logit dynamics that the rest of the recipe was tuned around.
+
+What it does not buy. In the Moonlight paper's fine-tuning tables, Muon used for SFT on an AdamW-pretrained model showed no significant advantage over AdamW, and the best results came from Muon in both pretraining and SFT. The authors call the mismatch an open problem.
+
+## When to try Muon
+
+Pretraining from scratch, with time to run a matched pair at small scale, a recipe that has QK-norm or a logit clip, and an implementation that handles the gather under your parallelism, which with tensor parallelism means an extra gather per matrix. Not as a drop-in for fine-tuning an AdamW-pretrained checkpoint, where the published evidence shows no gain, and not on a run whose hyperparameters cannot be revisited, because the RMS matching makes AdamW's learning rate a starting point, not a guarantee.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your next pretraining run starts in three weeks on a fixed budget. A researcher wants Muon for the reported 2x efficiency. Every sweep you have is AdamW, and you have room for one small matched comparison. What do you decide, and what has to be true to switch?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Run the matched pair, AdamW against Muon with RMS matching and decoupled decay at the same learning rate, at the largest scale that fits in a week, and switch only if Muon wins on loss at equal FLOPs with attention logits bounded. Without a logit control in the recipe I would not switch at all, since Kimi K2 needed one at 53B total.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Two answers are defensible. Stay on AdamW: the sweeps transfer, the risk is known, and the cost is whatever efficiency Muon would have bought. Switch: the reported 2x comes from the paper's own scaling-law fit at its scales, and the cost is a run whose optimizer hyperparameters have never been tuned on this data, plus a second optimizer for the non-matrix parameters.</p>
+<p>The quantity I choose is the size of the comparison: big enough that the efficiency gap exceeds seed noise, small enough to finish in a week. I would rather run two seeds of each at half the size than one seed each at full size, because a single pair cannot separate a 10% gain from noise.</p>
+<p>The switch criteria, written before the comparison runs: loss at equal FLOPs better by more than the seed spread; max attention logit per head bounded by QK-norm or a clip; step time overhead under a few percent with our parallelism. What I give up by switching is comparability with every earlier run, which matters for the data ablations queued behind this one.</p>
+<p>How the recommendation fails: a week-long comparison is in the regime where Muon's early advantage is largest, and the Moonlight paper found that advantage faded in over-trained runs without decay. If our run is far past compute-optimal, the small comparison overstates the gain.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The comparison shows a 15% gain at small scale and the logits are fine. The data team says switching invalidates their ablation baselines. Who decides, and what do you write down?</li>
+<li>Halfway through the real run, three heads' logits start climbing despite the clip. What would make you switch back to AdamW from a checkpoint?</li>
+<li>Product wants to fine-tune the result with Muon too. What does the published evidence say, and what would you need to see?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The L2 analysis assumes the moments track the penalty's gradient. With a very large ε, Adam's denominator stops depending on the gradient history and Adam with L2 moves toward SGD with L2, where the two forms of decay agree; OLMo 2's choice of 10^−8 over 10^−5 is a reminder that ε is not a neutral setting.
+
+The schedule arithmetic assumes PyTorch's form, where decay is multiplied by the learning rate. Implementations that apply decay with a separate schedule multiplier, or with a fixed per-step rate, change the survival numbers above, and a recipe copied across frameworks has to carry the formula with the coefficient.
+
+Muon's reported gains are the paper's own measurements on its own models and data, at scales up to Moonlight's. They are not a guarantee at other scales or for dense models trained far past compute-optimal, and the fine-tuning results argue against treating Muon as a universal replacement.
+
+<SelfRate id="lesson:training/numerics/optimizers" />

@@ -1,0 +1,350 @@
+---
+title: Build a pipeline schedule simulator
+track: training
+module: distributed
+kind: lab
+minutes: 120
+summary: Grow one simulator over six steps, from an all-forward-all-backward timeline to the bubble fraction, 1F1B, peak in-flight activations, interleaved stages and a zero-bubble schedule that splits the backward pass, with the published bubble formulas as tests.
+updated: 2026-10-28
+sources:
+  - title: Hugging Face, The Ultra-Scale Playbook, pipeline parallelism
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "all-forward-all-backward bubble time (p - 1)(t_f + t_b) and bubble ratio (p - 1)/m; 1F1B keeps the bubble and stores activations for p micro-batches instead of m; interleaving gives (p - 1)/(v m) and multiplies communication by v; zero-bubble schedules split the backward into B (inputs) and W (weights), with W placed anywhere after its B. Checked 2026-10-28."
+  - title: Narayanan et al., Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM (arXiv 2104.04473)
+    url: https://arxiv.org/abs/2104.04473
+    note: "the interleaved pipeline schedule improves throughput by more than 10%, the paper reports; 1 trillion parameters on 3,072 GPUs at 502 petaFLOP/s, 52% of peak per GPU. Checked 2026-10-28."
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2), table 2
+    url: https://arxiv.org/html/2412.19437v2
+    note: "bubble terms: 1F1B (PP - 1)(F + B), ZB1P (PP - 1)(F + B - 2W), DualPipe (PP/2 - 1)(F&B + B - 3W); DualPipe keeps 2x parameters and PP + 1 activations. Checked 2026-10-28."
+  - title: Meta, The Llama 3 Herd of Models (arXiv 2407.21783), section 3.3.2
+    url: https://arxiv.org/html/2407.21783
+    note: "the number of contiguous micro-batches per stage is tunable to hide point-to-point communication; one transformer layer removed from each of the first and last stages to balance them; interleaved schedule with bubble (PP - 1)/(V M). Checked 2026-10-28."
+steps:
+  - title: All-forward-all-backward timeline
+    brief: |
+      A schedule is a list with one entry per device, each an ordered list of operations `(kind, mb, stage)`: kind is "F" (forward), "B" (backward) or, from step 6, "W" (weight gradient); mb is the micro-batch; stage is the model stage, numbered 0 to S - 1 along the network. Dependencies: F of stage s needs F of stage s - 1 for the same micro-batch; B of stage s needs its own F and the B of stage s + 1, except on the last stage; W needs the B of the same stage and micro-batch. A device runs its list in order, one operation at a time, and starts each as soon as the device is free and its dependencies have finished. Write `afab(p, m)` (device s holds stage s and runs all m forwards, then all m backwards), `simulate(orders, durations)`, which returns `{op: (start, end)}` and raises ValueError if the orders deadlock, and `makespan(timeline)`. Communication is free in this model.
+    starter: |
+      def afab(p, m):
+          """All-forward-all-backward: device s runs F of every micro-batch on stage s, then B of every one."""
+          raise NotImplementedError
+
+
+      def simulate(orders, durations):
+          """orders[d] is device d's ordered list of (kind, mb, stage); durations maps kind to time.
+          Return {op: (start, end)}. Raise ValueError if no device can make progress."""
+          raise NotImplementedError
+
+
+      def makespan(timeline):
+          raise NotImplementedError
+    tests: |
+      d = {"F": 1, "B": 2}
+      tl = simulate(afab(4, 8), d)
+      assert makespan(tl) == 33, makespan(tl)
+      assert tl[("F", 0, 3)] == (3, 4) and tl[("B", 0, 3)] == (11, 13)
+      assert tl[("B", 7, 0)][1] == 33
+      try:
+          simulate([[("B", 0, 0), ("F", 0, 0)], [("F", 0, 1), ("B", 0, 1)]], d)
+          raised = False
+      except ValueError:
+          raised = True
+      assert raised, "a device that must run B before its own F deadlocks"
+    hidden: |
+      import random
+      _r = random.Random(1)
+      _ok = True
+      for _ in range(60):
+          p, m = _r.randint(1, 8), _r.randint(1, 12)
+          f, b = _r.randint(1, 4), _r.randint(1, 6)
+          tl = simulate(afab(p, m), {"F": f, "B": b})
+          _ok = _ok and makespan(tl) == (m + p - 1) * (f + b) and len(tl) == 2 * p * m
+          _ok = _ok and all(tl[("F", i, s)][0] >= tl[("F", i, s - 1)][1] for s in range(1, p) for i in range(m))
+          _ok = _ok and all(tl[("B", i, s)][0] >= tl[("B", i, s + 1)][1] for s in range(p - 1) for i in range(m))
+      assert _ok
+    solution: |
+      def afab(p, m):
+          return [[("F", i, s) for i in range(m)] + [("B", i, s) for i in range(m)] for s in range(p)]
+
+
+      def _deps(op, last):
+          kind, i, st = op
+          if kind == "F":
+              return [("F", i, st - 1)] if st > 0 else []
+          if kind == "B":
+              return [("F", i, st)] + ([("B", i, st + 1)] if st < last else [])
+          return [("B", i, st)]
+
+
+      def simulate(orders, durations):
+          last = max(op[2] for ops in orders for op in ops)
+          timeline = {}
+          free = [0] * len(orders)
+          pos = [0] * len(orders)
+          remaining = sum(len(ops) for ops in orders)
+          while remaining:
+              progressed = False
+              for d, ops in enumerate(orders):
+                  while pos[d] < len(ops):
+                      op = ops[pos[d]]
+                      deps = _deps(op, last)
+                      if any(x not in timeline for x in deps):
+                          break
+                      start = max([free[d]] + [timeline[x][1] for x in deps])
+                      timeline[op] = (start, start + durations[op[0]])
+                      free[d] = start + durations[op[0]]
+                      pos[d] += 1
+                      remaining -= 1
+                      progressed = True
+              if not progressed:
+                  raise ValueError("the schedule deadlocks")
+          return timeline
+
+
+      def makespan(timeline):
+          return max(end for _, end in timeline.values())
+  - title: Bubble fraction
+    brief: |
+      Write `bubble_ratio(timeline, orders, durations)`: idle device-time over busy device-time, where idle is the makespan times the number of devices minus the busy time. For all-forward-all-backward with uniform stages the ratio is (p - 1)/m, which the playbook derives from a bubble of (p - 1)(t_f + t_b) against m (t_f + t_b) of useful work. Predict before running: for p = 16 and m = 32, what fraction of each device's step is idle? The ratio is 15/32, so the idle share of the step is 15/47, about 32%; quoting the ratio as the share of the step is a common slip.
+    starter: |
+
+
+      def bubble_ratio(timeline, orders, durations):
+          """Idle device-time over busy device-time."""
+          raise NotImplementedError
+    tests: |
+      d = {"F": 1, "B": 2}
+      o = afab(4, 8)
+      assert bubble_ratio(simulate(o, d), o, d) == 3 / 8
+      o = afab(16, 32)
+      assert abs(bubble_ratio(simulate(o, d), o, d) - 15 / 32) < 1e-12
+    hidden: |
+      import random
+      _r = random.Random(2)
+      _ok = True
+      for _ in range(60):
+          p, m = _r.randint(1, 10), _r.randint(1, 20)
+          d = {"F": _r.randint(1, 4), "B": _r.randint(1, 6)}
+          o = afab(p, m)
+          _ok = _ok and abs(bubble_ratio(simulate(o, d), o, d) - (p - 1) / m) < 1e-12
+      assert _ok
+    solution: |
+      def bubble_ratio(timeline, orders, durations):
+          busy = sum(durations[op[0]] for ops in orders for op in ops)
+          return (makespan(timeline) * len(orders) - busy) / busy
+  - title: 1F1B
+    brief: |
+      Write `one_f_one_b(p, m)`. Device s runs min(p - s - 1, m) warm-up forwards, then alternates one forward and one backward until the forwards run out, then drains the remaining backwards. The point of the reordering is memory, not time: the bubble stays (p - 1)/m, and the makespan matches all-forward-all-backward exactly. Step 4 measures what it buys.
+    starter: |
+
+
+      def one_f_one_b(p, m):
+          """Warm-up forwards, then alternate F and B, then the remaining backwards."""
+          raise NotImplementedError
+    tests: |
+      d = {"F": 1, "B": 2}
+      o = one_f_one_b(4, 8)
+      assert o[3][:4] == [("F", 0, 3), ("B", 0, 3), ("F", 1, 3), ("B", 1, 3)]
+      assert o[0][:4] == [("F", 0, 0), ("F", 1, 0), ("F", 2, 0), ("F", 3, 0)]
+      tl = simulate(o, d)
+      assert makespan(tl) == 33 and bubble_ratio(tl, o, d) == 3 / 8
+    hidden: |
+      import random
+      _r = random.Random(3)
+      _ok = True
+      for _ in range(60):
+          p, m = _r.randint(1, 10), _r.randint(1, 20)
+          d = {"F": _r.randint(1, 4), "B": _r.randint(1, 6)}
+          o = one_f_one_b(p, m)
+          _ok = _ok and all(sorted(o[s]) == sorted([(k, i, s) for k in "FB" for i in range(m)]) for s in range(p))
+          tl = simulate(o, d)
+          _ok = _ok and makespan(tl) == makespan(simulate(afab(p, m), d))
+      assert _ok
+    solution: |
+      def one_f_one_b(p, m):
+          orders = []
+          for s in range(p):
+              warm = min(p - s - 1, m)
+              ops = [("F", i, s) for i in range(warm)]
+              f, b = warm, 0
+              while f < m:
+                  ops.append(("F", f, s))
+                  f += 1
+                  ops.append(("B", b, s))
+                  b += 1
+              ops += [("B", i, s) for i in range(b, m)]
+              orders.append(ops)
+          return orders
+  - title: Peak in-flight activations
+    brief: |
+      Write `peak_in_flight(timeline, orders)`, one number per device: the most micro-batch stages whose activations the device holds at once. A micro-batch's activations for a stage are held from the start of its F to the end of the last of its B and W on that stage (W arrives in step 6). When one operation ends at the moment another starts, count the release first. All-forward-all-backward holds all m micro-batches on every device; 1F1B holds p - s on device s, at most p, which is why the playbook calls it the schedule that stores activations for p micro-batches instead of m. In the step-2 example that is 16 against 32.
+    starter: |
+
+
+      def peak_in_flight(timeline, orders):
+          """Per device, the most (micro-batch, stage) activations held at once."""
+          raise NotImplementedError
+    tests: |
+      d = {"F": 1, "B": 2}
+      o = afab(4, 8)
+      assert peak_in_flight(simulate(o, d), o) == [8, 8, 8, 8]
+      o = one_f_one_b(4, 8)
+      assert peak_in_flight(simulate(o, d), o) == [4, 3, 2, 1]
+    hidden: |
+      import random
+      _r = random.Random(4)
+      _ok = True
+      for _ in range(60):
+          p, m = _r.randint(1, 10), _r.randint(1, 20)
+          d = {"F": _r.randint(1, 4), "B": _r.randint(1, 6)}
+          o = one_f_one_b(p, m)
+          _ok = _ok and peak_in_flight(simulate(o, d), o) == [min(p - s, m) for s in range(p)]
+          o = afab(p, m)
+          _ok = _ok and peak_in_flight(simulate(o, d), o) == [m] * p
+      assert _ok
+    solution: |
+      def peak_in_flight(timeline, orders):
+          peaks = []
+          for ops in orders:
+              held = {}
+              for op in ops:
+                  key = (op[1], op[2])
+                  start, end = timeline[op]
+                  lo, hi = held.get(key, (None, None))
+                  if op[0] == "F":
+                      held[key] = (start, hi)
+                  else:
+                      held[key] = (lo, end if hi is None else max(hi, end))
+              events = sorted([(lo, 1) for lo, _ in held.values()] + [(hi, -1) for _, hi in held.values()])
+              cur = peak = 0
+              for _, delta in events:
+                  cur += delta
+                  peak = max(peak, cur)
+              peaks.append(peak)
+          return peaks
+  - title: Interleaved stages
+    brief: |
+      Split the model into p x v stages and give device d the stages d, d + p, ..., d + (v - 1) p, so a micro-batch visits every device v times. Write `interleaved(p, m, v)` with a breadth-first order: device d runs every micro-batch's forward on its first stage, then on its second, and so on, then the backwards in reverse stage order. Each stage now does 1/v of a device's work, so the caller passes per-stage durations of t_f / v and t_b / v. With m at least p, the bubble falls to (p - 1)/(v m). Then write `forward_hops(orders)`, the number of device-to-device transfers one micro-batch makes on its forward pass: p - 1 without interleaving and v p - 1 with it, which is the communication interleaving pays for the smaller bubble. This order keeps all-forward-all-backward's memory; the interleaved 1F1B order of Narayanan et al. reaches the same bubble with less memory and a harder bookkeeping problem.
+    starter: |
+
+
+      def interleaved(p, m, v):
+          """Device d holds stages d, d + p, ..., d + (v - 1) p; breadth-first forwards, then backwards in reverse."""
+          raise NotImplementedError
+
+
+      def forward_hops(orders):
+          """Transfers between devices along one micro-batch's forward pass."""
+          raise NotImplementedError
+    tests: |
+      o = interleaved(4, 8, 2)
+      assert o[1][:2] == [("F", 0, 1), ("F", 1, 1)] and ("F", 0, 5) in o[1]
+      d = {"F": 1, "B": 2}
+      assert bubble_ratio(simulate(o, d), o, d) == 3 / 16
+      assert forward_hops(o) == 7 and forward_hops(afab(4, 8)) == 3
+    hidden: |
+      import random
+      _r = random.Random(5)
+      _ok = True
+      for _ in range(50):
+          p, v = _r.randint(1, 8), _r.randint(1, 4)
+          m = _r.randint(p, 3 * p)
+          d = {"F": _r.randint(1, 3), "B": _r.randint(1, 5)}
+          o = interleaved(p, m, v)
+          _ok = _ok and abs(bubble_ratio(simulate(o, d), o, d) - (p - 1) / (v * m)) < 1e-9
+          _ok = _ok and forward_hops(o) == (v * p - 1 if p > 1 else 0)
+          _ok = _ok and all(len(ops) == 2 * m * v for ops in o)
+      assert _ok
+    solution: |
+      def interleaved(p, m, v):
+          orders = []
+          for d in range(p):
+              fwd = [("F", i, k * p + d) for k in range(v) for i in range(m)]
+              bwd = [("B", i, k * p + d) for k in reversed(range(v)) for i in range(m)]
+              orders.append(fwd + bwd)
+          return orders
+
+
+      def forward_hops(orders):
+          where = {op[2]: d for d, ops in enumerate(orders) for op in ops}
+          stages = sorted(where)
+          return sum(1 for a, b in zip(stages, stages[1:]) if where[a] != where[b])
+  - title: Zero-bubble split of backward into input and weight gradients
+    brief: |
+      Split each backward into B, the gradient with respect to the stage's input, which the previous stage is waiting for, and W, the gradient with respect to the stage's weights, which nobody downstream needs. W can run any time after its B, so it can fill the gaps 1F1B leaves idle. Write `zero_bubble(p, m, durations)` returning orders that `simulate` accepts, with every F, B and W on every stage exactly once, at most p - s activations held on device s (the 1F1B memory bound), and a makespan strictly below 1F1B's with B + W as one backward. The scheduling policy is yours: one that works is to build the order by simulating a clock and, whenever a device is free, running a ready B first, else a ready F if under the memory bound, else a pending W. Durations are positive integers here. DeepSeek-V3's table gives this family's bubble as (p - 1)(F + B - 2W) against 1F1B's (p - 1)(F + B).
+    starter: |
+
+
+      def zero_bubble(p, m, durations):
+          """Orders over F, B and W for p stages and m micro-batches, at most p - s in flight on device s."""
+          raise NotImplementedError
+    tests: |
+      dz = {"F": 2, "B": 2, "W": 2}
+      o = zero_bubble(4, 8, dz)
+      tl = simulate(o, dz)
+      o1 = one_f_one_b(4, 8)
+      t1 = simulate(o1, {"F": 2, "B": 4})
+      assert all(sorted(o[s]) == sorted([(k, i, s) for k in "FBW" for i in range(8)]) for s in range(4))
+      assert makespan(tl) < makespan(t1), (makespan(tl), makespan(t1))
+      assert all(pk <= 4 - s for s, pk in enumerate(peak_in_flight(tl, o)))
+    hidden: |
+      import random
+      _r = random.Random(6)
+      _ok = True
+      for _ in range(80):
+          p, m = _r.randint(2, 8), _r.randint(1, 24)
+          dz = {"F": _r.randint(1, 3), "B": _r.randint(1, 3), "W": _r.randint(1, 3)}
+          o = zero_bubble(p, m, dz)
+          tl = simulate(o, dz)
+          _ok = _ok and all(sorted(o[s]) == sorted([(k, i, s) for k in "FBW" for i in range(m)]) for s in range(p))
+          _ok = _ok and all(tl[("W", i, s)][0] >= tl[("B", i, s)][1] for s in range(p) for i in range(m))
+          _ok = _ok and all(pk <= p - s for s, pk in enumerate(peak_in_flight(tl, o)))
+          _ok = _ok and makespan(tl) < makespan(simulate(one_f_one_b(p, m), {"F": dz["F"], "B": dz["B"] + dz["W"]}))
+      assert _ok
+    solution: |
+      def zero_bubble(p, m, durations):
+          def deps(op):
+              kind, i, s = op
+              if kind == "F":
+                  return [("F", i, s - 1)] if s > 0 else []
+              if kind == "B":
+                  return [("F", i, s)] + ([("B", i, s + 1)] if s < p - 1 else [])
+              return [("B", i, s)]
+
+          done = {}
+          free = [0] * p
+          next_f = [0] * p
+          next_b = [0] * p
+          pending_w = [[] for _ in range(p)]
+          live = [0] * p
+          orders = [[] for _ in range(p)]
+          t = 0
+          while sum(len(o) for o in orders) < 3 * p * m:
+              for s in range(p):
+                  if free[s] > t:
+                      continue
+                  ready = lambda op: all(x in done and done[x] <= t for x in deps(op))
+                  op = None
+                  if next_b[s] < m and ready(("B", next_b[s], s)):
+                      op = ("B", next_b[s], s)
+                      next_b[s] += 1
+                      pending_w[s].append(("W", op[1], s))
+                  elif next_f[s] < m and live[s] < p - s and ready(("F", next_f[s], s)):
+                      op = ("F", next_f[s], s)
+                      next_f[s] += 1
+                      live[s] += 1
+                  elif pending_w[s] and ready(pending_w[s][0]):
+                      op = pending_w[s].pop(0)
+                      live[s] -= 1
+                  if op is not None:
+                      done[op] = t + durations[op[0]]
+                      free[s] = done[op]
+                      orders[s].append(op)
+              t += 1
+          return orders
+---
+
+This lab builds the simulator from the pipeline lesson as one program. Each step adds functions to the same file and its tests run against everything written so far: every schedule from step 3 on is checked by the `simulate` from step 1, the `bubble_ratio` from step 2 and the `peak_in_flight` from step 4.
+
+The model is deliberately small: identical stages, fixed operation times, free communication, one operation per device at a time. Under those conditions the published formulas are exact, so the tests assert them: (p - 1)/m for all-forward-all-backward and 1F1B, (p - 1)/(v m) for the interleaved order, and in-flight activations of m against p - s. The hidden tests run the same checks on seeded random p, m, v and operation times. Step 6 leaves the policy to you and tests only invariants: dependencies hold, the memory bound holds, and the makespan beats 1F1B.
+
+What the model leaves out is what decides real schedules. Communication is free here, so interleaving looks like a pure win; in a real job each of the v p - 1 hops costs a send on the critical path during warm-up and drain, which is why Llama 3 made the number of consecutive micro-batches per stage tunable to hide it. Stages are identical here; in a real model the first stage carries the embedding and the last the output layer and loss, and Llama 3 removed one transformer layer from each to balance them. And W is free to move here; in a real engine deferring it holds the activations it needs for longer, which is the memory the zero-bubble papers trade against the bubble.

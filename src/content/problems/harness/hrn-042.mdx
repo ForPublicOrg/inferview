@@ -1,0 +1,115 @@
+---
+id: hrn-042
+title: The harness restarts at step fourteen of twenty
+subtitle: what happens to the run, and what had to be written down
+track: harness
+module: long-running-parallel
+type: design
+difficulty: hard
+seniority: [senior, staff]
+minutes: 40
+core: false
+tags: [durable-execution, event-log, crash-recovery, idempotency, deploys, agents]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: KORE1, AI agent engineer interview questions (Jennifer Burdick, 2026-09-23)
+    url: https://www.kore1.com/ai-agent-engineer-interview-questions/
+    note: "the question this problem is built on, \"The server restarts at step fourteen of twenty. What happens to the task?\"; a recruiter's guide that ties the question to no company, so none is tagged"
+  - title: Anthropic Engineering, Scaling Managed Agents, decoupling the brain from the hands (2026-04-08)
+    url: https://www.anthropic.com/engineering/managed-agents
+    note: "vendor design: the session is an append-only event log outside the harness; the harness records events with emitEvent(id, event), and a new harness started with wake(sessionId) reads the log with getSession(id) and resumes from the last event; a dead sandbox container comes back to the model as a tool-call error"
+  - title: Wang et al., The OpenHands Software Agent SDK (arXiv 2511.03690v2, MLSys 2026)
+    url: https://arxiv.org/html/2511.03690
+    note: "the paper reports an event-sourced ConversationState: metadata in base_state.json, one JSON file per event, resume by replaying events; over 433 SWE-Bench Verified conversations, median 0.20 ms to persist an event and median 7.4 ms to recover from a crash (replay plus unmatched-action scan); system-attributable errors per 1,000 conversations fell from 78.0 to 30.0 in a 15-day parallel rollout"
+  - title: OpenAI Agents SDK docs, Human in the loop (checked 2026-10-28)
+    url: https://openai.github.io/openai-agents-python/human_in_the_loop/
+    note: "approval permits a tool call to execute but does not guarantee exactly-once execution; resuming an older approved snapshot can run the tool again; assign a stable idempotency key to each logical action; if the outcome is uncertain, record it as unknown and avoid automatic replay"
+  - title: Anthropic Engineering, How we built our multi-agent research system (2025-06-13)
+    url: https://www.anthropic.com/engineering/multi-agent-research-system
+    note: "rainbow deployments shift traffic gradually from old to new versions while both run, so agents mid-task are not broken; the system resumes from where the agent was when an error occurred"
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Design round, 40 minutes">
+The harness that runs your operations agent restarts while a run is at step fourteen of twenty. What happens to that run today? Design what the harness has to record, and how a new harness instance continues the run safely.
+</Callout>
+
+The runbook the agent follows to move a customer tenant between regions. Scenario, not a real system:
+
+| Step | Action | What the target system offers |
+|---|---|---|
+| 1 to 9 | Inventory and plan | Read-only |
+| 10 | Snapshot the database as `snap-<tenant>-<date>` | A second call with the same name returns 409 |
+| 11 | Create the tenant in the target region | Accepts an `Idempotency-Key` header |
+| 12 | Start the data copy | Returns a job ID; jobs can be listed by tenant |
+| 13 | Point DNS at the new region | Upsert |
+| 14 | Email the tenant's admins that maintenance starts | No idempotency key, no way to list what was sent |
+| 15 | Verify copy checksums | Read-only |
+| 16 | Wait for a human approval | Can take up to three days |
+| 17 | Cut traffic over with a flag | Idempotent set |
+| 18 | Delete the source tenant's data | Irreversible |
+| 19 | Comment a summary on the ticket | Comments can be listed |
+| 20 | Close the ticket | Idempotent |
+
+How it runs today: one harness service keeps each run's conversation in memory and generates a random idempotency key whenever step 11 is called. The service is redeployed every working day with a rolling restart and a 30-second termination grace; the platform team will raise the grace to at most two hours if you ask. The email integration in step 14 belongs to another team and will not change this quarter.
+
+Load, also scenario: 300 runs a week. Active time per run (excluding the approval wait) has a median of 25 minutes, a mean of 35 and a 95th percentile of 80. One run in five waits at step 16, for a day on average.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what the operator does today when a run disappears, and walk that procedure through steps 10 to 14.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>For each step, ask the owning team whether you can find out after the fact that the call took effect.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Work out how many runs are mid-step at the moment of a typical deploy, and how many are waiting for approval.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Today the run is gone, and the obvious recovery, starting it again, creates a second tenant (a fresh random key at step 11), hits a 409 at step 10 that the model has to improvise around, and emails the admins twice. The harness has to append each model response and each tool intent, with a key derived from the run and step, to a durable log before acting, and each result after. A new instance takes a lease on the run, replays the log to rebuild the conversation, and for any intent without a result applies that step's recovery rule: re-issue with the same key, check the effect, or record the outcome as unknown and hand it to a person.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>What happens today.</b> The conversation lived in the process, so the run ends with the process. Restarting from step 1 re-runs the read-only steps harmlessly, then step 10 returns 409 because the snapshot exists, step 11 creates a second target tenant because the new attempt generates a new key, step 12 starts a second copy job, and step 14 sends the email again. An idempotency key only helps if it is the same on the retry, so it has to be derived from the run and the step, for example a hash of <code>(run_id, step_id)</code>, and written down before the call.</p>
+<p><b>What to record.</b> An append-only event log per run in a database outside the harness: <code>run_started</code> (inputs, harness version, prompt and tool-schema version, model), every model response, <code>tool_intent</code> (step, tool, arguments, idempotency key) written before the call, <code>tool_result</code> after, and approval events. Managed Agents keeps the session as exactly this kind of log outside the harness and resumes with <code>wake</code> and <code>getSession</code>; the OpenHands SDK paper reports a median 0.20 ms to persist an event and 7.4 ms to recover from a crash, so writing an intent before every call costs nothing next to a model call.</p>
+<p><b>Resuming.</b> The new instance first takes a lease on the run with an epoch number. That matters on a rolling deploy: during the 30-second grace the old instance can still be finishing a call while the new one starts. Every tool call goes through a gateway that rejects calls carrying an old epoch, so a slow old instance cannot act after losing the run. The instance then rebuilds the conversation from the log and scans for intents without results. Each step has a recovery class, written in the runbook:</p>
+<ul>
+<li><b>Replay freely:</b> steps 1 to 9, 15. Read-only.</li>
+<li><b>Re-issue with the same key or idempotent by design:</b> 11, 13, 17, 20.</li>
+<li><b>Check the effect, then decide:</b> 10 (does the snapshot exist?), 12 (list jobs for the tenant), 18 (is the source data still there?), 19 (list comments).</li>
+<li><b>Unknown:</b> 14. There is no key and no way to ask. The OpenAI Agents SDK docs give the rule: record the outcome as unknown and do not replay automatically.</li>
+</ul>
+<p><b>The decision at step 14.</b> Two defensible answers. Resend: the cost is a possible duplicate maintenance email to a customer's admins, embarrassing and not harmful. Hold for a person: no duplicate, but a run interrupted at night stalls until someone looks. I hold, and attach the question to the approval that step 16 already waits for, so the person who approves the cut-over also answers whether the email went out. The run continues through step 15, which is read-only, and the extra latency is zero for runs that reach step 16 anyway.</p>
+<p><b>Drain or resume: the quantity I chose.</b> Average active runs in flight are 300 / 7 ≈ 43 a day × 35 minutes / 1,440 minutes ≈ 1.0, and runs waiting at step 16 are about 0.2 × 43 × 1 day ≈ 9. A two-hour drain would cover the 80-minute 95th percentile of active runs, but it cannot cover a three-day approval wait, so resume has to work regardless; a long drain only makes the resume path rare, which means untested. I keep the 30-second grace and use it to drain to a step boundary: on SIGTERM the harness starts no new step, lets an in-flight tool call finish and records its result. Each deploy then resumes about one active run and nine paused ones, every working day, which exercises the recovery path. Asking for the two-hour grace is the other defensible answer, as Anthropic's research system does with rainbow deployments; its cost is slower deploys and old versions kept running.</p>
+<p><b>Harness versions.</b> A run that waits three days will resume under a newer harness. Keeping old processes alive for days is what rainbow deployment would require here. I version the configuration instead: <code>run_started</code> records the prompt and tool-schema version, the harness keeps the last few versions loadable, and a resumed run continues on the version it started with. A compatibility test replays a stored log of each kept version on every release.</p>
+<p><b>The conflict.</b> Deploy speed against the correctness of side effects, with one step whose outcome cannot be checked. <b>Failure mode of the recommendation.</b> The recovery classes are only as good as the runbook's description of each API: if step 13's upsert turns out to append a second record in some provider configuration, the "idempotent" class replays it silently. The lease has its own: if the lease outlives a stuck instance's network partition, the run waits until the lease expires; set the lease length longer than the longest single tool call and accept that wait.</p>
+<p><b>What you give up.</b> A database write before every tool call, a gateway every call passes through, and a person answering an email question on interrupted runs, in exchange for deploys that do not need to wait for runs to finish.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Why not snapshot the conversation at step boundaries instead of logging every event?</em> A snapshot taken before step 14 has no record of whether 14 ran, which is the question that matters; the intent event is what the snapshot lacks.</li>
+<li><em>The model call, not a tool call, was in flight at the restart. What happens?</em> Re-issue it from the rebuilt conversation; the cost is the repeated call's tokens, at the uncached price if the prompt cache expired during the restart.</li>
+</ul>
+</Fragment>
+</Depth>
+
+### The written artefact
+
+A recovery table checked into the runbook repository, one row per step: the recovery class, the check for "check the effect" steps, and who answers for "unknown" steps. Rollout: first log only, with no resume, for two weeks while a nightly job replays every finished run's log into a fresh instance and compares the rebuilt conversation with the stored one; then resume enabled for steps 1 to 15; then for the whole runbook. Roll back to log-only if a resumed run ever repeats a side effect in the "check the effect" class, or if replay mismatches appear in more than 1% of nightly comparisons.
+
+## Follow-ups
+
+- *Pushback: the gateway and the epoch check cost your team a month. Which half do you cut, and what risk do you accept in writing?*
+- *Reversal: what would you need to see to let step 14 resend automatically?*
+- *Two senior engineers disagree: one wants a durable-execution framework, the other wants this log in the existing database. How do you decide without deciding by rank?*
+- *Operating: the email team will add an idempotency key next quarter. What changes in the recovery table, and what do you test before you trust it?*
+
+## Common mistakes
+
+- Saying "restart from the last completed step" without saying how the harness knows whether the step in flight completed.
+- Generating the idempotency key per attempt instead of per logical action.
+- Treating approval as a guarantee that the approved action runs once.
+- Draining every deploy until all runs finish, which a three-day approval wait makes impossible.
+- Letting two harness instances act on the same run during a rolling deploy.

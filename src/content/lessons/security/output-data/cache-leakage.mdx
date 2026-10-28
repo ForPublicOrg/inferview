@@ -1,0 +1,168 @@
+---
+title: Cross-tenant leakage through shared caches
+track: security
+module: output-data
+order: 3
+kind: lesson
+level: staff
+minutes: 14
+summary: A prefix cache shared across principals answers "has anyone sent this prefix recently" through timing or a reported cached-token count, so the isolation key is set server-side from identity and tested on every endpoint that can reach the engine.
+prerequisites: [security/output-data/pii-telemetry-residency, harness/cache-cost-latency/harness-caching]
+updated: 2026-10-28
+sources:
+  - title: "Gu, Li, Kuditipudi, Liang, Hashimoto, Auditing Prompt Caching in Language Model APIs (arXiv 2502.07776, v1 11 February 2025, v2 13 July 2025, ICML 2025)"
+    url: https://arxiv.org/abs/2502.07776
+    note: "17 API providers audited, caching detected in 8, global cache sharing across users in 7 (Azure, Deep Infra, Fireworks, Lepton, OpenAI, Perplexity, Replicate); one-sided two-sample KS test, 250 samples per procedure, significance 1e-8 before Bonferroni correction; 5,000-token prompts, attacker prefix 0.95 of the victim's, max 1 output token; disclosed October 2024 with 60 days; at least five providers changed something; evidence that OpenAI's embedding model is a decoder-only Transformer"
+  - title: "GitHub Advisory GHSA-935w-9g4m-p28p, CVE-2026-105752: Harmony tool continuations drop cache_salt (vLLM; published by vLLM 28 September 2026, in the GitHub Advisory Database 6 October 2026)"
+    url: https://github.com/advisories/GHSA-935w-9g4m-p28p
+    note: "vllm below 0.30.0, confirmed on 0.25.1, patched in 0.30.0; severity Low, CVSS 3.1 base 3.1; POST /v1/responses on the GPT-OSS Harmony path with a built-in or MCP tool; continuation re-submits tokens without cache_salt, so it is cached in the unsalted namespace; an attacker who reconstructs the post-tool history submits it unsalted and reads cached_tokens_per_turn; suggested regression test asserts zero cached tokens for a different-salt probe; reported by Patch the Planet (Trail of Bits and OpenAI)"
+  - title: vLLM documentation, Automatic Prefix Caching (design)
+    url: https://docs.vllm.ai/en/latest/design/prefix_caching.html
+    note: "block hash = parent block hash + block tokens + extra hashes (LoRA ids, multimodal input hashes, cache salt); the salt is injected into the hash of the first block so only requests with the same salt reuse cached KV blocks, to prevent timing attacks; sha256 default since v0.11; hash collisions can leak private information in multi-tenant environments; LRU eviction"
+  - title: Claude API documentation, Prompt caching
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: "caches never shared between organizations; isolated by workspace on the Claude API, Claude Platform on AWS and Microsoft Foundry; organization-level only on Bedrock and Claude Models on Google Cloud (Google managed); usage reports cache_read_input_tokens and cache_creation_input_tokens; hits require 100 percent identical prefixes"
+  - title: OpenAI API documentation, Prompt caching
+    url: https://developers.openai.com/api/docs/guides/prompt-caching
+    note: "caches are not shared across organizations or reused across regional processing boundaries; prompt_cache_key influences routing before GPT-5.6 and gives separate cache accounting on GPT-5.6 and later, and does not pin a machine or guarantee a hit; cached token count reported in usage input-token details; KV tensors, not prompt text, are stored"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## A shared prefix cache is a membership oracle
+
+A prefix cache stores KV blocks keyed by the tokens that produced them. When two requests share a prefix, the second skips prefill for the shared part, and two observable things change: time to first token drops, and most APIs report how many input tokens came from cache. Both answer one question for whoever sent the second request: did someone send this exact prefix recently enough that it was not evicted?
+
+That is a membership oracle, and it leaks content in proportion to how guessable the prefix is. A free-form conversation is hard to guess. A templated one is not: a system prompt everyone knows, followed by "Summarise the attached contract between" and a short list of candidate company names, or a form letter where one field varies over a small set. The attacker submits each candidate and keeps the one that hits. With a prefix cache that reuses blocks across principals, every tenant on the engine can run that search against every other tenant.
+
+The cache key is the isolation boundary. Content-addressed caches leak exactly when the key omits the principal, which is the same bug as a CDN cache that keys on the URL and forgets the `Authorization` header, with the difference that here the key is the content itself.
+
+## What the audit found
+
+Gu and colleagues (arXiv 2502.07776, ICML 2025) audited 17 API providers with a statistical test on response times. The cache-hit procedure has a "victim" send a 5,000-token prompt, then an "attacker" send a prompt sharing the first 95% of it with a different suffix, with output capped at one token so the measured time is time to first token. The miss procedure sends a fresh random prompt. They compared 250 timings from each with a one-sided two-sample Kolmogorov-Smirnov test at a significance level of 10<sup>−8</sup> before Bonferroni correction.
+
+The paper reports caching in 8 of the 17 providers and global sharing across users in 7: Azure, Deep Infra, Fireworks, Lepton, OpenAI, Perplexity and Replicate. Anthropic's Claude 3 Haiku and OpenAI's GPT-4o mini showed per-organization sharing, which matched their documentation and is not treated as a vulnerability. OpenAI's global sharing was on the `text-embedding-3-small` endpoint, and the audit also produced evidence that OpenAI's embedding model is a decoder-only Transformer, which was not public: the cache leaks architecture as well as content. They disclosed in October 2024 with a 60-day window; at least five providers made changes, such as disabling cross-organization sharing or updating documentation, and OpenAI patched the embedding endpoint before publication.
+
+Two lessons for design come out of the method rather than the result. The attacker needed no special access, only the ability to send requests and time them. And the signal is strong at long prefixes and fades as the prompt shortens or the shared fraction drops, so the risk sits in the workloads that cache best: long shared templates.
+
+## Provider isolation today, and what it does not cover
+
+Both large first-party APIs now document the boundary. Anthropic says caches are never shared between organizations and are isolated by workspace on the Claude API, Claude Platform on AWS and Microsoft Foundry, while Bedrock and Claude models on Google Cloud (Google managed) keep organization-level isolation. OpenAI says caches are not shared across organizations or reused across regional processing boundaries, and describes `prompt_cache_key` as a routing hint before GPT-5.6 and a cache-accounting key from GPT-5.6; the page does not present it as an isolation boundary.
+
+Read those boundaries from your product's side. If your SaaS sends every customer's traffic through one organization or one workspace, the provider's cache is shared across your customers. Whether that matters depends on whether any customer can observe the signal: if your API passes the provider's cached-token count through to callers, or exposes latency precise enough to time, one of your tenants can probe another through you. The provider's isolation ends at your account; isolation between your tenants is yours to build, by workspace per tenant where the provider isolates by workspace, or by not exposing the signal.
+
+## The vLLM mechanism: a salt in the first block
+
+On a self-hosted engine you own the key. vLLM hashes each block from the parent block's hash, the block's tokens and extra hashes such as LoRA ids, multimodal input hashes and the cache salt. The salt is injected into the hash of the first block only, and because every later block hash includes its parent, the salt reaches the whole chain: two requests with different salts share no block at all. vLLM's design page gives the motivation in so many words, preventing timing attacks that infer cached content from latency, and notes that hash collisions can leak private information in multi-tenant deployments, which is why `sha256` has been the default hash since v0.11.
+
+<Predict id="sec-cache-leakage-cached-tokens" question="How many cached tokens does the attacker's request report?" answer={4736} tolerance={0} unit="tokens">
+<Fragment slot="prompt">
+<p>Inputs: the audit's setup on a self-hosted engine with no salt. The victim's prompt is 5,000 tokens; the attacker's shares the first 95% and then differs. Scenario input: the engine caches in full blocks of 16 tokens, and only complete blocks whose whole chain matches are reused.</p>
+</Fragment>
+<p>The shared prefix is 0.95 × 5,000 = 4,750 tokens. Complete blocks inside it: ⌊4,750 / 16⌋ = 296, so 296 × 16 = <b>4,736 tokens</b> are reported as cached, against 0 for a miss. The paper had to separate two overlapping timing distributions with 250 samples each; a reported count separates hit from miss in a single request with no noise. Exposing the count to an untrusted caller turns a statistical attack into a lookup.</p>
+</Predict>
+
+## One code path without the salt
+
+The advisory GHSA-935w-9g4m-p28p (CVE-2026-105752) is the case that shows why the control must be tested per path. vLLM published it on 28 September 2026 and it reached the GitHub Advisory Database on 6 October 2026. On the Responses API path for GPT-OSS models with a built-in or MCP tool, the first turn passed the request's `cache_salt`, but each tool continuation re-submitted the token ids without it, so the continuation was cached in the unsalted namespace. An attacker who could reconstruct the victim's history after the tool call submitted it without a salt and read the per-turn cached-token counts from the response usage. A non-zero count confirmed the victim's prompt. Versions below 0.30.0 are affected and 0.30.0 fixes it; the advisory rates it Low, CVSS 3.1 base score 3.1, because the preconditions are narrow: that model family, a tool server enabled by the operator, a victim who sets a salt and triggers a tool, and an attacker who can guess the post-tool history.
+
+The severity is low; the design lesson is not. The salt was correct on the path everyone tested and absent on a path added later, and the engine reported the oracle's answer in a usage field. Any isolation key threaded through request objects by hand has this failure mode: retries, continuations, speculative re-submissions, batch replays and admin endpoints each construct a request, and each is a place to drop it.
+
+## Testing isolation per endpoint
+
+The test belongs in the suite of whoever runs the engine, written against every entry point that can reach it, and it checks the property, not the code: a request under another principal's salt, or no salt, must see zero cached tokens from a victim's prompt. The sketch below models the chained hash and one buggy path.
+
+```python
+import hashlib
+
+BLOCK = 16
+
+class PrefixCache:
+    """Chained block hashes: the salt enters the first block, so it reaches every block after it."""
+    def __init__(self):
+        self.blocks = set()
+    def _hashes(self, tokens, salt):
+        parent, out = b"", []
+        for i in range(0, len(tokens) - len(tokens) % BLOCK, BLOCK):
+            extra = salt.encode() if (i == 0 and salt) else b""
+            parent = hashlib.sha256(parent + extra + repr(tokens[i:i + BLOCK]).encode()).digest()
+            out.append(parent)
+        return out
+    def run(self, tokens, salt=None):
+        hit = 0
+        for h in self._hashes(tokens, salt):
+            if h not in self.blocks:
+                break
+            hit += BLOCK
+        self.blocks.update(self._hashes(tokens, salt))
+        return hit                                   # what the API reports as cached tokens
+
+cache = None
+
+def chat(tokens, salt):                       # turn 1 keeps the salt
+    return cache.run(tokens, salt)
+
+def tool_continuation(tokens, salt):          # the bug: the re-submission forgets it
+    return cache.run(tokens, None)
+
+ENDPOINTS = {"chat": chat, "tool_continuation": tool_continuation}
+
+def test_isolation(name, fn):
+    global cache
+    cache = PrefixCache()                     # a fresh engine per endpoint under test
+    victim = list(range(1000, 1400))          # 400 tokens of someone else's conversation
+    fn(victim, salt="tenant-a")
+    leaked = {probe_salt: cache.run(victim, probe_salt) for probe_salt in ("tenant-b", None)}
+    status = "ok" if not any(leaked.values()) else "LEAKS"
+    print(f"{name:18} cached tokens seen by other tenants: {leaked}  {status}")
+    return status == "ok"
+
+results = [test_isolation(n, f) for n, f in ENDPOINTS.items()]
+print("all endpoints isolated:", all(results))
+```
+
+The run prints zero for `chat` and 400 for the unsalted probe against `tool_continuation`: the different-salt probe misses, and the no-salt probe hits, which is the advisory's shape. Against a real engine the same test sends HTTP requests, reads the usage field and, where the engine reports nothing, compares time to first token over repeated samples. The endpoint list is generated from the router, so a new route fails the suite until it is added.
+
+Two decisions follow, and both are server-side. The salt comes from the authenticated principal at the gateway and overwrites whatever the client sent, because vLLM's salt is a request field and a client that omits it lands in the shared namespace. And the cached-token count is either withheld from untrusted callers or reported only to the principal whose salt produced it; withholding it lowers the rate of a successful probe, since timing remains, while the salt holds by construction on every path it reaches.
+
+## Choosing the salt granularity
+
+The salt decides who shares with whom, and the hit rate pays for it. Salt per tenant lets users inside a tenant share the system prompt and templates, and also lets them probe each other. Salt per user closes that and gives up cross-user reuse: with a 4,000-token shared system prompt and 500 active users (scenario inputs), the engine prefills 500 × 4,000 = 2,000,000 tokens per eviction cycle instead of 4,000. Whether users within a tenant are a trust boundary is a product fact: colleagues on one team often are not, patients of one clinic are.
+
+Separate engine pools per sensitive tenant hold by construction and cost GPUs that a shared pool would have used. Most deployments end with a mix: per-user salts for tenants whose users are mutually untrusted, per-tenant salts elsewhere, and dedicated pools only where a contract requires it.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You run a shared vLLM fleet for 60 tenants with one salt per tenant. A healthcare tenant asks for isolation between its own users and wants it in two weeks. Prefix caching is the main reason the fleet fits its GPU budget. What do you ship, and what do you tell the other 59?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Ship per-user salts for that tenant only, set at the gateway from the authenticated user, plus a per-endpoint isolation test in CI and cached-token counts removed from responses to that tenant's callers. The other tenants keep per-tenant salts, and their documentation says users within a tenant share a cache namespace, so each can ask for the same option.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Per-user salts for one tenant is a gateway change, not an engine change, so two weeks is enough if the isolation test exists or is written first. The cost lands on that tenant's prefill: every user re-prefills the shared system prompt. I would measure their hit rate before and after and price it, because it is their contract that buys it.</p>
+<p>The test is what makes the promise true. Every route that reaches the engine, including retries, tool continuations and batch replays, gets a probe from another user and from no salt, and the build fails on any non-zero cached count. Without it, the advisory pattern returns the next time someone adds a path.</p>
+<p>What I give up in writing: timing remains a weaker side channel even with counts withheld, and a dedicated pool is the only answer that removes it. A failure mode of the plan: shared LoRA adapters, multimodal caches or any other cache keyed on content outside the prefix cache need the same review.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The tenant's security team says per-user salts are not enough and asks for a dedicated pool at your shared-fleet price. What do you need to measure to answer, and who signs the residual timing risk if they accept salts?</em></li>
+<li><em>An engine upgrade changes the default block hash and your isolation test still passes. What would make you distrust a passing test, and what would you add?</em></li>
+<li><em>Two senior engineers disagree: one wants to remove cached-token counts from every API response, the other says customers use them to tune prompts and costs. How do you decide without deciding by rank?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The lesson models one cache. A serving stack has several keyed on content: the prefix cache, an application-level response cache, an embedding cache, a semantic cache that returns a stored answer for a similar question, and multimodal encoder caches. A semantic cache is worse than a prefix cache, because a hit returns another user's answer, not a timing difference. Each needs its own key review and its own probe.
+
+The membership oracle needs a guessable prefix. Where every prompt starts with per-user content that an attacker cannot guess, such as a user-specific retrieval result early in the context, the practical risk is lower than the mechanism suggests; the risk is highest for long shared templates with a few variable fields, which are also the prompts that cache best.
+
+And salts protect the cache, not the engine. Requests from different tenants still share GPUs, batches and memory bandwidth, and contention is itself observable. A salt removes the content-addressed channel; it does not make a shared engine equivalent to a dedicated one.
+
+<SelfRate id="lesson:security/output-data/cache-leakage" />

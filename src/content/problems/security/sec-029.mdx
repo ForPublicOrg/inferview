@@ -1,0 +1,137 @@
+---
+id: sec-029
+title: One user's prompt must never reach another user
+subtitle: caches, logs, memory and retrieval, with a review in eight weeks
+track: security
+module: output-data
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 50
+core: false
+tags: [isolation, multi-tenancy, prefix-caching, cache-salt, memory, retrieval, telemetry]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: ombharatiya, AI system design guide, interview question bank (Q58, checked 2026-10-28)
+    url: https://github.com/ombharatiya/ai-system-design-guide/blob/main/00-interview-prep/01-question-bank.md
+    note: "a synthesised question bank listing \"Design a system where one user's prompt cannot leak to another user\"; no company named"
+  - title: Auditing Prompt Caching in Language Model APIs (Gu, Li, Kuditipudi, Liang, Hashimoto; v1 2025-02-11, v2 2025-07-13)
+    url: https://arxiv.org/abs/2502.07776
+    note: "the paper reports global cache sharing across users at seven API providers, including OpenAI, and treats shared caches as a timing side channel on other users' prompts"
+  - title: vLLM docs, Automatic prefix caching design (checked 2026-10-28)
+    url: https://docs.vllm.ai/en/latest/design/prefix_caching.html
+    note: "block hashes chain through the parent hash and include extra keys such as cache_salt, injected into the first block, so only requests with the same salt share blocks; sha256 is the default hash and a non-cryptographic hash raises collision risk that can leak private information in multi-tenant deployments"
+  - title: GHSA-935w-9g4m-p28p, CVE-2026-105752, vLLM Harmony tool continuations drop cache_salt (published 2026-09-28)
+    url: https://github.com/advisories/GHSA-935w-9g4m-p28p
+    note: "on /v1/responses, continuation turns after a tool call were resubmitted without the caller's salt, and cached_tokens_per_turn exposed exact cached-token counts, restoring a cross-tenant membership oracle; fixed in 0.30.0; the advisory suggests a regression test asserting zero cached tokens for a different-salt probe"
+  - title: GHSA-4qjh-9fv9-r85r, CVE-2025-46570, timing side channel in vLLM prefix caching (2025-05-28)
+    url: https://github.com/advisories/GHSA-4qjh-9fv9-r85r
+    note: "a hit shows as a faster time to first token; the advisory reports AUC 0.571 for a 1-token prefix and 0.99 for 8 tokens on its test setup; fixed in 0.9.0"
+  - title: Claude API docs, Prompt caching (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: "different organizations never share caches; caches are isolated per workspace on the Claude API; a hit needs 100 percent identical prompt segments up to the cache breakpoint"
+  - title: OpenAI API docs, Prompt caching (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/guides/prompt-caching
+    note: "caches are not shared across organizations; on models before GPT-5.6, prompt_cache_key influences routing and does not pin a machine or guarantee a hit, and from GPT-5.6 it mainly separates cache accounting; separate keys help prevent cache-hit probing across users"
+  - title: OpenTelemetry semantic conventions for generative AI spans (status Development, checked 2026-10-28)
+    url: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md
+    note: message content is sensitive and captured only on explicit opt-in
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"Design our assistant so that one user's prompt cannot leak to another user: not through caches, logs, memory or retrieval. Then tell me how you would prove it to a customer's security team."
+</Callout>
+
+The operating constraints are a scenario, given by the interviewer:
+
+- A B2B assistant with 900 tenant companies and about 60,000 user sessions a day. Users in a tenant share documents according to Drive permissions; conversations and uploads are private to the user.
+- The main model is a provider API in one organization. A self-hosted vLLM 0.30 pool runs a smaller model for routing and summaries, and its API is also sold to tenants for their own prompts.
+- Every request starts with a 7,000-token system prompt that is the same for all tenants.
+- Already in production: a semantic response cache shared by all tenants, OpenTelemetry tracing with message content on, retrieval over one pgvector table for all tenants, and a per-user memory feature launching next month.
+- The largest customer's security review is in eight weeks and asks for a written isolation statement covering every shared component and how isolation is tested. Three engineers.
+- The platform lead opposes any cache change that stops tenants sharing the system prompt's prefix, because of GPU cost.
+
+Write the design, choose the salt granularity for the self-hosted pool and defend it with numbers, and end with the isolation statement and a rollout plan with rollback triggers.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which components keep any derivative of a prompt after the response is sent, and list them before designing anything.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the self-hosted pool's prefix-cache hit rate and the prefill share of its GPU time, split by tenant.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask the reviewing customer whether their concern is other tenants, other users inside their own tenant, or your staff.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Inventory every place a prompt or anything derived from it persists or is shared, give each one an isolation key and a test, and refuse to ship a component that has no test. The keys: conversation state by unguessable id plus an owner check; the response cache keyed on tenant and user or off for personal context; the self-hosted prefix cache salted per tenant by the gateway, with cached-token counts hidden from tenants; provider caches reached only through prompts we assemble; content off in traces; memory keyed by tenant and user; retrieval filtered by tenant and permissions inside the query. Proof is a canary suite: a unique string planted in one user's conversation, upload, memory and prompts, and a battery of probes from another user that must never see it, run per endpoint in CI. What we give up is prefill sharing across tenants and most of the semantic cache's hits.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Conversation state.</strong> Server-generated ids of at least 128 random bits, and every read checks that the stored owner is the caller. An id is a lookup key, not an authorisation.</p>
+<p><strong>Response cache.</strong> A semantic cache shared across tenants returns an answer built from someone else's context whenever two questions embed close enough. The key becomes tenant, user and a hash of the retrieved context; requests whose context holds anything private to a user skip the cache. Hit rate falls, and the remaining hits are the ones that were safe.</p>
+<p><strong>Self-hosted prefix cache.</strong> Without a salt, any tenant who can send raw prompts gets a membership oracle on other tenants' prefixes through time to first token and, worse, through reported cached-token counts. The gateway sets <code>cache_salt</code> from the authenticated tenant on every request and overwrites any salt a client sends, because a client-chosen salt lets an attacker choose the victim's namespace. The gateway strips cached-token counts from tenant-facing responses and keeps them for billing. Hash algorithm stays sha256. vLLM is at 0.30.0 or later, because before that one endpoint's tool continuations dropped the salt.</p>
+<p><strong>Provider prompt caches.</strong> Isolated per organization, and on the Claude API per workspace, so all our tenants share one namespace there. The exposure exists only if a tenant can make us send an exact prefix of another tenant's prompt. Our main-model prompts are assembled by us and put tenant and user identifiers in the first block after the system prompt, so a shared prefix can never run past our own system prompt. OpenAI's <code>prompt_cache_key</code> is set per user, because OpenAI's docs say separate keys help prevent cache-hit probing across users, but the same docs describe it, for models before GPT-5.6, as influencing routing without guarantees, so it is defence in depth and the design does not rest on it.</p>
+<p><strong>Traces and logs.</strong> Content capture off by default; per-incident opt-in to a tenant-scoped store with short retention and logged reads.</p>
+<p><strong>Memory.</strong> Records keyed by tenant and user, written only from that user's own turns, read only into that user's prompts. A memory written while the user read a shared document is still the user's, so poisoned documents are a safety problem, not a leak; "team memory" is a separate object with explicit sharing.</p>
+<p><strong>Retrieval.</strong> Tenant id and the document's permission set are filters inside the vector query, not a filter on results, backed by row-level security keyed on a tenant set per transaction, so a query that forgets the filter returns nothing rather than everything. Chat uploads carry a permission set of one user. Permission sync lag is the window in which a revoked user can still retrieve, and it is measured and stated.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Your per-tenant salt and the response-cache change cost more GPU than the security review is worth to sales. Which half do you cut, and which risk do you accept in writing?</em></li>
+<li><em>What would you need to see in production to let tenants share the system prompt's prefix again?</em></li>
+<li><em>The customer's reviewer asks about users inside their own tenant probing each other. Your salt is per tenant. What do you answer, and what would it cost to change?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+### The salt granularity you were asked to choose
+
+The prefill cost of the shared 7,000-token system prompt on the self-hosted pool, using the scenario's numbers. A salt is injected into the first block, so nothing is shared across salts, not even the identical system prompt.
+
+| Salt | Prefill spent on the system prompt | What a malicious caller can probe |
+|---|---|---|
+| None (the platform lead's position) | 7,000 tokens per cache lifetime | Every other tenant's prefixes |
+| Per tenant | up to 900 × 7,000 = 6.3 million tokens per cache lifetime | Prefixes of colleagues in the same tenant |
+| Per user session | 60,000 × 7,000 = 420 million tokens a day, one warm-up per session | Nothing across users |
+
+Both salted rows are defensible. Per tenant matches the contract boundary most reviewers ask about and costs one warm-up per tenant; per user closes the intra-tenant oracle and costs prefill on every session, which on this pool would be measured against its current prefill share of GPU time from Hint 2 before anyone signs it. I would choose per tenant, and add per-user salts for tenants that ask for them in their contract, priced accordingly. Two things make per tenant less exposed than the table suggests: user identifiers sit near the start of every assembled prompt, so colleagues' prefixes diverge after the system prompt anyway, and the hidden cached-token counts leave only the noisier timing channel. Unsalted is not defensible once tenants can send raw prompts.
+
+### What you give up
+
+Prefill sharing across tenants, priced in the table; most semantic-cache hits; and the convenience of reading production prompts in traces. Debugging a tenant's bad answer now needs an opt-in or an incident grant.
+
+### The isolation statement and rollout
+
+| Component | Shared across | Isolation key | Test |
+|---|---|---|---|
+| Conversation state | all users | owner check on 128-bit id | read another user's id, expect a new empty conversation |
+| Response cache | tenants and users | tenant, user, context hash | canary answer never served to a second user |
+| Self-hosted prefix cache | tenants | gateway-set salt per tenant | per endpoint, a different-salt probe of a planted prefix reports zero cached tokens internally |
+| Provider prompt cache | our tenants | tenant and user ids in the first block after the system prompt | prompt assembly unit test: no two tenants share bytes past the system prompt |
+| Traces | staff | content off; scoped store on opt-in | canary never appears in default spans |
+| Memory | users | tenant and user key | canary from user A never in user B's prompt |
+| Retrieval | tenants and users | in-query tenant and permission filter, row-level security | canary document never retrieved without permission |
+
+**Rollout.** Weeks 1 and 2: the canary suite and the gateway salt, because the suite is what the review asks for and it measures everything after. Weeks 3 to 5: response-cache keys, trace content off, retrieval filters. Week 6: memory launches behind the same tests. Weeks 7 and 8: the statement, with the suite's results.
+
+**Rollback triggers.** Any canary seen by another user stops the release that introduced it. A vLLM or gateway upgrade that fails the per-endpoint salt test is not deployed. Time to first token for the self-hosted pool more than the agreed budget over the salted baseline for a week reopens the granularity decision, not the salt.
+
+**The failure mode of this design.** Isolation that depends on a parameter fails on the code path that forgets it. vLLM's own salt was dropped on one endpoint's tool continuations until 0.30.0, and the advisory came from outside researchers. The per-endpoint canary test only covers endpoints someone listed; a new route added by another team, or a new continuation path in an upgrade, is untested until the list changes. The list has to be generated from the gateway's route table, not maintained by hand.
+
+## Follow-ups
+
+- *A tenant asks you to turn off the gateway's cached-token stripping because they reconcile their bill from it. What do you offer instead?*
+- *Two senior engineers disagree: one wants per-tenant engine pools for the ten largest tenants, the other wants salts everywhere and one pool. How do you decide without deciding by rank?*
+- *The memory feature's launch date is fixed and the canary suite for it will not be ready. Ship degraded, slip, or ship with memory off for the reviewing customer, and who signs off?*
+
+## Common mistakes
+
+- Refusing to batch requests from different users. Continuous batching shares compute, not state; the shared state is the prefix cache and every store around the model.
+- Filtering retrieval results after the vector query, so other tenants' chunks are fetched, ranked and sometimes logged before they are dropped.
+- Letting clients set the cache salt.
+- Treating provider cache isolation as per-user because it is per-organization.
+- An isolation statement with no tests, which is a list of intentions.

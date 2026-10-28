@@ -1,0 +1,180 @@
+---
+title: "Continuous batching: iteration-level scheduling"
+track: inference
+module: batching
+order: 1
+kind: lesson
+level: senior
+minutes: 14
+summary: Continuous batching makes one forward pass the unit of scheduling, so a finished request leaves on its last step and a waiting one joins on the next, which raises throughput in proportion to how much output lengths vary.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: "Orca: A Distributed Serving System for Transformer-Based Generative Models (Yu et al., OSDI 2022)"
+    url: https://www.usenix.org/conference/osdi22/presentation/yu
+    note: "Iteration-level scheduling and selective batching (non-attention operations run on a flattened [tokens, hidden] tensor, attention is split per request because it has no weights to share); the scheduler reserves max_tokens KV slots when it first schedules a request; the evaluation trace never emits an end-of-sequence token; 36.9x is 6.81 against 0.185 requests per second for GPT-3 175B at a median normalised latency of 190 ms against FasterTransformer behind a request-level scheduler. Checked 2026-10-28."
+  - title: Anyscale, How continuous batching enables 23x throughput in LLM inference while reducing p50 latency (2023-06-22)
+    url: https://www.anyscale.com/blog/continuous-batching-llm-inference
+    note: "OPT-13B on one A100 40GB; 1,000 requests of 512 input tokens with outputs drawn from an exponential distribution of mean 128; continuous batching in TGI and a Ray Serve reimplementation about 8x over Hugging Face Pipelines, FasterTransformer about 4x, vLLM up to 23x; the authors call it a simulated workload on one GPU and one model. Checked 2026-10-28."
+  - title: vLLM V1 alpha release blog (2025-01-27)
+    url: https://vllm.ai/blog/2025-01-27-v1-alpha-release
+    note: "No separate prefill and decode phases; scheduling decisions are a {request_id: num_tokens} dictionary; up to 1.7x throughput over V0 without multi-step scheduling, attributed to lower CPU overhead with nearly identical kernels. Checked 2026-10-28."
+  - title: vllm/v1/core/sched/scheduler.py at v0.32.0 (commit 5df63a7)
+    url: https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py
+    note: "schedule() serves the running list first, then the waiting queue only if nothing was preempted in the step; admission stops at max_num_seqs or when the token budget is spent; under FCFS the preemption victim is running[-1]. v0.32.0 was the current release on 2026-10-28."
+  - title: vLLM docs, Metrics design
+    url: https://docs.vllm.ai/en/latest/design/metrics.html
+    note: "Queue, prefill, decode and inter-token intervals from QUEUED, SCHEDULED, PREEMPTED and NEW_TOKENS events recorded in the engine core; a preemption during decode lands in inter-token latency, during prefill in TTFT. Checked 2026-10-28."
+  - title: vllm/v1/metrics/loggers.py at v0.32.0 (commit 5df63a7)
+    url: https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/metrics/loggers.py
+    note: "Metric names vllm:num_requests_running, vllm:num_requests_waiting, vllm:iteration_tokens_total (tokens per engine step), vllm:kv_cache_usage_perc, vllm:num_preemptions, vllm:request_queue_time_seconds, vllm:time_to_first_token_seconds, vllm:inter_token_latency_seconds."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import InferenceBatchSim from '../../../../components/widgets/InferenceBatchSim.astro';
+
+## The scheduling unit is one forward pass
+
+A request-level batcher hands the engine a batch and waits for the whole batch to return. For a model that generates one token per forward pass, that has two costs the Orca paper (OSDI 2022) names directly: a request that finishes early keeps occupying its slot and cannot be returned to its client, and a request that arrives mid-batch waits for the slowest member to finish. The batch behaves like a barrier, and its run time is the run time of its longest output, which nobody knows when the batch is formed.
+
+Iteration-level scheduling moves the decision to the forward pass. The scheduler asks the engine to run exactly one iteration over the current set of requests, collects one new token per request, retires the ones that just finished, and admits waiting ones before the next iteration. This track calls it continuous batching.
+
+The scheduler is now on the hot path. It runs once per forward pass, so at a 30 ms step it runs 33 times a second per replica, and a slow scheduler shows up as idle GPU time between steps. That is the main thing vLLM's V1 rewrite attacked: the release post reports up to 1.7 times V0's throughput and attributes it to lower CPU overhead, since the kernels were nearly identical.
+
+## Why a ragged batch can run in one pass
+
+A batch that changes every step contains requests at different positions: one is processing a 500-token prompt, sixty-three others are each adding their 200th or 900th token. Their tensors do not share a shape. Orca's second idea, selective batching, is what makes the step possible. Every operation that treats tokens independently (the QKV projection, the output projection, the MLP, layer norm, residual adds) runs on one flattened tensor of shape `[total tokens in the step, hidden]` with no batch dimension. Only attention needs to know which tokens belong to which request, so the batch is split for attention and merged afterwards.
+
+Orca's argument for why this is cheap is a bandwidth argument. Batching pays off by reusing each weight read across many tokens. Attention has no weights; batching it would save no weight reads, so running it per request costs little.
+
+The same structure survives in current engines. vLLM V1's scheduler output is a mapping from request id to the number of tokens to process this step, and a whole prompt, a slice of a prompt and a single decode token are all just entries in that map. The model runner packs them into one flat batch. There is no prefill phase and no decode phase in the scheduler, only requests whose computed-token count lags behind their known-token count.
+
+## Where the gain comes from
+
+The simulator runs 256 requests through 16 slots. Each running request emits one token per step, and the strips show the share of slots doing work over time.
+
+<InferenceBatchSim />
+
+The default mix (outputs of 20, 50 or 400 tokens) takes 6,400 steps at 43% slot use under static batching and 3,000 steps at 92% under continuous batching. Switch to similar lengths (100, 120 or 140) and static batching already reaches 87%, against 97.5% for continuous: the gain comes from length variance, and a workload with uniform outputs has little to win. The long-tail mix (one request in ten is 1,000 tokens) is where static batching collapses, to 15% at 16 slots. Continuous batching at 64 slots on that mix drops to 36% because at the end of a finite queue only the long requests remain; a server with steady arrivals keeps refilling, so treat the tail of the strip as an artefact of the toy.
+
+The toy charges every step the same, so slot use overstates the throughput gain; the next numbers come from systems that measured it.
+
+## The published multiples, with their conditions
+
+Orca reports 36.9 times the throughput of FasterTransformer on GPT-3 175B. The figure compares 6.81 requests per second with 0.185 at a median latency of 190 ms per generated token. The FasterTransformer baseline sat behind a request-level scheduler the authors wrote, because FasterTransformer has none. The synthetic trace never emits an end-of-sequence token, so every request runs to its `max_gen_tokens`. And Orca itself reserved `max_tokens` worth of KV slots for every request when it was first scheduled, which caps how many requests fit at once.
+
+Anyscale's numbers from June 2023 use OPT-13B on one A100 with 40 GB: 1,000 requests of 512 prompt tokens with output lengths drawn from an exponential distribution of mean 128, submitted in a burst. Against Hugging Face Pipelines with static batching, continuous batching in TGI and a Ray Serve reimplementation gave about 8 times the throughput, FasterTransformer with static batching about 4 times, and vLLM up to 23 times. The authors describe it as a simulated workload on one GPU and one model.
+
+Two things carry over. The gain grows with output length variance, because that is the waste being removed. And the baseline decides the multiple: "23x" is continuous batching plus paged KV memory against an unoptimised static batcher, and "36.9x" is against a pipeline-parallel system with no scheduler of its own.
+
+## Throughput without a latency penalty, and what that depends on
+
+The usual claim is that continuous batching raises throughput without hurting short requests. The mechanism is that a short request now leaves on its own last step instead of waiting for the batch, and a new request starts on the next step instead of at the next batch boundary. Queue time drops, and nothing about a short request's own computation changes.
+
+The step itself is not free. A decode step reads the weights once and the KV cache of every running request, so it lengthens as the batch and its contexts grow. Orca shows its throughput rising with max batch size without affecting latency on its hardware, then adds that there is no guarantee for arbitrary hardware, models and workloads. Steady-state capacity follows from Little's law once the step time is known.
+
+<Predict id="inf-cb-littles-law" question="A replica holds 64 decoding requests at all times. Each step takes 30 ms and emits one token per request, and the mean output is 256 tokens. How many requests per second does it complete?" answer={8.33} tolerance={0.4} unit="req/s">
+<p>Each request occupies a slot for 256 steps, or 256 × 0.030 = 7.68 s. With 64 slots always full, completions are 64 / 7.68 = <b>8.33 requests per second</b>, and the replica emits 64 / 0.030 = 2,133 tokens per second. Raising the concurrency to 128 only helps if the step time grows by less than a factor of two, which is the measurement that decides max_num_seqs.</p>
+</Predict>
+
+## One engine step in vLLM V1
+
+Here is a step in `vllm/v1/core/sched/scheduler.py` as of v0.32.0, the release current on 2026-10-28. The file moves quickly; the commit is pinned in the sources.
+
+1. **Running requests first.** The scheduler walks the running list in order. For each request it computes the tokens it still owes: one for a decoding request, the rest of the prompt (cut to the remaining budget) for a request still in prefill. It asks the KV cache manager for enough slots.
+2. **Preempt on allocation failure.** If the slots are not available, it preempts a running request (the last one in the list under first-come-first-served, the lowest priority under the priority policy), frees its blocks and retries. The paged allocator and recompute-based preemption are the next lesson.
+3. **Waiting requests, only if nothing was preempted.** If this step preempted anyone, no new request is admitted; otherwise the scheduler admits from the waiting queue while token budget remains and the running count is below `max_num_seqs`, checking the prefix cache for each newcomer.
+4. **Execute.** The output is the `{request_id: num_tokens}` map plus block tables. The model runner executes one forward pass and samples one token for every request whose prompt is complete.
+5. **Update.** New tokens are appended, stop conditions checked, finished requests freed. Their blocks go back to the pool before the next call to `schedule()`.
+
+The budget that bounds steps 1 and 3 is `max_num_batched_tokens`, the subject of the third lesson. The toy below implements steps 1, 3, 4 and 5 without memory, so the order of decisions is visible.
+
+```python
+from collections import deque
+
+def simulate(requests, max_seqs=4, budget=64):
+    """requests: (rid, prompt_tokens, output_tokens) in arrival order.
+    Returns {rid: (step of first token, step of last token)}."""
+    waiting = deque(requests)
+    running = {}   # rid -> [prompt tokens not yet computed, tokens still to sample]
+    first, done, step = {}, {}, 0
+    while waiting or running:
+        step += 1
+        plan, left = {}, budget
+        for rid, (todo, _) in running.items():      # running requests first, oldest first
+            n = min(todo or 1, left)                 # a decode needs 1 token, a prompt the rest
+            if n:
+                plan[rid] = n
+                left -= n
+        while waiting and left and len(running) < max_seqs:
+            rid, prompt, out = waiting.popleft()     # admit into the same step
+            running[rid] = [prompt, out]
+            plan[rid] = min(prompt, left)
+            left -= plan[rid]
+        for rid, n in plan.items():                  # the forward pass, then sampling
+            state = running[rid]
+            if state[0]:
+                state[0] -= n
+                if state[0]:
+                    continue                         # a prompt chunk; nothing sampled yet
+            state[1] -= 1
+            first.setdefault(rid, step)
+            if state[1] == 0:
+                done[rid] = (first[rid], step)
+                del running[rid]                     # retired; its slot is free next step
+    return done
+
+reqs = [("a", 30, 3), ("b", 200, 2), ("c", 10, 40), ("d", 10, 2), ("e", 10, 2)]
+for rid, (first_step, last_step) in sorted(simulate(reqs).items()):
+    print(rid, "first token at step", first_step, "last token at step", last_step)
+```
+
+It prints first tokens at steps 1, 4, 4, 4 and 5 and last tokens at steps 3, 5, 43, 5 and 6. Request `b`'s 200-token prompt is spread over four steps because the budget is 64, and `e` is admitted into step 4 with only the 4 tokens left in that step's budget, finishing its prompt in step 5. Request `c`'s 40-token output no longer holds `d` and `e` back: they finish at steps 5 and 6 while `c` runs to step 43.
+
+## Metrics that show it working
+
+vLLM exports the scheduler's view as Prometheus metrics per engine:
+
+- `vllm:num_requests_running` against `max_num_seqs`, and `vllm:num_requests_waiting`. Running pinned at the cap with a non-empty waiting queue means the slot cap binds.
+- `vllm:kv_cache_usage_perc` near 1 with waiting requests means memory binds before slots do; `vllm:num_preemptions` rising says the engine is admitting more than memory holds.
+- `vllm:iteration_tokens_total`, a histogram of tokens per engine step. Steps far below the budget with an empty queue mean the replica is demand-bound and more batching knobs will not help.
+- `vllm:request_queue_time_seconds`, `vllm:time_to_first_token_seconds` and `vllm:inter_token_latency_seconds`. The engine core records queued, scheduled, preempted and new-token events, so queue time and prefill time can be separated when TTFT rises.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Scenario: an internal model runs on eight GPUs behind a request-level batcher that flushes 16 requests or every 50 ms. Chat needs p95 time to first token under one second, and a nightly summarisation job must finish in six hours on the same pool. You have two weeks. Do you migrate to an engine with continuous batching, or tune the batcher?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Measure the output length distribution and where chat TTFT goes first. If outputs vary widely and TTFT is mostly queue time behind long batches, migrate: continuous batching removes exactly that wait and raises throughput for the nightly job at the same time. If outputs are uniform, or TTFT is mostly prefill compute, tuning the batcher and splitting chat from batch traffic gets most of the benefit in two weeks with less risk.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The decision turns on two measurements from the current system: the spread of output lengths (the static batcher's waste is roughly the gap between each batch's longest output and its mean), and the breakdown of chat TTFT into queue time and prefill time.</p>
+<p>If the spread is wide, the batcher is the bottleneck for both goals. Chat waits behind the longest member of the current batch, and the nightly job burns slot-steps on finished sequences. An engine with continuous batching fixes both, and paged KV usually lets the batch grow as well. The two-week risk is operational, not algorithmic: new defaults, new metrics, and an output-equivalence check, since a new engine changes kernels and numerics. I would shadow a copy of production traffic for a few days, compare outputs on a fixed sample, and cut chat over first because it has the tighter objective.</p>
+<p>If the spread is narrow, migration buys little, and the cheaper move is to stop mixing the two workloads: a small chat pool with a short flush interval, and the nightly job on the rest with large batches. That gives up pooling efficiency and leaves the long-output waste in place.</p>
+<p>Either way, chat and batch traffic need separate admission: a priority class or a separate queue, so a burst from the nightly job cannot fill the slots chat needs. What I give up by migrating in two weeks is depth of validation; I would write down the output-equivalence threshold and the rollback trigger (p95 TTFT or error rate over the current baseline for a set period) before the cutover.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The new engine passes the shadow test but the nightly job now finishes in seven hours because chat has priority. Which goal gives?</em> Name the owner of each objective, show the capacity arithmetic, and either reserve slots for the batch job during its window or add capacity; do not quietly weaken chat priority.</li>
+<li><em>Two senior engineers disagree: one wants to keep the batcher and add a length predictor to group similar outputs. How do you decide without deciding by rank?</em> Agree on a replayed trace and a metric (throughput at the chat TTFT objective), run both, and fix a date to decide.</li>
+<li><em>What would you need to see in production to reverse the migration?</em> Output differences above the agreed threshold on the fixed sample, or a TTFT regression traced to the scheduler itself, such as CPU-bound steps on a small model.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The simulator gives every step equal cost and every request one token per step. Real steps lengthen with batch size and context, and prefill tokens cost far more per step than decode tokens, so slot use is a picture of idle slots, not a throughput forecast.
+
+Continuous batching helps in proportion to output length variance. A workload of single forward passes (embeddings, classification, reranking) has no decode loop to schedule, and static batches of similar-length inputs are the right tool there.
+
+Iteration-level scheduling alone does not solve memory. Orca still reserved `max_tokens` of KV per request at admission, so the batch size was capped by worst-case reservations; the paged allocator in the next lesson is what let the batch grow to what the memory can actually hold. Mixing long prefills into decode steps also creates a latency problem of its own, which the third lesson covers.
+
+The step-by-step description of vLLM's scheduler is pinned to v0.32.0. The ordering rules (running before waiting, no admission in a step that preempted) are implementation choices, and SGLang, TensorRT-LLM and TGI make different ones. Read the scheduler of the engine and version you run.
+
+<SelfRate id="lesson:inference/batching/continuous-batching" />

@@ -1,0 +1,141 @@
+---
+id: fnd-029
+title: The batched decode that disagrees with itself
+subtitle: rank the defects
+track: foundations
+module: attention
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [kv-cache, rope, padding, batching, decode]
+companies:
+  - name: Startups.com
+    url: https://prachub.com/interview-questions/design-efficient-transformer-inference-with-kv-cache
+updated: 2026-10-28
+sources:
+  - title: PracHub, Design efficient Transformer inference with KV cache (posted 2026-03-10, checked 2026-10-28)
+    url: https://prachub.com/interview-questions/design-efficient-transformer-inference-with-kv-cache
+    note: "candidate report: a Startups.com machine learning engineer onsite asked how to add a KV cache with variable sequence lengths in a batch and named masking errors and position-encoding and RoPE mistakes as the common bugs; the trace and code here are original"
+  - title: "RoFormer: Enhanced Transformer with Rotary Position Embedding (Su et al., 2021)"
+    url: https://arxiv.org/abs/2104.09864
+    note: rotary embeddings rotate queries and keys by angles set by absolute position, so a score depends on the difference between the two positions
+  - title: Dao-AILab/flash-attention README (checked 2026-10-28)
+    url: https://github.com/Dao-AILab/flash-attention
+    note: variable-length (packed) batches, causal mask alignment from version 2.1, flash_attn_with_kvcache applies rotary embeddings to the new keys when given cos and sin
+choices:
+  - text: Decode positions count the padding columns, so padded rows get rotary angles offset by their pad count
+    correct: true
+    why: "cache.length is the padded width, so a row with p pads decodes its first new token at position n + p instead of n; every relative distance to the prompt is off by p, and only padded rows are affected."
+  - text: The cache is cast to bf16 while the reference stays in fp32, so every decode step drifts a little further
+    correct: false
+    why: "A real difference, and it shows in the table as the 0.02 to 0.04 logit gap on unpadded rows; it does not separate padded rows from unpadded ones, and it never flips a greedy token on the unpadded rows."
+  - text: Pad keys are masked with a finite fill of -1e4, so long padded rows leak attention weight onto padding
+    correct: false
+    why: "With scores of order ten, exp(-1e4) underflows to exactly zero in bf16 and fp32, so no weight reaches the padding; a finite fill matters only for rows where every key is masked."
+  - text: Each step rebuilds the cache with torch.cat, so step time grows with length and long rows stall and drift
+    correct: false
+    why: "A real cost, quadratic copying over a generation, worth fixing for latency; concatenation copies values exactly and in order, so it cannot change any output."
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Debug round">
+Last sprint the team moved the cache to bf16, switched batched prefill to left padding, and added a nightly check that compares greedy decode in production batches with a reference: each prompt run alone, unpadded, in fp32. Tonight's check failed. Which defect explains the failures? Rank the others.
+</Callout>
+
+The nightly report for one batch of 8 prompts (constructed for this problem). "Pads" is the number of left-padding columns in that row; "first token" is the token produced from prefill; "first divergence" is the first decode step whose greedy token differs from the reference.
+
+```text
+row  prompt_len  pads  first token  first divergence  max |logit diff| before divergence
+0    412         0     match        none (64 steps)   0.03
+1    388         24    match        step 1            -
+2    412         0     match        none (64 steps)   0.04
+3    97          315   match        step 1            -
+4    405         7     match        step 3            0.21 (steps 1 to 2)
+5    412         0     match        none (64 steps)   0.02
+6    260         152   match        step 1            -
+7    411         1     match        step 9            0.11 (steps 1 to 8)
+```
+
+The serving code (PyTorch; the model's attention applies rotary embeddings to queries and keys at the given positions, then masks with the key mask):
+
+```python
+# serve/decode.py
+PAD = 0
+
+def prefill(model, input_ids):
+    # input_ids: [batch, width], left-padded to the longest prompt
+    key_mask = (input_ids != PAD).long()
+    positions = (key_mask.cumsum(-1) - 1).clamp(min=0)
+    k, v, logits = model.forward(input_ids, positions=positions, key_mask=key_mask)
+    cache = KVCache(k.to(torch.bfloat16), v.to(torch.bfloat16), key_mask)
+    return cache, logits[:, -1]
+
+def decode_step(model, cache, next_ids):
+    batch = next_ids.shape[0]
+    positions = torch.full((batch, 1), cache.length)
+    cache.key_mask = torch.cat([cache.key_mask, torch.ones_like(next_ids)], dim=-1)
+    k, v, logits = model.forward(next_ids, positions=positions, past=cache, key_mask=cache.key_mask)
+    # append this step's keys and values
+    cache.k = torch.cat([cache.k, k.to(torch.bfloat16)], dim=-2)
+    cache.v = torch.cat([cache.v, v.to(torch.bfloat16)], dim=-2)
+    return logits[:, -1]
+```
+
+```python
+# model/attention.py (excerpt)
+scores = (q @ k.transpose(-1, -2)) * self.scale
+scores = scores.masked_fill(key_mask[:, None, None, :] == 0, -1e4)
+weights = scores.softmax(dim=-1)
+```
+
+```python
+# serve/cache.py (excerpt)
+class KVCache:
+    def __init__(self, k, v, key_mask):
+        self.k, self.v, self.key_mask = k, v, key_mask
+
+    @property
+    def length(self):
+        return self.k.shape[-2]
+```
+
+You do not have the positions each row used; the nightly check logs tokens and logits only.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Sort the rows by pad count and read the first-divergence column again.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>The first token matches everywhere. Which code ran for the first token, and which ran only afterwards?</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request one thing from the next nightly run: the position tensor passed to the model at prefill and at the first decode step, for one padded row.</p></details>
+
+## Answer
+
+Prefill is right and decode is wrong, and only for padded rows. The first token matches in every row, so prefill's positions, computed per row from the mask, are correct. In `decode_step`, `cache.length` is the width of the cache tensor, which includes the left padding. A row with prompt length n and p pads should place its first new token at position n; it gets n + p. Rotary embeddings make each score depend on the difference between the query's and key's positions, so every distance from the new token to its prompt is off by p, and the error repeats at every step. The table fits: unpadded rows never diverge, rows with hundreds of pads diverge at step 1, and rows with 7 pads and 1 pad survive a few steps first, because a small offset perturbs logits without flipping a greedy choice at once.
+
+The ranking. The bf16 cast is a real change in numerics and accounts for the 0.02 to 0.04 logit gaps on rows 0, 2 and 5; it does not explain why padding predicts divergence, and if it were the cause the unpadded rows would diverge sometimes too. The `torch.cat` rebuild is a real latency defect, copying the whole cache every step, and does not change values. The -1e4 fill does not leak: with scores of order ten the masked weights underflow to zero. It would matter only for a row whose every key is masked, which no row here has.
+
+The evidence is incomplete. Without logged positions you are inferring the offset from the correlation with pad count. The cheapest confirmation is to rerun row 3 alone with its 315 pads kept, and again with them removed; if only the padded run diverges, padding is the cause, and logging `positions` at the first decode step names the offset. If you cannot rerun before the release, ship the position fix behind the nightly check anyway: it is a one-line change with a test that compares a padded and an unpadded run of the same prompt.
+
+The fix is a decision with two defensible answers.
+
+- **Keep left padding and track positions per row.** Store `next_pos = key_mask.sum(-1)` at prefill, pass it at each decode step and increment it. One small change, and the current kernels stay. Cost: every operation that edits a row's history (beam reordering, speculative tokens rejected, a sliding-window eviction) now has two pieces of state to keep consistent, the cache and the position counter.
+- **Stop padding: packed variable-length batches.** Concatenate prompts with offsets per sequence and use a kernel that takes them, which FlashAttention provides. Position is then the index within each sequence, and the padding compute disappears too: row 3 spends 315 of its 412 prefill columns on padding. Cost: a different attention entry point, a cache layout change and a re-validation of every model you serve, which the release does not have time for.
+
+The constraint conflict is the release date against correctness of every batched request with padding. Recommendation: ship the per-row counter now with the padded-versus-unpadded test, and schedule packed batches as the follow-up that removes both the bug class and the padding compute. Failure mode of the recommendation: the counter is a second source of truth. The first time speculative decoding rejects tokens and rolls back the cache but not the counter, positions drift again, in a path the nightly greedy check never exercises. Put the counter inside `KVCache` and derive it from the mask on every truncation, not in the caller.
+
+## Follow-ups
+
+- *The release is in two days and the nightly check runs only greedy decoding. What do you add to the check before you trust the fix for sampled and speculative requests, and what do you accept untested in writing?*
+- *A colleague proposes right padding instead, because then positions are simply the index. What breaks in `prefill` and in the cache append, and is it cheaper than packing?*
+- *What would you need to see in a week of nightly reports to say the bf16 cache is acceptable, rather than a second defect waiting for a longer generation?*
+- *Two senior engineers disagree: one wants the nightly check to fail the release on any logit difference above 0.05, the other only on a greedy-token flip. How do you decide without deciding by rank?*
+
+## Common mistakes
+
+- Blaming the bf16 cast because it is the most recent numeric change; it does not explain why padding predicts the failure.
+- Fixing the mask fill value, which changes nothing here.
+- Fixing positions in the caller and leaving the cache without them, so the next feature that rewinds the cache brings the bug back.
+- Testing the fix with unpadded single prompts, the one configuration that was never broken.

@@ -1,0 +1,132 @@
+---
+title: DPO in practice
+track: training
+module: post-training
+order: 3
+kind: lesson
+level: senior
+minutes: 12
+summary: What DPO optimises and what it needs, how to build its dataset (fields, ties, noisy labels, offline versus on-policy pairs), the settings Llama 3 published, and why the chosen response's probability can fall while the loss improves.
+prerequisites: [training/post-training/reward-models]
+updated: 2026-10-28
+sources:
+  - title: Rafailov et al., Direct Preference Optimization, Your Language Model is Secretly a Reward Model (v3, 2024-07-29)
+    url: https://arxiv.org/abs/2305.18290
+    note: "the KL-constrained reward objective, its closed-form optimum, the implicit reward beta log(pi / pi_ref), the DPO loss and its gradient; the paper reports DPO matching or beating PPO-based RLHF in its experiments, and describes it as solving the RLHF problem with a classification loss. Checked 2026-10-28."
+  - title: Llama Team, The Llama 3 Herd of Models
+    url: https://arxiv.org/html/2407.21783
+    note: "section 4.1.4: DPO chosen over PPO because it needed less compute for large models and performed better, especially on instruction following such as IFEval; most recent preference batches from the best models; learning rate 1e-5, beta 0.1; header and termination tokens masked from the loss because they create a conflicting objective and can cause tail repetition; NLL term with coefficient 0.2 on chosen sequences to keep formatting and prevent the chosen log-probability from decreasing. Section 4.2.1: two responses per prompt from two different models; four preference strengths; only significantly better or better pairs used, similar responses discarded. Checked 2026-10-28."
+  - title: Razin et al., Unintentional Unalignment, Likelihood Displacement in Direct Preference Optimization (ICLR 2025)
+    url: https://arxiv.org/abs/2410.08847
+    note: "likelihood displacement: the preferred response's probability falls during DPO and mass can move to responses with the opposite meaning; driven by preference pairs with similar hidden embeddings (CHES score); in the paper's refusal experiment Llama-3-8B-Instruct's refusal rate fell from 74.4% to 33.4%; filtering high-CHES pairs mitigated it. Checked 2026-10-28."
+  - title: PracHub, Explain DPO and construct its training data (posted 2025-12-08)
+    url: https://prachub.com/interview-questions/explain-dpo-and-construct-its-training-data
+    note: "candidate report of a TikTok software engineer technical screen asking how DPO differs from PPO-based RLHF and how to build its dataset (fields, preferred and dispreferred sources, ties, noisy labels, filtering). Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What DPO removes
+
+PPO-based RLHF trains a reward model, then runs RL: sample from the policy, score with the reward model, estimate advantages with a value model, update, repeat, with a KL penalty keeping the policy near a reference. DPO keeps the objective and removes the loop. It needs a frozen reference model and a fixed dataset of preference pairs. It needs no separate reward model, no value model and no sampling during training. The training step is a forward pass of the policy and the reference over the chosen and rejected responses, and a classification-style loss.
+
+The derivation is short enough to carry into a design review. The RLHF objective is to maximise expected reward minus β times the KL divergence from the reference. Its optimum has a closed form: π*(y|x) ∝ π_ref(y|x) · exp(r(x, y)/β). Solve for the reward: r(x, y) = β log(π*(y|x)/π_ref(y|x)) + β log Z(x), where Z(x) is the normalising constant. Substitute that into the Bradley-Terry likelihood of a preference pair. The pair loss depends only on the reward difference, so β log Z(x) cancels, and what remains is a loss on the policy alone:
+
+L = −log σ(β [ (log π(y_w) − log π_ref(y_w)) − (log π(y_l) − log π_ref(y_l)) ])
+
+with y_w the chosen and y_l the rejected response. The term β log(π/π_ref) is the implicit reward. The gradient is
+
+∇L = −β σ(r̂_l − r̂_w) [∇ log π(y_w) − ∇ log π(y_l)]
+
+where r̂ is the implicit reward. A pair the policy already ranks correctly by a wide implicit margin gets a weight near zero; a pair it ranks wrongly gets a weight near β. The [preference-learning lab](/labs/preference-learning) has you derive this gradient for a small policy and check it against finite differences.
+
+## What β does
+
+β appears twice: it scales the implicit reward, and it is the strength of the KL constraint in the objective DPO was derived from. A smaller β lets the policy move further from the reference for the same margin. Label disagreement makes this concrete. Suppose a fraction p of the labels prefer A to B and the rest prefer B to A. The expected loss is p·softplus(−m) + (1 − p)·softplus(m), where m is the margin; setting its derivative to zero gives σ(m) = p, so m = log(p / (1 − p)). The policy's log-ratio difference settles at m/β. For p = 0.75 the margin is log 3 = 1.10; at β = 0.1 the policy's log-ratio difference between A and B settles at 11.0 nats, and at β = 0.5 at 2.2.
+
+With unanimous labels (p = 1) there is no finite optimum: the loss keeps falling as the margin grows, and only the number of steps and the learning rate stop the policy. That is the practical reason to watch KL from the reference during a DPO run even though the loss has a KL term built in.
+
+<Predict id="trn-dpo-loss" question="β = 0.1. For one pair, the policy's log-prob of the chosen response is −120 and the reference's is −125; for the rejected response the policy has −130 and the reference −127. What is the DPO loss for this pair, to two decimals?" answer={0.37} tolerance={0.01} unit="nats">
+<p>Chosen log-ratio: −120 − (−125) = +5. Rejected log-ratio: −130 − (−127) = −3. Margin m = 0.1 × (5 − (−3)) = 0.8. Loss = log(1 + e<sup>−0.8</sup>) = log(1.449) = <b>0.37</b>. The gradient weight on this pair is σ(−0.8) = 0.31 times β: still learning from it, at about 62% of the weight the pair carried at the start of training, when the margin was 0 and σ(0) = 0.5.</p>
+</Predict>
+
+## Building the dataset
+
+A DPO example is a prompt and two responses with a label. What to store with it:
+
+- the prompt as the model will see it, rendered through the chat template with system prompt and prior turns, since the loss is computed on token log-probs under that rendering;
+- chosen and rejected responses, and the model and sampling settings that produced each;
+- the label strength and who gave it (annotator, judge model and version);
+- the reference model's log-probs for both responses, computed once and cached, which removes the reference forward pass from training.
+
+**Sources of chosen and rejected.** Llama 3 sampled two responses per prompt from two different models and had annotators rate the preference in four strengths: significantly better, better, slightly better, marginally better. Annotators could also edit the preferred response, giving a third, best response. Pairs from different models differ in style as well as quality, and DPO learns any difference that predicts the label, including the style of the model that tended to win.
+
+**Ties and weak labels.** DPO has no tie term. A tie labelled at random contributes a pull in a random direction, and a weak preference contributes a pull as strong as a clear one. Llama 3 trained only on pairs rated significantly better or better and discarded pairs with similar responses. That discards data to buy label quality, and it is the cheaper fix compared with modelling label confidence.
+
+**Noisy labels.** The derivation above says disagreement on the same pair caps the margin rather than corrupting the gradient direction, which is benign. Systematic noise is not: if an annotator pool prefers longer answers, DPO learns length. Measure the length difference between chosen and rejected across the set before training; if the chosen side is longer on average, either rebalance or report length-controlled results.
+
+**Offline versus on-policy pairs.** DPO trains on whatever pairs it is given, including pairs the current policy would never generate. Llama 3 used mostly the most recent preference batches, collected from its best models, so that the data matched the policy being optimised, and repeated the cycle over six rounds. A one-shot DPO run on an old public preference set is offline in the strongest sense: the gradient pushes on responses far from what the model produces, and the implicit reward generalises poorly to its own outputs.
+
+## Settings and the two fixes Llama 3 published
+
+Llama 3 used DPO rather than PPO because, in its experiments, DPO needed less compute for large models and did better, especially on instruction-following benchmarks such as IFEval. The settings: learning rate 10⁻⁵ and β = 0.1. Two changes to the plain loss:
+
+1. **Mask formatting tokens.** Header and termination tokens appear in both chosen and rejected responses, so the loss asks the model to raise and lower their probability at once. The report says that including them can lead to behaviours such as tail repetition, so they are excluded from the loss on both sides.
+2. **Add an NLL term on the chosen response,** with coefficient 0.2, to keep formatting and to stop the chosen response's log-probability from falling.
+
+The second fix answers a behaviour that surprises people the first time they plot it. DPO only constrains the difference between the chosen and rejected log-ratios. Both can fall, as long as the rejected one falls faster, and the probability mass has to go somewhere. Razin et al. call this likelihood displacement and show it can move mass to responses with the opposite meaning: in their refusal experiment, Llama-3-8B-Instruct's refusal rate fell from 74.4% to 33.4% after training on pairs meant to reinforce refusals. They trace it to pairs whose chosen and rejected responses have similar hidden representations, and filtering those pairs, by a similarity score they define, mitigated it. Step 5 of the lab builds a three-response case where plain DPO moves almost all probability to the response neither label mentions, and the NLL term reverses it.
+
+```python
+import math
+
+def dpo_pair_loss(pc, pr, rc, rr, beta=0.1, nll_coef=0.2, n_chosen_tokens=1):
+    """DPO loss for one pair from summed log-probs, plus Llama 3's NLL term on the chosen response."""
+    m = beta * ((pc - rc) - (pr - rr))
+    dpo = max(-m, 0.0) + math.log1p(math.exp(-abs(m)))     # softplus(-m), finite for any m
+    return dpo + nll_coef * (-pc / n_chosen_tokens)
+
+assert abs(dpo_pair_loss(-12.0, -15.0, -12.0, -15.0, nll_coef=0.0) - math.log(2)) < 1e-12
+```
+
+Llama 3 does not say in the DPO section whether its NLL term is normalised by length; the per-token form above is one choice, and the scale it sets against the DPO term is a hyperparameter to sweep, not a constant to copy.
+
+## What to monitor during a run
+
+Plot the chosen and rejected log-probs separately, not only the margin; the reward accuracy on held-out pairs; KL from the reference on held-out prompts, sampled from the policy; mean response length; and the rate of a behaviour the data was meant to strengthen (refusals on a safety set, schema-valid outputs). A run where margin and accuracy rise while the chosen log-prob falls is not broken by that fact alone. It is broken if the held-out behaviour moves the wrong way.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+You have one week of a training cluster. Option one: DPO on 300,000 human preference pairs collected last year against an older model. Option two: two rounds of on-policy DPO, sampling pairs from the current model and labelling them with a judge model, about 50,000 pairs per round. The product lead wants better instruction following without longer answers. Which do you run, and what goes wrong with it?
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Two on-policy rounds, if the judge agrees with people on a calibration sample; otherwise the human set with heavy filtering. On-policy pairs match what the model generates, which is why Llama 3 used its most recent batches from its best models. The failure mode of the on-policy plan is that the judge's biases (length, confident tone) become the training signal; I would control that with a length-balanced pair selection and a human-rated held-out set checked after each round.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Option one costs label drift, not labels.</strong> 300,000 human pairs are expensive data, but they rank responses from an older model. Many pairs will be easy for the current model (its implicit margin is already wide) and contribute little gradient, and the rest push on regions it no longer visits.</p>
+<p><strong>Option two costs judge risk.</strong> Before the first round, have people label a few hundred of the judge's pairs. If agreement is low on the instruction-following slice, the judge is the wrong labeller for this goal.</p>
+<p><strong>Controls in either case.</strong> Drop pairs where the judge or the annotators were not confident, mirroring Llama 3's significantly better or better filter. Balance length: keep pairs where the chosen response is shorter about as often as longer. Mask formatting tokens, add the NLL term at Llama 3's 0.2 as a starting point, and plot chosen log-probs separately.</p>
+<p><strong>What you give up.</strong> On-policy rounds spend part of the week on generation and judging rather than training, so they see fewer pairs. The written artefact is a one-page run plan: the judge agreement threshold, the held-out sets, and the regression that stops round two (instruction-following up, length up beyond an agreed bound).</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The judge agrees with people on 68% of calibration pairs. Is that enough to train on, and what would you compare it to before deciding?</li>
+<li>After round one, IFEval improves and the safety refusal rate falls. What do you check first, and do you run round two?</li>
+<li>What would you need to see to switch from DPO to an online RL method with a reward model for the next quarter?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+DPO's derivation assumes the Bradley-Terry model of preferences and a policy class that can represent the optimum. Neither holds exactly, and the guarantee that DPO solves the same problem as RLHF holds at the optimum, not along the path a finite run takes.
+
+The Llama 3 settings are for its models and data; β and the NLL coefficient interact with the learning rate and the pair distribution. Copy them as a starting point and sweep.
+
+The 74.4% to 33.4% refusal drop is from Razin et al.'s experiment designed to provoke displacement, not a measurement of production DPO runs. It shows the mechanism can be large, not how often it is.
+
+<SelfRate id="lesson:training/post-training/dpo-practice" />

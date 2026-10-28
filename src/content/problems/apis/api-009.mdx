@@ -7,45 +7,37 @@ module: structured-outputs
 type: code
 difficulty: hard
 seniority: [senior, staff]
-minutes: 40
-core: false
+minutes: 45
+core: true
 tags: [streaming, sse, tool-calling, partial-json]
-companies:
-  - name: Decagon
-    url: https://www.techinterview.org/companies/decagon-interview-guide/
+companies: []
 updated: 2026-10-28
 sources:
-  - title: techinterview.org, Decagon interview guide
-    url: https://www.techinterview.org/companies/decagon-interview-guide/
-    note: third-party guide listing parsing a tool-call schema and handling a streaming response among coding-round examples
-  - title: amitshekhariitbhu/ai-engineering-interview-questions
-    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
-    note: "Implement streaming responses for an LLM API."
   - title: Claude docs, streaming messages
     url: https://platform.claude.com/docs/en/build-with-claude/streaming
-    note: event order; ping events; input_json_delta partial JSON; cumulative usage in message_delta; overloaded_error inside a stream after HTTP 200
+    note: "event flow; any number of ping events; input_json_delta carries partial JSON and current models emit one complete key and value at a time, chunked; usage in message_delta is cumulative; an overloaded_error can arrive as an event after the 200; on Claude 4.6 and later, recovery is a new request with a user message holding the partial response; tool use and thinking blocks cannot be partially recovered; new event types may be added and unknown ones should be handled gracefully; eager_input_streaming per tool. Checked 2026-10-28."
+  - title: Claude docs, API errors
+    url: https://platform.claude.com/docs/en/api/errors
+    note: "an error can occur after the API returns 200 on a stream, and then the standard HTTP error handling does not apply; error type values may grow over time. Checked 2026-10-28."
   - title: OpenAI API docs, function calling
     url: https://developers.openai.com/api/docs/guides/function-calling
-    note: response.function_call_arguments.delta events aggregated by output_index
+    note: "response.output_item.added, response.function_call_arguments.delta, response.function_call_arguments.done and response.output_item.done. Checked 2026-10-28."
   - title: Pydantic docs, JSON parsing
     url: https://pydantic.dev/docs/validation/latest/concepts/json/
-    note: allow_partial parsing for progressive display
+    note: "from_json(..., allow_partial=True) returns ['aa', 'bb'] for '[\"aa\", \"bb\", \"c'; partial parsing works reliably only when every model field has a default. Checked 2026-10-28."
 code:
   starter: |
     import json
 
     class StreamError(Exception):
-        pass
+        def __init__(self, kind, partial):
+            super().__init__(kind)
+            self.partial = partial   # the result dict as far as the stream got
 
     def collect(events):
-        """Fold a Claude-style SSE event list into a result dict:
-
-        {"text": str, "tool_calls": [{"id", "name", "input"}], "stop_reason": str, "output_tokens": int}
-
-        Text comes from text_delta events; tool input from input_json_delta
-        fragments, parsed once at that block's content_block_stop. Blocks are
-        ordered by index. Ignore ping events. Usage in message_delta is
-        cumulative. Raise StreamError(error type) on an error event.
+        """Fold a list of Claude Messages API stream events into
+        {"text": str, "tool_calls": [{"id", "name", "input"}],
+         "stop_reason": str | None, "output_tokens": int}.
         """
         raise NotImplementedError
   tests: |
@@ -59,126 +51,238 @@ code:
         return {"type": "content_block_stop", "index": i}
     def mdelta(reason, out):
         return {"type": "message_delta", "delta": {"stop_reason": reason}, "usage": {"output_tokens": out}}
-    PING = {"type": "ping"}
     MSG_START = {"type": "message_start", "message": {"usage": {"input_tokens": 50, "output_tokens": 1}}}
     MSG_STOP = {"type": "message_stop"}
 
-    simple = [MSG_START, start(0, "text", text=""), text_d(0, "Hello"), PING, text_d(0, ", world"), stop(0),
-              mdelta("end_turn", 6), MSG_STOP]
-    r = collect(simple)
+    r = collect([MSG_START, start(0, "text", text=""), text_d(0, "Hello"), text_d(0, ", world"), stop(0),
+                 mdelta("end_turn", 6), MSG_STOP])
     assert r["text"] == "Hello, world" and r["tool_calls"] == [] and r["stop_reason"] == "end_turn"
 
-    two_tools = [MSG_START,
-        start(0, "text", text=""), text_d(0, "Checking."), stop(0),
-        start(1, "tool_use", id="t1", name="get_weather", input={}),
-        json_d(1, '{"city": "Pu'), PING, json_d(1, 'ne"}'),
-        stop(1),
-        start(2, "tool_use", id="t2", name="get_time", input={}),
-        json_d(2, '{"tz": "Asia/'), json_d(2, 'Kolkata"}'), stop(2),
-        mdelta("tool_use", 40), mdelta("tool_use", 41), MSG_STOP]
-    r = collect(two_tools)
-    assert r["tool_calls"] == [{"id": "t1", "name": "get_weather", "input": {"city": "Pune"}},
-                               {"id": "t2", "name": "get_time", "input": {"tz": "Asia/Kolkata"}}], "parse each block at its stop event"
-    assert r["text"] == "Checking."
-    assert r["output_tokens"] == 41, "message_delta usage is cumulative: take the last value, do not sum"
-    assert r["stop_reason"] == "tool_use"
+    r = collect([MSG_START, start(0, "text", text=""), text_d(0, "Checking."), stop(0),
+                 start(1, "tool_use", id="t1", name="get_weather", input={}),
+                 json_d(1, '{"city": "Pu'), json_d(1, 'ne"}'), stop(1),
+                 mdelta("tool_use", 40), MSG_STOP])
+    assert r["tool_calls"] == [{"id": "t1", "name": "get_weather", "input": {"city": "Pune"}}]
+    assert r["text"] == "Checking." and r["stop_reason"] == "tool_use"
 
-    no_args = [MSG_START, start(0, "tool_use", id="t9", name="list_orders", input={}), stop(0), mdelta("tool_use", 5), MSG_STOP]
-    assert collect(no_args)["tool_calls"] == [{"id": "t9", "name": "list_orders", "input": {}}], "a tool with no argument deltas has input {}"
-
-    cut = [MSG_START, start(0, "tool_use", id="t3", name="get_weather", input={}), json_d(0, '{"city": "Pu')]
-    assert collect(cut)["tool_calls"] == [], "never return a tool call whose block did not stop"
-
-    broken = [MSG_START, start(0, "text", text=""), text_d(0, "Partial"),
-              {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}]
     try:
-        collect(broken)
+        collect([MSG_START, start(0, "text", text=""), text_d(0, "Partial"),
+                 {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}])
         raise AssertionError("an error event after HTTP 200 must raise")
     except StreamError as e:
         assert "overloaded_error" in str(e)
+  hidden: |
+    import json, random, time
+    def start(i, kind, **kw):
+        return {"type": "content_block_start", "index": i, "content_block": {"type": kind, **kw}}
+    def text_d(i, t):
+        return {"type": "content_block_delta", "index": i, "delta": {"type": "text_delta", "text": t}}
+    def json_d(i, s):
+        return {"type": "content_block_delta", "index": i, "delta": {"type": "input_json_delta", "partial_json": s}}
+    def stop(i):
+        return {"type": "content_block_stop", "index": i}
+    def mdelta(reason, out):
+        return {"type": "message_delta", "delta": {"stop_reason": reason}, "usage": {"output_tokens": out}}
+    PING = {"type": "ping"}
+    MSG_START = {"type": "message_start", "message": {"stop_reason": None, "usage": {"input_tokens": 50, "output_tokens": 1}}}
+    MSG_STOP = {"type": "message_stop"}
+    ERR = {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}
+
+    r = collect([MSG_START, start(0, "tool_use", id="t1", name="get_weather", input={}), PING,
+                 json_d(0, ""), json_d(0, '{"city":'), PING, json_d(0, ' "Pune"}'), stop(0),
+                 start(1, "tool_use", id="t2", name="get_time", input={}), json_d(1, '{"tz": "Asia/'),
+                 json_d(1, 'Kolkata"}'), stop(1), mdelta("tool_use", 40), mdelta("tool_use", 41), MSG_STOP])
+    assert [c["input"] for c in r["tool_calls"]] == [{"city": "Pune"}, {"tz": "Asia/Kolkata"}]
+    assert r["output_tokens"] == 41, "message_delta usage is cumulative"
+
+    r = collect([MSG_START, start(0, "tool_use", id="t9", name="list_orders", input={}), stop(0), mdelta("tool_use", 5), MSG_STOP])
+    assert r["tool_calls"] == [{"id": "t9", "name": "list_orders", "input": {}}]
+
+    r = collect([MSG_START, start(0, "thinking", thinking=""),
+                 {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "secret plan"}},
+                 {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "abc"}},
+                 stop(0), start(1, "text", text=""), text_d(1, "Answer."), stop(1),
+                 {"type": "some_future_event", "data": 1},
+                 {"type": "content_block_delta", "index": 1, "delta": {"type": "future_delta", "x": 1}},
+                 mdelta("end_turn", 9), MSG_STOP])
+    assert r["text"] == "Answer.", "thinking is not reply text, and unknown event types do not break the parser"
+
+    cut = [MSG_START, start(0, "text", text=""), text_d(0, "Looking."), stop(0),
+           start(1, "tool_use", id="t1", name="a", input={}), json_d(1, '{"k": 1}'), stop(1),
+           start(2, "tool_use", id="t2", name="b", input={}), json_d(2, '{"k": ')]
+    assert [c["id"] for c in collect(cut)["tool_calls"]] == ["t1"], "a tool call whose block did not stop is never returned"
+    assert collect(cut)["output_tokens"] == 1, "before any message_delta, report the message_start usage"
+    try:
+        collect(cut + [ERR])
+        raise AssertionError("must raise")
+    except StreamError as e:
+        p = e.partial
+        assert [c["id"] for c in p["tool_calls"]] == ["t1"], "the partial result keeps finished tool calls only"
+        assert p["text"] == "Looking."
+
+    try:
+        collect([MSG_START, start(0, "text", text=""), text_d(0, "Half a sen"), ERR])
+        raise AssertionError("must raise")
+    except StreamError as e:
+        assert e.partial["text"] == "Half a sen", "received text is kept on the error for a continuation request"
+
+    rng = random.Random(11)
+    for trial in range(300):
+        events, want_text, want_calls, idx = [MSG_START], "", [], 0
+        for _ in range(rng.randint(1, 5)):
+            if rng.random() < 0.5:
+                t = "".join(rng.choice("ab c\"{}\\") for _ in range(rng.randint(0, 30)))
+                events.append(start(idx, "text", text=""))
+                pos = 0
+                while pos < len(t):
+                    step = rng.randint(1, 7)
+                    events.append(text_d(idx, t[pos:pos + step]))
+                    pos += step
+                    if rng.random() < 0.2:
+                        events.append(PING)
+                want_text += t
+            else:
+                inp = {"q": "".join(rng.choice("xy \"{") for _ in range(rng.randint(0, 12))), "n": rng.randint(0, 99),
+                       "nested": {"list": [rng.random() < 0.5, None, 1.5]}}
+                raw = json.dumps(inp)
+                events.append(start(idx, "tool_use", id=f"t{idx}", name="tool", input={}))
+                pos = 0
+                while pos < len(raw):
+                    step = rng.randint(1, 9)
+                    events.append(json_d(idx, raw[pos:pos + step]))
+                    pos += step
+                    if rng.random() < 0.2:
+                        events.append(PING)
+                want_calls.append({"id": f"t{idx}", "name": "tool", "input": inp})
+            events.append(stop(idx))
+            idx += 1
+        events += [mdelta("end_turn", 3), mdelta("end_turn", 7), MSG_STOP]
+        r = collect(events)
+        assert r["text"] == want_text and r["tool_calls"] == want_calls and r["output_tokens"] == 7
+
+    N = 150000
+    events = [MSG_START, start(0, "text", text="")] + [text_d(0, "0123456789abcdefghij")] * N
+    events += [stop(0), start(1, "tool_use", id="t1", name="bulk", input={})]
+    raw = json.dumps({"rows": ["r%05d" % i for i in range(N // 2)]})
+    events += [json_d(1, raw[i:i + 8]) for i in range(0, len(raw), 8)]
+    events += [stop(1), mdelta("end_turn", N), MSG_STOP]
+    t0 = time.perf_counter()
+    r = collect(events)
+    elapsed = time.perf_counter() - t0
+    assert len(r["text"]) == 20 * N and len(r["tool_calls"][0]["input"]["rows"]) == N // 2
+    assert elapsed < 3.0, "a long reply must assemble in time linear in its length"
   solution: |
     import json
 
     class StreamError(Exception):
-        pass
+        def __init__(self, kind, partial):
+            super().__init__(kind)
+            self.partial = partial
 
     def collect(events):
         blocks = {}
         stop_reason, output_tokens = None, 0
         for ev in events:
-            kind = ev["type"]
-            if kind == "ping":
-                continue
-            if kind == "error":
-                raise StreamError(ev["error"]["type"])
-            if kind == "content_block_start":
+            kind = ev.get("type")
+            if kind == "message_start":
+                output_tokens = ev["message"].get("usage", {}).get("output_tokens", 0)
+            elif kind == "content_block_start":
                 b = ev["content_block"]
-                blocks[ev["index"]] = {"type": b["type"], "id": b.get("id"), "name": b.get("name"), "buf": ""}
+                blocks[ev["index"]] = {"type": b["type"], "id": b.get("id"), "name": b.get("name"),
+                                       "parts": [], "done": False}
             elif kind == "content_block_delta":
-                d = ev["delta"]
-                if d["type"] == "text_delta":
-                    blocks[ev["index"]]["buf"] += d["text"]
-                elif d["type"] == "input_json_delta":
-                    blocks[ev["index"]]["buf"] += d["partial_json"]
+                d, b = ev["delta"], blocks.get(ev["index"])
+                if b is None:
+                    continue
+                if d["type"] == "text_delta" and b["type"] == "text":
+                    b["parts"].append(d["text"])
+                elif d["type"] == "input_json_delta" and b["type"] == "tool_use":
+                    b["parts"].append(d["partial_json"])
             elif kind == "content_block_stop":
-                b = blocks[ev["index"]]
-                if b["type"] == "tool_use":
-                    b["input"] = json.loads(b["buf"]) if b["buf"] else {}
+                b = blocks.get(ev["index"])
+                if b is not None and b["type"] == "tool_use":
+                    raw = "".join(b["parts"])
+                    b["input"] = json.loads(raw) if raw else {}
+                if b is not None:
+                    b["done"] = True
             elif kind == "message_delta":
-                stop_reason = ev["delta"].get("stop_reason", stop_reason)
-                output_tokens = ev["usage"]["output_tokens"]
+                stop_reason = ev.get("delta", {}).get("stop_reason") or stop_reason
+                output_tokens = ev.get("usage", {}).get("output_tokens", output_tokens)
+            elif kind == "error":
+                raise StreamError(ev["error"]["type"], _result(blocks, stop_reason, output_tokens))
+        return _result(blocks, stop_reason, output_tokens)
+
+    def _result(blocks, stop_reason, output_tokens):
         order = sorted(blocks)
-        text = "".join(blocks[i]["buf"] for i in order if blocks[i]["type"] == "text")
+        text = "".join("".join(blocks[i]["parts"]) for i in order if blocks[i]["type"] == "text")
         calls = [{"id": blocks[i]["id"], "name": blocks[i]["name"], "input": blocks[i]["input"]}
-                 for i in order if blocks[i]["type"] == "tool_use" and "input" in blocks[i]]
+                 for i in order if blocks[i]["type"] == "tool_use" and blocks[i]["done"]]
         return {"text": text, "tool_calls": calls, "stop_reason": stop_reason, "output_tokens": output_tokens}
 ---
 import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
 
 ## Question
 
 <Callout kind="interview" label="The prompt">
-"Implement streaming responses for an LLM API." Here the network part is done: you get the parsed server-sent events as a list and must turn them into a usable result.
+"Our chat client streams from the Claude Messages API. The transport is done: you get the parsed server-sent events as a list. Turn them into the reply our agent loop consumes, and decide what the loop gets when the stream dies halfway."
 </Callout>
 
-Write `collect(events)`, which folds Claude-style stream events into:
+Write `collect(events)`, returning:
 
 ```python
-{"text": str, "tool_calls": [{"id", "name", "input"}], "stop_reason": str, "output_tokens": int}
+{"text": str, "tool_calls": [{"id", "name", "input"}], "stop_reason": str | None, "output_tokens": int}
 ```
 
-The events follow the documented order: `message_start`; for each content block a `content_block_start`, `content_block_delta` events and a `content_block_stop`; then `message_delta` events and `message_stop`. Rules:
+Work from the documented event stream for the Messages API, not from the three visible tests: the hidden tests replay streams with every event the documentation says can appear, and some it says may be added later. Two requirements are not in the documentation:
 
-- Text comes from `text_delta` deltas. Tool input arrives as `input_json_delta` fragments that are not valid JSON on their own. Parse a tool's input once, at its `content_block_stop`. A tool block with no argument deltas has input `{}`.
-- Blocks are identified by `index`, and the result lists them in index order.
-- `ping` events carry nothing; ignore them.
-- Usage in `message_delta` is cumulative. Report the last value.
-- An `error` event can arrive after the HTTP 200 that started the stream. Raise `StreamError` with the error type in the message.
-- Never return a tool call whose block did not reach `content_block_stop`.
+- On a mid-stream failure, raise `StreamError(kind, partial)`, where `partial` is a result dict built from what arrived. What `partial` may contain is part of your design; the hidden tests hold it to the rule that the agent loop must never execute anything from it that the model did not finish.
+- Replies with long tool inputs (a bulk upsert of 75,000 rows arrives as tens of thousands of fragments) must assemble in time linear in the reply's length.
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>Keep a dict from block index to a small record with the block type, id, name and a string buffer.</p></details>
-<details class="hint"><summary>Hint 2</summary><p>`json.loads` only at the stop event. Mark the block as finished there, so a block cut off mid-stream is easy to leave out.</p></details>
-<details class="hint"><summary>Hint 3</summary><p>Two `message_delta` events with 40 and then 41 output tokens mean 41 in total, not 81.</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask which events in the documented flow carry nothing your result needs, and which carry numbers that are running totals rather than increments.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask the interviewer for a recorded stream with thinking enabled, and one that was cut off mid tool call.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Measure how long your buffer takes on 150,000 deltas before you trust it.</p></details>
 
 ## Answer
 
-The reference solution keeps one record per block index with a string buffer. Text deltas and JSON fragments both append to the buffer; the stop event parses the buffer for tool blocks and stores `input`, which doubles as the "finished" marker. `message_delta` overwrites the stop reason and the output token count rather than adding to them. Pings are skipped, and an `error` event raises immediately. The final result sorts blocks by index, joins text blocks, and keeps only tool blocks that have an `input`.
+<Depth>
+<Fragment slot="short">
+<p>Keep one record per block index with a list of fragments. Text deltas append to text blocks, <code>input_json_delta</code> fragments append to tool blocks, and the stop event joins and parses the tool input once and marks the block finished. Skip pings, thinking blocks and unknown event or delta types. Treat <code>message_delta</code> usage as a running total. On an error event, raise with a partial result that keeps received text and finished tool calls only. On failure I would discard and re-request by default, and continue from the partial text only for long text-only replies, because a continuation is cheaper but can duplicate or drop words at the seam.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Parsing.</strong> The documented flow is <code>message_start</code>, then per block a <code>content_block_start</code>, deltas and a <code>content_block_stop</code>, then <code>message_delta</code> events and <code>message_stop</code>, with any number of <code>ping</code> events anywhere. A tool's input arrives as <code>input_json_delta</code> fragments; the documented example starts with an empty fragment, and a fragment such as <code>&#123;"city": "Pu</code> is not JSON, so parsing waits for the block's stop event. A tool block with no fragments has input <code>&#123;&#125;</code>. Thinking blocks stream <code>thinking_delta</code> and <code>signature_delta</code>; they are not reply text. The output token count in <code>message_delta</code> is cumulative, so 40 then 41 means 41; before any <code>message_delta</code>, the count from <code>message_start</code> is the best available.</p>
+<p><strong>Linear time.</strong> The fragments go into a list and are joined once. Appending to a string held in a dict entry copies the whole string each time, because the dict holds a second reference and CPython cannot resize it in place, so a 3 MB reply in 150,000 fragments copies about 225 GB in total (150,000 appends times an average of 1.5 MB). The reference assembles that stream in a fraction of a second.</p>
+<p><strong>Forward compatibility.</strong> The streaming docs say new event types may be added and code should handle unknown ones gracefully. An unknown event or delta type is ignored, not raised, because a client that crashes on a new event type breaks on the provider's schedule, not yours.</p>
+<p><strong>The partial result.</strong> Text received before the failure is kept, finished tool calls are kept, and a tool block that did not reach its stop event is dropped, since its input is truncated JSON. The streaming docs say tool use and thinking blocks cannot be partially recovered, which matches.</p>
+<p><strong>The decision: discard or continue.</strong> Discarding and re-requesting is simple and gives a reply the model produced in one pass. Its cost is the full output billed twice and the user's wait doubled for a long reply. Continuing sends a new request with a user message containing the partial text and an instruction to continue, which is the documented recovery on Claude 4.6 and later; it bills only the remaining output plus the re-sent input, but the seam is a place where the model repeats a clause or changes its plan. I would discard by default and continue only for text replies past a length threshold I would set from our own p95 reply length and the measured seam defect rate on recorded failures.</p>
+<p><strong>Failure mode of that choice.</strong> If the stream fails after a finished tool call that the loop has already executed, discarding and re-requesting can make the model propose the same call again. The re-request must carry the executed call and its result, or the executor's duplicate guard must catch it.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Product wants tool arguments shown as they arrive. You have a partial JSON parser. Which fields would you display before the block stops, and what stops a display component from triggering an action on a half-parsed value?</em></li>
+<li><em>Your continuation path cuts output spend on failed streams, but QA finds a repeated sentence in some continued replies. Who decides whether that defect rate is acceptable, and what number would make you remove the path?</em></li>
+<li><em>You move the same client to OpenAI's Responses stream. Which parts of this code change, and which invariant do you test identically on both?</em></li>
+</ul>
+</Fragment>
+</Depth>
 
-Each rule maps to a documented trap. Parsing fragments as they arrive fails, because `{"city": "Pu` is not JSON. Summing cumulative usage double counts, which shows up as an inflated bill in your own dashboards. Treating the HTTP status as the outcome misses an `overloaded_error` that arrives mid-stream. And acting on a half-received tool call can run a tool with truncated arguments.
+The constraint conflict is latency and cost against correctness: every option that reuses partial output saves tokens and time and adds a way for the final reply to differ from what the model would have written in one pass.
 
-OpenAI's Responses stream has the same shape under different names: `response.output_item.added`, then `response.function_call_arguments.delta` events aggregated by `output_index`, then `response.function_call_arguments.done`.
+For a real client, the event list becomes an iterator over an HTTP response, so `collect` turns into a generator that yields display updates and returns the final result, and the error path also has to handle a connection that closes without an error event or a `message_stop`. Treat that as a failure, not a reply.
 
 ## Follow-ups
 
-- *The UI wants to show the tool arguments as they arrive. How?* A partial JSON parser, such as Pydantic's `from_json(..., allow_partial=True)`, for display only. Execution still waits for the stop event.
-- *The stream errors after 400 tokens of text. What does the user see?* Decide per feature: keep the partial text with a retry button, or discard it. On Claude 4.6 and later the documented recovery is a new request with a user turn asking the model to continue.
-- *How would you test this against the real API?* Record real streams to fixtures, including an error mid-stream, and replay them in CI.
+- *A finished tool call arrived, then the stream died. Do you execute the call before retrying?*
+- *How do you build the fixtures for this parser so that a new event type in production shows up as a failing test rather than a support ticket?*
+- *Per-tool `eager_input_streaming` is turned on for latency. What changes in the assumptions this code makes about fragments?*
 
 ## Common mistakes
 
-- `json.loads` on each fragment.
-- Adding up `output_tokens` from every `message_delta`.
-- Assuming a block's deltas are contiguous, when a ping or another block can come between them.
-- Returning tool calls from a stream that broke before their stop event.
+- Calling `json.loads` on each fragment.
+- Adding up the output tokens from every `message_delta`.
+- Concatenating into a string stored in a dict, which is quadratic on long replies.
+- Treating the HTTP 200 that opened the stream as the outcome.
+- Raising on an event type the code does not recognise.
+- Returning a tool call whose block never stopped.

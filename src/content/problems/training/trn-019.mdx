@@ -1,0 +1,79 @@
+---
+id: trn-019
+title: Tensor or pipeline parallelism, for training and for serving
+subtitle: what each splits, what each sends, and why a batch of one changes the answer
+track: training
+module: distributed
+type: concept
+difficulty: medium
+seniority: [senior]
+minutes: 20
+core: false
+tags: [tensor-parallelism, pipeline-parallelism, inference, interconnect]
+companies:
+  - name: Mistral AI
+    url: https://prachub.com/interview-questions/compare-tensor-parallelism-and-pipeline-parallelism
+updated: 2026-10-28
+sources:
+  - title: PracHub, Compare Tensor Parallelism and Pipeline Parallelism
+    url: https://prachub.com/interview-questions/compare-tensor-parallelism-and-pipeline-parallelism
+    note: "candidate report of a Mistral AI software engineer technical screen, posted 2026-09-01 and updated 2026-09-21: compare tensor and pipeline parallelism for training or serving a transformer too large for one device; follow-ups on bubbles, micro-batches, keeping tensor parallelism on a fast local interconnect, and small inference batches. The question here is original material built on that report. Checked 2026-10-28."
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "column-then-row tensor-parallel MLP with two all-reduces per block in the forward pass; TP at most the GPUs per node; pipeline bubble (p - 1)/m; PP lost 14% from one node to two against around 43% for TP in similar cross-node cases. Checked 2026-10-28."
+  - title: Austin et al., How to Scale Your Model, GPUs chapter (JAX scaling book)
+    url: https://jax-ml.github.io/scaling-book/gpus/
+    note: "H100 about 3.35 TB/s of HBM bandwidth; NVLink 450 GB/s per direction per GPU; InfiniBand 50 GB/s per GPU. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Compare tensor and pipeline parallelism for a transformer that does not fit on one GPU. What does each split, what does each communicate, and when would you combine them? Then: we serve the same 70B model to one user at a time with a per-token latency target. Which do you use?"
+</Callout>
+
+For the serving half, take a 70B dense model in BF16, about 141 GB of weights, on H100 80GB GPUs in 8-GPU nodes, decoding one sequence at a time with a scenario target of 20 ms per output token. Choose the parallel degree and show the arithmetic.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask whether the model fails to fit because of weights, optimizer state or activations.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the measured latency of a small all-reduce inside one node on this hardware.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Tensor parallelism splits every matmul inside a layer across GPUs and pays collectives in every layer; pipeline parallelism splits the stack of layers into stages and pays one point-to-point send per stage boundary plus a bubble. In training, keep tensor parallelism inside the NVLink domain and use pipeline stages across nodes, with enough micro-batches to shrink the (p - 1)/m bubble. For single-sequence decoding, pipeline parallelism does not reduce per-token latency at all, because the token still passes through every layer in sequence; tensor parallelism does, because each GPU reads a fraction of the weights. TP 4 inside one node, at about 10.5 ms of weight reads per token, meets 20 ms with margin for the collectives.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>What each splits.</b> Tensor parallelism splits weight matrices: the first MLP matmul by columns and the second by rows, attention by heads, so each GPU holds 1/t of every layer and computes 1/t of every matmul. Pipeline parallelism gives each GPU whole layers, L/p of them.</p>
+<p><b>What each sends.</b> Tensor parallelism needs two all-reduces per block in the forward pass and two in the backward, each the size of the block's activations, on the critical path of every layer. Pipeline parallelism sends one activation per micro-batch per stage boundary, and those sends can overlap with other micro-batches' compute. That difference is why tensor parallelism stays on NVLink (450 GB/s per direction on H100) and pipeline stages tolerate InfiniBand (50 GB/s per GPU): the playbook measured a 14% loss for pipeline parallelism going from one node to two against around 43% for tensor parallelism in similar cross-node cases.</p>
+<p><b>Bubbles and micro-batches.</b> A pipeline of p stages fed m micro-batches idles for (p - 1) stage-times at fill and drain, a ratio of (p - 1)/m to useful work. More micro-batches shrink it; so does interleaving several stages per device, at the cost of more sends. Tensor parallelism has no bubble.</p>
+<p><b>Combining them.</b> Fit one replica first: tensor parallelism up to the node size, then pipeline stages across nodes until the model fits, then data parallelism for the rest.</p>
+<p><b>Serving at batch one.</b> Decoding one token reads every weight once, so its floor is weight bytes over HBM bandwidth: 141 GB at 3.35 TB/s is 42 ms on a GPU large enough to hold it. Pipeline parallelism over 4 GPUs gives each 35 GB, but the token visits the stages one after another, 4 x 10.5 ms = 42 ms, the same latency on four times the hardware; it only raises throughput once 4 sequences are in flight. Tensor parallelism over t GPUs reads 141/t GB on each, in parallel: 21 ms at TP 2, which misses 20 ms, 10.5 ms at TP 4, 5.3 ms at TP 8, plus 2 all-reduces per layer for each token, 160 for an 80-layer model. Those messages are one token's activations, about 16 KB at hidden size 8,192, so they cost latency, not bandwidth.</p>
+<p><b>Choice.</b> TP 4: 10.5 ms of weight reads leaves 9.5 ms for 160 small all-reduces and everything else, and the other 4 GPUs in the node can host a second replica. TP 8 halves the reads again but doubles the GPUs per replica for a latency the target does not ask for. If measured all-reduce latency inside the node exceeds about 60 microseconds, 160 of them take the whole 9.5 ms of margin and TP 8 becomes the answer.</p>
+<p><b>How the choice fails.</b> TP 4 leaves 320 GB of HBM per replica minus 141 GB of weights for KV cache; long contexts with many concurrent sequences fill it, and then the latency target is met at a batch size the business cannot afford.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Why does a micro-batch count smaller than the stage count make the bubble worse than the formula suggests?</li>
+<li>At what batch size does pipeline parallelism start to pay in serving, and what does it trade?</li>
+<li>Why is tensor parallelism across two nodes worse in training than pipeline parallelism across the same two nodes?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Your TP 4 plan meets 20 ms at batch one, and product now wants 16 concurrent sessions per replica at 32k tokens each. What changes, and what do you give up first?*
+- *A colleague proposes PP 2 by TP 4 across two nodes to serve a model twice the size. What happens to per-token latency, and what would you measure before agreeing?*
+- *What would you need to see in production traces to move from TP 4 to TP 8 for this model?*
+
+## Common mistakes
+
+- Claiming pipeline parallelism reduces latency for a single sequence; it divides memory, not the sequential path.
+- Putting tensor parallelism across nodes because the bytes per all-reduce look small, without counting how many sit on the critical path.
+- Quoting the bubble ratio without the micro-batch count that sets it.
+- Sizing serving parallelism by FLOPs rather than by weight bytes read per token.

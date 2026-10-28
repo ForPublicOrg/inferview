@@ -1,0 +1,163 @@
+---
+title: Tool output budgets and pruning
+track: harness
+module: tools-aci
+order: 2
+kind: lesson
+level: senior
+minutes: 14
+summary: Every tool result is a write into a bounded, re-sent buffer, so each tool needs an output budget, a visible and recoverable truncation path, and a rule for when old results are cleared.
+prerequisites: [harness/tools-aci/tool-set-playbook]
+updated: 2026-10-28
+sources:
+  - title: Claude Code docs, tools reference (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/tools-reference
+    note: "Read returns at most 25,000 tokens per call (CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS) and refuses a whole file over 256 KB, unless allow_large is set (v2.1.296 or later); exit 1 is a valid result only for grep, find, diff, test, git diff and similar; Bash valid results inline up to about 30,000 characters, then a saved file path and a preview of up to 2,000 characters; failures inline up to about 10,000 characters as a head-and-tail excerpt with no path; BASH_MAX_OUTPUT_LENGTH 30,000 by default, ceiling 150,000; bashOutputMaxChars up to 128,000 from v2.1.261; Glob capped at 100 files with a truncation flag"
+  - title: Anthropic, Writing effective tools for AI agents (2025-09-11)
+    url: https://www.anthropic.com/engineering/writing-tools-for-agents
+    note: "Claude Code restricts tool responses to 25,000 tokens by default; a response_format enum (concise or detailed); Slack example 206 tokens detailed against 72 concise; pagination, range selection, filtering and truncation; steer with truncation messages; resolve UUIDs to readable names"
+  - title: Anthropic, Effective context engineering for AI agents (2025-09-29)
+    url: https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents
+    note: "tool result clearing as one of the safest, lightest forms of compaction; recall falls as context grows; keep lightweight identifiers such as file paths and load just in time with head and tail"
+  - title: Claude API docs, context editing (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/build-with-claude/context-editing
+    note: "clear_tool_uses_20250919 under beta header context-management-2025-06-27; defaults: trigger 100,000 input tokens, keep 3 tool uses, clear_tool_inputs false; clearing invalidates cached prefixes, so clear_at_least sets a minimum worth the rewrite"
+  - title: Claude API pricing (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: "Claude Sonnet 5.5: $2.50 per million tokens for 5-minute cache writes, $0.10 per million for cache hits"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## A tool result is a write into a bounded buffer
+
+Everything a tool returns is appended to the conversation and re-sent on every later model call until something removes it. A 40,000-token test log read at turn 5 of a 60-turn session is paid for 55 more times (cheaply if cached) and sits between the model and everything it reads afterwards. Anthropic's context-engineering post names the second cost: the model's ability to recall information falls as the context grows. Output size is therefore a budget per tool, set in advance, like the memory limit on a query operator that spills to disk past its threshold. The difference from a database spill is that the consumer has to decide to read the spill file, and it only knows the file exists if the result says so.
+
+So every tool needs three things: a budget, a truncation path that is visible and recoverable, and a rule for when its old results leave the context.
+
+## What one production harness does at each boundary
+
+Claude Code's documented limits, checked on 2026-10-28, are a useful reference set because each one makes a different choice about what the model receives.
+
+| Tool | Budget | Over budget, the model receives |
+| :- | :- | :- |
+| Read | 25,000 tokens per call; a whole file over 256 KB is refused, unless the call sets `allow_large` (v2.1.296 or later), which sizes the read against the room left in the window | The first page with a `PARTIAL view` notice saying how much it got and how to read on with `offset` and `limit`; for an over-limit ranged read or a file over 256 KB, an error suggesting a smaller range or Grep |
+| Bash, valid result | About 30,000 characters inline | The path of a saved file plus a preview of up to the first 2,000 characters; the model reads or searches the file for the rest |
+| Bash, failure | About 10,000 characters inline | A head-and-tail excerpt of that size, with no file path |
+| Glob | 100 files, sorted by modification time | The 100 files and a truncation flag, so the model can narrow the pattern |
+| Grep | Paged with `head_limit` and `offset` | In count mode, a total that covers every match even when the listed entries are truncated; an offset past the end returns `No entries at this offset` instead of an empty result |
+
+Three details carry most of the design. The valid and failed Bash paths differ: a successful build's output is spilled whole to a file, but a failing command gets a head-and-tail excerpt and nothing on disk. Which path a result takes is itself a policy: exit code 1 counts as valid only for commands where it is a benign outcome (`grep`, `find`, `diff`, `git diff` and a few others), so `pgrep` finding nothing is treated as a failure. Grep's offset error exists so that an empty page is not read as "pattern not found". And the budgets are tunable, with ceilings: `BASH_MAX_OUTPUT_LENGTH` sets the read-back window (30,000 characters by default, 150,000 at most), and from v2.1.261 the `bashOutputMaxChars` setting raises the inline ceiling to as much as 128,000 characters.
+
+## Three properties of a truncation path
+
+**Visible.** The result says it was cut, by how much, and what was kept. A silent cut is worse than no budget, because the model treats a partial file or listing as complete. Glob's flag and Read's `PARTIAL view` notice both exist for this. Anthropic's tool-writing guidance adds that the truncation message should steer: tell the model to make small targeted searches rather than one broad one.
+
+**Recoverable.** The model can get the rest without rerunning the work. A saved file path, an offset or a cursor all qualify. Rerunning a 10-minute test suite to see its middle is the expensive non-answer.
+
+**Shaped by outcome.** Where the signal sits depends on whether the command succeeded. For a passing build the first lines are usually enough, and the rest is on disk if needed. For a failing test run the cause is usually near the end and the command's preamble is at the start, so a head-and-tail excerpt keeps both. Claude Code's failure path drops the middle and offers no file, which is a deliberate trade: smaller results on the path that loops most, at the price of a rerun when the cause is in the middle.
+
+Here is that policy as code, with tests for each path. Budgets are in characters because that is what the harness can count without a tokenizer.
+
+```python
+import hashlib, pathlib, tempfile
+
+SPILL_DIR = pathlib.Path(tempfile.mkdtemp())
+
+def render(output: str, ok: bool, inline: int = 30_000,
+           preview: int = 2_000, fail_inline: int = 10_000) -> dict:
+    """Shape one shell result for the model. Never drop bytes silently."""
+    if len(output) <= (inline if ok else fail_inline):
+        return {"text": output, "truncated": False}
+    if ok:  # success: the whole output stays reachable on disk
+        name = hashlib.sha256(output.encode()).hexdigest()[:12] + ".log"
+        path = SPILL_DIR / name
+        path.write_text(output)
+        return {"text": output[:preview], "truncated": True, "path": str(path),
+                "note": f"{len(output):,} chars; first {preview:,} shown. "
+                        f"Search {path} with grep instead of reading it whole."}
+    half = fail_inline // 2  # failure: the error is usually at the end
+    return {"text": output[:half] + "\n[... middle omitted ...]\n" + output[-half:],
+            "truncated": True,
+            "note": f"{len(output):,} chars; head and tail shown. Rerun with a filter to see the middle."}
+
+log = "".join(f"test_{i} PASSED\n" for i in range(4000)) + "FAILED test_auth: KeyError 'sub'\n"
+r_ok, r_fail = render(log, ok=True), render(log, ok=False)
+assert r_ok["truncated"] and pathlib.Path(r_ok["path"]).read_text() == log
+assert "KeyError" in r_fail["text"] and len(r_fail["text"]) < 10_100
+assert render("3 passed", ok=True) == {"text": "3 passed", "truncated": False}
+print(len(log), r_ok["note"].split(";")[0], len(r_fail["text"]))
+# 66923 66,923 chars 10026
+```
+
+The tests are the part to keep. Each truncation path needs one: below the budget nothing changes, above it the flag is set, the spilled file round-trips byte for byte, and the failure excerpt still contains the last line. Boundary cases (exactly at the budget, one over, empty output) belong in the same file.
+
+## Shape before you cut
+
+Truncation is the last resort. Anthropic's tool-writing guidance lists the earlier ones: pagination, range selection, filtering and a `response_format` parameter that lets the model ask for a concise or detailed result. In its Slack example the detailed response was 206 tokens and the concise one 72, about a third. The same post reports that replacing low-level identifiers such as UUIDs with readable names improved Claude's precision on retrieval tasks, which is a budget decision too: a result the model cannot use is waste at any length.
+
+For a coding agent the usual shaping moves are a count before a listing (Grep's count mode), a line range before a whole file (Read's `offset` and `limit`), and a summary line on top of structured output (pass and fail counts first, then failures only). Each one is a tool-design change, not a harness setting, so it lands in the tool's own code.
+
+## Clearing old results
+
+A budget controls what enters the buffer; clearing controls what stays. Anthropic's context-engineering post calls tool result clearing one of the safest, lightest forms of compaction, because an old result can usually be fetched again. The API exposes it as the `clear_tool_uses_20250919` context edit: once the prompt passes a trigger (100,000 input tokens by default), the oldest tool results are replaced with a placeholder, keeping the 3 most recent tool uses by default. Tool inputs stay visible unless `clear_tool_inputs` is set, so the model still sees what it asked for. `exclude_tools` protects results that cannot be recomputed.
+
+The cost is the cache. Clearing changes content in the middle of the prefix, so everything after the first cleared result is written to the cache again. The docs say to clear enough tokens to make the invalidation worthwhile, which is what `clear_at_least` enforces.
+
+<Predict id="tool-output-clearing-breakeven" question="After how many further turns do the cheaper cache reads pay back the one-time rewrite?" answer={55} tolerance={3} unit="turns">
+<Fragment slot="prompt">
+<p>Scenario inputs on Claude Sonnet 5.5 ($2.50 per million tokens for a 5-minute cache write, $0.10 per million for a cache hit): the context is 120,000 tokens, fully cached. Clearing removes 30,000 tokens of old tool results that start at token 20,000. Without clearing, each later turn reads 120,000 cached tokens. With clearing, the next turn reads the first 20,000 tokens from cache and rewrites the remaining 70,000; later turns read 90,000. Ignore the new tokens each turn adds, since they are the same either way.</p>
+</Fragment>
+<p>Next turn without clearing: 120,000 × $0.10/M = $0.012. With clearing: 20,000 × $0.10/M + 70,000 × $2.50/M = $0.002 + $0.175 = $0.177, so the rewrite costs $0.165 more. Each later turn then saves 30,000 × $0.10/M = $0.003. Break-even is $0.165 / $0.003 = <b>55 turns</b>. At a 0.05x cache-read price, clearing is almost never a cost saving inside a session. The reasons to clear are window headroom and recall, and the trigger should be set by those, with `clear_at_least` large enough that clearing happens rarely.</p>
+</Predict>
+
+## Setting budgets for a tool set
+
+A procedure that holds up in review:
+
+1. **Measure.** From recorded sessions, take each tool's result size distribution in characters and its share of total context at the end of the session. The tools that matter are the ones with a long tail, not a high mean.
+2. **Budget per tool, not globally.** A file reader, a test runner and a web fetcher have different shapes. Set each budget near the size where the tool's useful information stops (a page of a file, the failures of a test run), then check what fraction of recorded results would be cut.
+3. **Pick the over-budget behaviour per outcome.** Spill-and-preview for success, head-and-tail for failure, a count plus first page for listings. Every path sets a flag and says how to get the rest.
+4. **Test every path.** Under, at and over the budget, empty output, binary output, and the spilled file's round trip.
+5. **Set the clearing rule last.** Trigger on window headroom, keep the last few results, exclude tools whose results cannot be fetched again.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your coding agent's test-runner tool returns logs of 50,000 to 80,000 characters, and sessions hit the context limit around turn 15. You have two weeks, cannot change the test framework, and the model must still find failures in the middle of a run. What do you change?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Wrap the tool, not the framework. Write the full log to a file, return a summary line (pass, fail, error counts) plus each failure's block, and the file path with a flag saying what was cut. Middle failures survive because the wrapper extracts failures rather than slicing by position. Then clear old test results, since a newer run supersedes them.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The two constraints that conflict are context size and the requirement to see failures anywhere in the log. Positional truncation (head, tail, or head and tail) satisfies the first and breaks the second, so the wrapper has to parse. Most runners print a recognisable failure block and a final summary even when the framework cannot be changed, so the wrapper extracts those and returns them in order, with a cap on the number of failure blocks and a note when the cap is hit.</p>
+<p>The full log goes to a file, and the result carries the path, the total size and the instruction to grep it, so anything the parser missed is recoverable without a rerun.</p>
+<p>For pruning, test results are the clearest case for clearing: a newer run supersedes an older one, so the clearing rule keeps the latest result per test target. With cache reads at a small fraction of the input price the clearing is for window and recall, not cost, so it triggers on headroom.</p>
+<p>What I give up: the parser is one more thing to maintain per runner, and when it fails silently the model sees "0 failures" for a failing run. The guard is to always report the runner's exit code beside the parsed counts and to flag any disagreement between them.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The parser is wrong on 2% of runs and the model then declares success. Do you keep it, fall back to head and tail, or block on the exit code, and what failure rate do you accept in writing?</em></li>
+<li><em>A teammate wants to raise the inline budget to 128,000 characters instead. What would you need to measure to agree?</em></li>
+<li><em>Two weeks later the window doubles with a model upgrade. Which of these changes do you keep, and which become unnecessary?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Characters are a proxy for tokens, and the ratio depends on content: dense JSON, minified code and non-English text tokenize differently from prose. A character budget tuned on one repository can be loose or tight on another. If the budget matters at the margin, count tokens with the vendor's counter on recorded results.
+
+Head-and-tail assumes the signal is at the ends. Parallel test runners interleave output, and the first failure can be anywhere; positional truncation then drops the cause and keeps noise.
+
+A visible truncation flag only works if the model acts on it. Measure how often a truncated result is followed by a read of the spill file or a narrower call. If that rate is low, the notice wording is the next thing to change.
+
+Clearing assumes old results can be fetched again. A command with side effects, a web page that changed, or a flaky test cannot be reproduced on demand, and those tools belong in `exclude_tools` or in a memory file before clearing.
+
+With million-token windows, capacity stops being the binding constraint for many sessions. Budgets then exist for recall and cost per turn, which makes them harder to justify with a single number and easier to remove without noticing the quality loss.
+
+<SelfRate id="lesson:harness/tools-aci/tool-output-budgets" />

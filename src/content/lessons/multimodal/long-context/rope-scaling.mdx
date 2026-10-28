@@ -1,0 +1,154 @@
+---
+title: RoPE from the inside, and how a context window is stretched
+track: multimodal
+module: long-context
+order: 1
+kind: lesson
+level: staff
+minutes: 14
+summary: How rotary position embeddings turn absolute positions into relative attention scores, what Position Interpolation, NTK-aware scaling, YaRN, the llama3 rope type and LongRoPE each do to the 64 frequency pairs of a head, and what a stretched window costs at short lengths.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Su et al., RoFormer, Enhanced Transformer with Rotary Position Embedding (arXiv 2104.09864, v1 2021-04-20)
+    url: https://arxiv.org/abs/2104.09864
+    note: absolute position encoded with a rotation matrix, relative position dependency in self-attention, decaying inter-token dependency with distance; checked 2026-10-28
+  - title: Chen et al., Extending Context Window of Large Language Models via Positional Interpolation (arXiv 2306.15595, 2023-06-27)
+    url: https://arxiv.org/abs/2306.15595
+    note: LLaMA 7B to 65B extended to 32,768 tokens with fine-tuning within 1,000 steps; interpolation bound at least about 600 times smaller than the extrapolation bound; checked 2026-10-28
+  - title: Peng et al., YaRN, Efficient Context Window Extension of Large Language Models (arXiv 2309.00071)
+    url: https://arxiv.org/html/2309.00071
+    note: wavelength λ_d = 2π b^(2d/|D|); ramp on r = L/λ with α = 1 and β = 32 for Llama; NTK-aware base change b' = b s^(|D|/(|D|−2)) pushes some dimensions out of bound; √(1/t) = 0.1 ln s + 1; 10x fewer tokens and 2.5x fewer steps than previous methods; checked 2026-10-28
+  - title: Ding et al., LongRoPE, Extending LLM Context Window Beyond 2 Million Tokens (arXiv 2402.13753, 2024-02-21)
+    url: https://arxiv.org/abs/2402.13753
+    note: search for non-uniform interpolation gives 8x without fine-tuning; up to 1k fine-tuning steps at 256k, then 2048k; readjustment at 8k recovers the short window; checked 2026-10-28
+  - title: unsloth/Meta-Llama-3.1-8B-Instruct, config.json (Hugging Face)
+    url: https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct/blob/main/config.json
+    note: rope_scaling factor 8.0, low_freq_factor 1.0, high_freq_factor 4.0, original_max_position_embeddings 8192, rope_type llama3; rope_theta 500000; max_position_embeddings 131072; head_dim 128; checked 2026-10-28
+  - title: Hugging Face transformers, modeling_rope_utils.py (main branch)
+    url: https://raw.githubusercontent.com/huggingface/transformers/main/src/transformers/modeling_rope_utils.py
+    note: _compute_llama3_parameters (wavelength thresholds old_len / low_freq_factor and old_len / high_freq_factor, linear smoothing between them); YaRN attention_factor = 0.1 ln(factor) + 1 by default; checked 2026-10-28
+  - title: Qwen/Qwen3-8B model card (Hugging Face)
+    url: https://huggingface.co/Qwen/Qwen3-8B
+    note: native 32,768 tokens; YaRN block with factor 4.0 from 32768; open-source frameworks implement static YaRN, which may impact shorter texts; add the block only when needed; factor 2.0 for typical lengths of 65,536; checked 2026-10-28
+  - title: Meta AI, The Llama 4 herd (2025-04-05)
+    url: https://ai.meta.com/blog/llama-4-multimodal-intelligence/
+    note: Scout's 10M-token context; iRoPE with interleaved attention layers without positional embeddings; inference-time temperature scaling of attention; pre- and post-trained at 256K; checked 2026-10-28
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import RopeRotation from '../../../../components/widgets/MultimodalLongContextRopeRotation.astro';
+
+Attempt [mml-005](/problems/mml-005) before reading; this lesson is the mechanism behind its answer.
+
+## The decision
+
+Every long-context open-weight model you can download ships a `rope_scaling` block or an equivalent, and every one of them is a choice about how to bend a position encoding past the lengths the model was trained on. Llama 3.1 ships `rope_type: llama3` with factor 8 from 8,192 original positions. Qwen3 documents a YaRN block with factor 4 from 32,768 and warns that it can hurt short inputs. The engineering decision is which block to apply, to which requests, and what to measure when you do. That needs the mechanism one level down from "RoPE encodes position".
+
+## What RoPE computes
+
+RoPE splits each query and key vector of a head into pairs of coordinates and rotates pair *i* by an angle proportional to the token's position: angle = position × θ<sub>i</sub>, with θ<sub>i</sub> = base<sup>−2i/d</sup> for head dimension *d*. RoFormer's base was 10,000. Rotating `q` at position *m* and `k` at position *n* and taking their dot product leaves, in each pair, the cosine of the original angle between the pair vectors plus (*m* − *n*)θ<sub>i</sub>. The attention score depends on the vectors and their distance, not on where the pair sits in the sequence. That is the whole trick, and it is why a key cache can store keys already rotated: a key's rotation never changes after it is written, as long as the frequencies do not.
+
+The frequencies span a huge range. With *d* = 128 there are 64 pairs. Pair 0 rotates one radian per token, a wavelength of 2π ≈ 6.3 tokens. Pair 63 rotates at base<sup>−126/128</sup>: with base 10,000 its wavelength is 2π · 10,000<sup>126/128</sup> ≈ 54,410 tokens; with Llama 3's base of 500,000 it is about 2.56 million tokens. Fast pairs resolve "which of the last few tokens"; slow pairs carry coarse position over the whole window.
+
+It is a clock with 64 hands at different speeds, and the difference from a clock is what training saw. Any pair whose wavelength is shorter than the training window completed full turns during training, so every angle it can produce was seen. A pair whose wavelength is longer than the window only ever saw a fraction of a turn. Run past the window and those slow pairs produce angles the weights were never trained on. That is the failure of naive extrapolation, and every stretching method is a different answer to it.
+
+## The methods, as operations on frequencies
+
+**Position Interpolation (June 2023)** divides every position by the factor *s*, which is the same as dividing every θ by *s*. No slow pair leaves its trained range, because position *sL* now maps to angle θ*L*. The cost is the fast pairs: their per-token step shrinks by *s*, so neighbouring tokens look *s* times closer than they did in training. The PI paper fine-tuned LLaMA models from 7B to 65B to 32,768 tokens within 1,000 steps and argued that interpolation's error bound is at least about 600 times smaller than extrapolation's.
+
+**NTK-aware scaling** raises the base instead: b′ = b · s<sup>d/(d−2)</sup>. Pair 0 is untouched, the slowest pair slows by exactly *s*, and the pairs between slow by less. The YaRN paper reports that this pushes some dimensions slightly out of bound, so the factor has to be set higher than the extension wanted, and that fine-tuning with it did worse than PI.
+
+**YaRN** (the next lesson walks through it) applies a ramp per pair, using *r* = *L* / λ, the number of full turns a pair made in the trained window. Pairs with *r* above β = 32 are left alone, pairs with *r* below α = 1 are interpolated like PI, and the ones between are blended linearly. It also scales attention logits by a temperature term.
+
+**The llama3 rope type** is the same idea with thresholds in wavelength. From transformers' implementation: wavelengths under `original / high_freq_factor` keep their frequency, wavelengths over `original / low_freq_factor` are divided by the factor, and the band between is smoothed linearly. With Llama 3.1's values, that is: keep below 2,048 tokens, divide by 8 above 8,192.
+
+**LongRoPE** (February 2024) searches per-dimension factors instead of using a formula, reports an 8x extension from the search alone without fine-tuning, fine-tunes at 256K for up to 1,000 steps, extends again to 2,048K, and then readjusts at 8K to recover performance on the original short window. That last step is the paper admitting the cost every method here pays.
+
+## Try it
+
+The widget computes, for each of the 64 pairs of a head of dimension 128, the wavelength, the turns the pair made in the trained window, how much of its per-token step survives the method, and whether the angles it reaches at the new length were seen in training.
+
+<RopeRotation />
+
+Three readings worth doing. With no scaling, every slow pair goes out of range by the full factor. With Position Interpolation, none does, and every pair that wraps in training loses local resolution: 35 of 64 at the Llama 3.1 shape. With the NTK-aware base change at factor 8 on the Llama 3.1 shape, 28 of the 29 slow pairs still exceed their trained range, the worst by about 2.5 times.
+
+<Predict id="rope-scaling-llama3-kept" question="How many of Llama 3.1 8B's 64 pairs does its llama3 rope block leave unchanged?" answer={29} tolerance={0}>
+<Fragment slot="prompt">
+<p>Inputs from the model's config: <code>head_dim</code> 128, <code>rope_theta</code> 500,000, <code>original_max_position_embeddings</code> 8,192, <code>high_freq_factor</code> 4. A pair keeps its frequency when its wavelength 2π · 500,000<sup>2i/128</sup> is below 8,192 / 4.</p>
+</Fragment>
+<p>The condition is 2π · 500,000<sup>i/64</sup> &lt; 2,048, so <i>i</i> &lt; 64 · ln(2,048 / 2π) / ln(500,000) = 64 × 5.787 / 13.122 ≈ 28.2. Pairs 0 to 28 are unchanged: <b>29</b>. The same arithmetic with 8,192 gives <i>i</i> &gt; 34.98, so pairs 35 to 63, another 29, are divided by 8, and the six pairs from 29 to 34 are blended. The fast half of the head keeps its training-time resolution at every length; that is the design.</p>
+</Predict>
+
+One more number from the same config: factor 8 times 8,192 is 65,536, yet `max_position_embeddings` is 131,072. Past 65,536 positions, the divided pairs reach angles beyond any the original 8,192-position window produced. The config does not say what training covered that range; whatever did is not in the block. A `rope_scaling` block describes an inference-time transform, not the training that made it work.
+
+## The code
+
+The llama3 transform, written from transformers' `_compute_llama3_parameters`, for one head:
+
+```python
+import math
+
+def llama3_inv_freq(d=128, base=500_000.0, factor=8.0, low=1.0, high=4.0, original=8192):
+    out = []
+    for i in range(d // 2):
+        theta = base ** (-2 * i / d)
+        wave = 2 * math.pi / theta
+        if wave < original / high:          # fast pairs: unchanged
+            out.append(theta)
+        elif wave > original / low:         # slow pairs: interpolated like PI
+            out.append(theta / factor)
+        else:                               # the band between: linear blend
+            smooth = (original / wave - low) / (high - low)
+            out.append((1 - smooth) * theta / factor + smooth * theta)
+    return out
+
+freqs = llama3_inv_freq()
+print(sum(1 for i, f in enumerate(freqs) if f == 500_000.0 ** (-2 * i / 128)))   # 29
+```
+
+The code problem [mml-002](/problems/mml-002) has you write the rotation and a key cache, with hidden tests for the offset bug that chunked prefill exposes.
+
+## What changed in the last two years
+
+The direction of travel is away from formula-only stretching applied to a model trained short, toward models trained long and configured to match. Meta's Llama 4 post (April 2025) describes Scout as pre-trained and post-trained at 256K, with "iRoPE": interleaved attention layers that use no positional embeddings at all, RoPE in the rest, and inference-time temperature scaling of attention for length generalisation, for a stated 10M-token context. Its supporting evidence includes a needle-in-a-haystack retrieval result; the evaluation lesson in this module explains why that is not evidence of usable context. Qwen3 takes the other route: native 32,768 and a documented YaRN block that the operator adds, with the card's own warning that frameworks apply it statically.
+
+For an operator, the consequence is that `rope_scaling` is now a deployment parameter with a quality cost, chosen per workload. Qwen's card says to add the block only when long contexts are required, and to use factor 2 rather than 4 if typical lengths are around 65,536. Static application means a 1,000-token request pays for a 131,072-token stretch.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"We serve a 32K-native model to two products: a chat assistant with prompts under 4K and a document reader that needs 100K. One GPU pool, a quarter's budget, and the reader launches in three weeks. How do you configure position scaling?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Not one configuration. Static YaRN at factor 4 covers 100K but changes every request, and the model card warns that hurts short inputs. Either split the pool, native for the assistant and YaRN for the reader, or measure the assistant's paired regression under YaRN and accept it in writing. With three weeks, split now and measure in parallel.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The conflict is quality on the assistant, which is most of traffic, against the reader's deadline and one pool's budget. Two defensible answers. Split the pool: the assistant keeps the configuration it was evaluated on; the reader gets factor 4. Cost: two deployments to size and operate, an idle-prone long pool, and no shared prefix cache. One pool with YaRN everywhere: one deployment and one cache. Cost: an unmeasured regression on the assistant until the paired eval runs.</p>
+<p>The number I choose is the factor. The reader needs 100K, so factor 4 from 32,768 (131,072) is the smallest power of two that covers it with room for output; factor 2 stops at 65,536. If reader traffic turns out to be mostly under 64K, factor 2 with chunking above it halves the stretch.</p>
+<p>The failure mode of the split is the router. It has to count prompt plus maximum output with the serving tokenizer; a router that counts only the prompt sends a 30K prompt with a 4K answer to the native pool, which then generates past its trained window unscaled.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The paired eval shows the assistant loses 1.5 points under YaRN and finance wants one pool. Which do you ship, and what do you write down?</em></li>
+<li><em>What would you need to see in the reader's production traffic to reverse the factor-4 choice?</em></li>
+<li><em>Your engine adds dynamic scaling next month. What changes in the key cache, and what do you re-measure?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The frequency picture explains why methods differ; it does not predict quality. Two configurations with similar counts in the widget can behave differently on a given task, because the weights' use of each pair is learned and not uniform. Only measurement at the target lengths settles it.
+
+The "seen in training" test assumes training covered the full trained window evenly. A model pretrained mostly on short documents has seen the late positions of its own window less, so its effective range can be shorter than `original_max_position_embeddings` before any stretching.
+
+Models with layers that use no positional encoding, like Llama 4's interleaved layers, or with sliding-window layers, as in gpt-oss, change the arithmetic: only some layers rotate, and position information also comes from the causal mask. The per-pair analysis applies to the RoPE layers only.
+
+Finally, the numbers here are from configs and papers dated between 2021 and 2025. Engines change how they apply `rope_scaling`, and a dynamic mode in your engine changes the short-input cost entirely. Check the engine's version before reusing any conclusion from this page.
+
+<SelfRate id="lesson:multimodal/long-context/rope-scaling" />

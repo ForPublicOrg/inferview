@@ -1,0 +1,106 @@
+---
+id: inf-032
+title: Serve ten million daily users from two regions
+subtitle: offset peaks, a residency clause, and a cache that does not survive failover
+track: inference
+module: operating
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 50
+core: false
+tags: [system-design, multi-region, failover, capacity, prefix-caching, data-residency]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: techinterview.org, Design an LLM Inference API (published 2026-04-16, updated 2026-10-16)
+    url: https://www.techinterview.org/post/3233460079/design-an-llm-inference-api/
+    note: "third-party interview prompt, no company named, for the shape of the question: an inference API at 10M calls a day with streaming, TTFT and tokens-per-second targets, and follow-ups on autoscaling and observability. It does not cover regions or failover; this problem adds them as scenario. Checked 2026-10-28."
+  - title: Google Cloud, About GKE Inference Gateway (page updated 2026-10-26)
+    url: https://docs.cloud.google.com/kubernetes-engine/docs/concepts/about-gke-inference-gateway
+    note: "vendor docs: load-aware routing on KV cache utilisation and pending queue depth; prefix-cache-aware routing sends requests with shared context to the same replica to improve TTFT; requests carry a priority, and under pressure negative-priority requests are dropped first with a 429. The page does not describe multi-region routing. Checked 2026-10-28."
+  - title: AWS, Amazon Bedrock cross-Region inference (user guide)
+    url: https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference.html
+    note: "vendor docs: geographic inference profiles route within a geography such as the US or EU and are recommended for data residency requirements; global profiles route to any supported commercial Region at about 10% lower cost; for an availability target, add bounded retries and multi-Region or multi-model fallback in the application. Checked 2026-10-28."
+  - title: Google Cloud, Best practices for autoscaling LLM inference workloads with GPUs on GKE (page updated 2026-10-26)
+    url: https://docs.cloud.google.com/kubernetes-engine/docs/best-practices/machine-learning/inference/autoscaling
+    note: "scale on queue size or batch size; GPU utilisation does not measure work done while the GPU is active. Checked 2026-10-28."
+  - title: "Little, A Proof for the Queuing Formula L = lambda W (Operations Research, 1961)"
+    url: https://pubsonline.informs.org/doi/10.1287/opre.9.3.383
+    note: "Little's law, used for replica capacity in requests per second. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Design round, 50 minutes">
+"Design inference serving for a chat assistant with ten million daily users in two regions. Either region can fail. What do you build, and what happens to users when a region goes down?"
+</Callout>
+
+What you learn by asking (scenario):
+
+- A self-hosted open-weight model; one replica is 4 GPUs. 10 million daily users, 8 requests each a day. 60% of users are in the Americas, served from us-east; 40% in Europe, served from eu-west.
+- The busiest hour carries twice the region's daily average rate. Europe peaks at 20:00 CET, when us-east runs at its daily average; the Americas peak at 21:00 ET, 03:00 CET, when eu-west runs at 0.3 times its average.
+- A request averages 2,500 prompt tokens, 1,800 of them a shared system prompt and conversation history, and 400 output tokens streamed at no less than 40 tokens per second, with TTFT under 600 ms.
+- A load test found one replica holds 64 concurrent streams at the inter-token objective with conversations routed to the replica that holds their prefix; with random routing, the same replica holds 48.
+- A quarter of European traffic comes from education and enterprise accounts whose contracts require processing in the EU. The rest of the European traffic has no such clause.
+- GPU reservations are per region and can change once a quarter. Eight engineers, two quarters. The compliance lead wants no European traffic processed outside the EU at all; the product lead wants the free tier to keep working through the loss of a region.
+
+Cover routing, capacity per region, what each region can absorb when the other fails, the degraded mode, and how a model change reaches both regions. Write the failover decision memo, with what you give up.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what each region is doing during the other region's busiest hour.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask how a request's residency is known at the edge: from the account, or from where the request came from.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the load test's numbers for a replica that receives conversations it has never seen.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Active-active: each region serves its own users at its own peak, routed by account home region, with conversation-affine routing inside the region so prefixes stay cached. Sized at 80% of tested concurrency, us-east needs 231 replicas and eu-west 154. The peaks are offset, so each region's spare at the other's peak is large but not enough: eu-west can absorb 43% of the Americas peak and us-east 76% of Europe's movable traffic, both at the lower concurrency a cold cache allows. Making both 100% would cost 214 more replicas, 856 GPUs, 56% more than the base fleet. I would not buy that: on region loss, paid traffic fails over first and the free tier degrades to a shorter context and output limit, then sheds with 429. Residency-bound European traffic never leaves the EU; it gets zone redundancy inside eu-west instead. What I give up is the free tier's full service during a region loss, and EU residency accounts' survival of a whole-region outage.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Load, computed.</strong> 10 million users × 8 = 80 million requests a day: 48 million in us-east, 32 million in eu-west. Peak rates are twice the daily average: 48,000,000 / 86,400 × 2 = 1,111 requests a second in us-east, 32,000,000 / 86,400 × 2 = 741 in eu-west. Time in the system is about 0.6 + 400 / 40 = 10.6 s. At the planning headroom I chose, 80% of tested concurrency, a warm-cache replica serves 64 × 0.8 / 10.6 = 4.83 requests a second, and a cold-cache replica 48 × 0.8 / 10.6 = 3.62. Peak fleets: 1,111 / 4.83 = 230.03, so 231 replicas in us-east, and 741 / 4.83 = 153.4, so 154 in eu-west, 385 replicas and 1,540 GPUs.</p>
+<p><strong>What each region can absorb.</strong> The offset peaks are the useful fact. At the Americas peak, eu-west carries 0.3 × 370 = 111 requests a second on 23 replicas, leaving 131; serving redirected traffic with no cached prefixes, they handle 131 × 3.62 = 475 requests a second, 43% of 1,111. At the European peak, us-east carries its average, 556, on 115 replicas, leaving 116; at 3.62 each that is 420 of the 556 European requests a second that are allowed to move, 76%. The cold-cache figure matters: failover moves conversations to replicas that hold none of their prefixes, so each redirected request pays full prefill on 2,500 tokens instead of about 700, and the load test says that costs a quarter of a replica's concurrency.</p>
+<p><strong>The decision.</strong> Two defensible answers:</p>
+<ul>
+<li><em>Size each region to absorb the other's full peak.</em> eu-west needs 1,111 / 3.62 = 306.7, so 307 replicas for the Americas plus 23 for its own night traffic, 330 against 154; us-east needs 154 for Europe's movable traffic against 116 spare. That is 176 + 38 = 214 more replicas, 856 GPUs, a 56% larger reservation that runs idle except during a region loss.</li>
+<li><em>Size each region for its own peak and degrade on failover.</em> No extra GPUs. On region loss, the gateway in the surviving region admits redirected paid traffic first; free-tier requests get a lower priority, a shorter conversation window and a lower output limit, which raises concurrency per replica, and are shed with 429 and Retry-After when the queue passes its threshold. Cost: free-tier users get a worse product, or none, for the length of the outage, and the product lead's requirement is met only in part.</li>
+</ul>
+<p>I would take the second and buy part of the first: enough extra in eu-west to absorb all paid Americas traffic at its peak, if paid is a small share. The constraint conflict is availability against cost, with residency fixed underneath it.</p>
+<p><strong>Residency, routed from the account.</strong> The front door picks the region from the account's home region, not from the client's location, so a residency account travelling in the US still lands in eu-west. Residency accounts are tagged at the edge and excluded from cross-region failover in the router's configuration, not in each service. They survive a zone failure because eu-west runs across three zones with each zone sized to carry its share of residency traffic if one fails; they do not survive the loss of the whole region. Bedrock's documentation draws the same line between geographic and global routing profiles, recommending the geographic kind for residency requirements and pricing the global kind about 10% lower. The compliance lead's broader rule, that no European traffic leaves the EU, would cut us-east's help to Europe from 420 requests a second to zero; that is a decision for the compliance lead and the product lead together, with the number in front of them.</p>
+<p><strong>Inside a region.</strong> A gateway that routes by model, prefers the replica holding the conversation's prefix, balances on queue depth and KV usage, and sheds by priority; GKE Inference Gateway is one published implementation of all four. Autoscaling within a region scales on waiting requests and batch size, never GPU utilisation.</p>
+<p><strong>Changes reach one region at a time.</strong> Model, engine and system prompt changes go to a canary pool in the region that is in its trough, then to that region, then to the other, with a day between regions. Both regions must run the same configuration before failover is trusted: redirected users who land on a different engine configuration get different answers mid-conversation, and a regression that exists only in one region looks like a regional incident instead of a release.</p>
+<p><strong>The decision memo, as written.</strong></p>
+<ul>
+<li>Decision: active-active, each region sized for its own peak at 80% of tested concurrency; no cross-region headroom reserved beyond paid traffic.</li>
+<li>Failover trigger: a region's success SLI below 95% for 5 minutes, or a region declared lost by the provider. Paid traffic moves first; free traffic follows at lower priority and in degraded mode; residency accounts stay.</li>
+<li>Expected impact: if us-east is lost at the Americas peak, up to 57% of its traffic is shed or degraded; if eu-west is lost at the European peak, up to 24% of the movable European traffic is, and residency accounts are unavailable until eu-west returns.</li>
+<li>Failback: only after the restored region passes its quality probes, moving traffic back in steps so caches rebuild before the full load returns.</li>
+<li>Drill: one region failed on purpose each quarter at its trough, measuring time to shift and TTFT in the surviving region.</li>
+</ul>
+<p><strong>Where this design fails.</strong> Every absorb figure assumes the peaks stay offset. A global event, a launch or a news story, peaks both regions at once, and then each region has no spare for the other at all. The second failure is the failover itself: clients retry when their region drops, and the surviving region sees the redirected load plus the retries at cold-cache concurrency in the same minute. The gateway has to shed before the queue forms, with Retry-After values spread out, or the failover turns one regional outage into two.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Why route by account home region and not by geo-IP?</em> Residency follows the contract, not the device; geo-IP sends a travelling EU account to us-east.</li>
+<li><em>What does the quarterly drill measure that a load test does not?</em> The time to move traffic, cache rebuild under real conversations, and whether clients' retries behave the way the shedding plan assumes.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Pushback: the compliance lead rules that no European traffic may be processed in the US, including the free tier. us-east's help to Europe goes from 420 requests a second to zero. Do you buy a second EU region, accept a larger shed, or argue the rule, and what do you write down?*
+- *Reversal: what would you need to see in production to reserve full cross-region headroom after all?* A region loss that lasted long enough, at a peak, that the shed free tier cost more in churned users than the 856 GPUs, or paid traffic growing past what the surviving region can carry warm.
+- *Operating: a new model version answers 30% longer, and product wants it live in both regions within sixty days. Both regions' capacity and every absorb figure in the memo change. Which number do you re-measure first, and which region gets the new model first?*
+
+## Common mistakes
+
+- Sizing failover from warm-cache concurrency, when redirected conversations arrive with no cached prefix.
+- Assuming the peaks stay offset, with no plan for a global spike.
+- Routing residency by client location instead of by account.
+- Rolling a model change to both regions at once, so a regression has nowhere healthy to fail over to.
+- Writing "failover" without the share of traffic that is shed or degraded when it happens.

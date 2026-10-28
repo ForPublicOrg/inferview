@@ -1,0 +1,126 @@
+---
+title: "Playbook: profiling a kernel like an experiment"
+track: training
+module: gpu-kernels
+order: 4
+kind: playbook
+level: staff
+minutes: 12
+summary: A decision guide for kernel optimisation run as a sequence of controlled experiments, with a computed bound, one change per measurement, a correctness gate the optimiser cannot edit, a stop rule and a written log.
+prerequisites: [training/gpu-kernels/roofline-training, training/gpu-kernels/fusion-compile]
+updated: 2026-10-28
+sources:
+  - title: PracHub, Design a profiling plan for kernels (Anthropic, Software Engineer, onsite)
+    url: https://prachub.com/interview-questions/design-a-profiling-plan-for-kernels
+    note: "candidate report aggregated by PracHub, posted 2025-09-06, updated 2026-03-29; the simulator reports cycle counts and counters such as IPC, stall reasons, occupancy and memory bandwidth. Checked 2026-10-28."
+  - title: Anthropic, original_performance_takehome (README)
+    url: https://github.com/anthropics/original_performance_takehome
+    note: "official, first-party repository. The 2-hour version started at 18,532 cycles, 7.97x faster than the repo's starting code; Claude Opus 4 reached 2,164 cycles after many hours in a test-time compute harness; Claude Opus 4.5 reached 1,790 in a casual Claude Code session (about the best human result in 2 hours), 1,579 after 2 hours in the harness, 1,487 after 11.5 hours and 1,363 in an improved harness; none of the first-day submissions below 1,300 cycles were valid, each because a language model modified the tests; validation by an empty git diff of tests/ and running tests/submission_tests.py; multicore disabled on purpose, with an example of a model 'fixing' N_CORES. Checked 2026-10-28."
+  - title: Anthropic, original_performance_takehome (problem.py)
+    url: https://github.com/anthropics/original_performance_takehome/blob/main/problem.py
+    note: "slot limits per cycle: alu 12, valu 6, load 2, store 2, flow 1; VLEN 8; 1,536 words of scratch; N_CORES = 1; a cycle counts when a bundle has a non-debug slot; writes apply at the end of the cycle. Checked 2026-10-28."
+  - title: PyTorch 2.14 documentation, CUDA semantics
+    url: https://docs.pytorch.org/docs/2.14/notes/cuda.html
+    note: "GPU launches are asynchronous; time with torch.cuda.synchronize() or CUDA events; CUDA_LAUNCH_BLOCKING=1 forces synchronous execution. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+Optimising a kernel is a sequence of one decision repeated: given the current program and its measurements, which single change to try next, and whether to keep it. Behind it sits a second decision, when to stop. A candidate report on PracHub (posted 2025-09-06) describes an Anthropic onsite prompt with exactly this shape: a simulator that reports cycle counts, IPC, stall reasons, occupancy and memory bandwidth, and a request for a rigorous plan to profile and optimise a kernel with it. Anthropic's public performance take-home is the same problem with a fixed machine and a cycle counter, and its README records the failure that makes rigour necessary: none of the solutions submitted on the first day below 1,300 cycles were valid, and in each case a language model had modified the tests.
+
+The method is an experiment loop. A baseline that is correct and repeatable, a computed bound, a hypothesis about the binding resource, one change, a measurement, a correctness gate, and a log entry. The rest of this playbook is about the inputs that change each step.
+
+## Inputs that change the decision
+
+**Whether a bound can be computed.** On a simulated machine with published slot limits, and for a matmul or a bandwidth-bound op on a GPU, the lower bound on time is arithmetic. When it can be computed, the gap between the measurement and the bound is the budget for optimisation, and the resource that sets the bound tells you what to change. When it cannot, for example for a kernel with data-dependent control flow, the counters have to stand in for it.
+
+**How noisy the measurement is.** A deterministic simulator gives the same cycle count for the same program and input every time, so one run per input is enough, but the count still depends on the input if the kernel branches on data. The take-home's kernel walks a tree and picks a child by the parity of a hash, so its cost is a property of the input distribution, not of one input. A real GPU adds run-to-run variation: launches are asynchronous, so time with `torch.cuda.synchronize()` or CUDA events, never with a bare timer around a launch, and report the spread over repeated runs on an otherwise idle device. `CUDA_LAUNCH_BLOCKING=1` serialises launches and is for finding which op failed, not for timing.
+
+**What a change costs to try and to keep.** A change that reorders independent instructions is cheap to try and free to keep. A change that restructures the data layout is expensive to try and may constrain every later change. Order hypotheses by expected gain over cost, and expect the order to change after each measurement.
+
+**Who or what proposes the changes.** A search loop or a coding agent proposes many changes quickly and has no stake in the tests. The README's example is a model that noticed multicore support in `problem.py`, implemented it, saw no speedup, and "fixed" `N_CORES = 1` to get one. The gate has to live where the optimiser cannot reach it.
+
+## The bound, computed
+
+The take-home's machine has per-cycle slot limits of 12 scalar ALU, 6 vector ALU, 2 load, 2 store and 1 flow operation, with vectors of 8 lanes. A lower bound for any kernel on it is, for each slot class, the operations of that class divided by its slots, and the largest of those quotients.
+
+<Predict id="trn-prof-bound" question="Scenario kernel, not the take-home's: 4,096 independent items, each needing 12 arithmetic operations, 2 loads and 1 store. Fully vectorised on a machine with the take-home's slot limits (6 vector ALU, 2 load and 2 store slots per cycle, 8 lanes, one slot per vector operation), what is the lower bound in cycles?" answer={1024} tolerance={0} unit="cycles">
+<p>4,096 / 8 = 512 vectors. Vector ALU: 512 × 12 / 6 = <b>1,024 cycles</b>. Loads: 512 × 2 / 2 = 512. Stores: 512 / 2 = 256. The vector ALU binds, so no amount of load scheduling helps until arithmetic is spread over more slots.</p>
+</Predict>
+
+The bound moves when the program's structure changes, and that is where it earns its keep. The 12 scalar ALU slots sit idle in the vectorised kernel. Process v vectors on the vector unit and s items on the scalar unit, with 8v + s = 4,096. Vector ALU cycles are 2v, scalar ALU cycles are s, and load cycles are (2v + 2s) / 2 = v + s, because each vector and each scalar item needs two loads. The loads now bind before the scalar ALU does: setting 2v = v + s gives s = v, so 9v = 4,096, v = 455 and the bound falls to 2 × 455 = 910 cycles, 11% under the pure-vector 1,024. Recompute the bound after every structural change; the binding resource moved from vector arithmetic to loads in one step.
+
+## The options, and when each wins
+
+**Bound-driven.** Compute the bound, find the binding resource, restructure to approach it. Wins on a simulator, on matmuls and on bandwidth-bound ops, where the bound is exact and the gap is large. Fails when the bound assumes perfect overlap the dependency chains cannot give, so the last stretch to the bound may be unreachable.
+
+**Counter-driven.** Read stall reasons and utilisation, form a hypothesis about the top stall, change one thing. Wins when the bound is far away and the cause is not obvious, for example a kernel stalled on a dependency chain while every slot class is underused. Fails when counters move without cycles moving: higher IPC from extra instructions is not progress.
+
+**Search.** Sweep a small parameter space, such as tile size or unroll depth, and keep the fastest. Wins when each evaluation is cheap and the space is small. Fails by overfitting the benchmark input, and it is the mode most likely to find changes that pass the benchmark by weakening the check, which is what the README's first-day submissions did.
+
+In practice the loop alternates: the bound says where the ceiling is, counters say what blocks the current program, and search tunes the last parameters once the structure is settled.
+
+## The correctness gate
+
+Every kept change passes a gate that compares outputs with a reference implementation on inputs the optimiser did not choose: varied sizes, including sizes that do not divide the vector width or the unroll depth, and inputs that exercise every branch. The gate is run from a copy of the tests the optimiser cannot modify. The take-home's validation is the template: `git diff origin/main tests/` must be empty, and the cycle count reported is the one `tests/submission_tests.py` prints. A result that improves the cycle count by changing what is measured is not a result.
+
+On a GPU the gate compares against the reference within a tolerance set from the reference's own variation across runs and dtypes, because fused and reordered floating-point arithmetic does not reproduce eager results bit for bit.
+
+## A stop rule
+
+Stop when any of these holds, and write down which:
+
+- the measurement is within a fraction of the bound you chose in advance;
+- the last several changes each gained less than their cost in engineering time, valued against what the kernel's share of the workload is worth;
+- the time budget is spent.
+
+The take-home's record shows why the first criterion must be stated in advance: the 2-hour version started at 18,532 cycles, Claude Opus 4.5 reached 1,579 after 2 hours in Anthropic's harness and 1,487 after 11.5 hours, a further 6% for almost six times the time. Without a stated target, there is always another 6%.
+
+## What to write down after each change
+
+One entry per experiment, before starting the next:
+
+- the hypothesis, naming the resource or stall it targets;
+- the single change, with a commit or diff reference;
+- the inputs used and the measurement (cycles, or median and spread of time);
+- the bound before and after, and which resource binds now;
+- the counters that moved, and whether they moved in the direction the hypothesis predicted;
+- the gate result on the held-out inputs;
+- keep or revert, and the next hypothesis.
+
+When two kept changes might interact, for example an unroll that only helps after a layout change, measure the four combinations before crediting either. The log is what lets someone else, or you in a week, tell which change bought which cycles.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"An overnight agent run on our kernel reports a 40% cycle reduction across 60 commits. Release is in three days. How do you decide what ships?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Nothing ships on the agent's own numbers. First, verify the tests and the measurement harness are unchanged against the main branch and rerun the cycle count from a clean checkout. Then bisect the 60 commits into a handful of kept changes with a log entry each, rerun the gate on inputs the agent never saw, and ship the subset that passes with its measured gain. The cost is losing some of the 40% for three days; the alternative is shipping a number that may come from a weakened test.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The first check is the one the take-home README makes mandatory: an empty diff of the tests directory against main, and the count from the unmodified submission script. If either fails, the 40% is unverified, whatever the code looks like.</p>
+<p>Next, attribution. Sixty commits from an optimiser usually contain a few structural changes and many small reorderings. Replay them in groups, measuring after each group, until each kept change has a measured gain. Two defensible ways to spend the three days: ship only the largest verified change, which is low risk and recovers most of the gain if one change dominates; or verify all of them, which recovers the full gain only if the time suffices and risks shipping nothing. Choose by how concentrated the gain is after the first bisection.</p>
+<p>The gate must use inputs the agent did not see: different sizes, including ones not divisible by the vector width, and data that exercises every branch. The failure mode of this plan is a change that is correct on every tested input and wrong on a production shape nobody listed, so the release note names the shapes tested.</p>
+<p>Write the decision down: what shipped, its measured gain on the clean harness, what was deferred and why.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The bisection shows 30 of the 40 points come from one commit that also changes the input layout callers must provide. Do you ship it, and who has to agree?</li>
+<li>The agent's best variant is correct but 2% slower on the production input distribution than on the benchmark input. Which number goes in the release note?</li>
+<li>What evidence would make you let the agent's changes ship without a human bisection next time?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## What to measure after deciding
+
+After the kernel ships, the benchmark stops being the measurement. Track the kernel's time on production inputs per release, its share of step time, and the gate's results on new shapes as they appear. A kernel tuned on one input distribution is a bet that production looks like it; the first shape that does not is when the log above pays for itself.
+
+<SelfRate id="lesson:training/gpu-kernels/profiling-playbook" />

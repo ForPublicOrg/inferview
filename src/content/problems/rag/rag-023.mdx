@@ -1,0 +1,113 @@
+---
+id: rag-023
+title: Fine-tune a reranker for contract search, and decide when to stop
+subtitle: training data, negative mining, evaluation and a stopping rule written before the first run
+track: rag
+module: hybrid-search
+type: workflow
+difficulty: hard
+seniority: [staff]
+minutes: 45
+core: false
+tags: [reranking, fine-tuning, hard-negatives, distillation, evaluation, stopping-rule]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Tom Aarsen, Training and Finetuning Reranker Models with Sentence Transformers v4 (Hugging Face blog, 2025-03-26)
+    url: https://huggingface.co/blog/train-reranker
+    note: "BinaryCrossEntropyLoss with pos_weight set to the number of hard negatives (5); mine_hard_negatives with range_min, range_max, max_score, margin and sampling_strategy; 99k GooAQ pairs mined into 578k labelled pairs, 12.62 percent of samples lacked enough negatives; ModernBERT-base (150M) trained in about 30 minutes on an RTX 3090; GooAQ dev NDCG@10 reranking the top 30 of a static retriever: retriever 59.12, fine-tuned 150M 77.14 (83.51 when positives are always reranked), general rerankers 66.63 to 75.40; cross-encoders overfit quickly, so evaluate during training and load the best checkpoint; training only on hard negatives may hurt easier queries. Checked 2026-10-28."
+  - title: Xu, Huang, Zhuang and Srikumar, Distillation versus Contrastive Learning, How to Train Your Rerankers (arXiv 2507.08336, v3 2025-11-06, IJCNLP-AACL 2025 Findings)
+    url: https://arxiv.org/abs/2507.08336
+    note: "students of 0.5B to 7B parameters; distilling from a more performant teacher generally beats contrastive learning in and out of domain; a teacher of the same capacity gives no such advantage, especially out of domain; without a stronger teacher, contrastive learning is a robust baseline. Checked 2026-10-28."
+  - title: Sun et al., Is ChatGPT Good at Search? (EMNLP 2023, arXiv 2304.09542 v3)
+    url: https://arxiv.org/abs/2304.09542
+    note: "permutation distillation from ChatGPT: the paper reports a distilled 440M model outperforming a 3B supervised model on BEIR. Checked 2026-10-28."
+  - title: Cohere blog, Rerank 5 (2026-10-21)
+    url: https://cohere.com/blog/rerank-5
+    note: "vendor post: Rerank 5 Pro at $0.05 per million tokens. Checked 2026-10-28."
+checklist:
+  - Keeps the lawyer-judged queries out of training and splits dev and test by time and by tenant, so no tenant's contracts appear on both sides
+  - Excludes opted-out tenants before any data leaves the warehouse, and records legal's sign-off on the data used
+  - Mines negatives from the production first stage below the top ranks, and drops candidates that are near-duplicate boilerplate of the positive before calling them negatives
+  - Audits a sample of mined negatives with the lawyers and states the false-negative rate it will accept
+  - Chooses between training on labels with mined negatives and distilling from the hosted reranker, with the cost and the ceiling of each
+  - Evaluates at the production candidate depth against the retriever alone and the hosted reranker, per language and clause type, and does not report the always-rerank-positives number as the result
+  - Computes the smallest difference the test set can detect, and spends the labelling hours on named tasks with the arithmetic shown
+  - Writes the stopping rule before the first run, covering rounds without a detectable gain, the budget, and a slice regression
+  - Makes each step idempotent, keyed on data snapshot, miner config, base model and seed, with every artefact versioned
+  - Ships through shadow scoring and a canary with written rollback triggers on latency and on a user signal
+  - States what the company gives up and the failure modes of the chosen design
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Workflow, 45 minutes">
+"Our contract search reranks with a hosted model. We think a small reranker trained on our own data would be better on our domain and cheaper. Design the work: the training data, how negatives are mined, how you evaluate it, and the rule for stopping. Two people, eight weeks."
+</Callout>
+
+The situation (scenario):
+
+- 9 million clauses from customer contracts, English and German. Hybrid first stage, top 50 reranked by a hosted reranker. Reranking spend is about $41,000 a month; the existing GPU inference pool could serve a 150M cross-encoder for about $9,000 a month of capacity.
+- 14 months of query logs. Users click results and, more usefully, copy a clause into a memo; about 60,000 queries ended in a copy.
+- 1,200 queries judged by lawyers in an earlier eval project, 140 of them German. In that project, the per-query NDCG@10 difference between two rerankers had a standard deviation of about 0.25.
+- 12 percent of tenants opted out of their data being used for model training.
+- Two contract lawyers can give 30 hours in total. One ML engineer, one backend engineer, eight weeks. The head of product wants a launch date; the head of legal has not yet seen the plan.
+- Customer contracts are full of boilerplate: the same indemnity clause appears, word for word or nearly, in thousands of contracts.
+
+Design the workflow: steps, state, retries, approvals and budgets. Choose how the 30 lawyer hours are spent and the threshold in your stopping rule, and show the arithmetic.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask the lawyers to judge twenty mined negatives for one popular clause type and count how many are actually relevant.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask whether the vendor's terms and the customer contracts allow the hosted reranker's scores to be used as training labels.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask the head of product what "better" has to mean for launch: higher quality, the same quality at lower cost, or both.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>A pipeline of versioned, idempotent steps: extract and filter the logs, mine negatives, train, evaluate, approve, shadow, canary. Positives are copied clauses, not clicks. Negatives come from the production first stage at ranks 10 to 100, minus anything that is a near-duplicate of the positive, because boilerplate makes a large share of naive negatives relevant. The 1,200 judged queries are the test set and never train anything. The 30 lawyer hours buy a false-negative audit (7.5 hours) and 400 more German test queries (20 hours), which lets the German slice detect a 3-point NDCG@10 difference. I distil from the hosted reranker first, because the launch goal is the same quality at about a fifth of the cost ($9,000 against $41,000 a month) and the hosted model starts as the stronger one, the condition under which Xu et al. find distillation pays; then fine-tune on copy labels. The stopping rule, written in week 1: stop when two rounds in a row gain less than 2 points on dev, the smallest difference the test set can detect, or at week 7, and ship only with no slice worse than the hosted reranker by more than its detectable difference.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>1. Data, with legal first.</strong> Opted-out tenants are removed in the warehouse query, before anything is exported, and legal signs the data inventory in week 1, before training data exists. Positives are queries that ended in a copy into a memo: a click is mostly position, a copy is a decision. The judged 1,200 are the test set. Dev comes from the last two months of logs, from tenants not in the training months' sample; a tenant's contracts never sit on both sides, because the same boilerplate would leak across.</p>
+<p><strong>2. Negative mining.</strong> For each query, take the production first stage's candidates at ranks 10 to 100 and sample five, as the Sentence Transformers recipe does with range_min, range_max and five negatives per positive. Then remove candidates whose text is a near-duplicate of the positive (MinHash or an embedding-similarity margin), because an indemnity clause copied from the same template is the same answer. The recipe's run found 12.62 percent of samples without enough negatives under its settings; expect more here once duplicates are removed, and log the count.</p>
+<p><strong>3. The 30 lawyer hours, my choice.</strong> Audit 300 mined negatives at about 1.5 minutes each: 7.5 hours, giving the false-negative rate of the miner; I accept up to 10 percent and tighten the margin if it is higher. Then the German slice: with a per-query standard deviation of 0.25, a paired comparison at 5 percent significance and 80 percent power detects 2.8 × 0.25 / √n. For 3 points that is n ≈ 544, so about 400 more German queries at 3 minutes each, 20 hours. The remaining 2.5 hours go to adjudicating the disagreements the audit throws up. A choice that spends all 30 hours on training labels would be unreasonable: 600 labelled queries are a rounding error next to 60,000 copies, and the test set would stay too small to see a slice regression.</p>
+<p><strong>4. The decision, two defensible answers.</strong></p>
+<ul>
+<li><strong>Distil from the hosted reranker.</strong> Score the mined pairs with the current model and train the student on its scores. Xu et al. find distillation from a more capable teacher beats contrastive training in and out of domain. Cost: 500,000 pairs × 440 tokens = 220 million tokens, about $11 at the vendor's $0.05 per million. Its ceiling is the teacher, so it delivers the cost goal, not the quality goal, and it inherits the teacher's mistakes on contract language. It is also allowed only if the vendor terms and the customer contracts permit it, which legal has to confirm.</li>
+<li><strong>Train on copy labels with mined negatives, binary cross-entropy.</strong> Learns the domain directly and can beat the teacher where the teacher is weak, which is what the recipe's in-domain result shows: 77.14 NDCG@10 for a fine-tuned 150M model against 66.63 to 75.40 for general rerankers on that dataset. Cost: everything depends on the miner's false-negative rate, and in-domain dev gains are the easiest gains to overstate.</li>
+</ul>
+<p>I start with distillation because the launch goal the head of product will sign is the same quality at lower cost, and the ceiling is acceptable for that goal. The label-trained model runs as the second round on the same pipeline, and it ships only if it beats the distilled one by the detectable difference.</p>
+<p><strong>5. Training.</strong> One epoch, evaluating on dev during training and loading the best checkpoint, because cross-encoders overfit quickly. pos_weight equal to the negatives per positive. Mix in random negatives: the recipe warns that hard negatives alone can hurt easier queries.</p>
+<p><strong>6. Evaluation.</strong> NDCG@10 on the test set, reranking the production top 50, never with positives forced into the candidates: the recipe's own table shows that setting adds 6.37 points (77.14 to 83.51) that production will not see. Compare against the first stage alone and the hosted reranker, per language and per clause type, plus p95 latency at production load on the inference pool.</p>
+<p><strong>7. The stopping rule, written in week 1.</strong> The smallest difference the 1,200-query test set detects is 2.8 × 0.25 / √1,200 ≈ 0.02, two points. A round is a change to data or mining. Stop when two consecutive rounds each gain less than 2 points on dev, or at the end of week 7, whichever comes first. Ship only if overall test NDCG@10 is at least the hosted reranker's minus 2 points and no slice is worse by more than its own detectable difference (3 points for German after the extra labels). Otherwise the result is a written no, and the hosted reranker stays.</p>
+<p><strong>8. Workflow state and retries.</strong> Each step is keyed on its inputs: data snapshot id, miner config hash, base model revision, seed. A rerun with the same key returns the stored artefact instead of training again; a failed step retries twice and then pages the ML engineer, never moves on with a partial artefact. Approvals: legal on the data inventory (week 1), the lawyers on the false-negative audit (week 3), the head of product on the eval report against the stopping rule (week 7).</p>
+<p><strong>9. Rollout, written down.</strong> One week of shadow scoring on all traffic, comparing the student's top 10 with the hosted model's. Then a 10 percent canary by tenant hash. Rollback triggers: copy rate per query down by more than 3 percent relative for three days, or reranker p95 over 120 ms at production load.</p>
+<p><strong>What the company gives up.</strong> A vendor that improves its model without our work, a team that does not own a training pipeline, and the eight weeks. In return, about $32,000 a month if distillation reaches parity.</p>
+<p><strong>The constraint conflict.</strong> Product's launch date against a stopping rule that may say no, and lawyer hours against a test set big enough to see the German slice regress.</p>
+<p><strong>Where this design fails.</strong> The student learns the teacher's ranking of today's contract language and nothing updates it; when the hosted vendor improves, the student does not, and nobody owns noticing. And copy labels are biased toward what the current reranker already shows: a clause it never surfaces is never copied, so the second round can learn the old ranker's blind spots as truth. The audit catches false negatives, not that.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Why not use clicks as positives, given they are ten times more plentiful?</em> They are mostly a record of position; train on them and the model learns to rank what was ranked first.</li>
+<li><em>Why near-duplicate removal before the audit and not after?</em> The audit should measure the false negatives the miner still produces, not the ones a known filter would have removed.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Pushback: the lawyers' 30 hours shrink to 12. Which do you cut, the false-negative audit or the German test slice, and what risk do you write down for each?*
+- *Reversal: the distilled model reaches parity and ships. What would you need to see in production to decide the label-trained second round is worth another eight weeks?*
+- *Legal says the vendor terms do not allow training on its scores. What changes in the plan and in the date, and who tells the head of product?*
+- *Six months after launch the hosted vendor releases a model its benchmarks put well ahead. How do you decide whether to switch back, without rerunning the whole project?*
+
+## Common mistakes
+
+- Treating every first-stage candidate that is not the clicked one as a negative, in a corpus full of boilerplate.
+- Training on the judged set, or splitting by query when the same contracts appear under many queries.
+- Reporting the always-rerank-positives number as the result.
+- Deciding when to stop after seeing the results.
+- Launching a self-hosted model with nobody owning its retraining.

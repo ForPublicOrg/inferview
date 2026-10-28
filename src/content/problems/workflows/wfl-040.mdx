@@ -1,0 +1,73 @@
+---
+id: wfl-040
+title: Clone, run a coding agent, open a PR
+subtitle: one durable step or three
+track: workflows
+module: operating-workflows
+type: concept
+difficulty: medium
+seniority: [senior]
+minutes: 20
+core: false
+tags: [durable-execution, temporal, coding-agents, activities, idempotency]
+companies:
+  - name: Duolingo
+    url: https://blog.duolingo.com/buildingaiagents
+updated: 2026-10-28
+sources:
+  - title: Duolingo engineering blog, Building an AI agent to remove feature flags (2025-12-04)
+    url: https://blog.duolingo.com/buildingaiagents
+    note: official; one activity clones the repo to a temporary directory and runs Codex CLI because each activity may run on a separate worker; Codex runs as a subprocess in a sandboxed ECS instance; PRs go out without CI validation today
+  - title: Temporal docs, task routing
+    url: https://docs.temporal.io/task-routing
+    note: activities that must run on the host where an earlier activity downloaded a file; the application must route later tasks to specific worker processes; a unique task queue per worker process; Worker Sessions in some SDKs (checked 2026-10-28)
+  - title: Temporal docs, detecting activity failures
+    url: https://docs.temporal.io/encyclopedia/detecting-activity-failures
+    note: always set Start-To-Close; short Heartbeat Timeout for long activities; heartbeat payload to resume progress on retry (checked 2026-10-28)
+  - title: Temporal docs, retry policies
+    url: https://docs.temporal.io/encyclopedia/retry-policies
+    note: activity default retry policy has unlimited maximum attempts and no non-retryable errors (checked 2026-10-28)
+---
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+You are adding a "migrate this deprecated API" button to an internal developer portal. A Temporal workflow does three things: clone the repository, run a coding agent CLI against the working tree until it reports done, and open a pull request with the changes. Workers run on an autoscaled pool and do not share disks. Scenario figures: the clone takes about three minutes, the agent runs for 10 to 40 minutes and spends a few dollars of model tokens per run, and workers are replaced during deploys several times a day.
+
+Do you make this one activity, three activities, or something else? Say what each option costs when a worker dies at minute 30 of the agent run, and choose the timeouts and retry limits for the step that runs the agent.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what state each step leaves behind, and where that state lives once the worker is gone.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the agent's run-time distribution and the model spend per run.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the retry policy on the activity is today, and how many times a failed agent run should be paid for.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Not three activities on a shared-nothing pool: the second activity can land on a worker that has no clone, which is the reason Duolingo gives for cloning and running Codex CLI in one activity. One activity is the simple, defensible answer. I would make it two: clone, run the agent and push the result to a work branch named after the workflow id in one activity, then open the PR in a second activity that any worker can run, because git is now the durable state between them. The agent activity gets a Start-To-Close above the agent's slowest normal run, a heartbeat every few seconds with a heartbeat timeout of a minute or two, and a cap of two or three attempts, since Temporal's default retry policy for activities retries without limit and every attempt pays for the model again.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Three activities with a local working tree only work if activities two and three run on the same host as activity one. Temporal's task-routing docs describe exactly this file-processing case: the application must route the later activities to the worker process that holds the file, either through a task queue unique to that worker or through the Worker Session API that some SDKs provide. Both pin later steps to a host, and when that host is replaced during a deploy the files are gone and the workflow must go back to the clone. Pinning buys little here because the clone is three minutes and the agent run is the expensive part.</p>
+<p>One activity. A worker that dies at minute 30 loses the clone and the agent's work; the retry clones again and runs the agent from the start, paying for the tokens twice. If the crash comes after the PR is opened but before the activity completes, the retry opens a second PR unless the PR call looks up an existing PR for the branch first. It is easy to reason about, and it is what Duolingo shipped.</p>
+<p>Two activities with a pushed branch. The first activity ends with <code>git push</code> to <code>agent/&lt;workflow-id&gt;</code> and returns the commit sha; the second finds or opens the PR for that branch. A crash between the two costs nothing, and the PR step is cheap to retry and idempotent by branch name. A crash during the agent run costs the same as the one-activity design, unless the agent commits and pushes checkpoints, with the latest sha in the heartbeat payload so the retry starts from the branch rather than from main. Resuming mid-run only helps if the agent can pick up from a partly migrated tree, which depends on the task; for a mechanical migration it usually can.</p>
+<p>The numbers. Start-To-Close bounds one attempt, so it sits above the slowest normal run: with runs of 10 to 40 minutes, 50 to 60 minutes is reasonable, and 3 hours is not, because a hung agent then holds a worker slot and a sandbox for hours. The heartbeat timeout decides how fast a dead worker is noticed: one to two minutes with a heartbeat every 10 to 30 seconds is reasonable. The agent runs as a subprocess, so the heartbeat has to come from the activity's own loop while it waits, not from the agent. Maximum attempts of two or three, with "no changes made" and "repository archived" marked non-retryable.</p>
+<p>What this costs. Pushing agent output to the shared remote before review puts unreviewed code on a branch other people can see, and a push can trigger CI on every checkpoint. Use a branch prefix that CI ignores until the PR exists, and restrict who can push to it.</p>
+</Fragment>
+</Depth>
+
+The constraint conflict is between detection speed and false failures. A short heartbeat timeout notices a dead worker quickly, but a worker that blocks its event loop on a large `git` operation or a slow file scan misses heartbeats and gets its attempt failed while the agent is still running. If that happens, the first attempt's subprocess keeps running and pushing while the retry starts, and two writers race on one branch. Kill the subprocess when the activity is cancelled, and make the push a compare-and-swap on the expected previous sha (`git push --force-with-lease`) so the stale writer fails instead of overwriting.
+
+## Follow-ups
+
+- *The agent sometimes produces a change that does not compile. Does that change the step boundaries?* Add a verification activity after the push that runs the build and tests on any worker from the branch, and loop back to the agent with the failure output at most once or twice. Duolingo's post says its PRs currently go out without CI validation and names passing CI as a next step.
+- *Security asks that agent runs never have push credentials. What changes?* The agent activity uploads its patch (`git diff`) to object storage and returns the key, and a separate activity with push rights applies and pushes it. The checkpoint-and-resume design goes away with the push rights, so a crash mid-run costs a full rerun again; that is the price of the control.
+- *Why not put the clone in a workflow-level cache volume and skip pinning entirely?* A shared volume reintroduces shared state between workers: two runs on the same repository must not share a working tree, so the cache can hold a bare mirror for fast clones, and each run still checks out its own tree.
+
+## Common mistakes
+
+- Splitting into three activities on a pool without shared disks, so the agent step runs on an empty directory and fails or, worse, clones a different revision.
+- Leaving the default retry policy on the agent step, so a deterministic failure pays for the model on every attempt until someone notices.
+- Setting no heartbeat timeout, so a dead worker is only noticed when the 60-minute Start-To-Close expires.
+- Opening the PR without first looking up an existing PR for the branch, which turns a retry into a duplicate PR.

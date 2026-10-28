@@ -1,117 +1,136 @@
 ---
 id: inf-005
 title: Batching for a single GPU with synchronous callers
+subtitle: a profiled GPU, a retrying client and a 250 ms objective
 track: inference
 module: batching
 type: design
 difficulty: hard
 seniority: [senior, staff]
 minutes: 45
-core: true
-tags: [batching, scheduling, queueing, backpressure, system-design]
+core: false
+tags: [batching, dynamic-batching, admission-control, load-shedding, continuous-batching, system-design]
 companies:
   - name: Anthropic
     url: https://www.aced.io/blog/ai-engineer-interview-questions
 updated: 2026-10-28
 sources:
-  - title: aced.io, AI engineer interview questions
+  - title: aced.io, AI engineer interview questions (2026 guide, page says last updated a month before 2026-10-28)
     url: https://www.aced.io/blog/ai-engineer-interview-questions
-    note: lists this prompt under Anthropic; secondary aggregator of candidate reports, paraphrased
-  - title: "Orca: A Distributed Serving System for Transformer-Based Generative Models (OSDI 2022)"
-    url: https://www.usenix.org/conference/osdi22/presentation/yu
-    note: iteration-level scheduling
-  - title: "Efficient Memory Management for Large Language Model Serving with PagedAttention (SOSP 2023)"
-    url: https://arxiv.org/abs/2309.06180
-    note: paged KV cache allocation
-  - title: vLLM docs, optimization and tuning
-    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
-    note: max_num_batched_tokens trade-off between ITL and TTFT; chunked prefill
-  - title: Databricks, LLM inference performance engineering best practices
+    note: "candidate report: the guide says its questions are pulled from interviews candidates reported, and lists this prompt under Anthropic. Checked 2026-10-28."
+  - title: Databricks, LLM inference performance engineering best practices (2023-10-12)
     url: https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices
-    note: batch 64 raised latency about 4x and throughput about 14x in an A100 example
+    note: "vendor's own measurement on MPT-7B and one A100 with 512 input and 64 output tokens: at batch size 64, latency rose 4x and throughput 14x (0.9 to 12.5 requests per second from batch 1 to 64). Checked 2026-10-28."
+  - title: "Orca: A Distributed Serving System for Transformer-Based Generative Models (Yu et al., OSDI 2022)"
+    url: https://www.usenix.org/conference/osdi22/presentation/yu
+    note: "iteration-level scheduling: requests join and leave the batch at every model iteration. Checked 2026-10-28."
+  - title: "Efficient Memory Management for Large Language Model Serving with PagedAttention (Kwon et al., SOSP 2023, arXiv 2309.06180)"
+    url: https://arxiv.org/abs/2309.06180
+    note: "KV cache allocated in blocks on demand rather than reserved per request. Checked 2026-10-28."
+  - title: vLLM docs, Optimization and tuning (latest, checked 2026-10-28)
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: "smaller max_num_batched_tokens gives better inter-token latency, larger gives better time to first token; decodes are batched before prefills under chunked prefill. Checked 2026-10-28."
 ---
 import Callout from '../../../components/Callout.astro';
 import Depth from '../../../components/Depth.astro';
 
 ## Question
 
-<Callout kind="interview" label="As reported">
-"Design an inference batching system for a single GPU that can handle up to 100 inputs per batch while users wait synchronously."
+<Callout kind="interview" label="As reported by a candidate">
+"Design an inference batching system for a single GPU handling up to 100 inputs per batch while users wait synchronously."
 </Callout>
 
-You own one GPU running one model. Callers make a blocking HTTP request and wait for the complete result. The GPU can process at most 100 inputs in one batch. Design the component between the HTTP handlers and the model: how requests get into batches, when a batch runs, how results get back to the right caller, and what happens under overload. Start with fixed-size outputs, then extend to text generation where output lengths differ.
+The case, constructed for this problem:
+
+- One GPU serves a reranking model behind an existing Python HTTP service. Callers block on the response.
+- The team profiled one forward pass on this GPU, with inputs padded to 512 tokens, at 20 ms + 0.6 ms per input in the batch, up to 100 inputs.
+- Traffic peaks at 900 requests per second and falls to 20 at night. The objective is a server-side p99 of 250 ms.
+- Callers use a client library owned by another team. It times out at 1 second and retries a 429 or a timeout immediately, up to three times. That team will not change it this quarter.
+- You have one engineer and two weeks, and the HTTP service stays in Python.
+
+Design the component between the HTTP handlers and the GPU: how requests form batches, when a batch runs, how results reach the right caller, and what happens above capacity. Choose and defend the queue limit. Then say what changes when the same GPU serves text generation instead. Write the rollout plan with its rollback triggers.
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>There are two triggers for running a batch: it is full, or the oldest request has waited long enough.</p></details>
-<details class="hint"><summary>Hint 2</summary><p>A blocking caller needs something to wait on that the batch worker can complete: a future or a condition variable per request.</p></details>
-<details class="hint"><summary>Hint 3</summary><p>For generation, ask what the batch worker should do when one request finishes after 20 tokens and another needs 400.</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask for the profile at batch sizes 1, 40 and 100 with real input lengths rather than padded ones.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask whether anything else runs on this GPU, and whether anyone pays for its idle time.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the distribution of output lengths before promising a synchronous answer for generation.</p></details>
 
 ## Answer
 
 <Depth>
 <Fragment slot="short">
-<p>A bounded queue in front of a single batch worker. Each HTTP handler enqueues its input with a future and blocks on it with a timeout. The worker takes up to 100 items when the queue has 100 or when the oldest item has waited a maximum batching delay, runs the model, and completes each future. For generation, switch to continuous batching: the worker runs one decode step at a time, removes finished sequences, and admits new ones into free slots each step, bounded by KV cache memory. Overload is handled by rejecting at a queue limit with 429 rather than letting latency grow without bound.</p>
+<p>Handlers put (input, future, deadline) on a bounded queue and block on the future. One worker owns the GPU: whenever it is idle it takes everything queued, up to 100, runs it, and completes each future. Batches form on their own while the GPU is busy, so there is no wait timer: at 900 requests per second the profile settles at about 39 inputs per batch and 43 ms per batch, well inside 250 ms. The capacity is 1,250 requests per second at batch 100; above it, the queue admits a request only if the batches ahead of it fit its deadline, which works out to 199 queued requests at the profiled numbers, and rejects the rest with a cheap 429 that the retrying client cannot turn into GPU work. For generation, the batch becomes iteration-level: requests join and leave the running set every step, with KV memory and a per-step token budget as the limits, and a synchronous caller with a 1-second timeout can only be served for short outputs. What I give up: requests above capacity fail fast instead of succeeding slowly.</p>
 </Fragment>
 <Fragment slot="long">
-<p>Requirements to pin down: latency objective for callers, input and output size distribution, whether outputs are fixed (classification, embeddings) or generated, and peak arrival rate. These decide the batching delay and the queue limit.</p>
-<p>Fixed-size outputs: handlers put (input, future, deadline) into a bounded queue and wait on the future. One worker thread owns the GPU. Loop: block until the queue is non-empty; then collect until 100 items or until the oldest item's age reaches the batching delay; drop items whose deadline has passed; pad or bucket inputs by length so one long input does not inflate the whole batch; run; complete each future with its own output, or with the exception if the batch failed. The batching delay trades latency at low load (each request may wait up to it) for throughput at high load (batches fill on their own).</p>
-<p>Generated outputs: a static batch would run until its longest member finishes, leaving finished slots idle. Use iteration-level scheduling instead. The worker keeps a running set of at most 100 sequences. Each step it removes finished sequences and completes their futures, admits waiting requests while slots and KV memory allow, runs one forward pass that mixes new prompts' prefill with one decode token per running sequence, and appends results. Allocate KV cache in blocks so admission checks free blocks, not just slot count. Cap prefill tokens per step so a long new prompt does not stall the running decodes.</p>
-<p>Overload and failure: the queue limit is the backpressure point; return 429 with Retry-After once it is full, because a synchronous caller that waits longer than its own timeout has already gone. Cancel work for callers that disconnect. If the model raises, fail that batch's futures and keep the worker alive; if one input reliably crashes the batch, bisect and quarantine it. Expose queue depth, batch size per step, queue wait time and end-to-end latency percentiles.</p>
-<p>Scaling the answer: the same design runs per GPU; a load balancer that routes on queue depth spreads load across replicas.</p>
+<p><strong>The capacity, computed.</strong> A batch of <em>b</em> takes 20 + 0.6<em>b</em> ms. At <em>b</em> = 100 that is 80 ms, so the GPU's ceiling is 100 / 0.080 = 1,250 requests per second; at <em>b</em> = 1 it is 48.5. The fixed 20 ms is the weights' cost per pass, paid once per batch; this is the reason batching pays, and Databricks' measurement on an A100 shows the same shape for a language model (14 times the throughput for 4 times the latency at batch 64).</p>
+<p><strong>The decision: when to run a batch.</strong> Two answers are defensible.</p>
+<ul>
+<li><em>Run whenever the GPU is idle.</em> The worker takes whatever is queued the moment the previous batch finishes. Under load the batch size finds its own level: at 900 per second, <em>b</em> = 900 × (0.020 + 0.0006<em>b</em>) gives <em>b</em> ≈ 39 and a 43 ms batch, so the worst case is a request that arrives just after a batch starts and waits for it, then for its own: about 87 ms. At night a request runs alone in about 21 ms. The cost: at low load the GPU runs many small, inefficient batches. On a dedicated GPU nobody pays for that.</li>
+<li><em>Wait up to a window (say 10 ms) for the batch to fill.</em> Fewer, larger batches at low and middle load. The cost: every request at night pays up to 10 ms for nothing, and the window has to be retuned when the profile changes. It wins when the GPU is shared with another model, or when GPU-seconds are billed, because then the idle time has a buyer.</li>
+</ul>
+<p>Here the GPU is dedicated and the objective is latency, so I would run whenever idle and keep the window as a setting at zero.</p>
+<p><strong>The quantity: the queue limit.</strong> Above 1,250 per second the queue grows without bound unless something rejects. Under saturation a request with <em>Q</em> requests ahead of it waits up to 80 ms for the batch in flight, then runs in batch number ceil((<em>Q</em> + 1) / 100) after it, each 80 ms. Two batches fit 250 ms (80 + 160 = 240 ms) and three do not, so the request must be among the first 200 queued: <em>Q</em> ≤ 199. I would not ship 199 as a fixed count, for the reason in the failure mode below; I would admit a request only if the in-flight batch plus the batches ahead of it, at the measured batch time, fit its deadline, which gives 199 at the profiled numbers and less when batches slow down. A limit from 100 to 200 is reasonable here; below 100 rejects requests that would have made it, which matters with a client that retries. A limit of 1,000 is not: the request at position 1,000 waits for the batch in flight and 11 more, 960 ms, and the client gives up at 1 second and retries into a longer queue.</p>
+<p><strong>The constraint conflict: rejection against a client that retries.</strong> At 1,500 per second offered, 250 per second are rejected, and the client turns each into up to three more attempts at once. The GPU still does 1,250 per second; what must not happen is the retries reaching it. So the rejection is taken before the body is parsed or tokenized, costs microseconds, and carries <code>Retry-After</code> for the day the client honours it. A request whose deadline passes while queued is dropped before it reaches the GPU, because its caller has already gone.</p>
+<p><strong>Results to the right caller.</strong> Each queue entry carries its own future; the worker completes futures in input order after the batch returns, or sets the exception on every future in the batch if the pass fails. A failing input is found by splitting the batch in halves and rerunning, and quarantined so one bad request does not fail 99 others every time it is retried.</p>
+<p><strong>Generation on the same GPU.</strong> A batch that runs until its longest member finishes leaves finished slots idle, so the worker switches to iteration-level scheduling: the running set holds up to 100 sequences, each step computes one token for each running sequence plus a chunk of new prompts under a per-step token budget, and a finished sequence's slot and KV blocks go to the next waiting request on the next step. Admission is bounded by free KV blocks, not by the count of 100. The budget trades time to first token against the gap between tokens. The harder constraint is the client: a synchronous caller with a 1-second timeout gets an answer only if time to first token plus output length times inter-token latency fits in a second. At an illustrative 25 ms between tokens, that is fewer than 40 output tokens. Longer outputs need streaming or an asynchronous job, which is the other team's change, so I would write that down rather than design around it.</p>
+<p><strong>Where this design fails.</strong> The 199 assumes every batch costs what the profile says, and the profile padded every input to 512 tokens. With real inputs, one 512-token input pads a batch of short ones to its length; with length-bucketed batches, a bucket of long inputs costs more per input than the profile. Either way the batch time rises when long inputs cluster, a fixed count of 199 admits requests that will miss 250 ms, and the first sign is p99 rising with the queue limit never reached. The deadline-based check uses the measured batch time over the last few seconds, so it shrinks the effective limit when batches get slower; bucketing by length keeps one long input from inflating a batch of short ones.</p>
+<p><strong>What I give up.</strong> Callers above capacity get a fast 429 and their own retries instead of a slow success. GPU efficiency at night. Priorities between callers, which this design does not have.</p>
+<p><strong>Rollout plan.</strong> Week 1: build the worker, the queue and deadline admission behind a flag, with a fake model and a fake clock in tests for batch formation and rejection; replay a recorded hour of traffic against a staging GPU. Week 2: shadow production traffic at 10%, then serve 10%, 50% and 100% over three days. Rollback triggers, each reverting to the previous path: server-side p99 above 250 ms for 10 minutes at under 1,000 requests per second offered; any request completed with another request's result (checked by echoing a request id through the batch); a 429 rate above 1% while offered load is under 1,000 per second, which means admission is wrong rather than the GPU being full. The risk note names the retrying client as an accepted risk until next quarter.</p>
 </Fragment>
 <Fragment slot="followups">
 <ul>
-<li><em>How do you pick the batching delay?</em> From the latency budget: if p99 must stay under a target, the delay plus the batch run time must fit inside it at the expected load. Measure throughput against batch size to see where larger batches stop paying.</li>
-<li><em>Why not one thread per request calling the model?</em> The GPU would run many batch-1 passes, each rereading all the weights, which wastes most of its bandwidth.</li>
-<li><em>Callers want streaming after all. What changes?</em> Futures become per-request channels; the worker pushes each new token, and time to first token becomes a separate objective.</li>
+<li><em>Pushback: the checkout team says a 429 is worse for them than a 2-second answer. Which callers do you let queue longer, how do you keep them from taking everyone's latency with them, and what do you write down?</em></li>
+<li><em>Reversal: what measurement would make you add a batching window after all?</em> A second model sharing this GPU, or GPU-seconds billed to the team, with the night-time p99 still well inside the objective after adding the window.</li>
+<li><em>The model is replaced by one twice as slow per input. Which of your numbers change, and who signs off on the new objective or the second GPU?</em></li>
 </ul>
 </Fragment>
 </Depth>
 
-The parts interviewers listen for: two triggers for a batch (size and age), a per-request handle so results return to the right caller, bounded queues with explicit rejection, and recognising that generation needs per-step scheduling rather than per-batch. A strong answer also notes the trade-off that batching buys throughput at the cost of each caller's latency; Databricks' A100 example saw about 14 times the throughput for about 4 times the latency at batch 64.
-
 ### Sketch
 
 ```python
-class Batcher:
-    def __init__(self, model, max_batch=100, max_wait_s=0.01, max_queue=1000):
-        self.q = queue.Queue(maxsize=max_queue)
-        ...
+import queue, time
+from concurrent.futures import Future
 
-    def submit(self, x, timeout_s):
+class Batcher:
+    def __init__(self, model, max_batch=100, deadline_s=0.25):
+        self.q = queue.Queue()
+        self.model, self.max_batch, self.deadline_s = model, max_batch, deadline_s
+        self.batch_s = 0.080               # full-batch time, updated from measured batches
+
+    def submit(self, x):
+        batches_ahead = 1 + (self.q.qsize() + 1 + self.max_batch - 1) // self.max_batch   # in flight + up to its own
+        if batches_ahead * self.batch_s > self.deadline_s:
+            raise Overloaded()             # HTTP 429 with Retry-After, before parsing the body further
         fut = Future()
-        try:
-            self.q.put_nowait((x, fut, time.monotonic() + timeout_s))
-        except queue.Full:
-            raise Overloaded()                 # HTTP 429 with Retry-After
-        return fut.result(timeout=timeout_s)
+        self.q.put((x, fut, time.monotonic() + self.deadline_s))
+        return fut.result(timeout=self.deadline_s)
 
     def worker(self):
         while True:
-            batch = [self.q.get()]             # block for the first item
-            first_at = time.monotonic()
+            batch = [self.q.get()]         # idle: block for the first request
             while len(batch) < self.max_batch:
-                left = self.max_wait_s - (time.monotonic() - first_at)
-                if left <= 0:
-                    break
                 try:
-                    batch.append(self.q.get(timeout=left))
+                    batch.append(self.q.get_nowait())   # take what queued while the GPU was busy
                 except queue.Empty:
                     break
-            live = [b for b in batch if b[2] > time.monotonic()]
-            ...                                # run model, set each future's result or exception
+            now = time.monotonic()
+            live = [b for b in batch if b[2] > now]
+            ...                            # run live inputs, set each future, update batch_s
 ```
 
 ## Follow-ups
 
-- *Two model sizes on the same GPU?* Separate queues and a scheduler that time-slices the GPU, or separate GPUs; mixing models in one batch is not possible.
-- *Priority customers?* Two queues with weighted admission and a starvation guard for the lower tier.
-- *How do you test it?* Deterministic tests with a fake model and a fake clock for the batching triggers; a load test for latency percentiles against batch size.
+- *Two callers send 30% of the traffic each and one of them bursts. How do you stop one caller's burst from filling the queue for the other?*
+- *How do you test the batch formation and the admission rule without a GPU?* A fake model whose run time follows the profile and a fake clock, so batch sizes and rejections are exact for a scripted arrival pattern.
+- *The second GPU arrives next month. What routes between the two, and what signal does the router use?*
 
 ## Common mistakes
 
-- Waiting only for a full batch, so a single request at night waits forever.
+- Waiting only for a full batch, so a lone request at night waits forever.
 - An unbounded queue, which turns overload into timeouts for everyone instead of fast rejections for some.
-- Static batches for text generation, so short requests wait for long ones.
-- Admitting by slot count only, then running out of KV memory mid-generation.
+- A queue limit set as a count from a padded profile and never revisited.
+- Letting rejected requests reach tokenization or the GPU, so client retries add load where capacity is shortest.
+- Static batches for text generation, so short outputs wait for long ones.
+- Promising a synchronous response for generation without checking output length against the caller's timeout.

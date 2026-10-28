@@ -1,0 +1,355 @@
+---
+id: inf-020
+title: A step scheduler with chunked prefill and a token budget
+subtitle: the preemption order is yours; the tests check invariants, not one schedule
+track: inference
+module: batching
+type: code
+difficulty: hard
+seniority: [senior, staff]
+minutes: 50
+core: false
+tags: [continuous-batching, chunked-prefill, token-budget, preemption, scheduler, vllm]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: vLLM V1 alpha release blog (2025-01-27)
+    url: https://vllm.ai/blog/2025-01-27-v1-alpha-release
+    note: "scheduling decisions are a dictionary of request id to tokens for the step, with no separate prefill and decode phases; chunked prefill falls out of a fixed token budget. Checked 2026-10-28."
+  - title: vLLM docs, Optimization and tuning (latest, checked 2026-10-28)
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: "V1 batches all pending decodes before any prefill and chunks a prefill that does not fit max_num_batched_tokens; smaller values such as 2048 give better inter-token latency, higher values better time to first token; RECOMPUTE is the default preemption mode. Checked 2026-10-28."
+  - title: vLLM source, v1/core/sched/scheduler.py (main branch, read 2026-10-28)
+    url: https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/sched/scheduler.py
+    note: "RUNNING requests are scheduled first from the step's token budget; under FCFS the victim is the last request in the running list. Checked 2026-10-28."
+  - title: "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve (Agrawal et al., arXiv 2403.02310, v3 2024-06-17)"
+    url: https://arxiv.org/abs/2403.02310
+    note: "chunked prefills let new requests join a batch without pausing ongoing decodes; the abstract reports up to 2.6 times the serving capacity of vLLM for Mistral-7B on one A100 under tail-latency constraints. Checked 2026-10-28."
+code:
+  starter: |
+    class StepScheduler:
+        def __init__(self, token_budget, num_blocks, block_size=16, max_running=256):
+            self.token_budget = token_budget
+            self.num_blocks = num_blocks
+            self.block_size = block_size
+            self.max_running = max_running
+
+        def submit(self, rid, prompt_len, max_new):
+            """Queue a request. Raise ValueError if prompt_len + max_new could never fit in the KV pool."""
+            raise NotImplementedError
+
+        def step(self):
+            """Plan one engine step and apply it. Return (scheduled, preempted): scheduled maps rid to the tokens computed
+            this step; preempted lists the rids sent back to waiting this step (their KV is dropped and recomputed)."""
+            raise NotImplementedError
+
+        def done(self):
+            raise NotImplementedError
+  tests: |
+    class Model:
+        """Replays the scheduler's decisions and checks the rules from the outside."""
+
+        def __init__(self, s):
+            self.s, self.state, self.running, self.done = s, {}, set(), set()
+
+        def submit(self, rid, prompt_len, max_new):
+            self.s.submit(rid, prompt_len, max_new)
+            self.state[rid] = [0, prompt_len, 0, max_new]       # computed, known, outputs, max_new
+
+        def step(self):
+            start = set(self.running)
+            sched, preempted = self.s.step()
+            assert sum(sched.values()) <= self.s.token_budget, "token budget exceeded"
+            for rid in preempted:
+                assert rid in self.running and rid not in sched, f"{rid} preempted while not running, or scheduled anyway"
+                self.running.discard(rid)
+                self.state[rid][0] = 0
+            admitted = [rid for rid in sched if rid not in self.running]
+            if admitted:
+                assert start <= set(sched) | set(preempted), "a waiting request got tokens before every running one"
+            for rid, n in sched.items():
+                c, k, _, _ = self.state[rid]
+                assert rid not in self.done and 1 <= n <= k - c, f"{rid} scheduled {n} tokens with {k - c} left"
+                self.running.add(rid)
+            assert len(self.running) <= self.s.max_running, "too many running requests"
+            bs = self.s.block_size
+            blocks = sum(-(-(self.state[r][0] + sched.get(r, 0)) // bs) for r in self.running)
+            assert blocks <= self.s.num_blocks, f"{blocks} blocks in use, the pool has {self.s.num_blocks}"
+            for rid, n in sched.items():
+                st = self.state[rid]
+                st[0] += n
+                if st[0] == st[1]:
+                    st[1] += 1
+                    st[2] += 1
+                    if st[2] == st[3]:
+                        self.done.add(rid)
+                        self.running.discard(rid)
+            return sched, preempted
+
+        def run(self, limit):
+            steps = 0
+            while len(self.done) < len(self.state):
+                self.step()
+                steps += 1
+                assert steps <= limit, "some request never finished"
+            return steps
+
+    m = Model(StepScheduler(token_budget=64, num_blocks=100, block_size=16, max_running=8))
+    m.submit("a", 10, 3)
+    m.submit("b", 100, 2)
+    s, p = m.step()
+    assert s == {"a": 10, "b": 54} and p == [], f"a fits whole, b gets the 54 tokens left; got {s}"
+    s, p = m.step()
+    assert s.get("a") == 1 and s.get("b") == 46, f"a's decode goes first, then the rest of b's prompt; got {s}"
+    assert m.run(100) <= 100
+    m = Model(StepScheduler(token_budget=32, num_blocks=6, block_size=4, max_running=4))
+    for i in range(6):
+        m.submit(f"r{i}", 6, 8)
+    assert m.run(500) < 500
+  hidden: |
+    class Model:
+        def __init__(self, s):
+            self.s, self.state, self.running, self.done = s, {}, set(), set()
+
+        def submit(self, rid, prompt_len, max_new):
+            self.s.submit(rid, prompt_len, max_new)
+            self.state[rid] = [0, prompt_len, 0, max_new]       # computed, known, outputs, max_new
+
+        def step(self):
+            start = set(self.running)
+            sched, preempted = self.s.step()
+            assert sum(sched.values()) <= self.s.token_budget, "token budget exceeded"
+            for rid in preempted:
+                assert rid in self.running and rid not in sched, f"{rid} preempted while not running, or scheduled anyway"
+                self.running.discard(rid)
+                self.state[rid][0] = 0
+            admitted = [rid for rid in sched if rid not in self.running]
+            if admitted:
+                assert start <= set(sched) | set(preempted), "a waiting request got tokens before every running one"
+            for rid, n in sched.items():
+                c, k, _, _ = self.state[rid]
+                assert rid not in self.done and 1 <= n <= k - c, f"{rid} scheduled {n} tokens with {k - c} left"
+                self.running.add(rid)
+            assert len(self.running) <= self.s.max_running, "too many running requests"
+            bs = self.s.block_size
+            blocks = sum(-(-(self.state[r][0] + sched.get(r, 0)) // bs) for r in self.running)
+            assert blocks <= self.s.num_blocks, f"{blocks} blocks in use, the pool has {self.s.num_blocks}"
+            for rid, n in sched.items():
+                st = self.state[rid]
+                st[0] += n
+                if st[0] == st[1]:
+                    st[1] += 1
+                    st[2] += 1
+                    if st[2] == st[3]:
+                        self.done.add(rid)
+                        self.running.discard(rid)
+            return sched, preempted
+
+        def run(self, limit):
+            steps = 0
+            while len(self.done) < len(self.state):
+                self.step()
+                steps += 1
+                assert steps <= limit, "some request never finished"
+            return steps
+
+    import random
+    import time
+
+    def run_random(seed):
+        rng = random.Random(seed)
+        bs = rng.choice([4, 8, 16])
+        blocks = rng.randint(8, 60)
+        m = Model(StepScheduler(token_budget=rng.choice([16, 64, 256]), num_blocks=blocks, block_size=bs, max_running=rng.choice([2, 8, 32])))
+        n, steps, seen_preempt = 0, 0, False
+        for _ in range(60):
+            for _ in range(rng.randint(0, 3)):
+                k = rng.randint(1, 30)
+                p = rng.randint(1, max(1, blocks * bs - k))
+                m.submit(f"r{n}", p, k)
+                n += 1
+            _, pre = m.step()
+            seen_preempt = seen_preempt or bool(pre)
+            steps += 1
+        while len(m.done) < len(m.state):
+            _, pre = m.step()
+            seen_preempt = seen_preempt or bool(pre)
+            steps += 1
+            if steps > 50000:
+                return None
+        return seen_preempt
+
+    results = [run_random(s) for s in range(30)]
+    assert None not in results and sum(1 for r in results if r) >= 5
+    s = StepScheduler(token_budget=64, num_blocks=4, block_size=16)
+    try:
+        s.submit("never", 60, 5)
+        refused = False
+    except ValueError:
+        refused = True
+    assert refused
+    s = StepScheduler(token_budget=8192, num_blocks=1_000_000, block_size=16, max_running=256)
+    for i in range(200_000):
+        s.submit(i, 32, 4)
+    t0 = time.perf_counter()
+    for _ in range(1000):
+        s.step()
+    elapsed = time.perf_counter() - t0
+    assert len(s.finished) > 50_000
+    assert elapsed < 2.5
+  solution: |
+    from collections import deque
+
+
+    class Req:
+        __slots__ = ("rid", "known", "max_new", "computed", "outputs", "held")
+
+        def __init__(self, rid, prompt_len, max_new):
+            self.rid, self.known, self.max_new = rid, prompt_len, max_new
+            self.computed = self.outputs = self.held = 0
+
+
+    class StepScheduler:
+        def __init__(self, token_budget, num_blocks, block_size=16, max_running=256):
+            self.token_budget = token_budget
+            self.num_blocks = num_blocks
+            self.block_size = block_size
+            self.max_running = max_running
+            self.free_blocks = num_blocks
+            self.waiting = deque()
+            self.running = []               # admission order
+            self.reqs = {}
+            self.finished = []
+
+        def _blocks(self, tokens):
+            return -(-tokens // self.block_size)
+
+        def submit(self, rid, prompt_len, max_new):
+            if rid in self.reqs:
+                raise ValueError(f"duplicate request id {rid}")
+            if prompt_len < 1 or max_new < 1 or prompt_len + max_new > self.num_blocks * self.block_size:
+                raise ValueError("this request could never fit in the KV pool")
+            r = Req(rid, prompt_len, max_new)
+            self.reqs[rid] = r
+            self.waiting.append(r)
+
+        def _preempt(self, v, preempted):
+            self.free_blocks += v.held
+            v.held = v.computed = 0
+            self.running.remove(v)
+            self.waiting.appendleft(v)
+            preempted.append(v.rid)
+
+        def step(self):
+            sched, preempted, budget = {}, [], self.token_budget
+            decodes = [r for r in self.running if r.known - r.computed == 1]
+            prefills = [r for r in self.running if r.known - r.computed > 1]
+            gone = set()
+            for r in decodes + prefills:
+                if budget == 0:
+                    break
+                if r.rid in gone:
+                    continue
+                n = min(r.known - r.computed, budget)
+                need = self._blocks(r.computed + n) - r.held
+                while need > self.free_blocks:
+                    # Policy: preempt the most recently admitted request not yet scheduled this step (vLLM's FCFS order).
+                    victim = next(v for v in reversed(self.running) if v.rid not in sched)
+                    self._preempt(victim, preempted)
+                    gone.add(victim.rid)
+                    if victim is r:
+                        break
+                if r.rid in gone:
+                    continue
+                self.free_blocks -= need
+                r.held += need
+                sched[r.rid] = n
+                budget -= n
+            if not preempted:
+                # Admitting in a step that preempted would hand the freed blocks straight back and thrash.
+                while self.waiting and budget > 0 and len(self.running) < self.max_running:
+                    r = self.waiting[0]
+                    n = min(r.known - r.computed, budget)
+                    need = self._blocks(n)
+                    if need > self.free_blocks:
+                        break
+                    self.waiting.popleft()
+                    self.running.append(r)
+                    self.free_blocks -= need
+                    r.held = need
+                    sched[r.rid] = n
+                    budget -= n
+            done = False
+            for rid, n in sched.items():
+                r = self.reqs[rid]
+                r.computed += n
+                if r.computed == r.known:
+                    r.outputs += 1
+                    r.known += 1
+                    if r.outputs == r.max_new:
+                        self.free_blocks += r.held
+                        r.held = 0
+                        self.finished.append(rid)
+                        done = True
+            if done:
+                self.running = [r for r in self.running if r.outputs < r.max_new]
+            return sched, preempted
+
+        def done(self):
+            return not self.waiting and not self.running
+---
+
+## Question
+
+Write the per-step scheduler of a continuous-batching engine. `step()` plans one forward pass, applies it, and returns `(scheduled, preempted)`: the tokens computed for each request this step, and the requests sent back to waiting.
+
+The engine's model of a request, which the tests replay from your return values:
+
+- A request knows `prompt_len + outputs` tokens and has computed some of them. A step may schedule it any number from 1 to the tokens it has left. In the step where its computed count reaches the known count, it emits one output token, so the known count grows by one; a decoding request has exactly one token left each step. It finishes at `max_new` outputs.
+- KV memory is `num_blocks` blocks of `block_size` tokens. A running request holds the blocks for the tokens it has computed plus those scheduled this step. A finished request releases them.
+- Preemption is by recompute: a preempted request releases its blocks, its computed count returns to zero, it keeps its outputs, and it goes back to waiting. It cannot also be scheduled in the step that preempted it.
+
+The rules every step must keep: tokens scheduled at most `token_budget`; running requests at most `max_running`; blocks in use at most `num_blocks`; and no waiting request gets tokens in a step unless every request that was running at the start of the step was either scheduled or preempted. Every request must finish. `submit` refuses a request that could never fit in the pool on its own.
+
+Two decisions are yours: which running request to preempt when blocks run out, and whether to cap the tokens one prefill takes per step. State the cost of each choice.
+
+Some test workloads queue 200,000 requests at once. A thousand steps of such a workload must take under 2.5 seconds, including in the browser. Standard library only.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask whether a request can be chosen as the victim of its own block shortage, and what happens to it then.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the scheduler should do with waiting requests in a step that has just preempted one.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Profile one step with 200,000 waiting and 256 running: count how many requests your code touches.</p></details>
+
+## Answer
+
+The reference solution holds a deque of waiting requests, a list of running ones in admission order, and a count of free blocks; each request carries its known count, computed count, outputs and blocks held.
+
+**One step.** It spends the budget on running requests first, decodes before partial prefills, giving each `min(tokens left, budget left)`. Before scheduling a request it computes the new blocks it needs, `ceil((computed + n) / block_size) - held`. If they are not free, it preempts until they are. Only then, and only if nothing was preempted this step, does it admit from the head of the waiting queue, while the budget, the running cap and the free blocks allow. Admitting in a step that preempted would hand the blocks just freed to a newcomer, and the next step would preempt again. Last, it applies the step: computed counts advance, requests that reached their known count emit a token, and finished requests release their blocks.
+
+**The work per step** is proportional to the running set and to the requests admitted, never to the waiting queue. A deque gives the head in constant time. The reference runs the 1,000-step test in about 0.1 seconds on a laptop; a variant that only adds one list comprehension over the waiting queue per step took long enough to fail the 2.5-second limit there.
+
+**The preemption decision.** The candidates are running requests not yet scheduled this step, including the one that needs room.
+
+- *Most recently admitted first*, which is what vLLM V1 does under FCFS and what the reference does. The oldest request is never a victim while a younger one is running, so it always progresses, and that is the argument that every request finishes. The cost: when the request needing room is itself the newest, it preempts itself, and a long prompt admitted last under steady pressure can be thrown back repeatedly with its prefill recomputed each time.
+- *The request holding the most blocks*. Fewest victims per shortage. The cost: it targets long contexts, which are the most expensive to recompute, and it gives up the argument above, so it needs its own guarantee that every request finishes, such as an age after which a request is never a victim.
+
+**The cap.** Without one, a running prefill takes everything decodes leave, and waiting prompts get nothing until it completes. A per-request cap (vLLM calls it `long_prefill_token_threshold`) leaves budget for short prompts behind a long one. It costs the long prompt time to first token, since its prefill now spans more steps. The reference ships without a cap, and the tests accept either.
+
+**The budget is a constraint conflict.** A larger budget gets prompts through prefill in fewer steps, so time to first token falls. Every step that carries a large prefill chunk is slower, so every running decode waits longer for its next token. The vLLM docs give the same direction for `max_num_batched_tokens`: 2048 for inter-token latency, above 8192 for throughput. The scheduler cannot resolve this. It can only make the budget a parameter and report both latencies.
+
+**Where it fails.** Decodes are served before prefills and running before waiting, so under heavy decode load with a small budget, prefills get only what is left. A burst of decodes can hold time to first token for every waiting request at whatever the queue length implies, with nothing in this design to bound it.
+
+## Follow-ups
+
+- *A product team wants their requests' time to first token under 500 ms at p99 and offers to pay for it. Your scheduler has no priorities. What do you add, which of the four rules does it bend, and what do you put in writing about the cost to everyone else?*
+- *What would you need to see in production to switch from preempting the newest request to preempting the one holding the most blocks?* Preemption counts by victim size, and the recompute tokens each policy would spend on the same trace.
+- *What changes to run this in a real engine?* The step's plan feeds the model runner's batch and the block manager, which owns real block ids; the token count per step comes from the measured step time, not a constant; the scheduler runs on one thread and overlaps with the GPU's previous step, so its own time per step becomes part of inter-token latency.
+
+## Common mistakes
+
+- Scanning or sorting the waiting queue every step, which makes step time grow with the backlog.
+- Admitting waiting requests ahead of running ones, which starves decodes whenever the queue is long.
+- Scheduling a request in the same step it was preempted, or choosing a victim already scheduled, so the step computes tokens for a request with no blocks.
+- Reserving blocks for a request's whole `max_new` at admission, which is the contiguous allocator's waste in another form.
+- Forgetting that the step completing a prompt also emits a token.

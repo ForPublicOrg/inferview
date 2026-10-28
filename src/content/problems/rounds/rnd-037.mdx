@@ -1,0 +1,279 @@
+---
+id: rnd-037
+title: Duplicate passages after the second nightly run
+subtitle: an ingestion job, two runs of logs and one search result
+track: rounds
+module: codebase-rounds
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 35
+tags: [debug, rag, ingestion, incremental, idempotency, vector-index, code-reading]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: amitshekhariitbhu, AI engineering interview questions
+    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
+    note: "question bank; lists \"How do you handle document updates and maintain freshness in a RAG system?\", which this problem turns into a code-reading round. Checked 2026-10-28."
+  - title: Python docs, data model, object.__hash__
+    url: https://docs.python.org/3/reference/datamodel.html
+    note: "the __hash__() values of str and bytes objects are salted with an unpredictable random value; they stay constant within one process but are not predictable between repeated invocations of Python; see PYTHONHASHSEED. Hash randomisation has been on by default since Python 3.3. Checked 2026-10-28."
+choices:
+  - text: "`chunk_id` hashes text with the built-in `hash`, salted per process, so each run gives unchanged chunks new ids"
+    correct: true
+    why: "Every one of the 2,904 upserts became a new row, and the duplicate rows hold identical text under different ids; only an id that changes between processes for the same text explains both."
+  - text: "Nothing deletes the chunks an edit no longer produces, so earlier versions of edited passages stay in the index"
+    correct: false
+    why: "A real defect, and the next one to fix, but it leaves old versions of changed passages, not the same passage twice, and with stable ids the unchanged chunks would have overwritten their rows."
+  - text: "The watermark query also returns documents saved in the boundary second, so each run inserts some documents again"
+    correct: false
+    why: "The CMS call is strictly after the watermark, the log shows 312 documents, and a re-read document with stable ids would overwrite its rows rather than add to them."
+  - text: "`embed_all` reuses the previous batch's response after four rate-limit errors, so rows get another batch's vectors"
+    correct: false
+    why: "A real defect that attaches wrong vectors to some rows, but it changes no ids and adds no rows, and the job logged no failures."
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"Search results got worse after last night's ingestion run. Here is the job, its last two logs and one bad result. What is wrong, and what would you change first?"
+</Callout>
+
+The job, its logs and the result below are constructed for this problem. The job runs nightly in a fresh container: it asks the CMS for documents changed since the last run, chunks them, embeds the chunks and upserts them into a vector index whose `upsert` overwrites a row with the same id.
+
+```python
+"""Nightly job: pull documents changed in the CMS since the last run, chunk, embed, upsert into the vector index."""
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass
+from datetime import datetime
+
+from openai import OpenAI, RateLimitError
+
+from search.index import VectorIndex
+from cms.client import CmsClient
+
+log = logging.getLogger("ingest")
+
+STATE_PATH = os.environ.get("INGEST_STATE", "/var/lib/ingest/state.json")
+EMBED_MODEL = "text-embedding-3-small"
+CHUNK_WORDS = 300
+OVERLAP_WORDS = 40
+EMBED_BATCH = 64
+PAGE_SIZE = 200
+
+
+@dataclass
+class Doc:
+    id: str
+    title: str
+    body: str
+    updated_at: datetime
+    deleted: bool = False
+
+    @classmethod
+    def from_api(cls, d):
+        return cls(
+            id=d["id"],
+            title=d["title"].strip(),
+            body=d.get("body") or "",
+            updated_at=datetime.fromisoformat(d["updated_at"]),
+            deleted=d.get("deleted", False),
+        )
+
+
+def load_state():
+    if not os.path.exists(STATE_PATH):
+        return {"watermark": "1970-01-01T00:00:00+00:00", "runs": 0}
+    with open(STATE_PATH) as f:
+        return json.load(f)
+
+
+def save_state(state):
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE_PATH)
+
+
+def fetch_changed(cms, since):
+    # The CMS returns documents with updated_at strictly after `since`, oldest first.
+    docs, cursor = [], None
+    while True:
+        page = cms.list_documents(updated_after=since, cursor=cursor, limit=PAGE_SIZE)
+        docs.extend(Doc.from_api(d) for d in page["documents"])
+        cursor = page.get("next_cursor")
+        if not cursor:
+            return docs
+
+
+def split_words(text):
+    return text.replace("\r\n", "\n").split()
+
+
+def chunk(doc):
+    words = split_words(doc.body)
+    step = CHUNK_WORDS - OVERLAP_WORDS
+    pieces = []
+    for start in range(0, max(len(words), 1), step):
+        piece = " ".join(words[start:start + CHUNK_WORDS])
+        if piece:
+            pieces.append(f"{doc.title}\n\n{piece}")
+        if start + CHUNK_WORDS >= len(words):
+            break
+    return pieces
+
+
+def chunk_id(doc_id, text):
+    return f"{doc_id}:{hash(text) & 0xFFFFFFFF:08x}"
+
+
+def embed_all(client, texts):
+    vectors = []
+    for i in range(0, len(texts), EMBED_BATCH):
+        batch = texts[i:i + EMBED_BATCH]
+        for attempt in range(4):
+            try:
+                resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
+                break
+            except RateLimitError:
+                time.sleep(2 ** attempt)
+        vectors.extend(item.embedding for item in resp.data)
+    return vectors
+
+
+def to_rows(doc, texts, vectors):
+    return [
+        {
+            "id": chunk_id(doc.id, text),
+            "values": vector,
+            "metadata": {
+                "doc_id": doc.id,
+                "title": doc.title,
+                "text": text,
+                "updated_at": doc.updated_at.isoformat(),
+            },
+        }
+        for text, vector in zip(texts, vectors)
+    ]
+
+
+def ingest_doc(index, client, doc):
+    if doc.deleted:
+        index.delete(filter={"doc_id": doc.id})
+        return 0
+    texts = chunk(doc)
+    if not texts:
+        return 0
+    vectors = embed_all(client, texts)
+    rows = to_rows(doc, texts, vectors)
+    for i in range(0, len(rows), 100):
+        index.upsert(rows[i:i + 100])
+    return len(rows)
+
+
+def run():
+    state = load_state()
+    cms, client, index = CmsClient.from_env(), OpenAI(), VectorIndex.from_env("kb-chunks")
+    since = state["watermark"]
+    docs = fetch_changed(cms, since)
+    log.info("run %d: %d documents changed since %s", state["runs"] + 1, len(docs), since)
+    upserted = deleted = failed = 0
+    newest = since
+    for doc in docs:
+        try:
+            n = ingest_doc(index, client, doc)
+        except Exception:
+            log.exception("document %s failed", doc.id)
+            failed += 1
+            continue
+        if doc.deleted:
+            deleted += 1
+        upserted += n
+        newest = max(newest, doc.updated_at.isoformat())
+    state["watermark"] = newest
+    state["runs"] += 1
+    save_state(state)
+    log.info("chunks upserted: %d, documents deleted: %d, failed: %d", upserted, deleted, failed)
+    log.info("index size: %d", index.count())
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    run()
+```
+
+The two logs, from the first run on an empty index and the run the night after:
+
+```text
+INFO run 1: 6412 documents changed since 1970-01-01T00:00:00+00:00
+INFO chunks upserted: 48210, documents deleted: 0, failed: 0
+INFO index size: 48210
+
+INFO run 2: 312 documents changed since 2026-10-26T23:58:41+00:00
+INFO chunks upserted: 2904, documents deleted: 0, failed: 0
+INFO index size: 51114
+```
+
+A support agent's search for the refund rules on annual plans returns, as its top two results:
+
+```text
+score  id                    doc_id       updated_at                 text
+0.83   faq-billing:3f9a01c2  faq-billing  2026-10-27T14:02:11+00:00  Billing FAQ / Annual plans can be refunded until the end of the first billing period...
+0.83   faq-billing:a71e5d09  faq-billing  2026-10-25T09:40:57+00:00  Billing FAQ / Annual plans can be refunded until the end of the first billing period...
+```
+
+The FAQ was edited on 27 October, in a different section. Pick the defect that explains these symptoms, then rank the other real defects in the file by what they will do next.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what the index size after run 2 would have been if every upsert of an unchanged chunk had overwritten its row.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the result of running run 2 a second time on the same 312 documents, once inside the same Python process and once in a new container.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask for every row the index holds for a document that has not changed since run 1.</p></details>
+
+## Answer
+
+The arithmetic in the logs settles most of it: 48,210 + 2,904 = 51,114, so every chunk upserted in run 2 became a new row and none overwrote an old one. An edit to one section of the FAQ leaves most of its chunks word for word the same, and those should have overwritten their rows. They did not, so the id of an unchanged chunk changed between the two runs. `chunk_id` uses the built-in `hash`, which Python salts per process: the value is stable inside one run, which is why run 1 looks perfect and every test that runs the pipeline once passes, and it differs in the next container. The duplicate in the search result is the same text under two ids, with run 1's `updated_at` on one and run 2's on the other.
+
+Why the wrong picks are tempting. The missing delete is real: the FAQ chunks whose text changed leave their old versions behind, and once ids are stable it is the defect users see next. But it produces an old and a new version of a passage, not the same passage twice, and it cannot explain the size arithmetic. The boundary-second theory confuses a re-read with a duplicate: the comment says strictly after, the run listed 312 documents, and with stable ids a re-read document would overwrite its own rows. The `embed_all` defect is real and nasty, since after four rate limits `resp` still holds the previous batch's response and its vectors go onto this batch's chunks, but it adds no rows and changes no ids.
+
+The rest of the file, ranked by what it will do:
+
+1. **Failed documents are skipped for good.** A document that raises is logged and skipped, but the watermark still moves past it when a later document succeeds, so it is never fetched again. Like the id bug, this shows on the second run, and only as an absence.
+2. **No delete of superseded chunks**, as above.
+3. **`embed_all` after exhausted retries** attaches wrong vectors, or raises `NameError` on the first batch, which then feeds defect 1.
+4. **The watermark boundary.** The newest `updated_at` seen becomes the watermark, and the next run asks for strictly later times. A document saved in that same second, but committed after the CMS listing was read, is skipped forever. Rare, and silent.
+5. **`max` over ISO strings.** It works only while every timestamp carries the same offset.
+
+What to collect before acting, and what to do without it. Ask for every row the index holds for `faq-billing`, and whether the job's container sets `PYTHONHASHSEED`. Without either, the size arithmetic and the identical texts are enough to fix the id now: a hash that does not depend on the process, `sha256(doc_id + "\0" + text)`, which also makes reruns overwrite.
+
+### The decision: how to clean up
+
+Two cleanups are defensible, and the deadline is that duplicates are in production search today.
+
+- **Rebuild into a new index and switch over.** Re-chunk and re-embed every document with the fixed ids, then point search at the new index. Cost: a full re-embed. Each chunk is at most 300 words, so 48,210 chunks are at most 14,463,000 words; choose a tokens-per-word figure for your corpus and multiply. It also takes as long as the embedding rate limit allows, during which the old index keeps serving duplicates.
+- **Re-key in place.** Re-chunk every document (no embedding), compute the new ids, copy the stored vector of each surviving chunk to its new id, delete every row whose id is not in the new set. Cost: no embedding spend, but it is a one-off migration over the live index, and a mistake in it deletes good rows; it also keeps any wrong vectors that the `embed_all` defect already wrote.
+
+The rebuild is the safer choice when the re-embed cost is small next to the cost of a bad migration, and it also clears the wrong vectors. The re-key wins when the corpus is large enough that the re-embed cost or time is the constraint.
+
+For new runs, delete what an edit no longer produces: per document, upsert the new rows first, then delete that document's rows whose ids are not in the new set. Upserting first means search never sees the document missing.
+
+**Where this answer fails.** The per-document delete needs a list of the document's current row ids. Some vector stores serve filtered listings from an index that lags writes, so the list can miss rows written seconds earlier, and a crash between the upsert and the delete leaves stale rows until the document is next edited. Make the per-document step safe to repeat and run a nightly reconciliation that compares row counts per document with the chunk counts the job expects. Content-addressed ids also merge identical chunks inside one document, such as repeated boilerplate, so "chunks upserted" in the log will no longer equal the change in index size, and any alert built on that equality has to change.
+
+## Follow-ups
+
+- *The full re-embed costs more than this quarter's embedding budget allows, and the re-key migration needs a week of review. Which do you run, and what risk do you accept in writing?* Re-key, with a dry run that reports how many rows each document would lose, and accept in writing that rows with wrong vectors stay until those documents are next edited.
+- *What would you need to see to switch from per-document diffs to delete-all-then-insert for each edited document?* Evidence that the vector store's filtered listing lags writes enough to leave stale rows, and edit volumes small enough that re-embedding whole documents costs little.
+- *Two engineers disagree: one wants ids from content hashes, the other from (document id, chunk position). How do you decide without deciding by rank?* Replay a month of real edits through both and count re-embedded chunks and stale rows; position ids shift every chunk after an insertion, which is usually the deciding cost.
+- *Which test would have caught the id bug before it shipped?* Run the pipeline twice on the same input in two separate processes and assert the index size does not change; a test that runs it twice in one process passes with the bug.
+
+## Common mistakes
+
+- Picking the missing delete because it is the most visible gap in the code; it explains old versions, not identical duplicates.
+- Keeping `hash` and setting a fixed `PYTHONHASHSEED`, which ties every id in the index to an environment variable that nothing in the code checks.
+- Rebuilding the index without fixing the id first, which produces a clean index that duplicates again on the next run.
+- Adding the delete before the upsert, which leaves the document out of search for the length of the embedding call.
+- Treating the run log's "failed: 0" as proof that nothing was skipped, when a skipped document never appears in a later run's count at all.

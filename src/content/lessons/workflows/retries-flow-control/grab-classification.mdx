@@ -1,0 +1,161 @@
+---
+title: Grab data classification
+track: workflows
+module: retries-flow-control
+order: 4
+kind: teardown
+level: senior
+minutes: 13
+summary: Grab classifies the columns of its data entities with GPT-3.5 behind an orchestration service that batches requests through a queue and rate-limits them under one shared quota, then publishes tags to Kafka for owners to verify weekly.
+prerequisites: [workflows/retries-flow-control/queues-backpressure]
+updated: 2026-10-28
+sources:
+  - title: Grab Engineering, LLM-powered data classification for data entities at scale (published October 2023, updated 2024-07-15)
+    url: https://engineering.grab.com/llm-powered-data-classification
+    note: Gemini orchestration service; mini-batches through a message queue at fixed intervals; workflow-level rate limiter; one 240K tokens-per-minute quota shared by all Azure OpenAI deployments; GPT-3.5 context of 4,000 tokens shared by input and output; prompt from table and column names with a tag library, few-shot examples and a JSON output schema; default None tag; Kafka publication; weekly owner verification; over 20,000 entities in the first month at about 300 to 400 per day; 2 minutes per entity and about 360 man-days per year saved; owners change fewer than one tag on average on acknowledged tables; 80 percent in an internal survey said it helped; half of all schemas were Tier 1 under manual tagging
+---
+
+import Depth from '../../../../components/Depth.astro';
+import Diagram from '../../../../components/Diagram.astro';
+import Trace from '../../../../components/Trace.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What it is and who runs it
+
+Grab's data engineering team (Caspian) and its data governance team built a pipeline that tags every column of a data entity, meaning a database table, a stream message schema or a data lake table, with a sensitivity or data-type tag such as Personal.ID, Personal.Name, Personal.Contact_Info or Geo.Geohash, or None. The tags, combined with rules from Grab's data privacy office, determine an entity's sensitivity tier; Grab writes that the tier will be used to enforce attribute-based access control policies and dynamic data masking on downstream queries.
+
+The orchestration service is called Gemini. It is Grab's internal name and has nothing to do with Google's model; the model in the published version is GPT-3.5 on Azure OpenAI. Gemini predates the model: it was first built around a third-party classification service whose regex patterns produced too many false positives in Grab's evaluation and whose classifiers could not be customised. The post says both engines were running concurrently while Grab evaluated them.
+
+The problem it replaced was manual tagging that could not keep up and that developers applied inconsistently. Under the manual process half of all schemas were marked Tier 1, the strictest level, because one Tier 1 table makes its whole schema Tier 1. Over-tagging there is an access-control cost, not only a labelling error.
+
+This is a workflow with one model step, not an agent. It sits in this module because its design is shaped by the constraint the previous lesson covered: one token quota shared by every caller.
+
+## The system
+
+<Diagram
+  title="Grab's classification pipeline, as published"
+  nodes={[
+    { id: 'platforms', label: 'Data platforms', note: 'send classification requests' },
+    { id: 'gemini', label: 'Request grouping', note: 'Gemini orchestration service' },
+    { id: 'queue', label: 'Message queue', note: 'mini-batches at fixed intervals' },
+    { id: 'limiter', label: 'Workflow rate limiter', note: 'one 240K TPM quota, shared' },
+    { id: 'llm', label: 'GPT-3.5 on Azure OpenAI', note: 'JSON out, default None tag' },
+    { id: 'third', label: 'Third-party classifier', note: 'evaluated concurrently' },
+    { id: 'kafka', label: 'Kafka topic', note: 'tag predictions' },
+    { id: 'meta', label: 'Metadata and database platforms', note: 'store tags, set tier' },
+    { id: 'owners', label: 'Data owners', note: 'weekly verification' },
+  ]}
+  edges={[
+    { from: 'platforms', to: 'gemini', label: 'requests' },
+    { from: 'gemini', to: 'queue', label: 'grouped' },
+    { from: 'gemini', to: 'third', label: 'also classified' },
+    { from: 'queue', to: 'limiter', label: 'mini-batch' },
+    { from: 'limiter', to: 'llm', label: 'prompt' },
+    { from: 'llm', to: 'kafka', label: 'tags' },
+    { from: 'kafka', to: 'meta', label: 'consumed' },
+    { from: 'meta', to: 'owners', label: 'weekly notice' },
+    { from: 'owners', to: 'meta', label: 'confirm or edit' },
+  ]}
+  rows={[['platforms'], ['gemini'], ['queue', 'third'], ['limiter'], ['llm'], ['kafka'], ['meta'], ['owners']]}
+/>
+
+**Data platforms** are the callers: the systems that own tables, streams and lake datasets send Gemini a request to classify an entity. The post names Grab's metadata management platform and its production database management platform as integrated.
+
+**Request grouping** is Gemini's first job. It receives requests from the platforms, schedules them and groups them, so that the model sees batches sized by Gemini rather than whatever a caller happened to send.
+
+**The message queue** is how the grouping happens: the post says aggregation is done through the queue at fixed intervals, producing mini-batches. A fixed interval turns a bursty arrival pattern, such as a new platform onboarding thousands of tables, into a steady one, at the price of up to one interval of added latency per request.
+
+**The workflow rate limiter** is attached at the workflow level, not per request or per Worker, so that calls to the cloud provider's API stay under its rate. The reason is the quota: all of Grab's Azure OpenAI model deployments shared one quota of 240K tokens per minute under one account. A per-request limiter would not see the other callers; a workflow-level one can hold this workflow to its share.
+
+**The model step** receives a prompt built from the table name and column names, with instructions, the tag library and few-shot examples, and returns JSON with a `column_name` and an `assigned_tag` for each column. GPT-3.5's context at the time was 4,000 tokens, with input and output sharing that limit in one request.
+
+**The third-party classifier** ran alongside during evaluation. The post does not say how its output and the model's were compared or which one was published when they differed.
+
+**Kafka** carries the predictions to the downstream platforms. Publishing to a topic rather than calling each platform decouples the classification workflow from however many consumers the tags acquire.
+
+**The metadata and database platforms** store the tags and, with the privacy office's rules, derive the sensitivity tier used for access control and masking.
+
+**Data owners** are notified weekly to verify the tags on their entities. Grab says verification improves correctness and feeds prompt iteration, and that it plans to remove the verification mandate once accuracy reaches a certain level.
+
+## One entity, end to end
+
+<Trace
+  title="One table, from registration to a verified tag"
+  note="steps from Grab's post; timing between steps is not published"
+  steps={[
+    { actor: 'platform', text: "A data platform sends Gemini a request to classify a table, for example a deliveries table with merchant_id, status and delivery_time." },
+    { actor: 'system', text: "Gemini holds the request in the message queue until the next fixed interval and groups it with other requests into a mini-batch.", note: 'The interval and batch size are not published.' },
+    { actor: 'system', text: "The workflow-level rate limiter releases the mini-batch when the workflow's share of the 240K tokens-per-minute quota allows.", note: 'The quota is shared by every Azure OpenAI deployment on the account.' },
+    { actor: 'assistant', text: "GPT-3.5 receives the table and column names, the tag library and examples, and returns JSON assigning one tag per column, with None where it cannot decide.", note: 'Input and output share the 4,000-token context.' },
+    { actor: 'tool', text: "The predictions are published to a Kafka topic." },
+    { actor: 'platform', text: "The metadata and database platforms consume the tags and attach them to the table, where privacy-office rules turn them into a sensitivity tier." },
+    { actor: 'user', text: "The table's owner receives the weekly notice and confirms or edits the tags.", note: 'On acknowledged tables, owners change fewer than one tag on average.' },
+  ]}
+/>
+
+## Context strategy
+
+The model sees metadata, not data: the table name and the column names. The post lists feeding sample data and user feedback into the prompt as future work, so the published version classifies sensitive data without sending any of it to the provider. That is a privacy property worth naming, and it is also the accuracy ceiling: a column called `notes` that holds phone numbers is invisible to a name-only classifier.
+
+The rest of the prompt is fixed: instructions to act as a column tag generator, one tag per column, the tag library with a definition for each tag, few-shot examples, and an output schema enforced in the style of TypeChat. Two rules in the prompt, outside the tag library's definitions, are explicit guards against over-tagging: Personal.ID should be very rarely assigned and never to columns named id, merchant id, passenger id or driver id, and None is the tag for a column where the model cannot decide or is confused. The post's own example output tags `merchant_id` as Personal.ID, against its own rule; read the example for its format, and as a reason the verification loop exists.
+
+Because instructions, library, examples and output share one 4,000-token window, the fixed part of the prompt and the expected output size together set how many columns fit in one request. The post does not publish that number or say how a wide table is split.
+
+## Tools and permissions
+
+The model has no tools. Its only output is a tag from a closed library per column, as JSON. The permission question is downstream: the tags set the sensitivity tier, which Grab plans to use for access control and dynamic data masking, so the model's output becomes an input to who can read what.
+
+That makes the direction of the default tag a security decision. None on a column that holds personal data is the permissive error: the entity's tier can come out lower than it should. Personal.ID on a merchant ID is the restrictive error: the schema can be pushed to Tier 1, which is the over-restriction the project set out to reduce. The prompt resolves uncertainty toward None. Whether downstream systems treat unverified tags conservatively until an owner confirms them is not in the post.
+
+The human gate is the weekly owner verification. It is asynchronous and advisory as published: tags are published before verification, and owners confirm or edit afterwards.
+
+## Cost and latency
+
+Grab gives no cost figures beyond describing the solution as extremely affordable for the current load. An upper bound on volume can be computed from what it does publish. At about 300 to 400 entities per day, if every entity used one full 4,000-token request, the daily total is at most 400 × 4,000 = 1.6 million tokens, which is 1,600,000 / 240,000 = 6.7 minutes of the shared quota. The quota exists for bursts and for other teams, not for this workflow's daily volume, which is why a workflow-level limiter and a fixed-interval queue are the right controls rather than a bigger quota.
+
+The labour baseline is Grab's estimate: about 2 minutes for a data owner to classify one entity by hand, and about 360 man-days per year saved. As a consistency check under an assumption of 8-hour days: 360 × 8 × 60 / 2 = 86,400 entities per year, which matches 300 to 400 per day over a working year of 250 days (75,000 to 100,000). The rollout scanned more than 20,000 entities in its first month.
+
+Latency is dominated by design choices, not the model: up to one queue interval before classification, and up to a week before an owner verifies. The post publishes neither interval.
+
+## Failure modes
+
+These are the failure modes a design with these published constraints has to handle. The post does not say how Grab handles them, so none is a claim about Grab's code.
+
+**Throttling from neighbours.** The 240K quota is shared by every deployment on the account. A burst from another team's workload can exhaust it while this workflow's limiter thinks it is under its share, because a client-side limiter sees only its own traffic. The 429 path still needs a retry policy, and the backlog alarm should be on the age of the oldest request.
+
+**Wide tables.** A table whose column list, plus the fixed prompt, plus the expected JSON, exceeds 4,000 tokens must be split. Each chunk then loses the other columns as context, and a long JSON reply can be cut off at the shared limit, which is a malformed result, not a classification.
+
+**Malformed or out-of-library output.** A tag outside the library or JSON that does not parse is a non-retryable error for that prompt, or a retry that gets a different answer; either way it needs a defined path that is not "publish whatever came back".
+
+**Verification fatigue and selection bias.** Fewer than one tag changed on average is measured on acknowledged tables. Tables whose owners never acknowledge the weekly notice are outside that number, and they are exactly the ones where an error persists.
+
+**Model change.** The prompt and its examples were tuned for GPT-3.5 under a 4,000-token window. Moving to another model reopens the evaluation, and the post lists building analytics pipelines to measure each prompt version as future work.
+
+## What is not public
+
+Grab's post does not publish an accuracy figure, a precision or recall per tag, or the measurement behind "fewer than one tag changed" beyond acknowledged tables. It does not describe error handling: what happens on a throttled call, a timeout, invalid JSON or a tag outside the library, or whether failed classifications are retried or dropped. The mini-batch size, the queue interval, the rate limiter's algorithm and its share of the quota, how wide tables are split, how the third-party engine's results were reconciled with the model's, what downstream systems do with unverified tags, and the cost are not stated. Where this page reasons about those areas, it says so; none of it should be quoted as Grab's design.
+
+## In the room
+
+You own this pipeline. Security wants tags to drive masking the moment they are published, data owners want fewer verification notices, and for the next quarter the shared quota is halved because a customer-facing feature needs the rest. What do you change, and what do you give up?
+
+<Depth>
+<Fragment slot="short">
+<p>Halving the quota does not threaten daily volume (at most about 7 minutes of the full quota per day by the upper bound) but it does threaten backfills, so the queue interval stays and the limiter's share is cut, with an alarm on the age of the oldest request. Masking on publication is acceptable only if uncertainty fails closed: unverified None tags on columns whose names match personal-data patterns get the stricter tier until an owner confirms. Verification notices drop for tags the model is confident about, which requires the confidence output Grab lists as future work.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Quota. The workflow's daily need is small; its risk is a burst. I keep the fixed-interval queue, lower the limiter's share to fit inside half the quota with headroom for the customer feature's peaks, and accept that a large onboarding takes longer to drain. The written statement: new platforms may wait days for first tags during the quarter, and the alarm is on age against that promise.</p>
+<p>Masking. The current default resolves uncertainty toward None, which is permissive. If tags drive masking immediately, a wrong None exposes data and a wrong Personal.ID only over-masks. So I invert the default for enforcement, not for the tag: an unverified None on a column that a cheap rule flags (names containing email, phone, name) is enforced at the stricter tier until confirmed. That costs some over-masking of the kind the project set out to reduce, and I state that cost to the owners whose queries slow down.</p>
+<p>Owner load. Fewer notices need a signal for which tags to send. Per-column confidence from the model is the obvious one; a second engine agreeing is another, and Grab already runs two. Notices go only for low confidence or disagreement. Failure mode: a confident wrong tag is never reviewed, so I keep a small random sample of confident tags in the weekly notice to measure the confident-error rate, and the notice reduction is reversed if that rate rises.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The customer feature's owner asks for three quarters of the quota instead of half. What do you need to know about your backlog before you agree, and what would you accept in writing?</li>
+<li>Failing closed on unverified None tags masks a column the finance team queries daily, and their reports break. Who decides whether that column is exempt, and how is the decision recorded?</li>
+<li>The sampled confident tags show a 3 percent error rate on Personal.Contact_Info. Do you restore verification for that tag only, or for all, and why?</li>
+<li>Two senior engineers disagree on sending sample values to the model to raise accuracy. What evidence would settle it, given the privacy property the current design has?</li>
+</ul>
+</Fragment>
+</Depth>
+
+<SelfRate id="lesson:workflows/retries-flow-control/grab-classification" />

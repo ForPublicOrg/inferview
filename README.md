@@ -1,6 +1,6 @@
 # Inferview
 
-Free, open-source interview prep for AI engineering, written for software engineers who already ship. Nine tracks, one lesson per module, a problem bank graded in the browser, a daily problem, and review scheduling. Progress stays in the browser, or syncs to the reader's own Firestore document after Google sign-in.
+Free, open-source interview prep for AI engineering, written for software engineers who already ship. Fifteen tracks, ordered lessons in every module, teardowns of public AI systems, a problem bank graded in the browser, labs, a mock interview loop, a daily problem, and review scheduling. Progress stays in the browser, or syncs to the reader's own Firestore document after Google sign-in.
 
 An Astro 5 static site, built from `SPEC.md`. Content lives in `src/content/` as MDX with a validated schema; `src/components/` holds the components lessons and problems import; `src/lib/` holds the progress store, auth and scheduling.
 
@@ -11,7 +11,7 @@ Other files:
 - `DESIGN.md`: the visual and copy direction, with a one-line reason per decision.
 - `SOURCES.md`: borrowed examples, measurements and licences. Each lesson and problem also lists its own sources in frontmatter.
 - `docs/`: Firebase setup and Vercel deployment.
-- `research/`: the research behind the plan and, under `research/tracks/`, the sourced notes behind each track.
+- `research/`: the research behind the plan; `research/curriculum-v2.json` is the curriculum the content follows (lessons, problems, teardowns, labs, level bar, Core 100), `research/gaps/` the gap study behind it, and `research/tracks/` the sourced notes behind each track.
 - `prototypes/`: the static HTML prototypes the site was designed from (no build step; `npx -y serve prototypes -l 4173`).
 
 ## Working on it
@@ -23,6 +23,8 @@ npm run validate     # check every lesson and problem against the schema and the
 npm run build        # validate, build to dist/, build the search index, check the CSP
 npm run preview      # serve dist/ with the vercel.json headers on http://localhost:4321
 npm run tokens       # re-measure the real token strips used by the tokens lesson
+npm run code         # run every code, multistage and repo solution against its visible and hidden tests (python -I)
+npm run labs         # run every lab step against its reference solutions (python -I)
 ```
 
 Sign-in is optional and needs a Firebase project: see `docs/firebase-setup.md`. Deployment: `docs/deploy-vercel.md`.

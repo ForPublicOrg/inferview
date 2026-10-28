@@ -1,0 +1,113 @@
+---
+id: fnd-023
+title: Recall fell after the fine-tune got harder negatives
+subtitle: rank the causes
+track: foundations
+module: embeddings
+type: debug
+difficulty: hard
+seniority: [staff]
+minutes: 30
+tags: [embeddings, contrastive-loss, hard-negatives, false-negatives, fine-tuning]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: "NV-Retriever: Improving text embedding models with effective hard-negative mining (Moreira et al., 2024)"
+    url: https://arxiv.org/abs/2407.15831
+    note: "Naive top-k mining had a 38.8% false-negative rate on NQ and 47% on StackExchange by the authors' LLM-as-judge analysis; positive-aware mining (TopK-MarginPos, margin 0.05; TopK-PercPos, 95%) mined 57% and 50% fewer false negatives; average NDCG@10 over NQ, HotpotQA and FiQA with an e5-large-unsupervised base: naive top-k 0.5407, TopK-MarginPos 0.5835, TopK-PercPos 0.5856; cites Qu et al. that about 70% of the passages most similar to MS MARCO queries should be labelled positive. Checked 2026-10-28."
+  - title: Sentence Transformers, losses reference
+    url: https://sbert.net/docs/package_reference/sentence_transformer/losses.html
+    note: "MultipleNegativesRankingLoss: in-batch negatives plus optional hard-negative columns, default scale 20.0; recommends BatchSamplers.NO_DUPLICATES. Checked 2026-10-28."
+  - title: Hugging Face blog, Training and Finetuning Reranker Models with Sentence Transformers v4 (2025-03-26)
+    url: https://huggingface.co/blog/train-reranker
+    note: "Example mining call skips the top ranks: range_min 10, range_max 100, max_score 0.8, margin 0.1, 5 negatives. Checked 2026-10-28."
+choices:
+  - text: Many top-ranked mined negatives answer their own query, so the loss pushes valid answers away from them
+    correct: true
+    why: The spot check found 14 of 40 sampled negatives answering the query, mined from ranks 1 to 5 with no ceiling, and the recall drop is concentrated on queries with several valid passages, which is where unlabelled positives live.
+  - text: Cutting the batch from 256 to 48 left each query too few negatives to separate passages on the same topic
+    correct: false
+    why: Count them. Run A gives each query 255 negatives (255 other positives). Run B gives 47 in-batch positives plus 48 × 5 = 240 mined negatives, 287 in all, and harder ones. The batch cut changes which negatives are seen, not how many.
+  - text: Duplicate passages inside a batch become in-batch false negatives, and the smaller batch makes them more common
+    correct: false
+    why: It is a real defect, since no duplicate-free sampler is set, but the audit found it in 9 of 834 batches. That touches about 1% of steps and cannot move held-out recall from 0.79 to 0.68.
+  - text: A scale of 20 is too sharp for near-miss negatives, so their gradients dominate and training goes unstable
+    correct: false
+    why: The scale did not change between runs, and the run B loss curve is smooth and flat at the end. A harder final loss is expected when the negatives are harder; it is not a sign of instability.
+---
+
+## Question
+
+A support-search team fine-tunes an open embedding model on 40,000 (query, passage) pairs from its own help centre with Sentence Transformers' `MultipleNegativesRankingLoss`. Run A used in-batch negatives only. Run B added mined hard negatives. All numbers below are from this scenario.
+
+```diff
+  model = SentenceTransformer(BASE)
+- train = pairs                                   # (query, positive)
+- batch_size = 256
++ train = mine_hard_negatives(pairs, corpus, model=model,
++                             range_min=0, range_max=20, num_negatives=5)
++ batch_size = 48                                  # 6 texts per row; 256 ran out of GPU memory
+  loss = MultipleNegativesRankingLoss(model)       # scale 20.0
+  args = TrainingArguments(epochs=1, lr=2e-5, batch_sampler=None)
+```
+
+What they measured:
+
+```text
+held-out recall@10 (600 queries, labelled before training)
+  base model    0.71
+  run A         0.79
+  run B         0.68
+run B recall@10 by query group
+  queries with exactly one valid passage in the corpus    0.80
+  queries with two or more valid passages                 0.55
+training loss, last 100 steps: run A 0.41, run B 1.12, both curves smooth
+batches with an exact duplicate passage (run B): 9 of 834
+spot check by one engineer, 40 mined negatives from ranks 1 to 5:
+  14 marked "answers the query"
+```
+
+Which cause best explains the drop in recall? Then rank the other defects you can see and say what you would sample before changing the training config.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask who judged the 40 negatives, against which instructions, and from which ranks they were drawn.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the number of negatives each query sees per step in run A and in run B.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Which query group would be hurt most if a negative were wrong, and does the split agree?</p></details>
+
+## Answer
+
+The mined negatives contain unlabelled positives. The miner took the five highest-scoring passages other than the labelled one, starting at rank 0 and with no ceiling relative to the positive's score. In a help centre, the passages just below the labelled answer are often other valid answers: a second article on the same setting, an older version of the same page. Training on them as negatives teaches the model to push valid answers away from the query. The query split points the same way: queries with one valid passage barely moved (0.80), and queries with several fell to 0.55.
+
+The spot check is consistent with the published rate and is not yet proof. 14 of 40 is 35%; the normal-approximation 95% interval is 1.96 × √(0.35 × 0.65 / 40) ≈ ±15 points, so the true rate in ranks 1 to 5 is somewhere around 20% to 50%, from one judge with no written definition of "answers the query". NV-Retriever's LLM-judged analysis of naive top-k mining found 38.8% false negatives on NQ and 47% on StackExchange, so a rate in that range is plausible, not exceptional.
+
+What to sample before changing the config: about 200 mined negatives stratified by rank band (1 to 5, 6 to 10, 11 to 20), judged by two people against a written rule, with agreement reported. That gives a false-negative rate per band, which is what decides the fix.
+
+Two fixes are defensible, and they cost different things.
+
+- **A positive-aware ceiling.** Reject any candidate scoring above a fraction of the positive's score, as NV-Retriever's TopK-PercPos does at 95%, or above the positive minus a margin (TopK-MarginPos, best at 0.05). With an e5-large-unsupervised base, the paper reports average NDCG@10 over three datasets rising from 0.5407 with naive top-k to 0.5856. The paper mines with a stronger teacher (e5-mistral-7b-instruct), so the cost is running a larger model over the corpus, and some true hard negatives above the ceiling are lost.
+- **Skip the top ranks.** Set `range_min` to 10, as the reranker write-up's example does. It is one line and no teacher, but it treats rank as a proxy for false negatives. A corpus with many near-duplicates puts false negatives below rank 10 too, and the hardest true negatives are thrown away.
+
+The labelling budget decides between them. With a few hundred labels to spend, measure the rate per band, pick `range_min` from where the rate falls, and keep a ceiling as a second filter. With no labels, the ceiling with a teacher is the safer default. The ceiling has a failure mode of its own: it is anchored on the labelled positive's score, so for a query whose labelled positive is weak (scored low by the teacher), the ceiling drops and rejects nearly every candidate, and that query trains on in-batch negatives only. Log the number of negatives kept per query and alert when many queries keep none.
+
+The other defects, ranked:
+
+1. No duplicate-free batch sampler. Real, and it should be fixed with `BatchSamplers.NO_DUPLICATES`, but 9 of 834 batches is about 1% of steps.
+2. The batch cut from 256 to 48. It changes the mix: fewer easy in-batch negatives and more mined ones, 287 negatives per query against 255 in run A. Worth an ablation after the mining fix, not before.
+3. The higher training loss in run B is not a defect. Harder negatives raise the loss floor.
+
+Why the wrong choices are tempting: smaller batches hurting contrastive training is a well-known result, and the memory comment invites it, but the count of negatives per query went up. The duplicate sampler is a genuine bug, so it is the easiest thing to fix and the least likely to move recall. A scale that is too sharp is a real tuning problem in other settings, and nothing in this run changed it.
+
+## Follow-ups
+
+- Mining with a 7B teacher over the corpus costs more GPU time than the fine-tune itself. Which half of the fix do you drop, and what false-negative rate do you accept in writing?
+- After the fix, recall on multi-answer queries recovers to 0.78 and single-answer queries fall from 0.80 to 0.76. What would you need to see to reverse the ceiling and go back to rank skipping?
+- Two engineers disagree on whether a near-duplicate article version is a positive or a negative. How do you decide the labelling rule without deciding by rank, and what does each answer do to the mined set?
+- The product team wants the fine-tune shipped this week. Would you ship run A, which beats the base model, and what do you write down about run B?
+
+## Common mistakes
+
+- Reverting to run A without measuring the false-negative rate, which leaves the next mining attempt to fail the same way.
+- Treating the higher training loss in run B as the bug.
+- Quoting the 35% spot check as the rate without its interval and its single judge.
+- Fixing the duplicate sampler and calling the investigation done.

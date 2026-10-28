@@ -1,0 +1,144 @@
+---
+id: hrn-028
+title: The policy hook that passed review
+track: harness
+module: permissions-sandboxing
+type: critique
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [hooks, fail-closed, policy, claude-code, coding-agents]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Claude Code docs, Hooks reference (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/hooks
+    note: "exit 0 succeeds and Claude never sees its stderr; exit 2 blocks on events that can block, with stderr as the message; any other exit code, a hook that cannot start or invalid JSON is a non-blocking error and the action goes ahead; exit 1 without valid JSON is non-blocking even though it is the conventional failure code; a command hook that reaches its timeout is cancelled and on PreToolUse does not block the call; onFailure set to block (command and http hooks, Claude Code v2.1.295 or later) makes a failure or timeout block, and has no effect on Stop hooks; default timeout 600 seconds for command hooks; matchers made only of letters, digits and | are exact lists; cwd follows Claude when it runs cd; hooks run in parallel"
+  - title: Claude Code docs, Configure permissions (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/permissions
+    note: "deny and ask rules are evaluated whatever a PreToolUse hook returns; a hook that exits 2 blocks before permission rules are evaluated"
+  - title: Claude Code docs, Permission modes (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/permission-modes
+    note: "writes to protected paths, including .claude, are never auto-approved except in bypassPermissions mode and in interactive plan-mode sessions with bypass permissions available; deny rules block in every mode"
+checklist:
+  - Names that exit 1 is a non-blocking error, so every denial the service returns lets the call run
+  - Spots that the reason is printed to stdout, which Claude never sees on a block, so even after the exit code is fixed the agent gets no reason to act on
+  - Names that a 5-second hook timeout against a 7-second p99 at peak cancels the hook and the call runs, so the gate fails open exactly when load is highest
+  - Spots that urlopen has no timeout and that any exception (refused connection, a missing key in the response) exits 1 and fails open
+  - Spots that the relative script path breaks after the agent runs cd, so the hook cannot start and every later call in that directory is ungated
+  - Spots that the exact-list matcher leaves MCP tools and other editing tools ungated
+  - Notes that the hook and its script live in the repository's .claude directory, which the agent can write in bypassPermissions mode
+  - Moves the static denials such as force pushes to deny rules, which hold whatever the hook returns and in every mode
+  - Chooses fail-closed or fail-open per tool with a stated cost, and sets the client timeout below the hook timeout so the script decides rather than the harness
+  - Judges that sending full tool input to the service is acceptable if the service is internal, stores it under the same retention as source code and caps the payload size
+  - Asks for a test that proves the hook blocks when the script is missing and when the service is down
+  - States a failure mode of the fix, such as a policy-service outage stopping every agent in the company
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Critique, 30 minutes">
+Platform engineering shipped a PreToolUse hook that sends every Bash, Edit and Write call to the company's policy service and blocks what the service denies. It passed review and went to every engineer's machine. A week later, a force push to <code>main</code> from an agent session in one of the data team's dev containers went through during the Monday CI peak, though the service has a rule denying it. List every flaw you find in the hook and its rollout, then say what you would change and what the change costs.
+</Callout>
+
+The committed `.claude/settings.json`:
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(npm test *)", "Bash(npm run lint *)"]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "python3 .claude/hooks/policy_gate.py", "timeout": 5 }]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [{ "type": "command", "command": "python3 .claude/hooks/policy_gate.py", "timeout": 5 }]
+      }
+    ]
+  }
+}
+```
+
+The script:
+
+```python
+#!/usr/bin/env python3
+import json, sys, urllib.request
+
+POLICY_URL = "https://policy.internal/v1/check"
+
+def main():
+    event = json.load(sys.stdin)
+    body = json.dumps({
+        "tool": event["tool_name"],
+        "input": event["tool_input"],
+        "session": event["session_id"],
+    }).encode()
+    req = urllib.request.Request(POLICY_URL, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as resp:
+        verdict = json.load(resp)
+    if verdict["decision"] == "deny":
+        print(f"Blocked by policy: {verdict['reason']}")
+        sys.exit(1)
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
+```
+
+From the rollout note, with numbers that belong to this scenario: the policy service answers in 120 ms at the median; during the Monday CI peak its p99 is 7 seconds. Most engineers run the agent in Manual mode (the `default` setting) on their laptops; the data team runs it in `bypassPermissions` inside dev containers. The incident session's hook log has one line for the push: `PreToolUse:Bash hook error: ... timed out`.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>For each way the script can end (deny, allow, exception, timeout, never starting), ask what Claude Code does with the tool call.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the hook log from the sessions where the service returned deny, not only from the incident.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask which directory the hook runs in after the agent changes directory, and which files the agent can write in each permission mode the company uses.</p></details>
+
+## Answer
+
+The flaws, roughly in the order a reviewer finds them.
+
+**Exit 1 does not block.** Claude Code treats exit 2 as a block on PreToolUse and every other exit code as a non-blocking error, after which the action goes ahead. The documentation calls out exit 1 by name: it is the conventional Unix failure code and it is still non-blocking. Every deny the service has returned since rollout was logged and ignored. The incident was a timeout, but the gate would have let the push through on a clean deny as well.
+
+**The reason goes to the wrong stream.** On a block, the message the agent reads is the hook's stderr; a hook that exits 0 never has its stderr shown. The script prints to stdout. Fix the exit code alone and the agent is blocked with no reason, so it retries variants of the same command. Write the reason to stderr with exit 2, or exit 0 with a JSON `permissionDecision` of `deny` and a `permissionDecisionReason`.
+
+**It fails open under load.** The hook timeout is 5 seconds and the service's p99 at peak is 7. A command hook that reaches its timeout is cancelled and, on PreToolUse, does not block the call. That is the incident: the push arrived during the peak, the hook timed out, and in `bypassPermissions` nothing else stood in the way. On a laptop in Manual mode the same push would still have prompted the engineer, which is why the gap went unnoticed for a week.
+
+**It fails open on any error.** `urlopen` has no timeout of its own, a refused connection raises, and a response without `decision` raises `KeyError`. Each ends in a traceback and exit 1, a non-blocking error.
+
+**It fails open after `cd`.** The command uses a relative path. The hook's working directory follows Claude when it changes directory, so after `cd packages/api` the script is not found, the hook cannot start, and that is a non-blocking error too. A reviewer reads `.claude/hooks/policy_gate.py` as a path from the repository root; the harness resolves it from wherever the agent is. Use `${CLAUDE_PROJECT_DIR}`.
+
+**The matcher leaves tools out.** `Edit|Write` contains only letters and `|`, so it is an exact list. MCP tools and any other tool that edits files are not gated.
+
+**The agent can edit the gate.** The script and the settings live in the repository's `.claude` directory. Writes there are never auto-approved in Manual mode, but in `bypassPermissions`, the mode the data team uses, protected-path writes are allowed. An agent there can rewrite the hook that is supposed to stop it.
+
+**Static rules are in the wrong place.** "Never force-push to main" does not need a network call. A deny rule such as `Bash(git push --force *)` is evaluated whatever a PreToolUse hook returns and blocks in every mode, including `bypassPermissions`. It is still a rule over command text, so `git push -f` and `git -C . push --force` need their own rules, and branch protection on the server is the control that cannot be argued with.
+
+**The decision with two defensible answers: fail closed or fail open.**
+
+- **Fail closed.** Set `"onFailure": "block"` (Claude Code v2.1.295 or later), give `urlopen` a timeout below the hook's, and exit 2 on any exception. Every failure blocks. The cost: the policy service becomes a dependency of every engineer's agent. A Monday peak that pushes its p99 past the timeout blocks every Bash call for everyone, and the first workaround engineers find is running without the hook.
+- **Fail open on a deny-rule floor.** Keep the network hook for decisions that need context, move every static denial into deny rules (managed settings where they exist), let a service failure fail open, and alert on the failure rate. The cost: during an outage, anything the deny rules do not name runs unchecked.
+
+The conflict is agent availability against enforcement. I would split by tool and choose the timeout. Edits inside the workspace fail open on the deny-rule floor, because they land in a working tree under version control and pass code review before they reach anything shared. Bash and MCP calls fail closed. Set the client timeout at 2 seconds and the hook timeout at 3, and cache allow decisions per session and command for a few minutes so the peak's tail lands on cache hits. That choice of 2 seconds is the quantity to defend: it has to sit above the service's p99 outside the peak, which you measure, and below the hook timeout, so the script decides and returns a reason rather than being cancelled. A setting at 7 seconds or more puts the timeout above the peak's p99 and makes every agent wait it out. Then add the test the rollout skipped: run the hook with the script missing and with `POLICY_URL` pointing at a closed port, and assert that the call is blocked.
+
+**What you give up, and where the fix fails.** Bash calls stop when the service is down, and that is a page to the service's owners rather than a silent gap. A cache means a rule change takes effect only after the cache expires. The deny rules are command text and miss rewritten forms. And `onFailure` has no effect on Stop hooks, so a typecheck gate in a Stop hook that crashes still lets the agent finish.
+
+## Follow-ups
+
+- *The service owners say they cannot promise a p99 under 2 seconds at peak, and your fail-closed Bash gate blocked agents for forty minutes last Monday. Which half of the gate do you relax, and what risk do you accept in writing?*
+- *Two senior engineers disagree: one wants the policy service to be the only source of rules, the other wants every rule as a local deny rule and the service removed. How do you decide without deciding by rank?*
+- *What would you need to see in a month of hook logs to move Edit from fail-open to fail-closed?*
+- *The data team says `bypassPermissions` in a dev container is safe because the container has no credentials. What do you check before you accept that, and what do you change if it is wrong?*
+
+## Common mistakes
+
+- Fixing the exit code and stopping there, which leaves the timeout, the exception paths and the relative path all failing open.
+- Treating the hook as the enforcement layer for rules that a deny rule or server-side branch protection enforces without a network call.
+- Raising the hook timeout to 30 seconds so the peak fits, which makes every agent wait on the service's tail.
+- Testing the hook only against a healthy service, so the paths that fail open are never exercised.

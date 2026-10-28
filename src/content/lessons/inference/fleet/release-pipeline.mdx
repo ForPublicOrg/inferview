@@ -1,0 +1,149 @@
+---
+title: "Model release pipelines for a serving fleet"
+track: inference
+module: fleet
+order: 2
+kind: lesson
+level: staff
+minutes: 13
+summary: A serving change can degrade answers without moving an error rate, so the release pipeline gates each platform build on quality probes sent through the production router at production load, with stated rollback triggers, an owner, and a retirement leg for the version being replaced.
+prerequisites: [inference/fleet/fleet-routing]
+updated: 2026-10-28
+sources:
+  - title: "A postmortem of three recent issues (Anthropic, 17 September 2025)"
+    url: https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues
+    note: "Three infrastructure bugs, August to September 2025. Context window routing error from 5 August (0.8% of Sonnet 4 requests), worsened by a 29 August load balancing change to 16% at the worst hour on 31 August; fix deployed 4 September, rollout complete on the first-party API and Vertex AI by 16 September and on Bedrock by 18 September. Output corruption on TPU servers from a misconfiguration deployed 25 August, rolled back 2 September, after which detection tests for unexpected character outputs were added to the deployment process. Approximate top-k XLA:TPU miscompilation triggered 25 August, sometimes dropping the highest-probability token for certain batch sizes and model configurations, partly masked by a December 2024 workaround; Haiku 3.5 rolled back 4 September, Opus 3 on 12 September; replaced by exact top-k. Evaluations missed the degradation partly because Claude often recovers from isolated mistakes; privacy controls limit access to user interactions; commitments include more sensitive evaluations and evaluations run continuously on production systems."
+  - title: "Model deprecations (Claude Platform docs)"
+    url: https://platform.claude.com/docs/en/about-claude/model-deprecations
+    note: "Checked 2026-10-28. Lifecycle: active, legacy, deprecated, retired; requests to retired models fail; at least 60 days' notice before retirement for publicly released models; usage audit by API key and model via a CSV export; partner platforms set their own retirement schedules. Sonnet 4.5 notified 30 September 2026, retiring 30 November 2026; Opus 4.1 notified 5 June 2026, retired 5 August 2026. temperature, top_p and top_k removed in API version 2026-10-21, returning a 400 error."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The release gate has to see answers, not errors
+
+A fleet release has the shape of any staged rollout, with one difference that changes every gate: most of the ways a model-serving change goes wrong produce well-formed, successful responses. A miscompiled sampling kernel, a misconfigured precision setting or a routing rule that sends requests to a server configured for a different context length all return HTTP 200 with plausible text. Error rate, latency and saturation, the signals a canary normally watches, stay flat. The pipeline has to measure answer quality on the canary, at production load, through the production router, and roll back on that measurement.
+
+Anthropic's postmortem of August and September 2025 shows each of these. Three independent bugs overlapped:
+
+- From 5 August, 0.8% of Sonnet 4 requests were routed to servers configured for the upcoming 1M-token context window. A load-balancing change on 29 August raised that to 16% at the worst hour on 31 August. The fix was deployed on 4 September, 30 days after the start; the rollout finished on the first-party API and Vertex AI by 16 September and on Bedrock by 18 September.
+- On 25 August a misconfiguration deployed to TPU servers occasionally gave high probability to tokens that should rarely appear: Thai or Chinese characters in English answers, or obvious syntax errors in code. It was rolled back on 2 September, 8 days later.
+- Also on 25 August, a change to token selection exposed a latent XLA:TPU miscompilation in approximate top-k that sometimes dropped the highest-probability token for certain batch sizes and model configurations. A December 2024 workaround had partly masked it, and removing the workaround exposed it. Haiku 3.5 was rolled back on 4 September, Opus 3 on 12 September, and the fix moved to exact top-k.
+
+The postmortem gives the reasons detection was slow: the evaluations did not capture the degradation, partly because the model often recovers from isolated mistakes; privacy controls limit engineers' access to user interactions that were not reported as feedback; and each bug hit different platforms at different rates, so reports conflicted. Its commitments are more sensitive evaluations, evaluations run continuously on production systems, and faster tooling for user feedback. Each of those becomes a stage below.
+
+## What counts as a release
+
+The release unit on a multi-platform fleet is not the model. It is the model on one platform build: weights, serving configuration, compiler and kernel versions, sampling implementation and the routing rules that decide which requests reach it. The postmortem's three bugs came from a routing rule, a server configuration and a compiler path, and none was a new model. The 29 August change was a load-balancing change, and the top-k bug surfaced when a workaround was removed. A cleanup that deletes a workaround is a release; so is a router change.
+
+That definition decides the pipeline's scope. If router configuration, sampling code and compiler upgrades ship through a different path from model versions, the strict gate covers only the change that failed least often in this incident.
+
+## Probes that can see the defect
+
+A quality probe is a fixed set of prompts with checkable answers, sent continuously to canary and control on the same platform, with results compared between them. Three properties decide whether it can see the kind of defect above.
+
+It goes through the production router. A probe sent straight to a canary replica tests the replica and cannot see a routing defect, because routing decides which replica a request reaches. The routing bug only existed in the path from the load balancer to the pools.
+
+It runs at production load. The top-k bug depended on batch size. An idle canary that serves only probes runs at batch sizes production never uses and the bug does not trigger. Probes have to be mixed into canary replicas that also carry real traffic.
+
+It scores tokens, not only tasks. If the model often recovers from a single bad token, a task-level pass rate barely moves while users see corrupted text. Detectors that look at every token catch what task scores miss: characters outside the expected script, a drop in the log-probability the build assigns to known reference continuations, and differences in the top tokens against a reference implementation on fixed inputs. The postmortem's own fix for the corruption bug was a detection test for unexpected character outputs in the deployment process.
+
+The number of probes needed follows from the share of requests a defect touches.
+
+<Predict id="inf-fleet-probes" question="A defect affects 0.8% of requests that pass through the router, independently per request. How many probe requests must go through the router for a 95% chance that at least one of them is affected?" answer={373} tolerance={5} unit="probes">
+<p>Solve 1 − (1 − 0.008)^n ≥ 0.95: n = ln(0.05) / ln(0.992) = (−2.9957) / (−0.0080322) = 372.96, so <b>373</b>. That is the floor for the probe to have a chance, before the detector has to recognise the affected answer. At the Bedrock peak of 0.18% the same arithmetic gives 1,663, and for a defect confined to one platform the count applies to that platform's traffic alone, so probes are budgeted per platform.</p>
+</Predict>
+
+Probe counts are cheap compared with what they protect, but a probe that cannot fail is noise. Before a probe set gates releases, run it against a deliberately broken build (a perturbed sampling kernel, a wrong context configuration) and confirm it fires. A probe set that has never caught an injected fault has not shown it can catch a real one.
+
+## The pipeline
+
+The stages for a new model version, or any serving change, on one platform build:
+
+1. **Build identity.** The artefact carries a build id covering weights, serving config, compiler and kernel versions, and sampling code. The router routes on it.
+2. **Offline equivalence.** Fixed inputs run on the new build and on a reference implementation; top tokens and log-probabilities must match within a stated tolerance, at several batch sizes.
+3. **Shadow at load.** Mirrored production traffic exercises memory, batch sizes and latency without serving answers.
+4. **Canary through the router.** A small share of real traffic plus the probe stream, per platform, with control replicas on the old build in the same pool. Promotion needs the probe count from the arithmetic above and no trigger fired.
+5. **Staged rollout by platform and surface.** Each platform and each distribution surface is its own stage, because each has its own build and bug rate; the postmortem's fix itself completed on different days on different surfaces.
+6. **Hold the old build warm.** The previous build stays loaded until the new one has passed a stated soak period, so rollback is a routing change rather than a cold start.
+
+The rollback triggers are written before the canary starts, each with a number: off-script character rate above control by a set margin, mean probe score below control by a set margin, log-probability divergence from the reference above a set tolerance, and a spike in user-reported negative feedback grouped by build id. Feedback is the slowest of the four, and the postmortem notes that the 29 August spike in reports was not immediately connected to the load-balancing change, which is why feedback has to be grouped by the build and routing version a request actually hit.
+
+Each release has one named owner who can roll back without a meeting, and the trigger list says which triggers roll back automatically and which page the owner.
+
+## The retirement leg
+
+Every release also starts the retirement of the version it replaces. Anthropic's deprecation page gives the external contract: models move from active to legacy to deprecated to retired, requests to a retired model fail, and publicly released models get at least 60 days' notice before retirement. The recent schedule matches that floor: Opus 4.1 was notified on 5 June 2026 and retired on 5 August 2026, 61 days; Sonnet 4.5 was notified on 30 September 2026 and retires on 30 November 2026, 61 days, which on 28 October 2026 leaves 33. Partner platforms set their own schedules, so the same model can retire on different days on different surfaces.
+
+For the team that serves the old version, retirement is capacity planning: its replicas come back only when its traffic has gone. For a team consuming a provider's models, the same pipeline runs in reverse, with the provider's release as the change under test: export usage by key and model, run the replacement against the probe set and the product's evaluations, and migrate before the date. API changes travel with model changes; in API version 2026-10-21, setting `temperature`, `top_p` or `top_k` returns a 400 error, so a client upgrade that changes the version header is a release with its own canary.
+
+## The gate in code
+
+```python
+import math, unicodedata
+
+def probes_needed(rate, confidence=0.95):
+    """Probes through the router so that at least one hits a defect touching `rate` of requests."""
+    return math.ceil(math.log(1 - confidence) / math.log(1 - rate))
+
+def off_script(text):
+    """Share of letters outside the Latin script, for probes whose answers should be English."""
+    letters = [c for c in text if c.isalpha()]
+    bad = [c for c in letters if not unicodedata.name(c, "").startswith("LATIN")]
+    return len(bad) / len(letters) if letters else 0.0
+
+def gate(control, canary, min_probes, max_flag_delta=0.002, max_score_drop=0.01):
+    """control, canary: lists of (answer_text, task_score in [0, 1]) from the same probe set."""
+    if len(canary) < min_probes or len(control) < min_probes:
+        return "wait"
+    flag = lambda runs: sum(off_script(t) > 0.01 for t, _ in runs) / len(runs)
+    mean = lambda runs: sum(s for _, s in runs) / len(runs)
+    if flag(canary) - flag(control) > max_flag_delta:
+        return "rollback: off-script output"
+    if mean(control) - mean(canary) > max_score_drop:
+        return "rollback: probe score"
+    return "promote"
+
+n = probes_needed(0.008)
+control = [("The index is rebuilt nightly.", 1.0)] * n
+canary = control[:-3] + [("The index is rebuilt ทุกคืน.", 1.0)] * 3
+print(n, gate(control, canary, n))     # 373 rollback: off-script output
+```
+
+The example is the postmortem's failure in miniature: every corrupted answer still scores 1.0 on the task, and only the token-level detector fires. The thresholds are placeholders for numbers each team sets from its own control variance.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"A new model version is ready on GPUs; the TPU build is two weeks behind. Sales has promised the launch date to three large customers, and the old version's retirement notice has already gone out, so its capacity is committed elsewhere in 70 days. Your probe set takes three days to reach the required count on the smaller platform. Write the release plan."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Launch on GPUs only, with the router pinning the new version to the GPU pool by build id, and gate the TPU build separately when it is ready, on its own probes at its own load. The old version stays warm until both builds have soaked, which fits inside 70 days if the TPU build arrives on time. I give up TPU capacity for the new version for at least two weeks, so launch traffic is capped to what the GPU pool holds.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The launch date is met by the platform that is ready. The router treats the new version as eligible only on the GPU build, so no request reaches an unreviewed TPU build, and the capacity gap is handled by admission: launch customers first, then a cap on new-version traffic for everyone else, with the old version serving the rest.</p>
+<p>The TPU build runs offline equivalence at several batch sizes against the GPU reference, then shadow, then a canary through the router with probes mixed into real traffic. Three days to reach the probe count is the price of a platform with less traffic; I would not shorten it by sending probes directly to replicas, because that cannot see routing faults.</p>
+<p>The risk note says what slips if the TPU build fails its gate: the old version's capacity is needed until the TPU build passes, and if that runs past the retirement date, either the new version is capped longer or the retirement is renegotiated internally. The triggers, the owner who can roll back alone, and the date by which the TPU build must enter canary for the plan to hold go in the same note.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The TPU canary shows off-script characters at 0.1% against 0.02% on control, below your rollback margin but above control every day. Ship or not, and who signs off?</em></li>
+<li><em>Your probe set costs as much as 5% of the platform's capacity during canary. Finance asks you to halve it; which probes do you cut, and what defect class do you accept missing, in writing?</em></li>
+<li><em>What would you need to see in the first month to stop requiring per-platform canaries for kernel-only changes?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Probes measure what they ask. A fixed probe set drifts away from production traffic, and a defect that only affects long contexts, tool calls or a language the set lacks passes every gate. Refresh the set from traffic categories rather than from real user prompts, which privacy controls may forbid, and track which categories it covers.
+
+Comparing canary to control assumes the control is healthy. If both run a build with the same latent bug, the difference is zero; this is why the offline stage compares against a reference implementation as well as against the previous build.
+
+The probe arithmetic assumes defects hit requests independently. Sticky routing breaks that assumption: in the postmortem, follow-up requests tended to reach the same misrouted server, so a defect concentrated on some users while others saw nothing. Probes keyed to many synthetic sessions, rather than one, sample that structure.
+
+<SelfRate id="lesson:inference/fleet/release-pipeline" />

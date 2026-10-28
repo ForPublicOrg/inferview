@@ -1,0 +1,189 @@
+---
+title: "The AI gateway: auth, quotas, routing, caching and logging"
+track: inference
+module: gateways-finops
+order: 1
+kind: lesson
+level: senior
+minutes: 12
+summary: A model gateway owns the controls that must be uniform across teams (keys, token quotas, routing, usage records priced at the date of the call) and leaves anything whose correctness depends on a feature's semantics, including prompt layout and which model is acceptable, to the product.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: LiteLLM docs, Router (routing, cooldowns, retries) (checked 2026-10-28)
+    url: https://docs.litellm.ai/docs/routing
+    note: "strategies simple-shuffle (default), usage-based-routing-v2, latency-based-routing, least-busy, cost-based-routing, custom; usage-based routing tracks usage in Redis and is not recommended for production due to performance impacts; deployments missing from the cost map are assigned a cost of $1; cooldown_time default 5 s; max_parallel_requests over the cap returns an immediate 429 with no queue and the limit is per process, not shared across workers"
+  - title: LiteLLM docs, Fallbacks and reliability (checked 2026-10-28)
+    url: https://docs.litellm.ai/docs/proxy/reliability
+    note: "fallbacks, content_policy_fallbacks, context_window_fallbacks, default_fallbacks; context window checks need enable_pre_call_checks; x-litellm-model-id names the deployment that served or failed; spend log metadata attempted_fallbacks and original_model_group"
+  - title: LiteLLM docs, Budgets and rate limits (checked 2026-10-28)
+    url: https://docs.litellm.ai/docs/proxy/users
+    note: "max_budget and budget_duration on global proxy, team, team member, internal user, virtual key, customer, agent session; tpm_limit, rpm_limit, max_parallel_requests; budgets need Postgres; global max_budget fails open without a database; resets checked every 10 minutes by default; budget reservation holds the estimated maximum cost before the call and is on by default"
+  - title: Portkey docs, AI Gateway (checked 2026-10-28)
+    url: https://portkey.ai/docs/product/ai-gateway
+    note: "fallbacks, conditional routing, load balancing, retries, circuit breaker, timeouts, simple and semantic cache, budget limits by cost or tokens, rate limits per minute, hour or day on requests or tokens; gateway open source, runnable with npx @portkey-ai/gateway"
+  - title: Portkey docs, Fallbacks (checked 2026-10-28)
+    url: https://portkey.ai/docs/product/ai-gateway/fallbacks
+    note: "strategy mode fallback with ordered targets; by default triggers on any non-2xx status; on_status_codes narrows it; attempts visible in logs by trace ID"
+  - title: Portkey docs, Budget limits (checked 2026-10-28)
+    url: https://portkey.ai/docs/product/ai-gateway/virtual-keys/budget-limits
+    note: "cost limit in USD (minimum $1) or token limit (minimum 100); resets none, weekly (Sunday 00:00 UTC) or monthly (1st, 00:00 UTC); the key expires at the limit; Enterprise and select Pro customers; requests showing 0 cents do not count toward the budget"
+  - title: OpenRouter docs, Provider routing (checked 2026-10-28)
+    url: https://openrouter.ai/docs/features/provider-routing
+    note: "default load balancing prefers providers without significant outages in the last 30 seconds, then weights the cheapest by inverse square of price; $1 provider about 9x as likely to be tried first as a $3 one; sort or order disables load balancing; provider fields include order, quantizations, allow_fallbacks, data_collection, zdr, max_price"
+  - title: OpenRouter docs, Model fallbacks (checked 2026-10-28)
+    url: https://openrouter.ai/docs/guides/routing/model-fallbacks
+    note: "models array in priority order; any error can trigger a fallback, including context length validation, moderation flags, rate limiting and downtime; the model attribute of the response names the model used; priced at the model ultimately used"
+  - title: OpenRouter pricing (checked 2026-10-28)
+    url: https://openrouter.ai/pricing
+    note: "5.5% fee on credit purchases on Standard, 8% on Business; BYOK free up to $25,000 of list-price inference a month, then 5%; inference billed at the provider's list price; budgets and spend controls on Standard and above"
+  - title: Anthropic, Claude pricing (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: "Haiku 5.5 up to 100,000 prompt tokens $0.10 input, $0.125 5m write, $0.20 1h write, $0.01 hit, $0.50 output; over 100,000 tokens $0.50, $0.625, $1, $0.05, $2.50; prompt length counts cache reads and writes; Sonnet 5.5 $2, $2.50, $4, $0.10, $10; inference_geo us is 1.1x on all token categories for Claude 4.6 and later"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+Once more than one team calls a model API, someone decides where keys, quotas, routing, caching and usage records live: in a library each service imports, in a proxy every call passes through, or in a hosted router that also holds your provider relationships. All three are an API gateway with a token meter. Three things make the model case different from an HTTP gateway in front of stateless services.
+
+The unit of cost varies by more than an order of magnitude between requests to the same endpoint, and it is not known until the response finishes, because the model decides the output length. Price is also not one number per token. A Claude request is billed separately for fresh input, 5-minute cache writes, 1-hour cache writes, cache hits and output, and Haiku 5.5 raises every one of those rates fivefold when the prompt crosses 100,000 tokens (Anthropic pricing page, checked 2026-10-28).
+
+Backends are not interchangeable. Two HTTP replicas return the same body; two models, or one open-weight model from two providers running different quantisations, return different answers. A fallback is therefore a behaviour change, not only an availability event.
+
+The usage record is the only source of truth for attribution. The provider's invoice knows keys and models; it does not know tenants or features.
+
+The rule that follows: the gateway owns whatever must be uniform across teams or needs the whole picture of spend, and the product owns whatever depends on a feature's semantics.
+
+## What the gateway owns, in request order
+
+**Identity and tags.** The gateway issues its own keys to services and holds the provider keys, so a leaked service key is revoked without rotating a provider key shared by every team. Each call carries tenant, feature and environment tags. In production an untagged call is rejected, because it becomes spend nobody can attribute.
+
+**Token quotas with reserve and settle.** A requests-per-minute limit treats a 200-token classification and a 150,000-token document review as equal. The limit has to be in tokens, and since output length is unknown at admission, the gateway reserves prompt tokens plus `max_tokens`, then settles to the actual count when the response ends. LiteLLM's proxy does this for dollar budgets: its docs describe a reservation that holds the estimated maximum cost before the call and replaces it with the actual cost afterwards, on by default.
+
+<Predict id="inf-gw-reserve" question="A tenant's bucket holds 100,000 tokens. Each request sends 3,000 prompt tokens with max_tokens 4,096, and real outputs average 400 tokens. How many requests does a full bucket admit before it refuses, ignoring refill?" answer={14} tolerance={0} unit="requests">
+<p>Each reservation is 3,000 + 4,096 = 7,096 tokens, and 100,000 / 7,096 = 14.09, so <b>14</b>. The requests will consume 3,400 tokens each, so the same bucket could have carried 29 of them. Dropping <code>max_tokens</code> to 1,000 raises admission to 25 without changing the limit. A generous default <code>max_tokens</code> halves a tenant's concurrency under reservation, so the gateway should report reserved against settled tokens per feature: a large gap is a product bug, not a quota problem.</p>
+</Predict>
+
+**Routing and fallback.** The gateway chooses a deployment for the requested model (provider routing) and, by policy, a different model when the first fails (model fallback). Provider routing among identical deployments is the gateway's job. Deciding which model is acceptable for a feature is not; the product declares an ordered allowlist per feature, and the gateway enforces it. Routing by difficulty is the next lesson.
+
+**Caching.** An exact-match response cache is safe at the gateway for deterministic, tenant-scoped calls, with tenant, model and every sampling parameter in the key. Provider prompt caching is different: a hit needs a byte-identical prefix, so the hit rate depends on how the product assembles the prompt. The gateway can measure the hit rate per feature; only the product can fix it.
+
+**The usage record.** One row per attempt, with requested model, served model, every token category, latency, the tags, and the cost computed from a dated price table. The served model matters because each of the products compared below can serve a model other than the one requested.
+
+## What stays in the product
+
+The prompt, its layout and its cache breakpoints. Output validation, and what happens when validation fails. Safety of the user-visible operation under retries: a gateway retry of a call whose first attempt already triggered a tool call is the product's problem. Evals, because "model B is an acceptable fallback for feature X" can only be decided against feature X's eval set. Streaming behaviour toward the end user. A gateway that rewrites prompts, for example trimming context to fit a cheaper model's window, has made a product decision without the product's evals.
+
+## Three products, compared where they differ
+
+All three do fallbacks, retries and load balancing. They differ in where they run, how budgets are enforced, and what fails when a dependency is down.
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th></th><th>LiteLLM proxy</th><th>Portkey gateway</th><th>OpenRouter</th></tr></thead>
+<tbody>
+<tr><td>Runs</td><td>Self-hosted</td><td>Open-source gateway, self-hosted or with Portkey's hosted product</td><td>Hosted; traffic, and without your own keys your provider accounts, go through it</td></tr>
+<tr><td>Budget scopes</td><td>Proxy, team, team member, user, key, customer, agent session</td><td>Per provider integration and per workspace</td><td>Spend controls on Standard plan and above</td></tr>
+<tr><td>Budget mechanics</td><td>Reserve then settle, on by default; needs Postgres; resets checked every 10 minutes</td><td>USD (minimum $1) or tokens (minimum 100); weekly or monthly reset at 00:00 UTC; the key expires at the limit</td><td>Credits bought in advance</td></tr>
+<tr><td>Routing</td><td>Weighted shuffle (default), latency, least busy, usage, cost; cooldowns</td><td>Configs: fallback, load balance, conditional routing, circuit breaker</td><td>Price-weighted provider choice; model fallback list; sort by price, throughput or latency</td></tr>
+<tr><td>Default fallback trigger</td><td>Per error class: general, context window, content policy, default</td><td>Any non-2xx unless <code>on_status_codes</code> narrows it</td><td>Any error, including context length and moderation flags</td></tr>
+<tr><td>Fees</td><td>Your infrastructure</td><td>Your infrastructure, or a plan for hosted features</td><td>5.5% on credit purchases (Standard), 8% (Business); own keys free to $25,000 of list-price usage a month, then 5%</td></tr>
+</tbody>
+</table>
+</div>
+
+Four behaviours under those rows decide production outcomes.
+
+**What happens when the budget store is down.** LiteLLM's docs state that budgets are enforced against spend read from Postgres, and that the global `max_budget` fails open without a database rather than erroring. A runaway agent loop during a database incident is exactly when a budget is needed. Either alert on the fail-open path or check budgets against a store whose outage blocks traffic, and decide which per feature in writing, because it is a choice between an outage and an uncapped bill.
+
+**Where the counters live.** LiteLLM's `max_parallel_requests` returns an immediate 429 with no queue, and the docs state the limit is per process, not shared across workers: ten workers with a cap of 20 admit 200. Usage-based routing that shares counters goes through Redis, which the same docs say is not recommended for production because of the latency it adds. A token limit exact across replicas costs a round trip to a shared store per request; an approximate one splits the rate across replicas and accepts unfairness between them.
+
+**What the budget can see.** Portkey's budget page says requests showing 0 cents in its cost column do not count toward the budget, and limits apply to models it has pricing for. A self-hosted model, or a new model the price table does not know yet, is invisible to the cap. LiteLLM's cost-based routing has the mirror problem: a deployment missing from its cost map is assigned $1. Either way the price table is production configuration and needs an owner and a test that every routable model has a price.
+
+**How a fallback shows up.** OpenRouter returns the model actually used in the response's `model` attribute and bills at that model's price. LiteLLM sets `x-litellm-model-id` and records `attempted_fallbacks` and `original_model_group` in its spend logs. Portkey shows every attempt under the request's trace ID. None of them stop a product from treating a fallback answer as a primary answer. Unless the served model is written into the usage record and compared with the requested one, a context-length fallback can move a feature to a different model for weeks without anyone deciding it.
+
+OpenRouter's provider routing is not round robin, and the split is worth computing. Among providers with no significant outage in the last 30 seconds, it weights the cheapest by the inverse square of price. With three stable providers at $1, $2 and $3, the weights are 1, 1/4 and 1/9, which sum to 1.361, so the $1 provider is tried first 73% of the time, the $2 provider 18% and the $3 provider 8%. If those providers run different quantisations of the same open-weight model, about three quarters of your traffic goes to the cheapest quantisation unless you pin `quantizations` or `order`.
+
+## The usage record, priced at the date of the call
+
+Cost is a function of the full token breakdown, not of total tokens, and the function has thresholds. The record below keeps requested and served models apart and prices from a table that carries its check date.
+
+```python
+from dataclasses import dataclass
+
+# USD per million tokens, from platform.claude.com/docs/en/about-claude/pricing, checked 2026-10-28.
+PRICES = {
+    ("claude-haiku-5.5", "short"): dict(inp=0.10, w5m=0.125, w1h=0.20, hit=0.01, out=0.50),
+    ("claude-haiku-5.5", "long"): dict(inp=0.50, w5m=0.625, w1h=1.00, hit=0.05, out=2.50),
+    ("claude-sonnet-5.5", "short"): dict(inp=2.00, w5m=2.50, w1h=4.00, hit=0.10, out=10.00),
+}
+
+@dataclass
+class Usage:
+    tenant: str
+    feature: str
+    requested_model: str
+    served_model: str          # differs from requested_model after a fallback
+    fresh_in: int
+    write_5m: int
+    write_1h: int
+    cache_hit: int
+    out: int
+    us_only: bool = False      # inference_geo "us": 1.1x on every token category
+
+def cost_usd(u: Usage) -> float:
+    prompt = u.fresh_in + u.write_5m + u.write_1h + u.cache_hit
+    tier = "long" if u.served_model == "claude-haiku-5.5" and prompt > 100_000 else "short"
+    p = PRICES[(u.served_model, tier)]
+    usd = (u.fresh_in * p["inp"] + u.write_5m * p["w5m"] + u.write_1h * p["w1h"]
+           + u.cache_hit * p["hit"] + u.out * p["out"]) / 1e6
+    return usd * (1.1 if u.us_only else 1.0)
+
+a = Usage("acme", "contract-qa", "claude-haiku-5.5", "claude-haiku-5.5", 4_000, 0, 0, 95_000, 800)
+b = Usage("acme", "contract-qa", "claude-haiku-5.5", "claude-haiku-5.5", 6_000, 0, 0, 95_000, 800)
+print(f"{cost_usd(a):.5f} {cost_usd(b):.5f} {cost_usd(b) / cost_usd(a):.1f}x")  # 0.00175 0.00975 5.6x
+```
+
+The two requests differ by 2,000 fresh input tokens. The second crosses 100,000 prompt tokens, and Anthropic's page says prompt length counts cache reads and writes, so every token in it, including the 95,000 cached ones, moves to the higher rates: $0.00975 against $0.00175, 5.6 times the cost. A gateway that estimates cost as total tokens times an average price misses this, and a feature whose retrieved context grows by a few chunks can multiply its bill by five with no change in traffic.
+
+Attribution queries run on these rows: cost per tenant per feature per week, reserved against settled tokens, cache-hit tokens as a share of prompt tokens, and the share of attempts where the served model differs from the requested one. The last two explain most unexplained bills, and neither is visible on a provider invoice.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Six product teams call three providers with their own keys. Security wants every prompt logged at one egress point by the end of the quarter. Finance wants cost per customer for the board meeting in eight weeks. Two teams refuse a new hop on their p95 and fear lock-in. You have two engineers. What do you build, and what does the gateway own on day one?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>A self-hosted proxy in the callers' region that owns keys, tags, token quotas with reserve and settle, and a per-attempt usage record with requested and served model and a dated price. Routing is limited to provider failover within one model; model fallbacks stay off until each team declares an allowlist backed by its evals. Prompt logging is on for security but stored apart from usage rows, with its own retention. The two latency-sensitive teams move last, after the added p95 is measured on the others.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The order follows the deadlines. Finance's eight weeks need only attribution, so week one is keys and tags: the gateway issues service keys, holds provider keys, and rejects untagged production calls. That yields cost per customer from usage rows without touching routing.</p>
+<p>Self-hosted rather than a hosted router, because security's requirement is one egress point under our control, and a hosted router adds a processor to the data path with its own review. The cost is that we run it: replicated, health-checked, with a documented direct-to-provider path for when it is down.</p>
+<p>Prompts go to a separate store with its own access control and retention set with security, because finance and many engineers read usage rows, and prompts hold customer data.</p>
+<p>Budget-store failure is decided per feature: fail closed for batch and agent features, where a runaway loop is plausible, and fail open with a page for interactive features, accepting a bounded overspend during a database outage in exchange for availability.</p>
+<p>What we give up: model fallbacks and cost-based routing this quarter, and the two latency-sensitive teams stay direct until the overhead is measured. Written down: the fail-open decision per feature, the price-table owner, and the rollback, which is pointing the SDK base URL back at the provider.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Security now says logging prompts at the gateway doubles the places customer data lives and wants hashes only. Finance still needs per-customer cost. Which requirement gives?</em> Neither: cost needs token counts and tags, not prompt text. The open question is whether incident debugging can live with hashes, which is for security and the on-call team to settle, in writing.</li>
+<li><em>One latency-sensitive team measures the added p95 and still refuses. Do you exempt them?</em> From the hop but not from attribution: they emit the same usage record from a client library, and the exemption is reviewed when the gateway can run as a sidecar.</li>
+<li><em>What would you need to see a year from now to move to a hosted router?</em> Many providers serving the same open-weight models, where price-weighted provider routing and consolidated billing outweigh the fee and the extra processor, and a security review that accepts it.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+With one team and one provider, a gateway is a hop and a service to operate in exchange for what the provider console already shows. The case for it starts when attribution across teams, tenants or providers is a requirement, or when keys must be revocable per service.
+
+Cost computed from list prices is an estimate. Committed-use discounts, batch pricing, regional multipliers such as Anthropic's 1.1 times for US-only inference on Claude 4.6 and later, and credit fees such as OpenRouter's 5.5% on purchases all sit between the usage record and the invoice. Reconcile monthly against the provider's billing export and treat a persistent gap as a price-table bug.
+
+The comparison is dated 2026-10-28. These products ship often, and a documented default is what a fresh install does, not what yours does after a year of configuration. Read the running configuration before trusting any comparison table, this one included.
+
+<SelfRate id="lesson:inference/gateways-finops/gateway" />

@@ -1,0 +1,165 @@
+---
+id: wfl-022
+title: Two audit rows for one refund approval
+subtitle: a LangGraph approval step after an audit-table change
+track: workflows
+module: approvals-handoffs
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: true
+tags: [langgraph, interrupts, human-in-the-loop, idempotency, audit]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: LangGraph docs, interrupts
+    url: https://docs.langchain.com/oss/python/langgraph/interrupts
+    note: on resume the runtime restarts the entire node from the beginning; side effects before interrupt() should be idempotent; a bare try/except around interrupt() stops it reaching the graph (checked 2026-10-28)
+  - title: LangGraph docs, checkpointers
+    url: https://docs.langchain.com/oss/python/langgraph/checkpointers
+    note: durability modes exit, async and sync, where async has a small risk of losing checkpoints if the process crashes; pending writes keep successful nodes of a failed super-step from re-running; get_state_history (checked 2026-10-28)
+  - title: OpenAI Agents SDK, human-in-the-loop
+    url: https://openai.github.io/openai-agents-python/human_in_the_loop/
+    note: do not take the reviewer's identity from the approval request body (checked 2026-10-28)
+choices:
+  - text: The reviewer UI retries the POST once after a 504, so one decision resumes the same thread twice
+    correct: false
+    why: The retry is a real defect, but it fires only on 504s, and it cannot explain the first row, which was created hours before anyone clicked.
+  - text: On resume the node restarts from its first line, so the INSERT above interrupt() runs a second time
+    correct: true
+    why: LangGraph restarts the whole node when it resumes, and the evidence fits it exactly; every resumed thread has two rows, and the second row was created at resume time.
+  - text: Async durability can lose the checkpoint written at the pause, so the node replays from the step before
+    correct: false
+    why: Async durability does widen a crash window, but it loses checkpoints only when a process crashes, and these duplicates appear on every resumed thread.
+  - text: Pending writes saved at the paused super-step are replayed on resume and apply the INSERT again
+    correct: false
+    why: Pending writes do the opposite; they record nodes that already finished so that a resumed super-step does not run them again.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The round">
+"Refund approvals write two audit rows since last week's release. Compliance wants the duplicates explained and stopped, and nothing deleted from the audit table. Here is the release diff and what we have. Which explanation fits the symptom, and what do you change?"
+</Callout>
+
+The graph is `load_order`, then `request_approval`, then `issue_refund`, with a `PostgresSaver` checkpointer. Last week's release (one pull request) added the audit table, switched the checkpointer from `SqliteSaver`, passed `durability="async"` on every invoke, added a model-written `summary` to the approval payload, and gave the reviewer UI's API client one retry on a 504.
+
+```python
+def request_approval(state: RefundState) -> dict:
+    audit_id = db.fetchval(
+        "INSERT INTO approval_audit (thread_id, order_id, amount, status, requested_at) "
+        "VALUES ($1, $2, $3, 'pending', now()) RETURNING id",
+        state["thread_id"], state["order_id"], state["amount"],
+    )
+    decision = interrupt({
+        "order_id": state["order_id"],
+        "amount": state["amount"],
+        "summary": state["summary"],
+    })
+    # close the audit row with the reviewer's decision
+    db.execute(
+        "UPDATE approval_audit SET status = $1, reviewer = $2, decided_at = now() WHERE id = $3",
+        decision["action"], decision["reviewer"], audit_id,
+    )
+    return {"approved": decision["action"] == "approve", "audit_id": audit_id}
+
+
+@app.post("/approvals/{thread_id}")
+async def decide(thread_id: str, body: DecisionBody):
+    config = {"configurable": {"thread_id": thread_id}}
+    resume = {"action": body.action, "reviewer": body.reviewer}
+    return await graph.ainvoke(Command(resume=resume), config, durability="async")
+```
+
+The two rows for one thread (the values are illustrative; the pattern is what the on-call engineer reported):
+
+| id | thread_id | order_id | amount | status | reviewer | requested_at | decided_at |
+|---|---|---|---|---|---|---|---|
+| 9101 | t-77a | A-1042 | 480.00 | pending | | 2026-10-26 10:02:11 | |
+| 9188 | t-77a | A-1042 | 480.00 | approve | priya | 2026-10-26 14:37:05 | 2026-10-26 14:37:05 |
+
+The on-call engineer adds that every thread they checked since the release has two rows once resumed. There are no logs from the reviewer UI's API client, and nobody has looked at the checkpoints.
+
+Pick the explanation that accounts for the symptom. Then rank the other real defects in the release, and say what evidence you would collect before you change anything.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Compare each row's requested_at with the time the reviewer clicked: which row was created by the click?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask whether rejected threads, and threads whose POST never saw a 504, also have two rows.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the checkpoint history for t-77a: which node is listed as next at the pause, and which nodes ran after the resume?</p></details>
+
+## Answer
+
+The node re-runs. LangGraph's docs say that on resume the runtime restarts the entire node from the beginning, so everything above `interrupt()` runs again. The first run inserts row 9101 and pauses. The resume re-enters `request_approval`, inserts row 9188, gets the decision back from `interrupt()` and updates 9188. Row 9101 stays `pending` forever. The table shows exactly that: the second row's requested_at equals its decided_at, because it was created a moment before the update in the same resumed run.
+
+The duplicate also corrupted a metric nobody has asked about yet. Review latency computed as decided_at minus requested_at on the decided row is close to zero for every approval since the release, because the decided row was created at resume time.
+
+Why the wrong picks are tempting. The 504 retry ships in the same release and is a real defect; it would add a row only for requests that saw a 504, and it cannot produce a row stamped hours before the click. The `durability="async"` change is a real weakening for a step that waits hours, but it loses a checkpoint only when a process crashes, which does not happen on every resume. Pending writes are the plausible mechanism with the direction reversed: they exist so that a node that finished in a failed super-step is not run again.
+
+### What to collect, and what to do without it
+
+Collect three things before changing code. The checkpoint history for one affected thread (`get_state_history`): the pause checkpoint should list `request_approval` as next. A count of rows per resumed thread, split by decision and by whether the POST saw a 504 in the gateway logs: if rejected threads and threads with no 504 also have two rows, the retry is ruled out as the main cause. Any request log for the API client, even from the gateway.
+
+If the client logs never turn up, the fix below does not depend on them: it makes the insert idempotent, which also neutralises a double resume.
+
+### The fix, and the decision inside it
+
+Two fixes are defensible, and they fail in different places.
+
+Move the INSERT into its own node before `request_approval` and keep `audit_id` in state. The pause then happens in a node with nothing above the interrupt. The cost is one more super-step and checkpoint per approval, and it holds only while that node's checkpoint is durable: with `durability="async"`, a crash after the INSERT and before the checkpoint lands re-runs the node and inserts again.
+
+Keep the INSERT where it is and make it idempotent with a unique key. This survives re-runs, crashes and double resumes. The cost is a migration on a table compliance owns, and a key that must be deterministic: a `uuid4()` generated inside the node is a new value on every re-run and deduplicates nothing.
+
+```sql
+ALTER TABLE approval_audit ADD COLUMN approval_key text;
+CREATE UNIQUE INDEX CONCURRENTLY approval_audit_key
+  ON approval_audit (thread_id, approval_key) WHERE approval_key IS NOT NULL;
+```
+
+```python
+def request_approval(state: RefundState) -> dict:
+    key = f"{state['order_id']}:{state['approval_round']}"   # set by the graph, never generated here
+    audit_id = db.fetchval(
+        "INSERT INTO approval_audit (thread_id, approval_key, order_id, amount, status, requested_at) "
+        "VALUES ($1, $2, $3, $4, 'pending', now()) "
+        "ON CONFLICT (thread_id, approval_key) WHERE approval_key IS NOT NULL "
+        "DO UPDATE SET approval_key = EXCLUDED.approval_key RETURNING id",
+        state["thread_id"], key, state["order_id"], state["amount"],
+    )
+    decision = interrupt({"order_id": state["order_id"], "amount": state["amount"], "audit_id": audit_id})
+    db.execute(
+        "UPDATE approval_audit SET status = $1, reviewer = $2, decided_at = now() "
+        "WHERE id = $3 AND status = 'pending'",
+        decision["action"], decision["reviewer"], audit_id,
+    )
+    return {"approved": decision["action"] == "approve", "audit_id": audit_id}
+```
+
+The `DO UPDATE` that changes nothing is there so that `RETURNING id` yields the existing row on a conflict; `DO NOTHING` returns no row. The partial index leaves the historical rows, which have no key, out of the constraint. The guarded UPDATE makes the second half safe to re-run too.
+
+The recommended answer is the idempotent insert, with `durability="sync"` for this graph, because an approval waits hours and the cost of a synchronous checkpoint is paid once per pause. Its own failure mode is the key. If the graph loops back for a second approval of an amended amount and `approval_round` is not incremented in state, the second request collides with the first, the upsert returns the old row, and the guarded UPDATE silently changes nothing because that row is already decided. Increment the round in the node that routes back, and alert when the guarded UPDATE touches zero rows.
+
+The existing duplicates stay in the table. Mark each orphan `pending` row whose thread has a decided row as `superseded`, with a column pointing at the decided row, and change latency reports to take requested_at from the orphan. Then pick an age after which any row still `pending` is flagged for a person. It has to exceed the longest legitimate wait: if reviewers work to a one-day target and escalation can add another day, two days is reasonable, and one hour would flag live requests.
+
+### Ranking the other defects
+
+1. `decision["reviewer"]` comes from the request body, so any caller can record any name as the approver. The OpenAI Agents SDK docs state the same rule for their run state: do not take the reviewer's identity from the request body. Take it from the authenticated session. This is a security defect and it outranks the rest.
+2. The client retries a non-idempotent POST. With the idempotent insert it no longer duplicates rows, but the handler should still return the recorded decision when the thread is no longer paused, rather than invoking the graph again.
+3. `durability="async"` on a graph whose pauses last hours. Use `sync` here.
+4. The reviewer sees a model-written `summary` instead of the exact refund arguments. That belongs to the approval-security discussion; it causes nothing in this table.
+
+## Follow-ups
+
+- *The unique index needs a migration on a compliance-owned table, and the release freeze starts Friday. Which half of the fix do you ship now, and what do you write down about the rows created until the index exists?*
+- *After the fix ships, what would you need to see in the audit table to conclude that the 504 retry, not the node re-run, was producing some of the duplicates?*
+- *Three hundred threads are paused inside the old `request_approval` when you deploy. What does each do on resume under the new code, who signs off on the orphan rows they leave, and how do you show that none of them refunded twice?*
+- *The step after the approval calls the payment provider instead of your database. What changes?* The provider call needs its own idempotency key derived from the order and the approval round, because a resumed node can reach it twice.
+
+## Common mistakes
+
+- Deleting the orphan rows to fix the count. The brief said nothing is deleted, and the orphans carry the only correct request times.
+- Generating the idempotency key with `uuid4()` inside the node. Every re-run gets a new key.
+- Moving the INSERT below `interrupt()`. It then runs once per resume, but the audit trail loses the moment the request was raised, which is the part compliance asked for.
+- Wrapping `interrupt()` in a `try` block to "catch the resume". The docs warn that a bare `except` swallows the interrupt so it never reaches the graph.

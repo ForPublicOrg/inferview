@@ -1,0 +1,195 @@
+---
+title: Structured handoffs between steps
+track: workflows
+module: approvals-handoffs
+order: 3
+kind: lesson
+level: senior
+minutes: 12
+summary: A step's output is the next step's input, so it gets a schema, a version and a size budget, and anything larger than the budget moves by an immutable reference.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Temporal Cloud docs, limits (checked 2026-10-28)
+    url: https://docs.temporal.io/cloud/limits
+    note: 2 MB maximum payload for a single request; 4 MB per gRPC message and per history transaction; history hard limit 51,200 events or 50 MB, warning at 10,240 events or 10 MB; offload regularly large payloads to External Storage
+  - title: Inngest docs, usage limits (checked 2026-10-28)
+    url: https://www.inngest.com/docs/usage-limits/inngest
+    note: 4 MiB returned by one step; 32 MiB function run state including event, step and return data; 1,000 steps per function; maximum run length 30, 90 or 366 days by plan
+  - title: Cloudflare Workflows docs, rules of Workflows (checked 2026-10-28)
+    url: https://developers.cloudflare.com/workflows/build/rules-of-workflows/
+    note: a step can persist up to 1 MiB (2^20 bytes) and fails above it; store large outputs externally, for example in R2, and save a reference; step names act as the cache key
+  - title: OpenAI Agents SDK docs, handoffs (checked 2026-10-28)
+    url: https://openai.github.io/openai-agents-python/handoffs/
+    note: handoffs are tools named transfer_to_<agent>; the next agent sees the entire previous conversation history by default; input_filter and HandoffInputData; remove_all_tools does not redact text already copied into messages; nested history is an opt-in beta and does not redact; input_type is model-decided metadata, application state belongs in the run context
+  - title: OpenAI Agents SDK reference, handoffs (checked 2026-10-28)
+    url: https://openai.github.io/openai-agents-python/ref/handoffs/
+    note: HandoffInputData.clone(**kwargs); HandoffInputFilter signature
+  - title: Anthropic, How we built our multi-agent research system (2025-06-13)
+    url: https://www.anthropic.com/engineering/multi-agent-research-system
+    note: subagents store work in external systems and pass lightweight references to the coordinator; multi-agent systems use about 15 times the tokens of chat (Anthropic's own measurement)
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## A step boundary is an API
+
+In a workflow with model steps, each step's output is persisted by the engine and handed to the next step as input. That makes the boundary an API in every sense that matters: it has a producer and a consumer that deploy separately, it outlives the code that wrote it (a run started last week replays this week's code against last week's recorded outputs), and the engine charges for its size. The difference from an RPC contract is the producer. When a model writes the payload, conformance is probabilistic, so validation sits at the boundary with a repair path (retry with the validation error, or route to a person), and the consumer treats every free-text field as untrusted input.
+
+Give each boundary three things: a schema the consumer validates, a version the consumer dispatches on, and a size budget the producer enforces before the engine does.
+
+## The engines cap payloads, and they disagree
+
+| Engine (docs checked 2026-10-28) | Per-step or per-payload cap | Run-level cap | What happens at the cap |
+|---|---|---|---|
+| Temporal Cloud | 2 MB per request payload; 4 MB per gRPC message and per history transaction | history of 51,200 events or 50 MB (warning at 10,240 events or 10 MB) | non-configurable; the docs say to offload regularly large payloads to External Storage |
+| Inngest | 4 MiB returned by one step | 32 MiB of run state, covering event data, step data, return data and metadata | the docs say to store larger results outside step state and return a reference |
+| Cloudflare Workflows | 1 MiB (2^20 bytes) persisted per step | not stated on the rules page | the step fails |
+
+Note the units: Temporal states MB, the other two MiB. Budget in bytes and take the smallest cap of any engine you might move to.
+
+A per-step cap is the obvious limit, and binary data is where teams first hit it. A 900 KiB scanned invoice, base64-encoded into a JSON step result, grows by a factor of 4/3 to 1,200 KiB, which is over Cloudflare's 1,024 KiB limit even though the file itself is under it. The run-level cap is the one that arrives later, in production, on the longest documents.
+
+<Predict id="handoff-run-state" question="How many such steps complete before the run's state reaches its cap?" answer={54} tolerance={0} unit="steps">
+<Fragment slot="prompt">
+<p>An Inngest function extracts line items page by page. Each step returns 600 KiB of JSON, well under the 4 MiB step cap. Ignore event data and metadata; the run state cap is 32 MiB.</p>
+</Fragment>
+<p><b>54.</b> 32 MiB is 32,768 KiB, and 32,768 / 600 is 54.6, so the 55th step's output does not fit. Every step passes its own check and the run still fails, on exactly the long documents that motivated a workflow. The per-step budget has to be derived from the run cap divided by the number of steps you expect, not from the per-step cap.</p>
+</Predict>
+
+Temporal has the same shape with different numbers: each recorded payload counts toward the 50 MB history limit, and a run that warns at 10 MB is telling you its payloads are too large or the run is too long, usually both.
+
+## Claim check: move bytes by reference
+
+The fix is the claim-check pattern. The producer writes the artefact to object storage and returns a small record; the consumer reads the bytes when it needs them. All three engines' docs recommend it (Temporal's External Storage, Inngest's reference return, Cloudflare's R2 plus a saved reference), and Anthropic describes the same move at the agent level: in its research system, subagents "store their work in external systems, then pass lightweight references back to the coordinator", rather than copying full outputs through the lead agent's context.
+
+A reference in a durable workflow has requirements a reference in a request handler does not.
+
+It must be immutable. On replay, the engine returns the recorded reference and the consumer reads it again; if the key is `invoices/123/latest.json` and something overwrote it, the replay reads different bytes than the original run did. Content addressing (the key is a digest of the bytes) makes the reference self-verifying.
+
+It must outlive the run. The blob's lifecycle rule has to exceed the longest run plus your debugging window. Inngest's maximum run length is 30, 90 or 366 days depending on plan; a 30-day object expiry under a 90-day run deletes inputs out from under a step that has not executed yet.
+
+It is a capability. Whoever holds a presigned URL can read the object until the URL expires, and the expiry has to cover the wait between steps, which includes any human approval. Keep URLs out of model context entirely: pass an opaque key, and let a tool that runs under the workflow's own identity fetch it. A URL in context can be exfiltrated by any injected instruction that can make a request.
+
+It adds a dependency. Object storage availability becomes part of every step's availability, so reads go through the same retry policy as any other activity.
+
+```python
+import hashlib, json
+from dataclasses import dataclass
+
+INLINE_BUDGET = 64 * 1024   # chosen: far under the smallest per-step cap, small enough for long runs
+
+class BlobStore:            # stand-in for S3, GCS or R2
+    def __init__(self):
+        self._d = {}
+    def put(self, data: bytes) -> str:
+        key = "sha256:" + hashlib.sha256(data).hexdigest()
+        self._d.setdefault(key, data)
+        return key
+    def get(self, key: str) -> bytes:
+        data = self._d[key]
+        if "sha256:" + hashlib.sha256(data).hexdigest() != key:
+            raise ValueError("blob does not match its reference")
+        return data
+
+@dataclass(frozen=True)
+class Envelope:
+    schema: str              # "invoice.extracted"
+    version: int             # bumped on any breaking change
+    inline: dict | None
+    ref: str | None
+    nbytes: int
+
+def wrap(schema, version, payload, store):
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    if len(raw) <= INLINE_BUDGET:
+        return Envelope(schema, version, payload, None, len(raw))
+    return Envelope(schema, version, None, store.put(raw), len(raw))
+
+def unwrap(env, store, accepts):
+    if (env.schema, env.version) not in accepts:
+        raise ValueError(f"cannot read {env.schema} v{env.version}")
+    return env.inline if env.ref is None else json.loads(store.get(env.ref))
+
+store = BlobStore()
+lines = [{"sku": f"S{i}", "qty": 1, "cents": 1999} for i in range(5000)]
+env = wrap("invoice.extracted", 2, {"lines": lines}, store)
+print(env.ref is not None, env.nbytes)            # True, and the size that went to storage
+print(len(unwrap(env, store, {("invoice.extracted", 1), ("invoice.extracted", 2)})["lines"]))
+```
+
+The `accepts` set is the versioning rule written down. A consumer deployed today reads every version a run still in flight could have recorded, so the window for dropping version 1 is the maximum run length since the last producer of version 1 shipped, not the deploy after it.
+
+## Handoffs between agents carry history
+
+An agent-to-agent handoff is a step boundary whose default payload is the transcript. In the OpenAI Agents SDK, a handoff is a tool the model calls (`transfer_to_refund_agent` for an agent named Refund Agent), and by default the receiving agent "gets to see the entire previous conversation history". That default is a security decision. If the triage agent read an email containing injected instructions, the refund agent now reads them too, with its own tools. The reach of one injected string is the union of the tools of every agent that receives the history it sits in.
+
+The SDK's controls, as of the docs checked on 2026-10-28:
+
+`input_filter` receives a `HandoffInputData` (`input_history`, `pre_handoff_items`, `new_items`, optional `input_items`, `run_context`) and returns what the next agent sees; `clone(**kwargs)` copies it with fields replaced. `handoff_filters.remove_all_tools` strips tool-call items, and the docs warn it does not redact tool arguments or results that were already copied into ordinary messages or summaries. `nest_handoff_history` is an opt-in beta that compacts prior history into summary segments; it also does not redact. `input_type` defines arguments the model supplies when it calls the handoff tool, validated against the schema and passed to `on_handoff`; the docs describe it as metadata such as a reason or priority, not conversation content, and say application state belongs in `RunContextWrapper.context`.
+
+That gives a typed handoff in three parts: the application puts what it knows and has verified (the customer, their orders) into the run context before the run starts; the model supplies a small typed brief through `input_type`, which `on_handoff` checks against that context; and the input filter drops the transcript.
+
+```python
+from pydantic import BaseModel
+from agents import Agent, handoff
+from agents.handoffs import HandoffInputData
+
+class RefundBrief(BaseModel):
+    order_id: str
+    reason: str
+
+async def check_brief(ctx, brief: RefundBrief) -> None:
+    if brief.order_id not in ctx.context.verified_order_ids:   # set by the app, not the model
+        raise ValueError("handoff names an order this customer does not own")
+    ctx.context.refund_brief = brief
+
+def drop_transcript(data: HandoffInputData) -> HandoffInputData:
+    # input_items, when set, replaces new_items, so clear it as well
+    return data.clone(pre_handoff_items=(), new_items=(), input_items=())
+
+refunds = Agent(name="Refund agent", instructions="Refund the order in the brief.")
+triage = Agent(name="Triage agent", handoffs=[
+    handoff(refunds, input_type=RefundBrief, on_handoff=check_brief, input_filter=drop_transcript),
+])
+```
+
+Typing narrows the channel; it does not make the values trustworthy. The model filled `order_id` from a context that may contain injected text, which is why the check compares it with application state. `reason` is free text and reaches the next agent as such; a schema full of `notes: str` fields is a transcript with extra steps. The original user input still flows through `input_history`, so if the run started from an untrusted document, filter that too.
+
+Cost points the same way. Anthropic reports that its multi-agent systems use about 15 times the tokens of chat interactions (its own measurement on its research workload); every handoff that forwards a full transcript adds that transcript to the next agent's input on every one of its turns.
+
+<Callout kind="gotcha">Cloudflare's rules page says step names act as the cache key for a step's result. A step named from the current time or a random id gets a different key on replay and re-executes; name steps from the workflow's structure and deterministic inputs.</Callout>
+
+## In the room
+
+A triage agent hands customers to a refund agent that has a payments tool, forwarding full history. Security wants every handoff filtered by the end of the month after a red-team found that an instruction pasted into a support email reached the refund agent. Product has an offline eval showing the refund agent resolves fewer cases when history is stripped. What do you ship?
+
+<Depth>
+<Fragment slot="short">
+<p>Ship the filter on the handoff into the agent with the payments tool by the deadline, with a typed brief checked against application state and the transcript dropped, and leave handoffs between read-only agents on full history for now. Recover the lost resolution rate by adding fields to the brief, driven by which eval cases regressed, not by restoring the transcript.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The risk is concentrated where the tools are, so the filter goes on edges into agents that can write. Read-only agents receiving history can still be misled, but cannot move money; I would note that as accepted risk with a date to revisit.</p>
+<p>The eval regression tells me which information the refund agent used. I would read the regressed cases and classify what was missing: order identity, customer intent, prior promises made by support. The first comes from application state, the second fits a short enumerated reason field, and the third is the hard one, because it is free text by nature. For that I would let the refund agent call a read tool over the ticket that returns quoted text marked as untrusted, rather than receiving it as conversation.</p>
+<p>What I give up is some resolution rate until the brief catches up, and I would put the measured gap and the target date in the same note as the accepted risk.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The eval gap does not close after two iterations of the brief. Product asks for full history back on the refund edge with an injection classifier in front. What would you need to see to agree?</li>
+<li>The read tool over the ticket returns the injected text as quoted data. What stops the refund agent from following it anyway, and how would you test that?</li>
+<li>Two senior engineers disagree on whether read-only agents need the filter this month. How do you decide without deciding by rank?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Most step outputs are small. If every payload in a workflow is a few kilobytes and runs are short, inline payloads with a schema and a version are the whole answer, and a claim check adds a store, a lifecycle rule and a failure mode for no gain. Introduce references at the steps that carry documents, images or model transcripts, not everywhere.
+
+A typed brief loses information by design, and sometimes the lost part was the point. Anthropic's reason for passing references was to stop information loss through a coordinator, which is the opposite risk from the one a brief addresses. When the next step needs the whole artefact, pass the whole artefact by reference and give the consumer a tool to read slices of it, rather than squeezing it into fields.
+
+The caps in the table are for Temporal Cloud, Inngest's hosted plans and Cloudflare's rules page as checked on 2026-10-28. Self-hosted Temporal has its own configurable defaults, Inngest's run-level limits vary by plan, and all three have changed before. Re-read the limits page for the plan and version you run.
+
+<SelfRate id="lesson:workflows/approvals-handoffs/structured-handoffs" />

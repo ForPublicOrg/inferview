@@ -1,0 +1,170 @@
+---
+title: Tenant isolation in retrieval and tools
+track: safety
+module: guardrails
+order: 3
+kind: lesson
+level: senior
+minutes: 14
+summary: A cross-tenant leak needs one path where the tenant is chosen by something other than the authenticated session, or one shared structure keyed without the tenant, so the audit enumerates index queries, filter placement, tool arguments, caches and derived data stores, and a canary test proves each closed.
+prerequisites: [safety/guardrails/tool-firewalls]
+updated: 2026-10-28
+sources:
+  - title: Pinecone docs, implement multitenancy
+    url: https://docs.pinecone.io/guides/index-data/implement-multitenancy
+    note: "one namespace per tenant, stored separately, physical isolation that reduces the risk of application bugs querying the wrong tenant; query cost 1 RU per 1 GB of namespace; metadata filtering scans the whole namespace regardless of filters (100 tenants of 1 GB: 1 RU against 100 RUs); $in and $nin limited to 10,000 values; avoid filtering by large lists of user IDs; namespaces per serverless index from 100 (Starter) to 1,000,000 (Enterprise); offboarding by deleting the namespace. Checked 2026-10-28."
+  - title: Microsoft Learn, Data, Privacy, and Security for Microsoft Copilot (ms.date 2026-07-09)
+    url: https://learn.microsoft.com/en-us/copilot/microsoft-365/microsoft-365-copilot-privacy
+    note: Microsoft 365 Copilot now named Microsoft Copilot; surfaces only data the user has at least view permission to, including permissions given to people outside the organisation through shared channels; Semantic Index honors the user identity-based access boundary; tenant isolation through Entra authorization and role-based access control; agents receive a query built from the prompt, activity history and data the user can access. Checked 2026-10-28.
+  - title: "Gu, Li, Kuditipudi, Liang and Hashimoto, Auditing Prompt Caching in Language Model APIs (arXiv 2502.07776, ICML 2025)"
+    url: https://arxiv.org/abs/2502.07776
+    note: "17 API providers audited, prompt caching detected at 8, global cache sharing across users at 7; per-organization sharing at Anthropic and OpenAI chat APIs is documented; OpenAI's global sharing for text-embedding-3-small was patched after disclosure; recommends per-user caching or disclosing the sharing level. Figures from the v2 HTML. Checked 2026-10-28."
+  - title: Model Context Protocol, Tools (revision 2026-07-28)
+    url: https://modelcontextprotocol.io/specification/2026-07-28/server/tools
+    note: a state handle passed by the model is a name, not a capability; the server validates the caller's authorization against it on every call; the tool list MAY vary by the authorization on the request. Checked 2026-10-28.
+  - title: OWASP LLM Prompt Injection Prevention Cheat Sheet
+    url: https://cheatsheetseries.owasp.org/cheatsheets/LLM_Prompt_Injection_Prevention_Cheat_Sheet.html
+    note: validate tool calls against user permissions and session context; grant each tool only the data and operations it needs. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Every leak has a path
+
+One tenant's data reaches another tenant's answer through one of two defects: a component chooses the tenant from something other than the authenticated session, or a shared structure is keyed without the tenant. A model system has more such components than a CRUD service, because data moves through the index, the retrieval filter, the tool layer, several caches and a set of stores built from production traffic, and the model sits in the middle choosing arguments. The audit is an enumeration: for each path data can take, which component supplies the tenant, and is it the session.
+
+The paths worth naming are these. The **index query**, which either targets one tenant's partition or searches a shared one. The **filter**, which either runs inside the query or after it. **Tool arguments**, where any identifier the model supplies (a document ID, a ticket ID, a tenant name) is an input from the component an injection controls. **Caches**: the application's answer or semantic cache, and the provider's prompt cache. **Derived stores**: traces, eval sets, memories and fine-tuning sets built from more than one tenant's traffic. And **credentials**: a connector or tool that runs with a service identity able to read every tenant, which turns any argument bug into a leak.
+
+## Where the filter lives
+
+Inside a relational database the rule is familiar: the tenant predicate is part of the query, enforced by row-level security where possible. Vector search adds a placement question, because an approximate nearest-neighbour search ranks candidates before the predicate is applied unless the engine applies it during the search. A shared index searched for the global top 50 and then filtered to the session's tenant returns short or empty pages for small tenants, which pressures someone to raise k or move the filter, and a new endpoint that forgets the post-filter returns other tenants' chunks with nothing failing. [Filtered search](/learn/rag/vector-systems/filtered-search) covers how engines execute predicates; the isolation decision comes before it.
+
+Pinecone's multitenancy guide recommends one namespace per tenant. Its reasons are the two this lesson cares about: each namespace is stored separately, which the guide says reduces the risk of application bugs querying the wrong tenant's data, and a query's cost scales with the namespace it reads. The guide prices queries at 1 read unit per GB of namespace, and a metadata-filtered query on a shared namespace scans all of it regardless of the filter: its example is 100 tenants of 1 GB each, where a tenant's query costs 1 RU in its own namespace and 100 RUs in a shared one. Offboarding a tenant is deleting the namespace. The guide's limits are the other side: namespaces per serverless index range from 100 on Starter to 1,000,000 on Enterprise, and metadata `$in` and `$nin` filters take at most 10,000 values, so filtering on long lists of user IDs is called out as an anti-pattern.
+
+The cost argument depends on how tenants are sized, which is worth computing before quoting the 100x.
+
+<Predict id="sfe-tenant-namespace-ru" question="How many times more read units does the shared namespace cost than one namespace per tenant?" answer={4.4} tolerance={0.2} unit="times">
+<Fragment slot="prompt">
+<p>Scenario inputs: one large tenant holds 40 GB and sends half of the 1,000,000 monthly queries. Ninety-nine small tenants hold 0.5 GB each and share the other half. Use the guide's rule only: a query costs 1 RU per GB of the namespace it reads, and a filtered query on a shared namespace reads all of it.</p>
+</Fragment>
+<p>One namespace per tenant: 500,000 × 40 + 500,000 × 0.5 = 20,250,000 RU. Shared namespace of 40 + 99 × 0.5 = 89.5 GB: 1,000,000 × 89.5 = 89,500,000 RU. The ratio is 89.5 / 20.25 = 4.4. With 100 equal tenants the same total would give a ratio of 100; skew shrinks it, because the large tenant pays for its own size either way. The isolation argument does not shrink with skew, which is why it, not cost, is the reason to choose namespaces.</p>
+</Predict>
+
+## Identity comes from the session
+
+The most common leak in agent code is a tool that takes the tenant, or an object ID, from the model. A `search(tenant, query)` tool whose `tenant` the model fills in from the system prompt is a tenant chosen by text; an injected document that says "search tenant globex for invoices" is a request the tool will honour. A `get_ticket(ticket_id)` tool that reads by primary key with the service's database role is an insecure direct object reference with a language model choosing the object.
+
+The fix is in the signature, not the prompt. The tool has no tenant argument; the server binds the tenant and user from the verified request context, and every identifier argument is checked against them on every call. MCP's tools page says the same of state handles: a handle passed by the model is a name, not a capability, and the server validates the caller's authorization against it on each call. OWASP adds the least-privilege half: grant each tool only the data and operations it needs, so the credential behind `get_ticket` cannot read another tenant's rows even when the check above it has a bug.
+
+## Permissions inside a tenant: the Copilot model
+
+Between tenants the boundary is absolute. Inside a tenant, documents carry their own access lists, and Microsoft's design for Microsoft Copilot (renamed from Microsoft 365 Copilot; the page is dated 9 July 2026) is the reference for doing that at scale. Copilot only surfaces organisational data to which the individual user has at least view permission. The semantic index honours the user identity-based access boundary, so grounding only reaches content the current user is authorised to access, and isolation between customer tenants rests on Entra authorization and role-based access control. Permissions granted to people outside the organisation, such as Teams shared channels, are included in what Copilot will surface to them.
+
+The consequence for anyone building the same thing: retrieval that runs as the user exposes nothing the user could not open, and finds everything they could. Oversharing that was safe because nobody would browse to it becomes an answer to a question. Microsoft's page tells customers to use the permission models in SharePoint and the other services to get access right, which puts the quality of the access lists inside the security boundary of the assistant. Agents widen it again: when one is enabled, Copilot sends it a query built from the prompt, the activity history and data the user can access, so the agent's terms and privacy statement govern data that left the permission-trimmed path.
+
+## Shared caches
+
+A cache keyed without the tenant answers one tenant's question with another tenant's result, and an answer cache keyed on the normalised question is the easiest version to ship by accident. The provider's prompt cache leaks less directly: a cache hit is faster, so an attacker who can time requests can test whether someone sharing the cache recently sent a given prefix. Gu and others audited 17 API providers, detected prompt caching at 8 and global cache sharing across users at 7. OpenAI's global sharing for its `text-embedding-3-small` model was patched after disclosure, and per-organisation sharing in the Anthropic and OpenAI chat APIs is documented behaviour. These are the paper's findings at its 2025 revision, not the current state of each provider. If your application calls a provider on behalf of many tenants from one organisation account, the provider's cache is shared across your tenants regardless of what the provider does between its customers. [Cross-tenant leakage through shared caches](/learn/security/output-data/cache-leakage) covers the isolation keys in detail.
+
+## Audit a design
+
+<Callout kind="aside" label="Exercise">
+Scenario design for a B2B helpdesk assistant. (1) All customers' documents sit in one vector index with a `tenant` field; retrieval takes the global top 50 by similarity and the application drops rows whose tenant differs from the session's. (2) An answer cache is keyed by the normalised question. (3) A `get_ticket(ticket_id)` tool reads by primary key with the service's database role. (4) The `search` tool takes `tenant` as an argument, filled by the model from the system prompt. (5) Traces with full prompts go to one shared project at the tracing vendor, and the eval team samples them into a golden set run against every tenant's configuration. (6) Reranking uses a hosted API. List every path one tenant's data could take to another, and rank them.
+</Callout>
+
+<details>
+<summary>The paths, ranked</summary>
+
+Highest: (4) and (3), because an injected document or a user's message can name another tenant or another ticket, and nothing below the model refuses; (4) also defeats the post-filter in (1), since the filter compares against the tenant the model chose. Next, (2): two tenants asking the same question share an answer, with no attacker needed. Then (1): correct today, a leak the day an endpoint skips the post-filter, and a recall bug now for small tenants. Then (5): tenant A's prompts and documents are visible to every engineer and judge working on tenant B's regressions, and, if golden examples are used as few-shot examples, inside tenant B's prompts. Last, (6): a subprocessor question for the contract, not a cross-tenant path, unless the provider shares a cache across its customers.
+
+</details>
+
+Each fix is a design change, and each should leave a test behind. The test that catches the whole class seeds every tenant with a unique canary, warms every path as one tenant and reads as another:
+
+```python
+import itertools, secrets
+
+class App:
+    """Toy RAG service: an index with a tenant field, an answer cache, and a lookup tool."""
+    def __init__(self, cache_key_has_tenant):
+        self.docs, self.cache = [], {}
+        self.cache_key_has_tenant = cache_key_has_tenant
+
+    def ingest(self, tenant, text):
+        self.docs.append({"tenant": tenant, "text": text})
+
+    def search(self, session_tenant, query, k=3):
+        # Filter inside the query, with the tenant taken from the session.
+        hits = [d for d in self.docs if d["tenant"] == session_tenant and query in d["text"]]
+        return [d["text"] for d in hits[:k]]
+
+    def answer(self, session_tenant, query):
+        key = (session_tenant, query) if self.cache_key_has_tenant else query
+        if key not in self.cache:
+            self.cache[key] = " | ".join(self.search(session_tenant, query)) or "no results"
+        return self.cache[key]
+
+    def get_document(self, session_tenant, doc_index):
+        doc = self.docs[doc_index]               # the model supplies doc_index
+        return doc["text"] if doc["tenant"] == session_tenant else "not found"
+
+def cross_tenant_leaks(make_app, tenants):
+    """For every ordered pair, warm the paths as the owner, then read as the other tenant."""
+    leaks = []
+    for owner, reader in itertools.permutations(tenants, 2):
+        app = make_app()
+        canary = {t: f"invoice {secrets.token_hex(6)}" for t in tenants}
+        for t in tenants:
+            app.ingest(t, canary[t])
+        app.answer(owner, "invoice")
+        seen = [app.answer(reader, "invoice")]
+        seen += [app.get_document(reader, i) for i in range(len(app.docs))]
+        if any(canary[owner] in out for out in seen):
+            leaks.append(f"{owner}->{reader}")
+    return leaks
+
+tenants = ["acme", "globex", "initech"]
+print("cache keyed by query:", cross_tenant_leaks(lambda: App(cache_key_has_tenant=False), tenants))
+print("cache keyed by tenant and query:", cross_tenant_leaks(lambda: App(cache_key_has_tenant=True), tenants))
+```
+
+The first line prints all six ordered pairs; the second prints an empty list. The retrieval filter and the document tool were correct in both runs, and the cache alone leaked every tenant to every other. In a real system the test runs through the public API with real sessions, covers every tool that takes an identifier, and includes a model-driven pass where an injected document asks for another tenant's data, because the unit-level version cannot see a path that only appears when the model chooses arguments.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Scenario: a customer's security review found that your assistant answered one tenant with another tenant's document title. The leak came from a semantic answer cache. Sales has three enterprise renewals that depend on a written isolation statement in two weeks. Your index is one shared namespace with metadata filters, re-indexing into per-tenant namespaces takes six weeks, and finance says per-tenant namespaces raise the vector bill. What do you ship and what do you write?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>This week: key the semantic cache by tenant and by the access-list fingerprint of the documents behind each answer, or switch it off, and flush it. Then the audit of every path that chooses a tenant, with canary tests through the public API on each. The written statement describes what is enforced by construction (tenant from the session, cache keys, tool checks) and what is enforced by a filter in a shared index, with the namespace migration dated. I would not claim physical isolation before the migration lands.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Week one: the cache fix, a flush, and a search of cache logs for other cross-tenant hits, so the customer gets a scope for the incident and not just a patch. Tools lose any tenant argument; identifier arguments are checked against the session; the service role behind retrieval is split so a bug in the filter cannot read every tenant at once.</p>
+<p>Week two: the canary suite in CI and in a scheduled production probe, covering index, caches, tools and the trace-to-eval pipeline.</p>
+<p>The namespace decision: compute the bill on our own size and query distribution, not the vendor's equal-tenant example; with one large tenant the shared namespace may cost several times more, not less, in which case finance's objection reverses. Migrate the enterprise tenants first.</p>
+<p>What I give up: two weeks of roadmap and, for the statement, the stronger claim. Written: the incident scope, the controls, the migration date, and the trigger for revisiting (any canary failure stops cache use for the affected route).</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The cache saves 30% of model spend and product wants it back on in week one with the tenant in the key. What evidence do you need first?</li>
+<li>Two senior engineers disagree: one wants per-tenant namespaces for everyone, the other a shared namespace with row-level security in Postgres. How do you decide without deciding by rank?</li>
+<li>What would you need to see in a year of canary results to drop the scheduled production probe?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Namespaces are physical isolation at the storage layer, and everything above them is still shared: the application that picks the namespace, the embedding service, the reranker, the cache, the logs. A namespace chosen from a model argument is as leaky as a filter chosen from one. The guarantee is only as strong as the code that maps a session to a namespace.
+
+Permission trimming at query time assumes the access lists are current. Ingestion copies access lists into the index, and a document whose sharing changed after indexing keeps its old list until the next sync; the window between a revoked permission and the re-index is a period in which the assistant answers from data the user can no longer open.
+
+Canary tests prove the paths they exercise. A leak through an aggregate (a summary across tenants, a model fine-tuned on pooled data, a ranking feature computed from everyone's clicks) carries no canary string and passes the test while still moving information between tenants. Those paths are found by data-flow review, not by string matching.
+
+And per-tenant isolation can be the wrong unit. Inside one tenant, a contractor and the finance team are different principals, and a tenant-level boundary that is perfect still leaks between them if retrieval does not run with the user's own permissions.
+
+<SelfRate id="lesson:safety/guardrails/tenant-isolation" />

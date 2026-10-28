@@ -1,0 +1,147 @@
+---
+id: ops-008
+title: Four points better, and 2,300 customers short
+subtitle: decide what the result is worth before anyone ships it
+track: llmops
+module: releases-experiments
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 25
+core: false
+tags: [ab-testing, sample-ratio-mismatch, intent-to-treat, latency, experiment-analysis]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Lukas Vermeer, SRM checker FAQ (checked 2026-10-28)
+    url: https://lukasvermeer.nl/srm/docs/faq/
+    note: "a goodness-of-fit test gives the SRM p-value; the SRM Checker extension flagged p below 0.01; whether results can be saved depends on the root cause, and not without extra assumptions; extreme value bounds are often wide enough to include the null; about 6% of experiments at Microsoft and about 10% of LinkedIn's triggered experiments showed an SRM"
+  - title: Lukas Vermeer, Taxonomy of SRM causes (checked 2026-10-28)
+    url: https://lukasvermeer.nl/srm/docs/causes/
+    note: "causes grouped by stage: assignment, execution, log processing, analysis and interference; a variant that changes performance loses users who leave before logs are sent; a wrong triggering condition, such as logging assignment only after slower results load, records fewer treatment users"
+  - title: Fabijan et al., Diagnosing Sample Ratio Mismatch in Online Controlled Experiments (KDD 2019)
+    url: https://www.lukasvermeer.nl/publications/papers/2019/07/25/diagnosing-sample-ratio-mismatch-in-online-controlled-experiments.html
+    note: "an SRM is a symptom of many data quality issues, and ignoring it without knowing the root cause can make a bad change look good; taxonomy built from experiments at four companies across more than 25 products. Checked 2026-10-28."
+  - title: Anthropic, A statistical approach to model evaluations (2024-11-19)
+    url: https://www.anthropic.com/research/statistical-approach-to-model-evals
+    note: "report a standard error and a 95% interval of 1.96 standard errors with every score. Checked 2026-10-28."
+choices:
+  - text: Customers count only once a first reply renders, so the slower arm sheds impatient ones
+    correct: true
+    why: The join on first_reply_rendered drops customers who leave before the first reply; treatment's first token is 1.8 s slower, so it loses 4.5 points more of its customers, and the ones it loses were never going to resolve.
+  - text: The team read the dashboard daily and called the test on the first significant day
+    correct: false
+    why: A real defect that inflates false positives, but it cannot remove customers from one arm; the imbalance would be there on day 14 as well.
+  - text: The hash salt is shared with another live test, so its treatment arm overlaps with this one
+    correct: false
+    why: Overlap with a non-orthogonal test can cause a mismatch at assignment, but the assignment log is balanced (p = 0.90); the customers go missing later.
+  - text: Staff accounts are removed after assignment, and more of them hashed into treatment
+    correct: false
+    why: Filtering after assignment is a known cause, but there are 140 staff accounts, and the gap is about 2,270 customers.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Debug, 25 minutes">
+"The new model won the A/B test by four points and the VP wants it in Thursday's release. The arms look a bit uneven. What is this result worth?"
+</Callout>
+
+Everything below is constructed for this problem.
+
+```text
+experiment   billing-assistant-model-v2
+assignment   hash(user_id, salt) mod 100 < 50 -> treatment, logged when the customer opens the assistant
+window       14 days, ended yesterday
+primary      resolved rate of each customer's first billing conversation in the window
+
+assignment service
+  control    50,120 customers        treatment   50,080 customers
+
+dashboard                       control      treatment
+  analysed customers             41,200         38,900
+  resolved rate                   66.0%          70.0%      lift +4.0 pts, 95% CI [+3.4, +4.6]
+  thumbs-up rate                  71%            73%
+  median turns                    5              4
+  p50 time to first token         1.1 s          2.9 s
+  cost per conversation           $0.031         $0.044
+  note                            lift significant on every day since day 3
+
+staff_accounts                    140 rows
+```
+
+The analysis query behind the dashboard:
+
+```sql
+WITH assigned AS (
+  SELECT user_id, arm
+  FROM exp_assignments
+  WHERE experiment = 'billing-assistant-model-v2'
+),
+convs AS (
+  SELECT c.user_id, c.conversation_id, c.started_at, c.resolved
+  FROM conversations c
+  JOIN client_events e
+    ON e.conversation_id = c.conversation_id AND e.name = 'first_reply_rendered'
+  WHERE c.queue = 'billing'
+),
+first_conv AS (
+  SELECT user_id, resolved,
+         ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY started_at) AS rn
+  FROM convs
+)
+SELECT a.arm,
+       COUNT(*) AS customers,
+       AVG(CASE WHEN f.resolved THEN 1.0 ELSE 0.0 END) AS resolved_rate
+FROM assigned a
+JOIN first_conv f ON f.user_id = a.user_id AND f.rn = 1
+-- internal accounts are not customers
+WHERE a.user_id NOT IN (SELECT user_id FROM staff_accounts)
+GROUP BY a.arm;
+```
+
+You do not have the client event stream or per-customer outcomes for anyone missing from the analysed set. Pick the defect that explains the uneven arms and the size of the lift, rank the rest, and say what the result is worth and what you would tell the VP.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Test the assignment counts and the analysed counts separately, and ask where between the two the customers went.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the number of customers in each arm who opened a billing conversation and never saw a reply.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the resolved rate would be if every assigned customer stayed in the denominator.</p></details>
+
+## Answer
+
+**First, the mismatch.** At 50/50 the analysed counts should be near 40,050 each. The goodness-of-fit statistic is (1,150² + 1,150²) / 40,050 = 66.0 on one degree of freedom, p ≈ 4 × 10⁻¹⁶. The assignment counts give 0.016, p = 0.90. Assignment is fine; customers disappear between assignment and analysis, which rules out the salt and anything else at the assignment stage.
+
+**Where they go.** Control loses 1 − 41,200 / 50,120 = 17.8% of its customers, treatment 1 − 38,900 / 50,080 = 22.3%. Every step of the query can drop customers, but only one depends on the arm: the inner join on `first_reply_rendered`. A customer who opens a billing conversation and leaves before the first reply has no such event, and treatment's first token arrives 1.8 s later at the median. This is the triggering-condition cause in Vermeer's taxonomy, and the customers it removes are exactly the ones who would have counted as unresolved.
+
+**What the result is worth.** At control's loss rate, treatment would have 50,080 × 41,200 / 50,120 = 41,167 analysed customers, so about 2,267 are missing. Two bounds:
+
+- If the missing customers are unresolved, which is what leaving before a reply means for this metric: 38,900 × 0.70 = 27,230 resolved out of 41,167 is 66.1%, against control's 66.0%. The lift is 0.1 points.
+- If every one of them would have resolved: (27,230 + 2,267) / 41,167 = 71.7%, a lift of 5.7 points.
+
+The second bound is not credible, and the first is close to zero. The intent-to-treat version, with every assigned customer in the denominator and no first reply counted as unresolved, gives 41,200 × 0.66 / 50,120 = 54.25% against 38,900 × 0.70 / 50,080 = 54.37%: a difference of 0.12 points with a 95% interval of about ±0.62. The four points came from the denominator.
+
+**Ranking the rest.**
+
+1. *Calling the test on the first significant day* is a real defect and ranks first among the rest: the note says the lift was read daily. It inflates false positives, but it cannot create a mismatch that is present on day 14.
+2. *The missing guardrails.* Cost per conversation is up 42% (0.044 / 0.031) and nothing in the decision mentions it. A real omission, and no explanation for the symptom.
+3. *Staff accounts* cannot account for 2,267 customers with 140 rows, and the shared salt fails on the balanced assignment counts.
+
+**What to collect, and what to do without it.** Ask for: conversations opened without a first reply, per arm; the time-to-first-token distribution per arm; and whether those customers came back within 7 days. Then rerun the query with a left join from the assignment table, so every assigned customer stays in. Without any of it, the bound above already decides Thursday: the result does not support shipping.
+
+**The decision, with two defensible answers.** Rerun for two weeks with the trigger fixed and the analysis on all assigned customers: the cost is the release date and another two weeks of traffic. Or treat this as a finding about latency: the candidate may resolve more of the conversations it answers, and the delay before the first reply gives that away. Cut the delay first (stream the first tokens, lower the reasoning effort on billing turns), then test again. I would tell the VP no for Thursday and run the second, because rerunning the same configuration will measure the same latency cost.
+
+**How the recommendation fails.** Counting every assigned customer dilutes the effect: 17.8% of control never sees a reply either, so the effect per assigned customer is smaller than the effect per answered one, and the rerun has to be powered for the diluted number. And a null intent-to-treat result mixes quality and latency; it does not show the model is worse, which is the next thing someone will claim.
+
+## Follow-ups
+
+- *Pushback: the VP says customers who leave in two seconds were never real billing customers and asks you to keep the original analysis. What do you put in writing, and what number goes next to it?*
+- *Reversal: what would the client event counts have to show for you to accept the analysed-customer result after all?* Equal no-reply rates in both arms, which would point to some other cause.
+- *Two senior engineers disagree: one wants an automatic block on any experiment with p below 0.0005 on the arm counts, the other wants a human to review each one. How do you decide without deciding by rank?*
+
+## Common mistakes
+
+- Reweighting the arms to 50/50 and reading the lift. The mismatch is a symptom; reweighting keeps the biased population.
+- Testing only the analysed counts and missing that the assignment counts are balanced, which locates the defect.
+- Treating a 4.5-point difference in drop rates as noise at 100,000 customers.
+- Concluding the candidate is worse. The intent-to-treat result says no measurable difference, with a latency cost.

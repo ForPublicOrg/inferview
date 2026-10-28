@@ -1,0 +1,164 @@
+---
+id: sec-028
+title: A new chat answers with another customer's refund
+subtitle: rank the causes from one request's trace
+track: security
+module: output-data
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: true
+tags: [cross-tenant-leakage, prefix-caching, cache-salt, conversation-state, response-cache, incident-response]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Auditing Prompt Caching in Language Model APIs (Gu, Li, Kuditipudi, Liang, Hashimoto; v1 2025-02-11, v2 2025-07-13)
+    url: https://arxiv.org/abs/2502.07776
+    note: "the paper reports global cache sharing across users at seven API providers, including OpenAI, and frames the risk as a timing side channel that can reveal other users' prompts"
+  - title: vLLM docs, Automatic prefix caching design (checked 2026-10-28)
+    url: https://docs.vllm.ai/en/latest/design/prefix_caching.html
+    note: "a block's hash covers its parent's hash, its tokens and extra keys such as cache_salt; only full blocks are cached; the salt is injected into the first block's hash, so only requests with the same salt reuse blocks; sha256 is the default hash and the docs warn that a non-cryptographic hash raises collision risk and can leak private information in multi-tenant deployments"
+  - title: GHSA-4qjh-9fv9-r85r, CVE-2025-46570, timing side channel in vLLM's chunk-based prefix caching (2025-05-28)
+    url: https://github.com/advisories/GHSA-4qjh-9fv9-r85r
+    note: "a prefix hit shows up as a faster time to first token; the advisory reports an AUC of 0.571 for a 1-token prefix and 0.99 for an 8-token prefix (LLaMA2-70B-GPTQ, one A100, vLLM 0.5.1); fixed in 0.9.0"
+  - title: GHSA-935w-9g4m-p28p, CVE-2026-105752, vLLM Harmony tool continuations drop cache_salt (published 2026-09-28)
+    url: https://github.com/advisories/GHSA-935w-9g4m-p28p
+    note: "the reported cached-token count is a membership oracle in its own right: a nonzero count for a probe shows that another tenant already sent that prefix; fixed in 0.30.0"
+  - title: MDN, Crypto.randomUUID() (checked 2026-10-28)
+    url: https://developer.mozilla.org/en-US/docs/Web/API/Crypto/randomUUID
+    note: returns a 36-character v4 UUID from a cryptographically secure generator
+  - title: RFC 9562, UUIDv4 layout (section 5.4)
+    url: https://www.rfc-editor.org/rfc/rfc9562.html
+    note: "122 random bits; the version nibble is the first digit of the third group, so the first eight hex characters are 32 random bits"
+choices:
+  - text: History is fetched by conversation id alone, and the new chat was given an id that another user's conversation already held
+    correct: true
+    why: "The cached-token count proves the prompt carried 1,232 tokens past the shared system prompt that the engine had already seen, so the wrong history was in the request before the engine touched it; a 32-bit id and a load with no owner check put it there."
+  - text: With cache_salt removed, the engine reused KV blocks computed from another user's prompt, so decoding continued their context
+    correct: false
+    why: "A real defect, since it reopens the cross-user membership oracle, but a prefix hit needs the same tokens, and the KV for the same tokens under a sha256 block hash is what the engine would have computed anyway; it cannot put text into a prompt that did not contain it."
+  - text: The gateway's response cache, keyed on model and last message, served a reply generated earlier for another customer
+    correct: false
+    why: "A real defect and the one most likely to cause the next incident, since common questions repeat across customers, but this request logged a miss, and a cached reply would not explain the 6-message history load."
+  - text: The support-v7 fine-tune memorised refund details from transcripts in its training data and reproduced them for this user
+    correct: false
+    why: "Memorisation happens, but the reply quotes a refund issued nine days ago, after support-v7 was trained, and the trace shows those details arriving in the prompt."
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Debug round">
+A customer writes in: they opened a new chat, asked about their refund, and the assistant answered with someone else's name, order and card digits. Using the evidence below, which defect explains what the customer saw? Rank the others, say what you would collect next, and say what you would ship today without it.
+</Callout>
+
+The system and its numbers are a scenario. A consumer support assistant: a web client, an API server that keeps conversation history in Redis, a gateway, and a self-hosted vLLM 0.30 engine with prefix caching on (block size 16, sha256 block hashes) serving `support-v7`, a model fine-tuned in August on that year's support transcripts. About 20,000 conversations start each day.
+
+The customer's report, as support pasted it:
+
+```text
+2026-10-21 14:02 UTC, user u_88412, "New chat" pressed, first message:
+  "Where is my refund?"
+Assistant: "As we discussed, the refund of EUR 312.40 for order 88213 went back to
+  the card ending 4471 on 12 October, so it should reach you, Ms Alvarez, within
+  five working days."
+The customer's name is not Alvarez and they have no order 88213.
+```
+
+The request log for that message:
+
+```text
+14:02:11.402 req=7f3a uid=u_88412 POST /chat conv=3f9c2a1e
+14:02:11.405 history.load key=conv:3f9c2a1e messages=6 bytes=4912
+14:02:11.406 gateway resp_cache=miss key=sha256(model|last_user_msg)
+14:02:11.521 engine prompt_tokens=3104 cached_tokens=3072 ttft_ms=94 completion_tokens=61
+```
+
+Measured by the team last week: the system prompt plus tool definitions is 1,840 tokens, identical for every user, and the chat template adds 24 tokens around a short user message.
+
+The API server's chat handler, unchanged for a year:
+
+```python
+@app.post("/chat")
+def chat(req: ChatRequest, user: User = Depends(current_user)):
+    key = f"conv:{req.conversation_id}"
+    history = [json.loads(m) for m in store.lrange(key, 0, -1)]
+    messages = [*PREAMBLE, *history, {"role": "user", "content": req.text}]
+    reply = gateway.chat(messages, user=user)
+    store.rpush(key, json.dumps({"role": "user", "content": req.text, "uid": user.id}),
+                     json.dumps({"role": "assistant", "content": reply}))
+    store.expire(key, CONVERSATION_TTL)
+    return {"reply": reply}
+```
+
+The release of 14 October, three commits, combined:
+
+```diff
+ # web/src/chat/newConversation.ts
+-  const conversationId = crypto.randomUUID();
++  const conversationId = crypto.randomUUID().slice(0, 8);
+   router.push(`/c/${conversationId}`);
+
+ # gateway/engine_client.py
+     body = {"model": MODEL, "messages": messages, "max_tokens": 800,
+-            "cache_salt": f"user:{user.id}"}
++            }
+
+ # api/settings.py
+-CONVERSATION_TTL = 7 * 86400
++CONVERSATION_TTL = 30 * 86400
+```
+
+The commit messages: "short ids for shareable chat links", "share the system prompt's KV across users to cut prefill", "keep history for a month". The gateway's response cache predates all three and is shared by every user.
+
+What you do not have yet: the contents of `conv:3f9c2a1e`, any other request that used that key, and which client build created it.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Request the engine's block size, and compare the cached-token count with the size of the part of the prompt that every user sends.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the <code>uid</code> fields stored under <code>conv:3f9c2a1e</code>, and ask how many conversation ids are live in Redis on a given day since the release.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask which client build created <code>conv:3f9c2a1e</code>, and request the time of the first request that ever used that key.</p></details>
+
+## Answer
+
+**The cause is a shared conversation id.** The customer pressed New chat, so their history should have been empty. The server loaded six messages from `conv:3f9c2a1e` and put them in the prompt, and the handler never compares the stored `uid` with the caller. Since the release the client makes that id from the first eight hex characters of a v4 UUID, which RFC 9562 places entirely in the random bits: 32 bits, 4,294,967,296 values.
+
+The arithmetic, with the scenario's 20,000 new conversations a day. Expected colliding pairs among n live ids are n² / (2 × 4,294,967,296). Seven days after the release, n = 140,000 and the expected count is 2.3, so a first report in week one is what the numbers predict. When the 30-day TTL window fills, n = 600,000 and each day's 20,000 new ids collide with a live one about 20,000 × 600,000 / 4,294,967,296 = 2.8 times a day. Under the old full UUIDs (122 random bits) the same rate is 20,000 × 600,000 / 2¹²² ≈ 2.3 × 10⁻²⁷ a day.
+
+**The cache counter is evidence of the leak, not its cause.** Only full blocks are cached. The 1,840 shared tokens are exactly 115 blocks of 16; 3,072 cached tokens are 192 blocks. So 1,232 tokens past the system prompt matched, token for token, a prompt the engine had already processed: another user's history, sent when that user last wrote. The prompt was wrong before the engine saw it. 3,072 + 32 = 3,104 also fits: 1,840 of preamble, 1,240 of history and 24 of new turn.
+
+The ranking:
+
+1. **History loaded by id alone, with a 32-bit id.** Explains the content, the "As we discussed" and the history load. The defect is spread across a line that changed and a handler that did not: the short id is harmless with an owner check, and the missing check was harmless with full UUIDs.
+2. **The global response cache.** Not this incident, which logged a miss, but the same class of leak waiting on the next common question: "Where is my refund?" is the kind of message thousands of customers send, and the key holds nothing about the user. Rank it second because it needs no collision to fire.
+3. **The removed `cache_salt`.** Every user now shares one cache namespace, which reopens the membership oracle the salt was there to close: a user who can guess another user's history prefix can learn from `ttft_ms`, or from a returned cached-token count, whether someone sent it. vLLM has published advisories for both channels, the timing one fixed in 0.9.0 and the token-count one in 0.30.0. It cannot write another user's text into a reply: a hit requires the same tokens, and with sha256 block hashes the reused KV is what this prompt would have produced.
+4. **Memorisation.** The refund is dated 12 October, after the model was trained, and the details arrived through the prompt.
+
+**What to collect.** First, `LRANGE conv:3f9c2a1e` with its `uid` fields: two different uids confirm the diagnosis in one read. Second, a scan for every `conv:*` key whose messages carry more than one uid since 14 October, which is also the notification list. Third, the response cache's hit log for the same period, to settle whether rank 2 has already fired.
+
+**Without any of it, ship two changes today**, because each is cheap and harmless if the diagnosis is wrong: generate conversation ids on the server from at least 128 random bits, and have the handler refuse a key whose stored uid differs from the caller's, returning a new empty conversation. Turn the response cache off for any request that has history or a user-specific tool in it until it is keyed on the user.
+
+**The decision with two defensible answers: what to do about the salt.**
+
+- **Restore a per-user salt.** Closes the oracle across users. Cost: no prefill is shared between users, so each user's first turn, and each turn after eviction, recomputes the 1,840-token preamble; that is the cost the second commit was cutting, and the team can measure it in TTFT and GPU time per conversation before and after.
+- **Keep one shared namespace.** Keeps the saving. Cost: the oracle stays open, and what it reveals is a function of how guessable histories are. For a support bot whose conversations open with templated questions about order numbers, guessable prefixes are the common case.
+
+The conflict is GPU cost against isolation, and the incident does not decide it, because the salt did not cause this leak. I would restore the salt per user now, because the product handles payment details and the saving is a prefill of 1,840 tokens, and reopen the question with measured cost per conversation.
+
+**Where the recommended fix fails.** The owner check breaks the feature the short ids were built for: a shared chat link is, by design, a conversation id opened by a different user. With the check in place, every share link returns an empty conversation. Sharing needs its own capability, a separate unguessable token that grants read access to a snapshot, so the conversation id never doubles as one. And the collided conversations are already mixed in both directions: the other customer's next visit to `conv:3f9c2a1e` shows them this customer's question.
+
+## Follow-ups
+
+- *Legal wants every affected customer notified within 72 hours, and the uid scan will take four days on the Redis cluster. Do you notify on the collision estimate, on a partial scan, or wait, and what do you put in writing?*
+- *The platform lead says restoring the salt costs more GPU than the incident cost in goodwill. What measurement would make you accept a shared namespace, and for which part of the prompt?*
+- *Two senior engineers disagree: one wants to delete every conversation that carries two uids, the other wants to filter messages by uid and keep the rest. How do you decide without deciding by rank, and what evidence do you preserve first?*
+- *What would you need to see in production to turn the response cache back on for requests with history?*
+
+## Common mistakes
+
+- Reading the large cached-token count as the cause instead of as proof that the prompt was already wrong.
+- Restoring full UUIDs and stopping: the handler still serves any conversation to anyone who has its id, and ids travel in URLs, logs and share links.
+- Turning off prefix caching as the fix, which costs latency everywhere and leaves the leak in place.
+- Treating the response cache as cleared because this request missed it.
+- Forgetting the other customer, whose conversation now contains this customer's message.

@@ -1,0 +1,84 @@
+---
+id: wfl-009
+title: A checkpoint replay gives a different answer
+track: workflows
+module: durable-execution
+type: concept
+difficulty: medium
+seniority: [senior, staff]
+minutes: 20
+core: false
+tags: [langgraph, checkpoints, time-travel, replay, nondeterminism]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: LangGraph docs, time travel
+    url: https://docs.langchain.com/oss/python/langgraph/use-time-travel
+    note: nodes before the checkpoint are not re-executed; nodes after it re-execute, including LLM calls, API requests and interrupts; update_state creates a branch from the chosen checkpoint
+  - title: LangGraph docs, interrupts
+    url: https://docs.langchain.com/oss/python/langgraph/interrupts
+    note: a resumed node restarts from its beginning; side effects before interrupt() should be idempotent
+  - title: Defeating Nondeterminism in LLM Inference (Horace He and Thinking Machines, 10 September 2025)
+    url: https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+    note: 1,000 completions from Qwen3-235B-A22B-Instruct-2507 at temperature 0 gave 80 unique outputs; the authors attribute it to batch size varying with server load
+  - title: Temporal blog, Of course you can build dynamic AI agents with Temporal (12 November 2025)
+    url: https://temporal.io/blog/of-course-you-can-build-dynamic-ai-agents-with-temporal
+    note: model calls run in Activities, and recovery replays recorded model decisions from Event History instead of asking the model again
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"A user reports a bad answer from our LangGraph agent. I pulled the thread's state history, invoked the graph from the checkpoint just before the planner node, and got a different, correct answer. Is that a bug in our replay? And how do I get a replay I can actually debug?"
+</Callout>
+
+Scenario. The graph is `route` (a model call), `plan` (a model call), `act` (tool calls, one of which sends a status email to the customer), then `respond` (a model call). The thread uses a Postgres checkpointer. The engineer called `get_state_history`, took the checkpoint whose `next` is `plan`, and passed its config to `invoke`. Production uses a hosted model behind a version alias, at temperature 0.
+
+Answer both parts, and say what this replay did to the customer.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which nodes ran during the replay and which returned saved values. Where did the planner's output come from?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask which model version served the original request and which served the replay.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the replay is for: explaining the bad answer, or testing a fix for it. Do both need the same thing?</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Expected, not a bug. LangGraph saves state at checkpoints, not individual model responses: nodes before the chosen checkpoint return saved state, and every node after it runs again, including the model calls and the email tool. A rerun at temperature 0 is still not guaranteed to match, and the alias may now point at a different model. Two different replays, then. To explain the bad answer, take a checkpoint after the bad node so the recorded output flows downstream, or serve recorded model and tool responses from a cassette. To test a fix, re-execute on purpose, many times, with side-effecting tools stubbed out. This replay also sent the customer a second email.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>What replay means here.</strong> LangGraph's time travel re-executes everything downstream of the checkpoint you pick. That is the opposite of a Temporal-style replay, where the model call is an Activity whose recorded result is returned on recovery. In LangGraph the recorded thing is the state at the checkpoint, so the only recorded model output a replay can reuse is one already written into state before the checkpoint you chose.</p>
+<p><strong>Why the answer differs.</strong> Three sources, any of which is enough. The model call ran again. Temperature 0 does not make a hosted model deterministic: Thinking Machines sampled the same prompt 1,000 times at temperature 0 on Qwen3-235B and got 80 distinct completions, and attribute it to batch size changing with server load. And an alias can resolve to a newer snapshot than the one that served the user. So "it answered correctly on replay" says the failure is not certain on every sample; it does not say the bug is gone.</p>
+<p><strong>A replay you can debug.</strong> To reproduce the user's path, pick the checkpoint whose state already contains the bad plan (the one with <code>next</code> equal to <code>act</code>): downstream nodes then see exactly what the user's run saw. To reproduce the plan itself, you need the original request and response, which the checkpoint does not hold. Record them at the model client (request hash, resolved model id, response) and, in replay mode, serve the recorded response for a matching request and fail loudly on a miss. Pin the resolved model id in the trace, not the alias.</p>
+<p><strong>A replay that tests a fix.</strong> Here you want re-execution, and a cassette would defeat it: your fix changes the prompt, so every recorded response misses. The quantity to choose is the number of samples. If the bad plan appears with probability p per sample, the chance a run of n samples never shows it is (1 − p)<sup>n</sup>. With p = 0.2, ten samples miss it with probability 0.8<sup>10</sup> ≈ 0.11; twenty samples, 0.8<sup>20</sup> ≈ 0.012. One clean replay, as in the question, misses it 80 percent of the time. Pick n from the lowest failure rate you care about, and run the same n on the old prompt so the comparison is paired.</p>
+<p><strong>The side effect.</strong> The <code>act</code> node ran again, so the status email went out twice. Debug replays need tools that write to the outside world replaced by recorded responses or a sandbox, and the production tools need idempotency keys derived from the thread and step, which LangGraph also asks for around interrupts, since a resumed node restarts from its beginning.</p>
+<p><strong>Where this answer fails.</strong> The cassette reproduces a run only if the request is byte-identical; a timestamp or a random id in the prompt makes every lookup miss, and then the replay quietly calls the live model unless misses are errors. Recording every model response also stores customer text a second time, with its own retention and access rules.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Why not set a seed?</em> A seed parameter, where a provider offers one, controls sampling but not the batch-dependent arithmetic, so it narrows the variation without removing it.</li>
+<li><em>Pushback.</em> The cassette store doubles the volume of customer text you keep. Legal asks you to drop it. What do you lose, and what is the cheapest replacement?</li>
+<li><em>When would you choose an engine that records each model call as a step?</em> When debugging and recovery need the exact past output more often than they need re-execution.</li>
+</ul>
+</Fragment>
+</Depth>
+
+The conflict in this problem is between reproducing the past and testing the future. A cassette makes the replay faithful and makes it useless for evaluating a prompt fix; re-execution tests the fix and can never reproduce the user's exact answer. A team needs both modes, and the replay tool should make the mode explicit, because the default (re-execute everything after the checkpoint, live tools included) is the one that sends emails.
+
+## Follow-ups
+
+- The bad answer came from `route`, not `plan`. Which checkpoint can still reproduce it, and what do you need that the checkpointer did not save?
+- How do you make `update_state` forks safe to run against production tools?
+- Your eval suite runs each case once. What does the sample-size arithmetic above say about the flaky failures it reports?
+
+## Common mistakes
+
+- Concluding the bug is fixed because one replay answered correctly.
+- Assuming temperature 0 makes a hosted model's output repeatable.
+- Replaying with live tools and sending the customer duplicate messages.
+- Recording the model alias instead of the resolved model id, so the replay cannot tell whether the model changed.
+- Building a response cache keyed on the full prompt including timestamps, so nothing ever hits.

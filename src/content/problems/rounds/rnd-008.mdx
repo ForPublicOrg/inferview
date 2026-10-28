@@ -1,191 +1,423 @@
 ---
 id: rnd-008
-title: Run an LLM call over thousands of documents
-subtitle: retries, jitter and error isolation
+title: "Run a model call over thousands of documents"
+subtitle: "retry classification, per-item isolation and a resumable checkpoint"
 track: rounds
 module: llm-app-coding
 type: code
 difficulty: medium
-seniority: [mid, senior]
-minutes: 30
-core: true
-tags: [retries, backoff, jitter, batch, error-handling, llm-app]
+seniority: [senior]
+minutes: 40
+tags: [retries, backoff, jitter, batch, checkpointing, llm-app]
 companies: []
 updated: 2026-10-28
 sources:
-  - title: amitshekhariitbhu/ai-engineering-interview-questions
-    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
-    note: lists "write an async batch processor that runs an LLM call over 50,000 documents with a concurrency limit, retries with jitter, and error isolation"
-  - title: Exponential Backoff And Jitter (Marc Brooker, AWS Architecture Blog, 2015)
-    url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
-    note: compares full, equal and decorrelated jitter; the full-jitter delay is uniform between 0 and the capped exponential
-  - title: Timeouts, retries, and backoff with jitter (AWS Builders' Library, 2019)
-    url: https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter
-    note: retries at every layer of a five-deep stack multiply load on the database by 243; retry at a single point
-  - title: Claude API docs, errors
+  - title: "Claude API docs, errors"
     url: https://platform.claude.com/docs/en/api/errors
-    note: the SDKs retry transient failures twice by default with exponential backoff, honouring retry-after; error codes such as 429 and 529
-  - title: Pyodide, Python compatibility and WebAssembly constraints
-    url: https://pyodide.org/en/stable/usage/wasm-constraints.html
-    note: threads cannot run in the browser build, which is why this exercise injects sleep and randomness
-  - title: openai/openai-python README
-    url: https://github.com/openai/openai-python
-    note: requests are retried 2 times by default with a short exponential backoff
-  - title: Claude API docs, batch processing
-    url: https://platform.claude.com/docs/en/build-with-claude/batch-processing
-    note: 50 percent cost reduction; a batch expires if not done within 24 hours; results matched by custom_id
-  - title: OpenAI Batch API guide
-    url: https://developers.openai.com/api/docs/guides/batch
-    note: 50 percent discount; 24h completion window; output order may not match input order
-  - title: Claude API docs, rate limits
+    note: "status codes and error types (400, 401, 403, 404, 413, 429, 500, 504, 529); the SDK retries transient failures twice by default and honours retry-after; checked 2026-10-28"
+  - title: "Claude API docs, rate limits"
     url: https://platform.claude.com/docs/en/api/rate-limits
-    note: a 429 from the spend limit carries no retry-after and keeps failing until access resumes
+    note: "the spend-cap 429 has error_code enforced_spend_limit_reached and no retry-after, and keeps failing until access resumes; limits use a token bucket and short bursts can exceed them; checked 2026-10-28"
+  - title: "Claude API docs, batch processing"
+    url: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+    note: "50 percent cost reduction; 100,000 requests or 256 MB per batch; most batches finish within an hour and a batch expires after 24 hours; results in any order, matched by custom_id; errored, canceled and expired requests are not billed; checked 2026-10-28"
+  - title: "Exponential Backoff And Jitter (Marc Brooker, AWS Architecture Blog, 2015-03-04)"
+    url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+    note: "compares full, equal and decorrelated jitter against unjittered backoff"
+  - title: "Timeouts, retries, and backoff with jitter (AWS Builders' Library, 2019-12-05)"
+    url: https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter
+    note: "independent retries at each of five layers raise load on the database 243 times; retry at a single point in the stack"
 code:
   starter: |
-    class Transient(Exception):
-        """A retryable failure (429, 5xx, timeout). retry_after is seconds, or None."""
-        def __init__(self, retry_after=None):
-            super().__init__("transient")
-            self.retry_after = retry_after
+    import json
 
-    class Permanent(Exception):
-        """A failure that will not change on retry (400, validation error)."""
 
-    def run_batch(items, call, sleep, rng, max_retries=3, base=0.5, cap=8.0):
-        """Call `call(item)` for every item. Return [(index, "ok", result) or (index, "error", message)]
-        in input order.
-        - Transient: retry up to max_retries times. Wait retry_after if given, otherwise
-          rng.uniform(0, min(cap, base * 2 ** attempt)) where attempt counts from 0.
-        - Permanent or any other exception: record the error, no retry.
-        - Never sleep after the last attempt. One item's failure never stops the others."""
+    class APIError(Exception):
+        """An HTTP error from the model API: status code, retry-after in seconds (or None), and
+        error.details.error_code from the body (or None)."""
+
+        def __init__(self, status, retry_after=None, code=None):
+            super().__init__(f"HTTP {status}")
+            self.status, self.retry_after, self.code = status, retry_after, code
+
+
+    class Crash(BaseException):
+        """Process death in the tests. A BaseException, so `except Exception` cannot swallow it."""
+
+
+    class Checkpoint:
+        """Progress for one batch job. put() buffers a record in memory; flush() rewrites the whole checkpoint
+        file, so one flush costs time proportional to every record stored so far. A crash loses unflushed records."""
+
+        def __init__(self, durable=None, crash_after_puts=None):
+            self.durable = dict(durable or {})
+            self.pending = {}
+            self.puts = self.flushes = 0
+            self.crash_after_puts = crash_after_puts
+            self.file_text = json.dumps(self.durable)
+
+        def get(self, doc_id):
+            return self.pending.get(doc_id, self.durable.get(doc_id))
+
+        def put(self, doc_id, record):
+            self.puts += 1
+            if self.crash_after_puts is not None and self.puts > self.crash_after_puts:
+                raise Crash()
+            self.pending[doc_id] = record
+
+        def flush(self):
+            self.durable.update(self.pending)
+            self.pending = {}
+            self.file_text = json.dumps(self.durable, sort_keys=True)   # the whole file, every time
+            self.flushes += 1
+
+        def restart(self):
+            """The checkpoint a new process sees after a crash: flushed records only."""
+            return Checkpoint(self.durable)
+
+
+    # How many records to write between flushes. Choose it and say why.
+    FLUSH_EVERY = None
+
+
+    def run_batch(items, call, checkpoint, sleep, rng, max_retries=3, base=0.5, cap=8.0):
+        """Run call(document) for each (doc_id, document) in items and record the outcome in checkpoint.
+        Return {"ok": n, "failed": n, "skipped": n, "aborted": None or a reason}."""
         raise NotImplementedError
   tests: |
     import random
+    import time
 
     calls = {}
-    def fake_call(x):
-        calls[x] = calls.get(x, 0) + 1
-        if x == "flaky" and calls[x] < 3:
-            raise Transient()
-        if x == "told":
-            if calls[x] == 1:
-                raise Transient(retry_after=4.0)
-            return "TOLD"
-        if x == "bad":
-            raise Permanent("schema mismatch")
-        if x == "down":
-            raise Transient()
-        if x == "bug":
-            raise KeyError("oops")
-        return x.upper()
 
+    def fake_call(doc):
+        calls[doc] = calls.get(doc, 0) + 1
+        n = calls[doc]
+        if doc == "flaky" and n < 3:
+            raise TimeoutError()
+        if doc == "told" and n == 1:
+            raise APIError(429, retry_after=4.0)
+        if doc == "bad":
+            raise APIError(400)
+        if doc == "down":
+            raise APIError(529)
+        if doc == "bug":
+            raise KeyError("label")
+        return doc.upper()
+
+    docs = [(f"d{i}", text) for i, text in enumerate(["a", "flaky", "bad", "told", "down", "bug", "b"])]
+    cp = Checkpoint()
     slept = []
-    out = run_batch(["a", "flaky", "bad", "told", "down", "bug", "b"], fake_call, slept.append, random.Random(0))
-    assert [r[0] for r in out] == [0, 1, 2, 3, 4, 5, 6], "results in input order"
-    assert out[0] == (0, "ok", "A") and out[6] == (6, "ok", "B"), "other items finish despite failures"
-    assert out[1] == (1, "ok", "FLAKY") and calls["flaky"] == 3, "transient errors are retried"
-    assert out[2][1] == "error" and calls["bad"] == 1, "permanent errors are not retried"
-    assert out[3] == (3, "ok", "TOLD") and 4.0 in slept, "retry_after is obeyed exactly"
-    assert out[4][1] == "error" and calls["down"] == 4, "max_retries=3 means 4 attempts in total"
-    assert out[5][1] == "error" and calls["bug"] == 1, "unknown exceptions are recorded, not retried"
-    assert len(slept) == 6, "2 sleeps for flaky, 1 for told, 3 for down, none after a final attempt"
+    summary = run_batch(docs, fake_call, cp, slept.append, random.Random(0))
+    assert summary == {"ok": 4, "failed": 3, "skipped": 0, "aborted": None}
+    assert cp.get("d1") == {"status": "ok", "result": "FLAKY"} and calls["flaky"] == 3, "timeouts are retried"
+    assert calls["bad"] == 1 and calls["bug"] == 1, "a 400 and a bug in our code are not retried"
+    assert calls["down"] == 4, "max_retries=3: four attempts at a 529"
+    assert 4.0 in slept and len(slept) == 2 + 1 + 3, "retry-after obeyed; one sleep per retry, none after the last attempt"
+    assert cp.pending == {}, "everything is flushed before returning"
 
-    slept2 = []
-    calls.clear()
-    run_batch(["down"], fake_call, slept2.append, random.Random(1), max_retries=3, base=0.5, cap=8.0)
-    r = random.Random(1)
-    expected = [r.uniform(0, min(8.0, 0.5 * 2 ** a)) for a in range(3)]
-    assert slept2 == expected, "full jitter: uniform(0, min(cap, base * 2 ** attempt)), one draw per retry"
+    resumed = Checkpoint(cp.durable)
+    before = dict(calls)
+    again = run_batch(docs, fake_call, resumed, slept.append, random.Random(0))
+    assert all(calls[d] == before[d] for d in ["a", "flaky", "bad", "told", "bug", "b"]), "finished documents are never sent twice"
 
-    slept3 = []
     calls.clear()
-    run_batch(["down"], fake_call, slept3.append, random.Random(2), max_retries=6, base=1.0, cap=8.0)
-    assert all(0 <= s <= 8.0 for s in slept3) and len(slept3) == 6, "the cap bounds every delay"
+    def capped(doc):
+        calls[doc] = calls.get(doc, 0) + 1
+        if doc == "d3":
+            raise APIError(429, code="enforced_spend_limit_reached")
+        return "ok"
+    cp = Checkpoint()
+    s = run_batch([(f"d{i}", f"d{i}") for i in range(10)], capped, cp, slept.append, random.Random(0))
+    assert s["aborted"] and calls == {"d0": 1, "d1": 1, "d2": 1, "d3": 1}, "a spend-cap 429 stops the batch at once"
+    assert sorted(cp.durable) == ["d0", "d1", "d2"], "progress before the stop is flushed; d3 stays unrecorded for the next run"
+
+    assert isinstance(FLUSH_EVERY, int) and FLUSH_EVERY >= 1
+    cp = Checkpoint(crash_after_puts=1234)
+    calls.clear()
+    work = [(f"doc{i}", f"doc{i}") for i in range(3000)]
+    try:
+        run_batch(work, fake_call, cp, slept.append, random.Random(0))
+    except Crash:
+        pass
+    cp = cp.restart()
+    run_batch(work, fake_call, cp, slept.append, random.Random(0))
+    assert all(cp.get(d) == {"status": "ok", "result": d.upper()} for d, _ in work), "every document finishes after a crash"
+    assert sum(1 for c in calls.values() if c > 1) <= FLUSH_EVERY, "a crash repeats at most FLUSH_EVERY calls"
+
+    cp = Checkpoint()
+    t0 = time.perf_counter()
+    run_batch(((f"n{i}", "x") for i in range(6000)), lambda doc: doc, cp, slept.append, random.Random(0))
+    elapsed = time.perf_counter() - t0
+    assert len(cp.durable) == 6000
+    assert elapsed < 2, f"6,000 documents with an instant model took {elapsed:.1f} s; the budget is 2 s"
+  hidden: |
+    import random as _r
+
+    def _scripted(seed, n=150):
+        rng = _r.Random(seed)
+        script = {}
+        for i in range(n):
+            kinds = [rng.choice(["ok", "ok", "timeout", "conn", "500", "503", "529", "429", "429ra", "400", "404", "413", "bug"]) for _ in range(rng.randrange(1, 6))]
+            script[f"x{i}"] = kinds
+        return script
+
+    def _make_call(script, counter):
+        def call(doc):
+            counter[doc] = counter.get(doc, 0) + 1
+            seq = script[doc]
+            kind = seq[min(counter[doc] - 1, len(seq) - 1)]
+            if kind == "timeout":
+                raise TimeoutError()
+            if kind == "conn":
+                raise ConnectionError()
+            if kind == "bug":
+                raise ValueError("parse")
+            if kind == "429ra":
+                raise APIError(429, retry_after=1.25)
+            if kind != "ok":
+                raise APIError(int(kind))
+            return doc
+        return call
+
+    def _check_batch(seed):
+        script, counter = _scripted(seed), {}
+        slept = []
+        cp = Checkpoint()
+        s = run_batch([(d, d) for d in script], _make_call(script, counter), cp, slept.append, _r.Random(seed), max_retries=2, base=0.5, cap=1.0)
+        if s["aborted"] is not None or s["ok"] + s["failed"] != len(script):
+            return False
+        for d, seq in script.items():
+            rec = cp.get(d)
+            n = counter[d]
+            if n > 3:
+                return False
+            if seq[min(n - 1, len(seq) - 1)] in ("400", "404", "413", "bug") and rec["status"] != "failed":
+                return False
+            if rec["status"] == "ok" and seq[min(n - 1, len(seq) - 1)] != "ok":
+                return False
+        if any(x < 0 or (x > 1.0 and x != 1.25) for x in slept):
+            return False
+        return True
+
+    assert all(_check_batch(s) for s in range(6))
+
+    _c = {}
+    def _auth(doc):
+        _c[doc] = _c.get(doc, 0) + 1
+        raise APIError(401)
+    _cp = Checkpoint()
+    _s = run_batch([("a", "a"), ("b", "b")], _auth, _cp, lambda s: None, _r.Random(0))
+    assert _s["aborted"] and _c == {"a": 1} and _cp.get("a") is None, "a 401 stops the batch: every later call would fail the same way"
+
+    _c2 = {}
+    def _plain429(doc):
+        _c2[doc] = _c2.get(doc, 0) + 1
+        if _c2[doc] == 1:
+            raise APIError(429)
+        return 1
+    _sl = []
+    assert run_batch([("a", "a")], _plain429, Checkpoint(), _sl.append, _r.Random(0))["ok"] == 1 and len(_sl) == 1 and 0 <= _sl[0] <= 0.5
+
+    for _k in (1, 7, 499, 1500, 2999):
+        _cp = Checkpoint(crash_after_puts=_k)
+        _cnt = {}
+        def _fine(doc, _cnt=_cnt):
+            _cnt[doc] = _cnt.get(doc, 0) + 1
+            return doc
+        _w = [(f"w{i}", f"w{i}") for i in range(3000)]
+        try:
+            run_batch(_w, _fine, _cp, lambda s: None, _r.Random(0))
+        except Crash:
+            pass
+        _cp = _cp.restart()
+        run_batch(_w, _fine, _cp, lambda s: None, _r.Random(0))
+        assert len(_cp.durable) == 3000 and _cp.pending == {}
+        assert sum(1 for v in _cnt.values() if v > 1) <= FLUSH_EVERY
   solution: |
-    class Transient(Exception):
-        def __init__(self, retry_after=None):
-            super().__init__("transient")
-            self.retry_after = retry_after
+    import json
 
-    class Permanent(Exception):
+
+    class APIError(Exception):
+        """An HTTP error from the model API: status code, retry-after in seconds (or None), and
+        error.details.error_code from the body (or None)."""
+
+        def __init__(self, status, retry_after=None, code=None):
+            super().__init__(f"HTTP {status}")
+            self.status, self.retry_after, self.code = status, retry_after, code
+
+
+    class Crash(BaseException):
+        """Process death in the tests. A BaseException, so `except Exception` cannot swallow it."""
+
+
+    class Checkpoint:
+        """Progress for one batch job. put() buffers a record in memory; flush() rewrites the whole checkpoint
+        file, so one flush costs time proportional to every record stored so far. A crash loses unflushed records."""
+
+        def __init__(self, durable=None, crash_after_puts=None):
+            self.durable = dict(durable or {})
+            self.pending = {}
+            self.puts = self.flushes = 0
+            self.crash_after_puts = crash_after_puts
+            self.file_text = json.dumps(self.durable)
+
+        def get(self, doc_id):
+            return self.pending.get(doc_id, self.durable.get(doc_id))
+
+        def put(self, doc_id, record):
+            self.puts += 1
+            if self.crash_after_puts is not None and self.puts > self.crash_after_puts:
+                raise Crash()
+            self.pending[doc_id] = record
+
+        def flush(self):
+            self.durable.update(self.pending)
+            self.pending = {}
+            self.file_text = json.dumps(self.durable, sort_keys=True)   # the whole file, every time
+            self.flushes += 1
+
+        def restart(self):
+            """The checkpoint a new process sees after a crash: flushed records only."""
+            return Checkpoint(self.durable)
+
+
+    # Records written between flushes. A crash repeats at most this many model calls; each flush rewrites the
+    # whole checkpoint. 500 keeps a 50,000-document job to 100 flushes and the crash rework to 500 calls.
+    FLUSH_EVERY = 500
+
+    RETRY_STATUS = {408, 429, 500, 502, 503, 504, 529}
+    STOP_STATUS = {401, 403}          # every later item fails the same way
+
+
+    class _Abort(Exception):
         pass
 
-    def _one(item, call, sleep, rng, max_retries, base, cap):
+
+    def _classify(exc):
+        """'retry', 'stop' or 'fail' for one failed attempt."""
+        if isinstance(exc, (TimeoutError, ConnectionError)):
+            return "retry"
+        if isinstance(exc, APIError):
+            if exc.status == 429 and exc.code == "enforced_spend_limit_reached":
+                return "stop"         # no retry-after; retrying fails until the spend cap resets
+            if exc.status in STOP_STATUS:
+                return "stop"
+            if exc.status in RETRY_STATUS:
+                return "retry"
+        return "fail"                 # 400, 404, 413, a bug in our own parsing: retrying will not help
+
+
+    def _one(doc, call, sleep, rng, max_retries, base, cap):
         for attempt in range(max_retries + 1):
             try:
-                return "ok", call(item)
-            except Transient as e:
+                return {"status": "ok", "result": call(doc)}
+            except Exception as exc:                     # Crash is a BaseException and passes through
+                kind = _classify(exc)
+                if kind == "stop":
+                    raise _Abort(f"{type(exc).__name__}: {exc}")
+                if kind == "fail":
+                    return {"status": "failed", "retryable": False, "error": f"{type(exc).__name__}: {exc}"}
                 if attempt == max_retries:
-                    return "error", f"gave up after {attempt + 1} attempts"
-                if e.retry_after is not None:
-                    delay = e.retry_after                       # the server knows its own load
-                else:
-                    delay = rng.uniform(0, min(cap, base * 2 ** attempt))
-                sleep(delay)
-            except Exception as e:                              # permanent or a bug: retrying will not help
-                return "error", f"{type(e).__name__}: {e}"
+                    return {"status": "failed", "retryable": True, "error": f"gave up after {attempt + 1} attempts"}
+                after = getattr(exc, "retry_after", None)
+                sleep(after if after is not None else rng.uniform(0, min(cap, base * 2 ** attempt)))
 
-    def run_batch(items, call, sleep, rng, max_retries=3, base=0.5, cap=8.0):
-        results = []
-        for i, item in enumerate(items):
-            status, value = _one(item, call, sleep, rng, max_retries, base, cap)
-            results.append((i, status, value))
-        return results
+
+    def run_batch(items, call, checkpoint, sleep, rng, max_retries=3, base=0.5, cap=8.0):
+        summary = {"ok": 0, "failed": 0, "skipped": 0, "aborted": None}
+        unflushed = 0
+        try:
+            for doc_id, doc in items:
+                done = checkpoint.get(doc_id)
+                if done is not None and (done["status"] == "ok" or not done.get("retryable")):
+                    summary["skipped"] += 1
+                    continue
+                record = _one(doc, call, sleep, rng, max_retries, base, cap)
+                checkpoint.put(doc_id, record)
+                summary["ok" if record["status"] == "ok" else "failed"] += 1
+                unflushed += 1
+                if unflushed >= FLUSH_EVERY:
+                    checkpoint.flush()
+                    unflushed = 0
+        except _Abort as stop:
+            summary["aborted"] = str(stop)
+        if unflushed or summary["aborted"]:
+            checkpoint.flush()
+        return summary
 ---
 import Callout from '../../../components/Callout.astro';
 
 ## Question
 
 <Callout kind="interview" label="The prompt">
-"We need to run a classification prompt over 50,000 documents. Write the runner. Some calls will hit rate limits, some will time out, and a few documents are malformed."
+"We need to run a classification prompt over 50,000 documents. Write the runner. It will hit rate limits and timeouts, a few documents are malformed, and the process will be killed at some point. Rerunning it must not pay for finished work twice."
 </Callout>
 
-Write `run_batch`. The interviewer cares about three behaviours more than speed: transient failures are retried with backoff and jitter (or exactly `retry_after` seconds when the server says so), permanent failures are not retried, and one bad document never sinks the batch.
+Write `run_batch(items, call, checkpoint, sleep, rng, ...)`. The arguments are:
 
-`sleep` and `rng` are passed in. In production they are `asyncio.sleep` (or `time.sleep`) and `random`; in the tests they record delays and replay a seeded sequence. The browser runner here has no working threads, so this version processes items one at a time; the concurrency layer is in the answer.
+- **`items`.** An iterable of `(doc_id, document)`, possibly a generator.
+- **`call(document)`.** The model call. It raises `APIError` (with the HTTP status, `retry_after` in seconds when the response had a `retry-after` header, and the `error.details.error_code` from the body when present), `TimeoutError`, `ConnectionError`, or anything else.
+- **`checkpoint`.** It stores one record per document. `put` buffers a record; `flush` rewrites the whole checkpoint file, so one flush costs time proportional to everything stored so far. A crash loses whatever was not flushed.
+
+The runner has to meet five rules:
+
+- Classify each failure with the Claude API's documented error behaviour.
+- Retry what can succeed later, with capped exponential backoff and jitter, or exactly `retry_after` when the server gives it.
+- Record what will not change on retry, and keep going.
+- Stop the whole batch when every later document would fail the same way.
+- On a rerun with the same checkpoint, never call the model again for a document that already has a final record.
+
+`Crash` derives from `BaseException`, so it passes through `except Exception`.
+
+Choose `FLUSH_EVERY`, the number of records between flushes, and defend it. The visible tests crash a run partway and check that the rerun repeats at most `FLUSH_EVERY` calls, then push 6,000 documents through within a 2-second budget.
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>Write the retry loop for one item first, returning a status instead of raising. Then map it over the list.</p></details>
-<details class="hint"><summary>Hint 2</summary><p>`max_retries=3` means up to four attempts. Sleep between attempts, never after the last one.</p></details>
-<details class="hint"><summary>Hint 3</summary><p>The order of the `except` clauses matters: catch `Transient` first, then everything else as non-retryable.</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask which 429 responses carry retry-after and which never do.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what one model call costs and how long one checkpoint write takes at the size this job reaches.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask whether the HTTP client under call already retries, and how many times.</p></details>
 
 ## Answer
 
-The core is `_one`, a retry loop that returns `("ok", result)` or `("error", message)` and never raises. Transient errors sleep and loop; on the final attempt they return an error instead of sleeping. Everything else returns immediately. Because nothing escapes `_one`, the outer loop gives error isolation for free, and results come back keyed by index.
+The reference classifies each failed attempt as retry, stop or fail:
 
-The delay follows the full-jitter scheme from Brooker's AWS post: a uniform draw between 0 and `min(cap, base * 2 ** attempt)`. Jitter spreads retries from many clients over time, so a burst of 429s does not come back as a synchronised second burst. When the server sends `retry-after`, use it; it knows its own load better than your formula.
+- **Retry.** `TimeoutError`, `ConnectionError`, and `APIError` with status 408, 429, 500, 502, 503, 504 or 529. The errors page documents 529 as `overloaded_error` and says to retry a 500 with backoff.
+- **Stop.** A 429 whose `error_code` is `enforced_spend_limit_reached`, and 401 or 403. The rate-limits page says the spend-cap 429 has no `retry-after` header and keeps failing until access resumes, including through the SDK's own retries. A rejected key fails identically for every later document.
+- **Fail.** Everything else: a 400, 404 or 413, and bugs in our own code such as a `KeyError` while parsing the output. These are recorded and not retried.
 
-The production version adds concurrency with a semaphore:
+`_one` loops over attempts and returns a record, which is never raised past the loop, so one document cannot sink the batch. It sleeps `retry_after` when given, otherwise `rng.uniform(0, min(cap, base * 2 ** attempt))`, which is the full-jitter scheme from Marc Brooker's AWS post. It never sleeps after the last attempt. A stop raises an internal exception that `run_batch` turns into `aborted`, after flushing what it has.
 
-```python
-import asyncio
+On a rerun, a document whose record is `ok`, or a failure marked not retryable, is skipped. A document that ran out of transient retries is tried again, because the overload may have passed.
 
-async def run_batch_async(items, call, max_concurrency=16, **kw):
-    sem = asyncio.Semaphore(max_concurrency)
+The flush interval is the number this problem turns on. Each flush rewrites everything stored, so with n documents and interval F, total serialisation work is about n² ÷ (2F) records:
 
-    async def guarded(i, item):
-        async with sem:
-            return i, *(await _one_async(item, call, **kw))
+| Documents | FLUSH_EVERY | Records serialised |
+|---|---|---|
+| 50,000 | 1 | about 1.25 billion |
+| 50,000 | 500 | about 2.5 million |
 
-    return sorted(await asyncio.gather(*(guarded(i, x) for i, x in enumerate(items))))
-```
+In this harness's local CPython 3.12.6, `FLUSH_EVERY = 1` took 8.3 seconds for the visible test's 6,000 documents, and the reference's 500 took 0.019 seconds. On the other side of the trade, a crash repeats at most F calls, and each one costs a model call. Reasonable values run from a few hundred to a few thousand: a crash then wastes minutes of spend at most, and checkpoint cost stays negligible. One is unreasonable (quadratic cost); so is anything near n (a crash late in the run repeats nearly everything).
 
-`_one_async` is `_one` with `await call(item)` and `await asyncio.sleep(delay)`. The semaphore caps in-flight calls; a token-bucket limiter in front of `call` caps tokens per minute, which matters more for LLM APIs than request count.
+The production answer removes the quadratic term. Append one JSON line per record to a log, flush and `fsync` every F records, and on restart read the log and keep the last record per id. The interval then trades only crash rework against fsync rate.
 
-The number to have ready is from the AWS Builders' Library: if each layer of a five-deep call stack retries, load on the database multiplies by 243. Both the Anthropic and OpenAI Python SDKs already retry transient failures twice by default, so a hand-written loop on top of an SDK client multiplies attempts. Set the SDK's `max_retries=0` when you own the policy, or leave the SDK in charge and do not add a second layer.
+Retry layering is the other trap. The errors page says the official SDK already retries transient failures twice by default, honouring `retry-after`. The AWS Builders' Library shows what stacked retries do: with retries at each layer of a five-deep stack, load on the bottom layer rises 243 times. If this runner owns the policy, construct the client with `max_retries=0`.
+
+**How the recommended answer fails.** Retrying exhausted transient failures on every rerun means a document that always times out costs four calls on each run, forever. Store an attempt count in the record and stop after a run limit you choose. The guarantee is also at-least-once: a crash between `call` and `flush` repeats up to F calls, and nothing in a model API makes a repeated classification free.
 
 ## Follow-ups
 
-- *Is a provider's batch API better here?* For an offline job, usually. Both the Claude Message Batches API and the OpenAI Batch API price batch requests at a 50 percent discount and work within a 24-hour window, and both return results that may be out of order, so you join on `custom_id`.
-- *How do you resume after the process dies at document 31,000?* Write each result to durable storage keyed by document id as it completes, and skip ids already present on restart.
-- *A 429 keeps coming back with no `retry-after`.* On the Claude API, a 429 caused by the spend limit has no `retry-after` and will not clear by retrying. Check the error details and stop the batch rather than burn retries.
-- *Should calls with side effects be retried?* Only with an idempotency key, so the second attempt cannot repeat the effect.
+- *Is the provider's batch API a better fit?* For an offline job, usually. The Claude Message Batches docs give a 50 percent price reduction, a limit of 100,000 requests or 256 MB per batch, a 24-hour expiry, and results in any order matched by `custom_id`. Errored, canceled and expired requests are not billed, and the docs separate `invalid_request_error`, which must be fixed before resending, from server errors, which can be retried as they are. The cost is latency: the docs say most batches finish within an hour, but a batch that has not finished within 24 hours expires, and its unprocessed requests come back as `expired`.
+- *Add concurrency for the real client.* Wrap `_one` in an `asyncio.Semaphore`, and put a token bucket in front of `call` sized from your input-tokens-per-minute limit. The rate-limits page says limits are enforced with a token bucket and that short bursts can trip them, so request count alone is the wrong budget.
+- *Pushback: finance wants each document billed exactly once. What do you promise?* At-least-once with a bound: at most F repeated calls per crash, stated in writing with the measured crash rate. A model call has no idempotency key that would make a repeat free, so "exactly once" would be a false promise.
+- *The spend cap stops the batch at document 31,000 on a Friday night. What does the on-call see, and what happens on Monday?* A run summary with `aborted` and the error code, every finished record flushed, and an alert. On Monday someone raises the cap or waits for the reset, and reruns with the same checkpoint, which skips the 31,000.
 
 ## Common mistakes
 
-- Catching `Exception` in the retry branch, so a malformed document is retried four times and costs four calls.
-- Sleeping after the final failed attempt.
-- Exponential backoff with no jitter, so every client retries at the same instants.
-- Letting one exception propagate out of `gather`, which loses the results of every other document unless you use `return_exceptions=True` or catch inside.
-- Returning results in completion order and then joining them to inputs by position.
+- Treating every 429 the same, which burns retries against the spend cap.
+- Retrying a 400, or a bug in your own parsing code.
+- Catching `BaseException`, or letting `Crash` be swallowed.
+- Flushing after every record against a checkpoint that rewrites everything.
+- Never flushing before an abort.
+- Keeping the SDK's default retries underneath your own.
+- Skipping documents on rerun by position instead of by id.

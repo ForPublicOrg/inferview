@@ -1,0 +1,120 @@
+---
+id: sec-022
+title: A multi-tenant MCP server on the stateless revision
+subtitle: identity per request, handles that are not credentials, and a sales team that wants API keys
+track: security
+module: mcp-security
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 45
+core: false
+tags: [mcp, multi-tenant, state-handles, oauth, scopes, rate-limits, audit, row-level-security]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: ombharatiya, AI system design guide, interview question bank, Q127 (checked 2026-10-28)
+    url: https://github.com/ombharatiya/ai-system-design-guide/blob/main/00-interview-prep/01-question-bank.md
+    note: "synthesised question bank, not a company report, so no company is tagged: \"Design a secure multi-tenant MCP server on the stateless spec\"; the problem here is original material"
+  - title: MCP specification 2026-07-28, Security Best Practices, State Handle Hijacking and Scope Minimization
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/security_best_practices
+    note: "servers that need cross-request state mint a handle returned in a tool result and passed back as a tool argument; servers MUST verify every inbound request and MUST NOT treat possession of a handle as authentication; handles SHOULD be random, MAY expire, and SHOULD be keyed server-side as <user_id>:<handle> with the user id from the verified token; start from a minimal scope set, elevate with targeted WWW-Authenticate challenges, and log elevation events (scope requested, granted subset) with correlation ids. Checked 2026-10-28."
+  - title: MCP specification 2026-07-28, Authorization
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization
+    note: "audience validation; 401 for invalid tokens, 403 with insufficient_scope; servers account for scope hierarchies; client_credentials clients MAY attempt step-up or abort; authorisation servers listed in protected resource metadata are independent and clients keep separate registration state for each. Checked 2026-10-28."
+  - title: MCP specification 2026-07-28, Changelog
+    url: https://modelcontextprotocol.io/specification/2026-07-28/changelog
+    note: "sessions removed and replaced by server-minted handles passed as tool arguments (SEP-2567); tools/list results no longer vary per connection; list results carry ttlMs and cacheScope, public or private; tools SHOULD be listed in a deterministic order; OpenTelemetry trace context in _meta. Checked 2026-10-28."
+  - title: MCP specification 2026-07-28, Streamable HTTP transport
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http
+    note: "Origin validation with 403; Mcp-Method and Mcp-Name headers must match the body, and intermediaries that rate-limit by mirrored headers SHOULD reject versions without that validation. Checked 2026-10-28."
+  - title: Invariant Labs, MCP Security Notification, Tool Poisoning Attacks (2025-04-01)
+    url: https://invariantlabs.ai/blog/mcp-security-notification-tool-poisoning-attacks
+    note: "descriptions are model input that users do not see in full; rug pulls after approval; the authors recommend clients pin tool descriptions by hash"
+  - title: PostgreSQL documentation, SET
+    url: https://www.postgresql.org/docs/current/sql-set.html
+    note: "SET LOCAL lasts until the end of the current transaction; outside a transaction block it emits a warning and has no effect; plain SET persists for the session. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Design round, 45 minutes">
+You run the platform team at an expense-management SaaS. Customers want their agents to search expenses, build and submit expense reports, approve reports, and export the ledger, through an MCP server on the 2026-07-28 revision. Design the server so one tenant's agent can never read or change another tenant's data, and decide what you tell sales.
+</Callout>
+
+Scenario numbers, not measurements of a real company:
+
+- About 2,000 customer organisations share one deployment; the largest has 6,000 users.
+- One Postgres database, a `tenant_id` column on every table, row-level security not enabled. It cannot be split per tenant this quarter.
+- Enterprise customers sign in to the web app through their own identity providers, federated by the company's login service.
+- The public REST API allows 1,000 requests a minute per tenant.
+- Three engineers, ten weeks to general availability.
+- The head of sales wants static API keys for the MCP server, because two large customers want agents that run unattended at night, and "OAuth is too much for them".
+
+Building a report takes several calls (`create_report`, `add_expense` repeated, `submit_report`), so the server needs state across requests. Choose the per-user and per-tenant rate limits and say how you derived them.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which request field your server would read the tenant from today, and who controls that field.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask the two night-time customers what their agents do unattended: read, submit, or approve.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the peak share of users active at once in the largest tenant, and how often an agent calls a tool while it works.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Every request re-establishes identity from the bearer token: audience and issuer checked, tenant and user taken from the token's claims, never from an argument. Report handles are random, stored with the owning user and tenant, and resolve to not-found for anyone else; Postgres row-level security keyed on a transaction-local tenant setting is the second wall. Scopes start at read and report-building; approval and export are step-up scopes, and approval is never granted to a machine principal. Unattended agents get the client-credentials grant with narrow scopes, not static keys. Limits are per user and per tenant from the token, sized from a stated peak estimate, not from the REST budget. Tool descriptions ship only with reviewed releases, and list results are identical for every tenant.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>Identity on every request.</b> The revision has no sessions, so nothing about a previous request vouches for this one. The server validates the token's audience (its own URI), issuer (the company login service, the only one in its protected-resource metadata) and expiry, then reads <code>sub</code> and a tenant claim set by the login service. Enterprise identity providers stay behind the login service's federation, so there is one issuer and one place that maps an identity to a tenant. Listing each customer's identity provider in <code>authorization_servers</code> is the alternative; it saves the federation work for new customers and costs a per-issuer table of which tenants each issuer may assert, where one wrong row lets a customer's IdP mint tokens for another tenant.</p>
+<p><b>Handles that are not credentials.</b> <code>create_report</code> inserts a draft row and returns a handle drawn from a secure random generator. The server stores the handle with <code>tenant_id</code> and <code>owner_id</code> from the token, and every later call looks it up by handle and both ids; a mismatch returns the same not-found as a missing handle, so the handle space cannot be probed. This is the keying the specification suggests: the user id from the verified token, then the handle. The draft is a durable row, so the handle does not need a short expiry for safety; I close drafts untouched for 30 days, which covers a monthly expense cycle; a lifetime of hours would close reports people are still filling in.</p>
+<p><b>The second wall.</b> Enable row-level security with a policy comparing <code>tenant_id</code> to a setting the server writes at the start of each transaction with <code>SET LOCAL</code>, from the verified token. An application bug that forgets a <code>WHERE tenant_id</code> then returns nothing instead of another tenant's rows. This is the part that fits the "cannot split the database" constraint.</p>
+<p><b>Scopes.</b> Initial scopes: <code>expenses:read</code> and <code>reports:write</code>. <code>reports:approve</code> and <code>ledger:export</code> are requested by a 403 <code>insufficient_scope</code> challenge on first use, and each elevation is logged with the requested and granted scopes and a correlation id. Approval also checks, inside the server, that the token's user is the report's approver under the tenant's rules; a scope says what kind of action, not whose report.</p>
+<p><b>The decision: what unattended agents use.</b> Static API keys have no audience, no expiry and no user, live in configuration files, and are exactly the "possession is authentication" pattern the handle design avoids. Two answers are defensible. <i>Client credentials:</i> the customer's admin registers the agent as a client of the login service; it gets 10-minute tokens with <code>expenses:read</code> and <code>reports:write</code>, revocable per client, attributable in the audit log. Cost: admins must register a client, and a machine principal has no user, so it can never hold <code>reports:approve</code>. <i>Delegated refresh tokens:</i> a person consents once and the agent refreshes as that person overnight. Cost: the job dies when that person leaves or changes role, and a stolen refresh token acts as a named employee. I would ship client credentials, tell sales that unattended approval is not offered, and give the two customers an admin-registration guide in week one. Approvals need a person, which is a product rule written down, not a gap.</p>
+<p><b>Rate limits, derived.</b> REST allows 1,000 requests a minute per tenant. Assume 10% of the largest tenant's 6,000 users run an agent at peak and each agent calls a tool every 5 seconds: 600 × 12 = 7,200 calls a minute, seven times the REST budget, so MCP gets its own budget. I set 30 calls a minute per user (one every 2 seconds, above the assumed agent's 12); per tenant, 1.5 calls a minute per seat with a floor of 600, which gives the largest tenant 9,000 (25% above its 7,200 estimate) and lets a 20-seat tenant run 50 agents at the assumed rate; one concurrent <code>export_ledger</code> per tenant and 10 a day; and 60 approvals an hour per user. Limits are keyed on the token's user and tenant, never IP, because vendor agents share egress addresses. A different peak share or call rate moves these numbers, and anything that keeps the largest tenant's estimate under its limit is defensible. Two choices are not: a per-tenant limit equal to the REST limit throttles the largest tenant's agents at their first busy hour, and a flat per-tenant limit sized for the largest tenant lets a 20-seat tenant send as much load to the shared database as a 6,000-seat one. No export limit lets one tenant's bulk exports starve the database every other tenant shares.</p>
+<p><b>Tool descriptions and lists.</b> Descriptions change only with a reviewed release, are listed in a fixed order, and their hash is published so clients can pin them. Every tenant sees the same tool list; entitlement is checked at call time, so <code>tools/list</code> can be <code>cacheScope: "public"</code> safely. Per-tenant lists would have to be <code>private</code>.</p>
+<p><b>The conflict.</b> Agent autonomy against safety (unattended agents cannot approve), and the deadline against defence in depth (row-level security on a shared schema is weeks of policy work and testing for three engineers).</p>
+<p><b>Failure mode of this design.</b> The second wall leaks through the connection pool. <code>SET LOCAL</code> outside a transaction block only warns and does nothing, so a code path that runs in autocommit mode silently queries with the previous value or none; and a plain <code>SET</code> persists for the session, so a pooled connection carries one tenant's setting into the next request. Both turn the backstop into a cross-tenant read. The control is a test that runs every tool in autocommit and pooled modes with two tenants and fails on any row from the other, plus a policy that denies all rows when the setting is unset.</p>
+<p><b>What you give up.</b> Static keys, and with them two customers' first month of unattended use; unattended approvals entirely; colleagues continuing each other's drafts through MCP, since handles resolve only for their owner (sharing stays a web-app action on the row); and per-tenant compute isolation, since a shared deployment is bounded only by rate limits.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Why return not-found instead of forbidden for another tenant's handle?</em> Forbidden confirms the handle exists, which turns a guessing attack into an enumeration with feedback.</li>
+<li><em>Does the tenant claim go stale?</em> For one token lifetime after a user moves tenant; at 10 minutes that is the window you accept.</li>
+</ul>
+</Fragment>
+</Depth>
+
+### The written artefact
+
+A threat model for the security review, one row per threat:
+
+| Threat | Control | Test that fails the build |
+|---|---|---|
+| Token issued for another service replayed here | Audience and issuer check on every request | Token with another `aud` or `iss` gets 401 |
+| Tenant A's agent uses tenant B's report handle | Handle stored with tenant and owner from the token; not-found on mismatch | Two tenants, swapped handles, expect not-found |
+| Application query misses its tenant filter | Row-level security on a `SET LOCAL` tenant setting; deny when unset | Every tool in autocommit and pooled modes returns no foreign rows |
+| Unattended agent approves a report | `reports:approve` never granted to client-credentials clients; approver check in the server | Client-credentials token calling `approve_report` gets 403 |
+| One tenant's exports starve the shared database | One concurrent export per tenant, 10 a day | Second concurrent export gets a rate-limit error |
+| A tool description is edited to steer agents | Descriptions only in reviewed releases; published hash | Release fails if the hash changed without a reviewed diff |
+| Header and body disagree at the gateway | Server rejects mismatched `Mcp-Method` or `Mcp-Name` with 400 | Mismatched request gets 400 `HeaderMismatch` |
+
+Rollout: 20 design-partner tenants in week 6, all tenants in week 10. Rollback triggers: any audit record whose resource tenant differs from the token's tenant disables the tool that produced it and pages the on-call; a step-up challenge rate above 20% of calls for a tenant for a day means the initial scopes are wrong for real use and gets reviewed before widening; database CPU from exports above the level agreed with the database team for an hour pauses `export_ledger` for all tenants.
+
+## Follow-ups
+
+- *Pushback: the two night-time customers threaten to churn without static keys, and sales takes it to the CEO. Which half of your design do you trade, and what do you put in writing?*
+- *Reversal: what would you need to see in six months of production to let client-credentials agents approve reports under a per-tenant amount limit?*
+- *Two senior engineers disagree: one wants a schema per enterprise tenant this quarter, the other says row-level security is enough. How do you decide without deciding by rank?*
+- *Your row-level security test passes, and a month later a reporting job written by another team reads every tenant's rows through the same database role. What did your design miss?*
+
+## Common mistakes
+
+- Reading the tenant from a tool argument or a header the client sets.
+- Making the handle unguessable and stopping there, with no owner check.
+- Accepting static API keys "for now" and planning to migrate the customers later.
+- Granting approval to a machine principal because the scope exists.
+- Rate limiting by IP address.
+- Enabling row-level security with session-level settings on a pooled connection.

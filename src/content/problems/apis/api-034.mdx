@@ -1,0 +1,102 @@
+---
+id: api-034
+title: Three frameworks, one product
+subtitle: review the adoption proposal
+track: apis
+module: frameworks
+type: critique
+difficulty: medium
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [frameworks, langgraph, agents-sdk, rag, architecture-review]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: LangChain and LangGraph 1.0 (LangChain blog, 2025-10-22)
+    url: https://www.langchain.com/blog/langchain-langgraph-1dot0
+    note: "LangGraph 1.0: durable state, persistence, human-in-the-loop pauses; no breaking changes until 2.0"
+  - title: LangGraph docs, Graph API (checked 2026-10-28)
+    url: https://docs.langchain.com/oss/python/langgraph/graph-api
+    note: "checkpoints at super-step boundaries; a resumed or retried node runs again from its start, so its logic should be idempotent"
+  - title: OpenAI Agents SDK, running agents (checked 2026-10-28)
+    url: https://openai.github.io/openai-agents-python/running_agents/
+    note: "MaxTurnsExceeded past max_turns; model_provider defaults to OpenAI; mixing client-managed and OpenAI-managed conversation state can duplicate context"
+  - title: openai-agents-python, src/agents/run_config.py on main (checked 2026-10-28)
+    url: https://github.com/openai/openai-agents-python/blob/main/src/agents/run_config.py
+    note: "DEFAULT_MAX_TURNS = 10"
+  - title: OpenAI Agents SDK, tracing (checked 2026-10-28)
+    url: https://openai.github.io/openai-agents-python/tracing/
+    note: "tracing on by default and exported to the OpenAI backend with inputs and outputs; add_trace_processor adds beside the default exporter, set_trace_processors replaces it; unavailable under Zero Data Retention"
+  - title: OpenAI Agents SDK, human in the loop (checked 2026-10-28)
+    url: https://openai.github.io/openai-agents-python/human_in_the_loop/
+    note: "a paused run is resumed from serialised RunState; approval does not guarantee exactly-once execution"
+  - title: openai-agents on PyPI (checked 2026-10-28)
+    url: https://pypi.org/project/openai-agents/
+    note: "0.24.0 uploaded 2026-10-15, pre-1.0"
+checklist:
+  - Spots that the agent SDK's default turn cap of 10 sits inside a LangGraph node with retries, so MaxTurnsExceeded can become a node retry that repeats every tool call made before it
+  - Names that pausing for approval inside the agent SDK run, inside a LangGraph node, means a LangGraph resume or retry re-runs the node and the agent run from its start
+  - Spots that conversation history is stored twice (LangGraph checkpoints and agent SDK sessions) with no stated source of truth, so the agent can see duplicated or divergent context
+  - Notices that adding a Langfuse processor beside the default leaves traces with inputs and outputs going to OpenAI as well, which conflicts with the data section
+  - Notices that the retrieval tool calls a query engine that synthesises an answer with its own model call, so the one-call-per-turn cost estimate is low
+  - Names that the provider-agnostic claim conflicts with an agent SDK whose model provider defaults to OpenAI and whose features are built around the Responses API
+  - Flags weekly automatic upgrades for a pre-1.0 SDK and three frameworks with no eval gate on upgrades
+  - Asks where the rendered prompt can be read in one place when templates live in three libraries
+  - Judges LangGraph for the overnight approval acceptable if the approval pause uses LangGraph's interrupt, the agent SDK run is confined to a node with no side effects, and refunds carry idempotency keys
+  - Judges the RAG library acceptable if it is used for indexing and retrieval only, returning documents rather than synthesised answers
+  - Asks who is on call for each framework and how a failed run is traced across all three
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"Here is the architecture section of a proposal a team brought to review. List what you would push back on before you read the checklist."
+</Callout>
+
+> **Support assistant v2: architecture**
+>
+> We will adopt three well-supported frameworks so that we write as little plumbing as possible.
+>
+> **Orchestration: LangGraph.** A graph with nodes `classify`, `agent`, `await_approval` and `respond`, checkpointed to Postgres per conversation. Each node has a retry policy of 3 attempts with backoff, so transient provider errors never reach the user. Refunds above the threshold wait in `await_approval` for a team lead, which can take overnight.
+>
+> **Agent: OpenAI Agents SDK.** The `agent` node runs `Runner.run(support_agent, input, session=SQLAlchemySession(conversation_id, engine))` with default settings. `support_agent` has four tools: `search_kb`, `get_order`, `issue_refund` (with `needs_approval=True`) and `escalate`. When `issue_refund` needs approval, the node stores the run state and the graph moves to `await_approval`. Sessions give the agent memory across turns.
+>
+> **Retrieval: a RAG library.** `search_kb` calls the library's query engine over our help-centre index and returns its response to the agent.
+>
+> **Provider strategy.** All three libraries support multiple providers, so the design is provider-agnostic and we can move to another vendor without code changes.
+>
+> **Observability.** We add a Langfuse trace processor with `add_trace_processor` so every span lands in our Langfuse project. Customer messages may contain account details; our data agreement says they stay in our systems and the model vendor's API.
+>
+> **Cost.** One model call per user turn, at our expected traffic, gives the monthly figure in the appendix.
+>
+> **Maintenance.** Dependabot opens weekly upgrade pull requests for all three libraries; CI runs the unit tests and merges on green.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>For each framework, ask what default it applies to step limits, history and tracing when the proposal says "default settings".</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask the team to log every HTTP request to the model provider for one conversation that includes a refund, and count them.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what happens to the refund if the process restarts while the team lead is deciding.</p></details>
+
+## Answer
+
+Two flaws are easy to miss on a first read because each framework is used as documented; the problem is the nesting. The `agent` node runs an agent SDK loop whose default turn cap is 10. A long conversation raises `MaxTurnsExceeded`, and a retry policy that does not filter exception types retries the node up to three times, re-running every tool call made before the cap. And the approval pause lives inside the agent SDK run while the graph's durability lives in LangGraph: if the process restarts or the node retries, LangGraph re-runs the node from its start, the agent run starts over, and the agent can reach `issue_refund` again. The fix is one pause mechanism: let the agent SDK run end when approval is needed, move the refund into its own LangGraph node after an `interrupt()`, and give it an idempotency key.
+
+The data section contradicts the observability section. `add_trace_processor` adds Langfuse beside the default exporter; it does not replace it, so traces with inputs and outputs still go to OpenAI's trace backend. The proposal needs `set_trace_processors` or tracing disabled.
+
+History is held twice, in LangGraph's checkpoints and in the agent SDK's session, with no statement of which is the source of truth. The cost estimate counts one call per turn while the retrieval tool calls a query engine that writes its own answer with a model call, and approvals add more turns. The provider-agnostic claim is weaker than stated: the agent SDK's model provider defaults to OpenAI and its tooling is built around the Responses API. Weekly automatic merges of a pre-1.0 SDK (0.24.0 on 15 October 2026), gated by unit tests and no eval, will change behaviour without anyone deciding to.
+
+Two parts are acceptable with conditions. LangGraph is a reasonable home for an overnight approval if the pause uses its interrupt and the side effect sits after it. The RAG library is reasonable if it indexes and retrieves documents and the agent writes the answer, so there is one model deciding what to say.
+
+## Follow-ups
+
+- *The team answers that two of the three frameworks could go. Which one do you keep, and what do you write yourself?*
+- *How would you trace one conversation across all three libraries in one view?*
+
+## Common mistakes
+
+- Objecting to the number of frameworks without naming a concrete interaction between them.
+- Treating "default settings" as safe without reading the defaults.
+- Assuming an added trace processor replaces the default exporter.
+- Flagging the RAG library as redundant when the real issue is the extra synthesis call.

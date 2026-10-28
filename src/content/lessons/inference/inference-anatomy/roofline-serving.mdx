@@ -1,0 +1,187 @@
+---
+title: Prefill and decode on the roofline
+track: inference
+module: inference-anatomy
+order: 1
+kind: lesson
+level: senior
+minutes: 14
+summary: Prefill pushes hundreds or thousands of tokens through each weight it reads and sits above the H100's ridge point, decode pushes one token per sequence through every weight and its own KV cache and sits far below it, so a GPU, format or scheduling change can be assigned to the phase it speeds up before anyone benchmarks it.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: NVIDIA H100 product page
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: "H100 SXM 80 GB, 3.35 TB/s; 1,979 BF16 and 3,958 FP8 tensor TFLOPS, both marked 'with sparsity' (dense is half). Checked 2026-10-28."
+  - title: NVIDIA H200 product page
+    url: https://www.nvidia.com/en-us/data-center/h200/
+    note: "H200 SXM 141 GB, 4.8 TB/s; the same 1,979 BF16 and 3,958 FP8 sparse tensor TFLOPS as the H100 SXM. Checked 2026-10-28."
+  - title: How to Scale Your Model, All About Rooflines (Google DeepMind, JAX team)
+    url: https://jax-ml.github.io/scaling-book/roofline/
+    note: "Arithmetic intensity is FLOPs over bytes moved; H100 at about 9.89e14 dense BF16 FLOPs/s (the spec sheet's figure includes sparsity) and 3.35 TB/s, a threshold of about 295; H100s and B200s usually reach only about 80 to 85% of claimed peak FLOPs. Checked 2026-10-28."
+  - title: How to Scale Your Model, All About Transformer Inference
+    url: https://jax-ml.github.io/scaling-book/inference/
+    note: "During prefill the matmuls are basically always compute bound; generation needs a token batch above the hardware's critical intensity (about 280 for an H100 in its estimate) to be compute bound in the linear layers; attention during generation is memory-bandwidth bound because every batch item has its own KV cache; GQA raises attention intensity by the Q:KV ratio. Checked 2026-10-28."
+  - title: Scaling Laws for Neural Language Models (Kaplan et al., 2020), section 2.1
+    url: https://arxiv.org/abs/2001.08361
+    note: "Forward pass costs about 2N + 2 n_layer n_ctx d_model FLOPs per token; the context term is a small fraction when d_model > n_ctx / 12."
+  - title: The Llama 3 Herd of Models (Meta, 2024), Table 3
+    url: https://arxiv.org/html/2407.21783
+    note: "8B: 32 layers, 4,096 dim, 32 heads; 70B: 80 layers, 8,192 dim, 64 heads; 405B: 126 layers, 16,384 dim, 128 heads; all with 8 KV heads, chosen to improve inference speed and reduce the KV cache during decoding."
+  - title: Qwen3-32B config.json
+    url: https://huggingface.co/Qwen/Qwen3-32B/raw/main/config.json
+    note: "64 layers, 64 query heads, 8 KV heads, head_dim 128 set explicitly. Checked 2026-10-28."
+  - title: gpt-oss-120b config.json
+    url: https://huggingface.co/openai/gpt-oss-120b/raw/main/config.json
+    note: "36 layers, 128 local experts with 4 active per token. Checked 2026-10-28."
+  - title: Databricks, LLM inference performance engineering best practices (2023-10-12)
+    url: https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices
+    note: "MBU = achieved bandwidth / peak, achieved = (parameter bytes + KV bytes) / TPOT; 7B in 16-bit at 14 ms TPOT is 1 TB/s, 50% MBU on a 2 TB/s part; at batch 1, 60% MBU on 2x H100-80GB against 55% on 4x A100-40GB; on one A100, batch 64 raised latency 4x and throughput 14x. Vendor's own measurements."
+  - title: "DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving (Zhong et al., OSDI 2024)"
+    url: https://arxiv.org/html/2401.09670
+    note: "Per-GPU goodput is the maximum request rate served while meeting the SLO attainment goal; with a 13B model on one A100 at 90% attainment, colocated serving reaches about 1.6 rps, prefill alone 5.6 rps and decode alone 10 rps."
+  - title: NVIDIA NIM benchmarking, metrics
+    url: https://docs.nvidia.com/nim/benchmarking/llm/latest/metrics.html
+    note: "AIPerf ITL = (e2e_latency - TTFT) / (output_tokens - 1), also called TPOT, first token excluded; tools differ on including TTFT, so ITL values compare only when definitions match. Checked 2026-10-28."
+  - title: vLLM design docs, Metrics
+    url: https://docs.vllm.ai/en/latest/design/metrics.html
+    note: "V1 Prometheus names quoted in the lesson; inter-token latency is sampled per streamed output, request_time_per_output_token once per finished request. Checked 2026-10-28."
+  - title: SGLang, Production metrics
+    url: https://docs.sglang.io/references/production_metrics.html
+    note: "sglang: metric names quoted in the lesson, exposed with --enable-metrics; inter_token_latency_seconds is token-weighted. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The question to answer before the benchmark
+
+Someone proposes a faster GPU, FP8 weights, a bigger batch or speculative decoding. Each of these helps one phase of generation and does little or nothing for the other, and the roofline tells you which before a load test does. Prefill runs every prompt token through the model in one pass. Decode then produces one token per sequence per step, and each step rereads every weight plus that sequence's whole KV cache. The two phases run the same kernels on the same GPU and are bound by different resources.
+
+## Intensity, counted for a transformer
+
+A forward pass costs about 2N FLOPs per token for N parameters (Kaplan et al., section 2.1, plus a context term that matters only at long context; see the last section). A step that pushes t tokens through weights stored in b bytes each does 2Nt FLOPs and reads Nb bytes of weights, so its intensity is 2t / b FLOPs per byte: t in BF16, 2t in FP8.
+
+The H100 SXM's ridge point is peak FLOPs over peak bandwidth. NVIDIA's 1,979 BF16 TFLOPS figure is marked "with sparsity"; the dense rate is half, 989.5 TFLOPS. Divided by 3.35 TB/s that gives a ridge of 295 FLOPs per byte, the figure the JAX scaling book also computes. In FP8 the dense rate doubles to 1,979 TFLOPS and the ridge to 591, while the intensity per token also doubles because each weight is one byte. Both sides move together, so the step crosses the ridge at about 295 tokens either way. FP8 halves the time of both phases and leaves the crossover where it was.
+
+A 2,000-token prompt puts t = 2,000 through each weight read, about seven times past the ridge: compute bound. Decode at batch B puts t = B through each weight read, and B is usually tens of sequences, not hundreds. The scaling book's estimate for an H100 is that generation needs a batch of about 280 before the linear layers become compute bound.
+
+Toy numbers for a 70B model in FP8, 70 GB of weights on one H100 SXM. Prefilling 2,000 tokens takes at least 2 × 70e9 × 2,000 / 1.979e15 = 141 ms. One decode step at batch 1 reads 70 GB at 3.35 TB/s and takes at least 20.9 ms. The GPU prefills 2,000 tokens in the time of seven decode steps.
+
+<Predict id="inf-roofline-batch1" question="Upper bound on decode tokens per second for one sequence: 70 GB of FP8 weights on one H100 SXM (3.35 TB/s), batch 1, KV cache ignored" answer={48} tolerance={4} unit="tokens/s">
+<p>Each step reads at least 70 GB, so 3,350 / 70 = <b>47.9 steps per second</b>, one token each. A GPU with twice the FLOPs and the same bandwidth gives the same ceiling. The H200, with the same listed FLOPs and 4.8 TB/s, raises it to 4,800 / 70 = 68.6.</p>
+</Predict>
+
+### Attention reads that batching never shares
+
+The weight read is shared by every sequence in the batch; the KV read is not, because each sequence attends over its own history. Count it for one KV head and one cached token in BF16: the step reads a key and a value of d_head elements each, 4 × d_head bytes. Each of the G query heads that share that KV head does about 2 × d_head FLOPs for the score and 2 × d_head for the weighted value, 4 × G × d_head FLOPs. The intensity is G FLOPs per byte whatever the batch size. Llama 3 70B has 64 query heads over 8 KV heads, so G = 8, roughly 37 times below the ridge. The scaling book reaches the same conclusion: decode attention is bandwidth bound, and grouped-query attention raises its intensity by the query-to-KV head ratio.
+
+## Bytes per decode step, by model
+
+A decode step on one replica reads W + B × C × k bytes: weights W, plus B sequences at C cached tokens of k bytes each. The KV term grows with batch and context, so past some batch it dominates the step, and from there more batch buys little. Setting B × C × k = W gives the batch at which KV reads equal weight reads.
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Model (config source)</th><th>Layers, KV heads, head_dim</th><th>KV per token, BF16</th><th>KV per 8,192-token sequence</th><th>BF16 weights at nominal size</th><th>Batch where KV reads equal weight reads</th></tr></thead>
+<tbody>
+<tr><td>Llama 3 8B (paper)</td><td>32, 8, 128</td><td>128 KiB</td><td>1.07 GB</td><td>16 GB</td><td>15</td></tr>
+<tr><td>Qwen3-32B (config.json)</td><td>64, 8, 128</td><td>256 KiB</td><td>2.15 GB</td><td>64 GB</td><td>30</td></tr>
+<tr><td>Llama 3 70B (paper)</td><td>80, 8, 128</td><td>320 KiB</td><td>2.68 GB</td><td>140 GB</td><td>52</td></tr>
+<tr><td>Llama 3 405B (paper)</td><td>126, 8, 128</td><td>504 KiB</td><td>4.23 GB</td><td>810 GB</td><td>192</td></tr>
+</tbody>
+</table>
+</div>
+
+KV per token is 2 × layers × KV heads × head_dim × 2 bytes; the next lesson derives it for architectures where that formula breaks. The weights column uses the size in the model's name, so it is approximate.
+
+The asymptote is the useful number. Tokens per second per replica is B / step time, and as B grows that tends to bandwidth / (C × k), set by the KV term alone. For Llama 3 70B at 8,192 cached tokens with a BF16 cache, no batch size takes one H200's worth of bandwidth past 4.8e12 / 2.68e9 = 1,788 tokens per second, and an H100 past 1,248. Halving k with an FP8 cache doubles the ceiling; a faster GPU raises it by its bandwidth ratio; a bigger batch does not move it.
+
+## Which phase a change speeds up
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Change</th><th>Prefill</th><th>Decode</th><th>Reason</th></tr></thead>
+<tbody>
+<tr><td>H200 instead of H100 SXM</td><td>about the same</td><td>up to 1.43x</td><td>Same listed FLOPs; 4.8 / 3.35 TB/s. Also 141 GB against 80 GB, so a larger batch fits.</td></tr>
+<tr><td>FP8 weights with FP8 matmuls</td><td>up to 2x</td><td>up to 2x at small batch</td><td>Dense FP8 rate is twice BF16; the weight term halves, the KV term does not.</td></tr>
+<tr><td>FP8 KV cache</td><td>little</td><td>up to 2x where KV dominates</td><td>Halves k, so the KV term and the asymptote both move; capacity doubles.</td></tr>
+<tr><td>Larger batch</td><td>none</td><td>more tokens/s per GPU, slower per sequence</td><td>Shares the weight read; adds KV reads to every step.</td></tr>
+<tr><td>Prefix caching</td><td>skips the cached prefix</td><td>none</td><td>Removes prefill FLOPs for repeated prefixes.</td></tr>
+<tr><td>Speculative decoding</td><td>none, plus a draft model's prefill</td><td>more tokens per weight read</td><td>Verifies several drafted tokens in one pass, raising t per step while the step stays below the ridge.</td></tr>
+<tr><td>Fewer KV heads (GQA, MQA) or MLA</td><td>little</td><td>smaller KV term</td><td>Fixed by the model's training, chosen when you choose the model.</td></tr>
+</tbody>
+</table>
+</div>
+
+Databricks measured the batch row on one A100: batch 64 raised latency 4x and throughput 14x against batch 1 (the vendor's own measurement). The per-GPU number and the per-user number moved in opposite directions, which is the table's prediction.
+
+## Measuring which roof you are under
+
+**Model bandwidth utilisation** is the decode-side utilisation number. Databricks defines achieved bandwidth as (parameter bytes + KV bytes) / TPOT and MBU as that over peak: a 7B model in 16-bit at 14 ms TPOT moves 14 GB in 14 ms, 1 TB/s, which is 50% of a 2 TB/s part. Their measurements at batch 1 reached 60% MBU on 2x H100-80GB and 55% on 4x A100-40GB. On the prefill side the scaling book's guide is that H100s and B200s usually reach about 80 to 85% of claimed peak FLOPs. A floor computed from peak numbers is therefore optimistic by at least 1 / 0.85 in prefill and by roughly 1 / 0.6 in decode.
+
+**Goodput** is the throughput number that respects latency. DistServe defines per-GPU goodput as the maximum request rate served while meeting the SLO attainment goal, 90% in their experiments. For a 13B model on one A100, colocated serving reached about 1.6 requests per second, while prefill alone could sustain 5.6 and decode alone 10. Neither phase was the limit; their interference was. A change that raises tokens per second while pushing more requests past the TTFT or ITL target lowers goodput.
+
+The engines report the phases separately, so a change's effect shows up in the histogram of the phase it targets. vLLM V1 exposes `vllm:time_to_first_token_seconds`, `vllm:inter_token_latency_seconds`, `vllm:request_time_per_output_token_seconds`, `vllm:e2e_request_latency_seconds`, `vllm:request_queue_time_seconds`, `vllm:request_prefill_time_seconds`, `vllm:request_decode_time_seconds`, the gauges `vllm:num_requests_running`, `vllm:num_requests_waiting` and `vllm:kv_cache_usage_perc`, and the counters `vllm:prefix_cache_queries` and `vllm:prefix_cache_hits`. SGLang, with `--enable-metrics`, exposes `sglang:time_to_first_token_seconds`, `sglang:inter_token_latency_seconds`, `sglang:request_time_per_output_token_seconds`, `sglang:e2e_request_latency_seconds`, `sglang:num_running_reqs`, `sglang:num_queue_reqs`, `sglang:token_usage`, `sglang:cache_hit_rate` and `sglang:gen_throughput`.
+
+<Callout kind="gotcha">
+Both engines keep two decode-latency histograms. Inter-token latency gets one sample per streamed output, so long responses dominate its percentiles; time per output token gets one sample per finished request. NIM's AIPerf computes ITL as (e2e - TTFT) / (output tokens - 1), excluding the first token, and NVIDIA notes that other tools include it. A p99 from one definition is not comparable with a p99 from another.
+</Callout>
+
+## The arithmetic in code
+
+```python
+H100 = dict(flops_bf16=989.5e12, flops_fp8=1979e12, bw=3.35e12)
+
+def step_floor_s(gpu, n_params, w_bytes, tokens, kv_bytes_read):
+    flops = 2 * n_params * tokens                     # Kaplan: about 2N per token
+    peak = gpu['flops_fp8'] if w_bytes == 1 else gpu['flops_bf16']
+    t_compute = flops / peak
+    t_memory = (n_params * w_bytes + kv_bytes_read) / gpu['bw']
+    bound = 'compute' if t_compute > t_memory else 'memory'
+    return max(t_compute, t_memory), bound
+
+kv_tok = 2 * 80 * 8 * 128 * 2                          # Llama 3 70B, BF16 cache
+print(step_floor_s(H100, 70e9, 1, 2000, 0))            # (0.1414..., 'compute')  prefill 2,000 tokens
+print(step_floor_s(H100, 70e9, 1, 1, 0))               # (0.0208..., 'memory')   decode, batch 1
+print(step_floor_s(H100, 70e9, 1, 32, 32 * 8192 * kv_tok))  # (0.0465..., 'memory') batch 32 at 8K
+```
+
+The last line is a single-GPU floor that ignores whether 70 GB of weights plus 86 GB of cache fit in 80 GB; they do not, which is the subject of the next lesson.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Llama 3 70B in FP8 serves chat at about 8,192 cached tokens per sequence, tensor parallel 4 on H100s, 64 sequences per replica at peak. p99 ITL is just over the 40 ms objective, and you measured 50% MBU. Finance will fund one change this quarter: H200s at the same GPU count, or 50% more H100s. Which, and what do you measure before signing?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>ITL here is a decode step, which is bandwidth bound, so both options work through bytes per step over bandwidth. Per GPU the step reads 17.5 GB of weights plus 64 × 2.68 / 4 = 42.9 GB of cache, 60.4 GB: an 18.0 ms floor on an H100, 36 ms at 50% MBU. H200s cut that to 25.2 ms at the same batch. 50% more H100 replicas cut the batch to about 43 and the step to 46.1 GB, 27.5 ms. Both meet 40 ms; I would choose on cost per unit of goodput and on headroom, after checking that the p99 is really decode and not prefill stalls.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The H200 option speeds up every step by the bandwidth ratio, 1.43x, and adds 61 GB of memory per GPU, so the same fleet holds larger batches later or runs tensor parallel 2 replicas with half the all-reduce traffic. Its risk is procurement time and price per GPU-hour. The extra-H100 option is available now and spreads the same load over more replicas, but it buys latency by lowering batch, so the cost per token rises, and the gain shrinks if traffic grows.</p>
+<p>Before signing I would split p99 ITL by cause. If long prompts arriving mid-stream stall decode steps, `vllm:request_prefill_time_seconds` and the step timeline show it, and neither purchase fixes it: chunked prefill or a separate prefill pool does. Then I would load-test one replica at batch 43 and 64 to replace the 50% MBU assumption with measured step times, and price both options per request served at 90% SLO attainment.</p>
+<p>What I give up with the H100 option is cost per token; with the H200 option, a quarter of waiting. I would write that trade into the request with the measured numbers.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The H200 quote comes back 30% over budget and finance offers the extra H100s today. You take them; what risk do you accept in writing, and what traffic growth triggers the next purchase?</em></li>
+<li><em>Your load test shows MBU falling from 50% to 35% at batch 64. What does that say about the kernels, and does it change the choice?</em></li>
+<li><em>An engineer argues for FP8 KV cache instead of either purchase. Using the asymptote, what does it buy at 8,192 tokens, and what accuracy evidence would you need before shipping it?</em></li>
+<li><em>What would you need to see in production after the change to reverse it?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The floors use peak bandwidth and FLOPs; real kernels reach 50 to 60% of peak bandwidth in Databricks' measurements and 80 to 85% of peak FLOPs in the scaling book's guidance, and kernel launches, scheduler time on the CPU and tensor-parallel all-reduces add gaps between steps. Use a floor to rule configurations out, then measure the ones left.
+
+The 2N rule drops Kaplan's context term, 2 × n_layer × n_ctx × d_model per token, which the paper calls small when d_model exceeds n_ctx / 12. For Llama 3 70B that holds below 98,304 tokens. At a 131,072-token prompt the term is 2 × 80 × 131,072 × 8,192 = 1.7e11 FLOPs per token, more than the 1.4e11 of the weights, so long-context prefill spends more time in attention than in the weight matmuls.
+
+Prefill is compute bound only when the prompt is long. A 50-token prompt puts t = 50 through each weight read, well below the ridge. Engines also mix prefill chunks and decode tokens in one step, so a production step is neither phase; the roofline then applies to each kernel, not to the step.
+
+Mixture-of-experts models break W. gpt-oss-120b activates 4 of 128 experts per token, so batch 1 reads a small fraction of the weights, but at larger batches different tokens route to different experts and the bytes per step rise with batch until most experts are read. Derive W per step from the routing, not from the parameter count.
+
+<SelfRate id="lesson:inference/inference-anatomy/roofline-serving" />

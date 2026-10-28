@@ -1,0 +1,196 @@
+---
+title: Sessions as an event log outside the harness
+track: harness
+module: long-running-parallel
+order: 2
+kind: lesson
+level: staff
+minutes: 13
+summary: Keeping the session as an append-only event log outside both the harness and the sandbox turns a crashed harness into a restart and a dead container into a tool error, and leaves two problems the log does not solve, the tool call with no recorded result and the harness upgrade mid-session.
+prerequisites: [harness/long-running-parallel/long-running-harness]
+updated: 2026-10-28
+sources:
+  - title: Anthropic, Scaling Managed Agents, decoupling the brain from the hands (Lance Martin, Gabe Cemaj, Michael Cohen, 2026-04-08)
+    url: https://www.anthropic.com/engineering/managed-agents
+    note: session as an append-only event log; harness, session and sandbox virtualised; execute(name, input) returning a string, provision({resources}), wake(sessionId), getSession(id), emitEvent(id, event), getEvents() positional slices; container death returned as a tool-call error; tokens never reachable from the sandbox; Anthropic's own measurement of p50 time to first token down roughly 60% and p95 down over 90%. Checked 2026-10-28.
+  - title: "Wang et al., The OpenHands Software Agent SDK (arXiv 2511.03690, v2 2026-04-22, MLSys 2026)"
+    url: https://arxiv.org/abs/2511.03690
+    note: event-sourced ConversationState; base_state.json plus one JSON file per event; resume by replay with an unmatched-action scan; Table 2 (system-attributable errors 78.0 to 30.0 per 1,000 conversations over a 15-day rollout, attributed to co-located execution); Table 3 overhead on 433 SWE-Bench Verified conversations and 39,870 events. Checked 2026-10-28.
+  - title: OpenHands SDK paper, HTML version
+    url: https://arxiv.org/html/2511.03690
+    note: Table 3 values (per-event persist 0.20 ms median, crash recovery 7.4 ms median and 32.1 ms at 358 events, storage 380 KB median and 1.4 MB at P95); the text's "under 20 ms" recovery claim, which Table 3's maximum contradicts. Checked 2026-10-28.
+  - title: Anthropic, How we built our multi-agent research system (2025-06-13)
+    url: https://www.anthropic.com/engineering/multi-agent-research-system
+    note: agents are stateful and errors compound; resume from where the error occurred; rainbow deployments to avoid disrupting running agents; the lead agent saves its plan to memory because context beyond 200,000 tokens is truncated. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Where the session lives
+
+Every agent run has three things that can fail independently: the loop that calls the model and routes tool calls (the harness), the machine where code runs (the sandbox), and the record of what has happened so far (the session). The design decision is where the session lives. Inside the harness process, a harness crash loses the run. Inside the sandbox, a container crash loses it, and anyone debugging a stuck run has to open a shell in a container that holds user data. Outside both, as an append-only log with a small API, either of the other two can die and be replaced.
+
+Anthropic's April 2026 post on Managed Agents describes moving from the first arrangement to the third. The early design ran session, harness and sandbox in one container. The container became a pet: when it failed the session was lost, a stuck session could not be diagnosed from the event stream alone, and connecting to a customer's VPC meant peering networks, because the harness assumed every resource sat next to it.
+
+## The three interfaces
+
+The redesign keeps the interfaces narrow and says nothing about what runs behind them.
+
+The sandbox is a tool. The harness calls `execute(name, input)` and gets a string back. If the container has died, that call fails and the failure goes back to the model as a tool-call error, like any other. The model may retry, and `provision({resources})` builds a fresh container from a standard recipe.
+
+The harness is stateless. During the loop it writes every event with `emitEvent(id, event)`. When a harness process dies, a new one starts with `wake(sessionId)`, fetches the log with `getSession(id)` and resumes from the last event. Nothing in the harness needs to survive a crash.
+
+The session is not the context window. `getEvents()` returns positional slices of the log, so the harness can resume from where it last read, rewind a few events before a given point, or re-read context before an action. Whatever the harness fetches it may transform before it reaches the model, including organising context for a higher prompt cache hit rate. Anthropic's stated reason for the split is that compaction and similar techniques are irreversible decisions about which tokens to keep, and that the team cannot predict what context engineering future models will need; the session guarantees only that the full record is durable and queryable, and leaves context management to the harness.
+
+The arrangement is event sourcing with the model's context as one projection of the log among many: the database analogy holds, and the difference is that the projection is rebuilt by code that changes with every model generation.
+
+Two side effects of the split are worth separating from the recovery story. Credentials moved out of the sandbox: a repository token is used once to clone and configure the git remote during sandbox setup, and MCP tools go through a proxy that fetches OAuth tokens from a vault using a session-scoped token, so generated code never sees a credential. And latency improved because containers are now provisioned only when the model first calls a tool. Anthropic reports, as its own measurement, that p50 time to first token fell roughly 60% and p95 fell over 90%. That gain comes from taking provisioning off the critical path for sessions that do not need a sandbox yet, not from the log.
+
+## The same design, measured
+
+The OpenHands Software Agent SDK paper (first posted November 2025, revised April 2026, accepted at MLSys 2026) describes the same shape in an open-source codebase and publishes numbers. Agents, tools and LLM configurations are immutable; all mutable state sits in a `ConversationState` holding metadata plus an append-only event log. On disk the metadata is one `base_state.json` rewritten on each change and each event is its own JSON file, so only new events are written. A conversation resumes by loading the metadata and replaying the events; recovery includes an unmatched-action scan, a search for actions with no observation.
+
+Table 3 of the paper replays 433 SWE-Bench Verified conversations (39,870 events) through the production file store:
+
+| Measure | Median | P95 | Longest conversation (358 events) |
+|---|---|---|---|
+| Persist one event | 0.20 ms | 0.31 ms | not reported |
+| Persist an action and its observation | 0.40 ms | 0.56 ms | not reported |
+| Replay full state | 4.1 ms | 9.7 ms | 18.9 ms |
+| Crash recovery (replay plus unmatched-action scan) | 7.4 ms | 14.9 ms | 32.1 ms |
+| Storage per conversation | 380 KB | 1.4 MB | 3.4 MB |
+
+The paper's text says recovery completes in under 20 ms even for the longest conversation; its own table gives 32.1 ms for that case. Either way the cost is small next to model round trips, which the paper puts at 1 to 30 seconds.
+
+The paper's reliability result needs a careful read. Over a 15-day parallel rollout, system-attributable errors fell from 78.0 to 30.0 per 1,000 conversations, a 61% reduction. The eliminated errors were dominated by inter-pod authentication failures and runtime-not-ready errors, and the paper attributes the drop to co-located execution, not to event sourcing; the remaining errors were mostly one condensation bug. It is evidence that the new architecture is more reliable, not that the log caused it.
+
+<Predict id="hrn-session-log-storage" question="Scenario: your platform runs 20,000 agent sessions a day, and your sessions look like the OpenHands sample (median 380 KB of events each). Using the median, how many GB of session log do you write per day? Use 1 GB = 1,000,000 KB." answer={7.6} tolerance={0.1} unit="GB per day">
+<p>20,000 × 380 KB = 7,600,000 KB = <b>7.6 GB a day</b>. The median understates the total: the P95 conversation is 1.4 MB, almost four times the median, and the mean of a right-skewed distribution sits above its median. Plan capacity on the mean from your own traffic. Retention, not write volume, usually decides the bill, and retention is also where the privacy questions sit, since the log holds every tool output the agent saw.</p>
+</Predict>
+
+## The call with no result
+
+A log outside the harness makes restarts cheap, and it also makes one failure mode explicit. The harness writes a `tool_call` event, executes the call, and dies before writing the `tool_result`. On restart the log shows a call with no outcome. If the call read a file, run it again. If it opened a pull request, sent a message or charged a card, running it again may do it twice, and not running it may leave the model believing it never happened.
+
+This is ordinary at-least-once delivery, and the fixes are the ordinary ones: an idempotency key derived from the call ID for tools that support one, a lookup of the external system's state before retrying for tools that do not, and an honest observation to the model when neither is possible. Where the policy lives matters. If the harness decides, the decision is consistent and testable; if the model decides from a vague error, it will usually retry.
+
+```python
+import json
+import os
+
+
+class SessionLog:
+    """Append-only event log, one JSON object per line, outside the harness process."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def emit(self, event):
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def events(self, start=0, end=None):
+        with open(self.path, encoding="utf-8") as f:
+            return [json.loads(line) for line in f.read().splitlines()][start:end]
+
+    def drop_torn_tail(self):
+        # A crash mid-write leaves a final line with no newline; cut it before appending again.
+        with open(self.path, "rb+") as f:
+            data = f.read()
+            f.truncate(data.rfind(b"\n") + 1)
+
+
+def recover(log, safe_to_rerun):
+    """Close every tool call that has no result; return the calls the harness may simply re-run."""
+    log.drop_torn_tail()
+    events = log.events()
+    answered = {e["call_id"] for e in events if e["type"] == "tool_result"}
+    rerun = []
+    for e in events:
+        if e["type"] != "tool_call" or e["call_id"] in answered:
+            continue
+        if e["name"] in safe_to_rerun:
+            rerun.append(e)
+        else:
+            log.emit({"type": "tool_result", "call_id": e["call_id"],
+                      "error": "harness restarted before this call reported; outcome unknown, check before retrying"})
+    return rerun
+
+
+log = SessionLog("session.jsonl")
+log.emit({"type": "user", "text": "Fix the flaky test and open a PR"})
+log.emit({"type": "tool_call", "call_id": "c1", "name": "read_file", "input": {"path": "tests/test_api.py"}})
+log.emit({"type": "tool_result", "call_id": "c1", "output": "..."})
+log.emit({"type": "tool_call", "call_id": "c2", "name": "run_tests", "input": {}})
+log.emit({"type": "tool_call", "call_id": "c3", "name": "create_pull_request", "input": {"title": "Fix flaky test"}})
+with open("session.jsonl", "a", encoding="utf-8") as f:
+    f.write('{"type": "tool_res')   # the process dies here
+
+print([e["call_id"] for e in recover(log, safe_to_rerun={"read_file", "run_tests"})])  # ['c2']
+print(log.events()[-1]["call_id"], log.events()[-1]["error"][:24])                     # c3 harness restarted before
+```
+
+Two details in that sketch matter more than the rest. The torn final line has to be cut before anything new is appended, or the next event is glued onto it and lost. And the unmatched non-idempotent call is closed with an explicit "outcome unknown" result, so the model's next turn sees the uncertainty as a fact in its history instead of inferring it.
+
+## What the log does not hold
+
+The log holds events. It does not hold the sandbox's filesystem. When Managed Agents provisions a fresh container after a crash, the new container comes from a standard recipe; any file edits that existed only in the dead container are gone, and the log will contain tool results that describe files that no longer exist. A long-running coding harness therefore needs a second durable store for file state, and in practice that is git: commit or push at boundaries the log records, so that after a sandbox loss the harness can tell the model which commit the new workspace starts from.
+
+The same reasoning applies to anything else with side effects outside the log: a dev server's database, a deployed preview, a message sent. The log records that the call happened; only the external system knows its current state.
+
+## Upgrading the harness under running sessions
+
+Anthropic's multi-agent research post describes the operational version of this problem. Agents are stateful and errors compound, so restarting from the beginning is expensive; the system resumes from where an error occurred. Deploys use rainbow deployments, shifting traffic gradually from the old version to the new while both run, to avoid breaking agents mid-task.
+
+With the session outside the harness, an upgrade is a new harness reading an old log, and the open questions become schema questions.
+
+Event schema. A new harness must read every event version still present in a live log. Version each event type and upcast old events on read, the same way you would treat a migration you cannot run in place.
+
+Tool set. A session resumed by a new harness may have history that calls a tool the new version renamed or removed. The harness has to map those calls or present them as historical text, or the model will try to call a tool that no longer exists.
+
+Context projection. If the new harness builds the prompt differently, the cached prefix from the old one is useless and the first turn after the switch is a full-price request. Compaction may also differ: a summary written by the old harness's compaction prompt is now part of the record the new one reads.
+
+The decision is pin or migrate. Pinning each session to the harness version that started it is simplest and keeps behaviour stable, and it means old versions run until the longest session ends. Migrating at a turn boundary retires old code quickly and pays the schema, tool and cache costs above. Security fixes usually force migration; behaviour changes usually justify pinning.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Scenario: 2,000 agent sessions are running, some for several hours, when a harness bug that can leak a tool's output into the wrong session is found. The fix changes the shape of tool-result events. It has to be live today, and you cannot drop the running sessions. What do you do, and what did the session store need to record for this to be possible?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Migrate, do not pin: a leak justifies the cost. Ship the new harness with an upcaster for old tool-result events, drain each session at its next turn boundary (stop the old harness after it writes a result, wake the session on the new one), and close any call left without a result as "outcome unknown". This works only if the log carries a schema version per event, the harness version that wrote it, and call IDs that pair calls with results.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Order of work: first stop the leak without touching sessions, by routing tool outputs through a check that the session ID on the result matches the session being written, which the old harness can call. That buys hours. Then roll the new harness by turn boundary, not by process, so no session is cut mid-call.</p>
+<p>The upcaster is the risky part. Test it by replaying a sample of live logs through the new harness offline and diffing the reconstructed state against the old harness's state for the same sessions before switching any traffic.</p>
+<p>Expect a one-turn cost spike: every migrated session's first request misses the prompt cache. Estimate it from the number of active sessions and their average context, and tell whoever owns the budget before it shows up.</p>
+<p>What you give up: sessions migrated mid-task may behave differently from how they started, because the context projection changed. Record which sessions crossed versions so later evals and incident reviews can separate them.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The upcaster cannot reconstruct one field the new harness needs for 3% of old events. Do you terminate those sessions, run them on a patched old harness, or synthesise the field, and who signs off?</li>
+<li>Security asks you to delete one customer's session logs, but the log is append-only and replicated. What does the store need to support that, and what breaks for running sessions?</li>
+<li>Two senior engineers disagree: one wants every session pinned to its starting version forever, the other wants all sessions migrated on every deploy. What data from your own fleet settles it?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Replay is not re-execution. OpenHands claims the design enables deterministic replay but does not explain how, and it cannot mean re-running model calls, which are not deterministic. What replay gives you is reconstruction of state from recorded outputs. Treating the log as a way to reproduce a run by calling the model again will produce a different run.
+
+Append-only logs grow, and full replay gets slower with them. The OpenHands numbers come from SWE-Bench Verified conversations of at most 358 events; a session that runs for days needs periodic snapshots of derived state, which reintroduces a second representation that can drift from the log.
+
+The log is a store of everything the agent saw: file contents, command output, customer data returned by tools. Append-only conflicts with deletion requests and retention limits, and the design has to say how a record is removed or made unreadable before the first audit asks.
+
+More hands make the model's job harder. Managed Agents notes that choosing among many execution environments is a harder reasoning task than working in one shell. Decoupling makes recovery and scaling easier for the platform and can make individual runs worse, which is an eval question, not an architecture one.
+
+Finally, the performance numbers here are each vendor's own: Anthropic's latency figures and the OpenHands reliability figures come from their production systems, with their traffic, and neither has been independently reproduced.
+
+<SelfRate id="lesson:harness/long-running-parallel/session-log" />

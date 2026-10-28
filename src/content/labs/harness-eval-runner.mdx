@@ -1,0 +1,486 @@
+---
+title: Build a harness eval runner
+track: harness
+module: evaluating-harnesses
+kind: lab
+minutes: 120
+summary: Grow one runner over six steps that runs two harness variants on the same tasks, scores pass@k and pass^k with cost and turns, records the resource configuration, and refuses to call a gap inside the noise band a win.
+updated: 2026-10-28
+sources:
+  - title: Yao, Shinn, Razavi and Narasimhan, tau-bench (arXiv 2406.12045, 2024-06-17)
+    url: https://arxiv.org/abs/2406.12045
+    note: pass^k and pass@k and their per-task estimators C(c, k) / C(n, k) and 1 - C(n - c, k) / C(n, k), used in step 2; checked 2026-10-28
+  - title: Anthropic Engineering, Quantifying infrastructure noise in agentic coding evals (2026-02-05)
+    url: https://www.anthropic.com/engineering/infrastructure-noise
+    note: resource configuration as an experimental variable to record and match, infra-error rates by configuration, and pass rates that move with time of day; the reasons for steps 1, 4 and 6; checked 2026-10-28
+  - title: Anthropic Engineering, Demystifying evals for AI agents (2026-01-09)
+    url: https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents
+    note: each trial starts from a clean environment; Claude once read git history left by earlier trials; turns and tokens tracked per trial; the reasons for steps 1 and 3; checked 2026-10-28
+  - title: Anthropic, A statistical approach to model evaluations (2024-11-19)
+    url: https://www.anthropic.com/research/statistical-approach-to-model-evals
+    note: paired differences when two systems answer the same questions, used in step 5; checked 2026-10-28
+steps:
+  - title: Run both variants, interleaved, in fresh sandboxes
+    brief: |
+      The starter holds ScriptedAgent, a deterministic stand-in for a model plus one harness variant: its outcomes come from a generator seeded by variant, task and trial, so every run of the lab gives the same records. Write run_trials, which runs n trials of every task under every variant and returns one record per trial. Two rules come from how real evals go wrong. Every trial gets its own sandbox from make_sandbox(), because an agent that finds an earlier trial's leftovers can copy them; the mock does exactly that and counts it in leaks. And the variants are interleaved: at no point in the run may one variant be more than one trial ahead of the other, so a slow hour or a cluster hiccup lands on both arms instead of one.
+    starter: |
+      import random
+
+
+      class ScriptedAgent:
+          """A deterministic stand-in for one model plus one harness variant.
+
+          Outcomes come from a generator seeded by (seed, variant, task, trial), so a rerun gives the same results.
+          skill maps a task to the chance that a trial succeeds. memory_gb maps a task to the memory the agent needs
+          for it; a sandbox with a lower memory_limit_gb ends the trial as an infra error. A trial that finds an earlier
+          trial's notes in its sandbox copies the result and passes: the leak a reused environment causes.
+          Every call is appended to ScriptedAgent.log, shared by all agents, in call order.
+          """
+
+          log = []
+
+          def __init__(self, variant, skill, memory_gb=None, seed=0):
+              self.variant = variant
+              self.skill = skill
+              self.memory_gb = memory_gb or {}
+              self.seed = seed
+              self.leaks = 0
+
+          def run(self, task, trial, sandbox):
+              ScriptedAgent.log.append((self.variant, task, trial))
+              rng = random.Random(f"{self.seed}|{self.variant}|{task}|{trial}")
+              turns = [
+                  {"input": rng.randint(2000, 9000), "cached": rng.randint(0, 40000), "output": rng.randint(100, 900)}
+                  for _ in range(rng.randint(3, 25))
+              ]
+              draw = rng.random()
+              if sandbox.get("memory_limit_gb", float("inf")) < self.memory_gb.get(task, 0):
+                  return {"ok": False, "infra_error": True, "turns": turns[:2]}
+              notes = sandbox.setdefault("notes", {})
+              if task in notes:
+                  self.leaks += 1
+                  ok = True
+              else:
+                  ok = draw < self.skill.get(task, 0.0)
+              notes[task] = ok
+              return {"ok": ok, "infra_error": False, "turns": turns}
+
+
+      def run_trials(agents, tasks, n, make_sandbox):
+          """agents maps a variant name to its agent. Run n trials of every task under every variant.
+
+          Return one record per trial: {"variant", "task", "trial", "ok", "infra_error", "turns"}.
+          """
+          raise NotImplementedError
+    tests: |
+      SKILL = {"fix-build": 0.9, "port-module": 0.5, "flaky-io": 0.3}
+      ScriptedAgent.log.clear()
+      agents = {"A": ScriptedAgent("A", SKILL), "B": ScriptedAgent("B", SKILL)}
+      recs = run_trials(agents, list(SKILL), 4, dict)
+      assert len(recs) == 2 * 3 * 4
+      assert sorted((r["variant"], r["task"], r["trial"]) for r in recs) == sorted((v, t, i) for v in "AB" for t in SKILL for i in range(4))
+      assert agents["A"].leaks == 0 and agents["B"].leaks == 0, "every trial needs a fresh sandbox"
+      assert recs == run_trials({"A": ScriptedAgent("A", SKILL), "B": ScriptedAgent("B", SKILL)}, list(SKILL), 4, dict), "a rerun gives the same records"
+    hidden: |
+      ScriptedAgent.log.clear()
+      _hx_sk = {f"t{i}": 0.5 for i in range(7)}
+      _hx_ag = {"A": ScriptedAgent("A", _hx_sk), "B": ScriptedAgent("B", _hx_sk)}
+      _hx_recs = run_trials(_hx_ag, list(_hx_sk), 5, dict)
+      _hx_ahead = 0
+      _hx_seen = {"A": 0, "B": 0}
+      for _hx_v, _, _ in ScriptedAgent.log:
+          _hx_seen[_hx_v] += 1
+          _hx_ahead = max(_hx_ahead, abs(_hx_seen["A"] - _hx_seen["B"]))
+      assert _hx_ahead <= 1
+      assert all(set(r) >= {"variant", "task", "trial", "ok", "infra_error", "turns"} for r in _hx_recs)
+      _hx_made = []
+      def _hx_factory():
+          _hx_made.append({})
+          return _hx_made[-1]
+      run_trials({"A": ScriptedAgent("A", _hx_sk)}, list(_hx_sk), 3, _hx_factory)
+      assert len(_hx_made) == 21 and len({id(s) for s in _hx_made}) == 21
+      assert run_trials({"A": ScriptedAgent("A", _hx_sk)}, [], 3, dict) == []
+    solution: |
+      import random
+
+
+      class ScriptedAgent:
+          log = []
+
+          def __init__(self, variant, skill, memory_gb=None, seed=0):
+              self.variant = variant
+              self.skill = skill
+              self.memory_gb = memory_gb or {}
+              self.seed = seed
+              self.leaks = 0
+
+          def run(self, task, trial, sandbox):
+              ScriptedAgent.log.append((self.variant, task, trial))
+              rng = random.Random(f"{self.seed}|{self.variant}|{task}|{trial}")
+              turns = [
+                  {"input": rng.randint(2000, 9000), "cached": rng.randint(0, 40000), "output": rng.randint(100, 900)}
+                  for _ in range(rng.randint(3, 25))
+              ]
+              draw = rng.random()
+              if sandbox.get("memory_limit_gb", float("inf")) < self.memory_gb.get(task, 0):
+                  return {"ok": False, "infra_error": True, "turns": turns[:2]}
+              notes = sandbox.setdefault("notes", {})
+              if task in notes:
+                  self.leaks += 1
+                  ok = True
+              else:
+                  ok = draw < self.skill.get(task, 0.0)
+              notes[task] = ok
+              return {"ok": ok, "infra_error": False, "turns": turns}
+
+
+      def run_trials(agents, tasks, n, make_sandbox):
+          records = []
+          for trial in range(n):
+              for task in tasks:
+                  for variant, agent in agents.items():
+                      out = agent.run(task, trial, make_sandbox())
+                      records.append({"variant": variant, "task": task, "trial": trial, **out})
+          return records
+  - title: Score pass@k and pass^k
+    brief: |
+      counts turns one variant's records into (n, c) per task, leaving out infra-error trials: the sandbox failed, so the trial says nothing about the agent. The rate of those trials is reported separately in step 3. pass^k is the chance that k trials of a task all succeed and pass@k the chance that at least one does; estimate each per task from its n trials, as the share of k-subsets of those trials that are all successes or contain one, then average over tasks. Raise ValueError when k is below 1, there are no tasks, or a task has fewer than k usable trials. The tests include a task with thousands of trials, so avoid computing huge factorials in floating point.
+    starter: |
+      def counts(records, variant):
+          """Map each task to (n, c): usable trials and successes for variant. Infra-error trials are not usable."""
+          raise NotImplementedError
+
+
+      def pass_at_k(task_counts, k):
+          """Chance that at least one of k trials succeeds, estimated per task from (n, c) and averaged over tasks."""
+          raise NotImplementedError
+
+
+      def pass_hat_k(task_counts, k):
+          """Chance that all k trials succeed, estimated per task from (n, c) and averaged over tasks."""
+          raise NotImplementedError
+    tests: |
+      tc = {"x": (6, 6), "y": (6, 3), "z": (6, 0)}
+      assert abs(pass_hat_k(tc, 1) - 0.5) < 1e-9 and abs(pass_at_k(tc, 1) - 0.5) < 1e-9
+      assert abs(pass_hat_k(tc, 2) - (1 + 3 / 15) / 3) < 1e-9
+      assert abs(pass_at_k(tc, 2) - (1 + 12 / 15) / 3) < 1e-9
+      recs = [
+          {"variant": "A", "task": "x", "trial": 0, "ok": True, "infra_error": False, "turns": []},
+          {"variant": "A", "task": "x", "trial": 1, "ok": False, "infra_error": True, "turns": []},
+          {"variant": "A", "task": "x", "trial": 2, "ok": False, "infra_error": False, "turns": []},
+          {"variant": "B", "task": "x", "trial": 0, "ok": True, "infra_error": False, "turns": []},
+      ]
+      assert counts(recs, "A") == {"x": (2, 1)}, "an infra error is not an attempt by the agent"
+      assert counts(recs, "B") == {"x": (1, 1)}
+      try:
+          pass_hat_k({"x": (2, 2)}, 3)
+          raise AssertionError("two trials cannot estimate pass^3")
+      except ValueError:
+          pass
+    hidden: |
+      import itertools, random
+      _hx_r = random.Random(11)
+      for _ in range(30):
+          _hx_tc = {}
+          for _hx_i in range(_hx_r.randint(1, 5)):
+              _hx_n = _hx_r.randint(1, 7)
+              _hx_tc[f"t{_hx_i}"] = (_hx_n, _hx_r.randint(0, _hx_n))
+          for _hx_k in range(1, min(n for n, _ in _hx_tc.values()) + 1):
+              _hx_all, _hx_any = [], []
+              for _hx_n, _hx_c in _hx_tc.values():
+                  _hx_sub = list(itertools.combinations([1] * _hx_c + [0] * (_hx_n - _hx_c), _hx_k))
+                  _hx_all.append(sum(all(s) for s in _hx_sub) / len(_hx_sub))
+                  _hx_any.append(sum(any(s) for s in _hx_sub) / len(_hx_sub))
+              assert abs(pass_hat_k(_hx_tc, _hx_k) - sum(_hx_all) / len(_hx_all)) < 1e-9
+              assert abs(pass_at_k(_hx_tc, _hx_k) - sum(_hx_any) / len(_hx_any)) < 1e-9
+      assert pass_hat_k({"big": (4000, 3990)}, 2000) > 0
+      ScriptedAgent.log.clear()
+      _hx_sk = {"p": 0.6, "q": 0.2}
+      _hx_recs = run_trials({"A": ScriptedAgent("A", _hx_sk, memory_gb={"q": 8})}, list(_hx_sk), 6, lambda: {"memory_limit_gb": 4})
+      assert counts(_hx_recs, "A").get("q", (0, 0))[0] == 0 and counts(_hx_recs, "A")["p"][0] == 6
+    solution: |
+      from collections import defaultdict
+
+
+      def counts(records, variant):
+          cells = defaultdict(lambda: [0, 0])
+          for r in records:
+              if r["variant"] != variant or r["infra_error"]:
+                  continue
+              cells[r["task"]][0] += 1
+              cells[r["task"]][1] += 1 if r["ok"] else 0
+          return {t: (n, c) for t, (n, c) in cells.items()}
+
+
+      def _all_of(n, c, k):
+          # C(c, k) / C(n, k) as a running product, so large n needs no big integers.
+          if n < k:
+              raise ValueError(f"{n} usable trials cannot estimate a metric over k={k}")
+          if c < k:
+              return 0.0
+          r = 1.0
+          for i in range(k):
+              r *= (c - i) / (n - i)
+          return r
+
+
+      def pass_hat_k(task_counts, k):
+          if not task_counts or k < 1:
+              raise ValueError("need k >= 1 and at least one task")
+          return sum(_all_of(n, c, k) for n, c in task_counts.values()) / len(task_counts)
+
+
+      def pass_at_k(task_counts, k):
+          if not task_counts or k < 1:
+              raise ValueError("need k >= 1 and at least one task")
+          return sum(1.0 - _all_of(n, n - c, k) for n, c in task_counts.values()) / len(task_counts)
+  - title: Attach cost and turns to every trial
+    brief: |
+      Each record's turns list carries the tokens of one model call: input, cached and output. trial_cost prices them with a table of prices per million tokens. summarize builds one variant's row of the report: trials, infra-error rate, pass^k, pass@k, mean cost and mean turns per trial, and cost per success. Cost and turns count every trial, infra errors included, since that money was spent; cost per success is None when nothing succeeded. A harness that wins by spending three times as much per task has made a trade, not an improvement, and this row is where the reader sees it.
+    starter: |
+      def trial_cost(turns, prices):
+          """Cost of one trial. prices gives the price per million tokens for "input", "cached" and "output"."""
+          raise NotImplementedError
+
+
+      def summarize(records, variant, prices, k=1):
+          """One variant's row for the report: trials, infra_error_rate, pass_hat_k, pass_at_k, mean_cost, mean_turns
+          and cost_per_success (None when nothing succeeded). Cost and turns count every trial, infra errors included.
+          Raise ValueError when the variant has no trials."""
+          raise NotImplementedError
+    tests: |
+      PRICES = {"input": 3.0, "cached": 0.3, "output": 15.0}   # made-up prices per million tokens for the tests
+      turns = [{"input": 1000, "cached": 10000, "output": 200}, {"input": 3000, "cached": 0, "output": 600}]
+      assert abs(trial_cost(turns, PRICES) - (4000 * 3.0 + 10000 * 0.3 + 800 * 15.0) / 1e6) < 1e-12
+      recs = [
+          {"variant": "A", "task": "x", "trial": 0, "ok": True, "infra_error": False, "turns": turns},
+          {"variant": "A", "task": "x", "trial": 1, "ok": False, "infra_error": True, "turns": turns[:1]},
+          {"variant": "A", "task": "y", "trial": 0, "ok": False, "infra_error": False, "turns": turns * 3},
+      ]
+      s = summarize(recs, "A", PRICES)
+      assert s["trials"] == 3 and abs(s["infra_error_rate"] - 1 / 3) < 1e-12
+      assert abs(s["mean_turns"] - 3) < 1e-12, "turns count every trial, infra errors included"
+      spent = trial_cost(turns, PRICES) * 4 + trial_cost(turns[:1], PRICES)
+      assert abs(s["mean_cost"] - spent / 3) < 1e-12 and abs(s["cost_per_success"] - spent) < 1e-12
+      assert abs(s["pass_hat_k"] - 0.5) < 1e-12
+    hidden: |
+      _hx_P = {"input": 1.0, "cached": 0.1, "output": 5.0}
+      ScriptedAgent.log.clear()
+      _hx_sk = {"a": 0.0, "b": 0.0}
+      _hx_recs = run_trials({"A": ScriptedAgent("A", _hx_sk)}, list(_hx_sk), 3, dict)
+      _hx_s = summarize(_hx_recs, "A", _hx_P)
+      assert _hx_s["cost_per_success"] is None and _hx_s["pass_at_k"] == 0
+      assert trial_cost([], _hx_P) == 0
+      _hx_recs = run_trials({"A": ScriptedAgent("A", {"a": 0.7}), "B": ScriptedAgent("B", {"a": 0.7})}, ["a"], 8, dict)
+      _hx_sa, _hx_sb = summarize(_hx_recs, "A", _hx_P, k=3), summarize(_hx_recs, "B", _hx_P, k=3)
+      assert _hx_sa["trials"] == 8 and _hx_sb["trials"] == 8 and _hx_sa["pass_hat_k"] <= _hx_sa["pass_at_k"]
+      try:
+          summarize(_hx_recs, "C", _hx_P)
+          raise AssertionError
+      except ValueError:
+          pass
+    solution: |
+      def trial_cost(turns, prices):
+          tokens = {"input": 0, "cached": 0, "output": 0}
+          for t in turns:
+              for kind in tokens:
+                  tokens[kind] += t.get(kind, 0)
+          return sum(tokens[kind] * prices[kind] for kind in tokens) / 1_000_000
+
+
+      def summarize(records, variant, prices, k=1):
+          mine = [r for r in records if r["variant"] == variant]
+          trials = len(mine)
+          if not trials:
+              raise ValueError(f"no trials for variant {variant!r}")
+          tc = counts(records, variant)
+          spent = sum(trial_cost(r["turns"], prices) for r in mine)
+          wins = sum(c for _, c in tc.values())
+          return {
+              "trials": trials,
+              "infra_error_rate": sum(1 for r in mine if r["infra_error"]) / trials,
+              "pass_hat_k": pass_hat_k(tc, k),
+              "pass_at_k": pass_at_k(tc, k),
+              "mean_cost": spent / trials,
+              "mean_turns": sum(len(r["turns"]) for r in mine) / trials,
+              "cost_per_success": spent / wins if wins else None,
+          }
+  - title: Record the resource configuration with each run
+    brief: |
+      A score is only comparable with another score run under the same model, task set, resources and time limits, and those drift between runs unless they are written down with the results. run_eval takes a config dict, runs config["trials"] trials per task, builds every sandbox with the config's memory_limit_gb when it has one, and returns the config with the records. Store a deep copy: a caller who reuses and edits the dict for the next run must not rewrite the history of this one. mismatches lists the config keys that differ between two runs, a key present on only one side included, minus any keys the caller says to ignore.
+    starter: |
+      def run_eval(agents, tasks, config):
+          """Run config["trials"] trials per task per variant in sandboxes built from config, and return
+          {"config": ..., "records": ...}. The stored config must not change if the caller's dict changes later."""
+          raise NotImplementedError
+
+
+      def mismatches(run_a, run_b, ignore=()):
+          """Sorted config keys whose values differ between two runs (a key missing on one side differs), except ignore."""
+          raise NotImplementedError
+    tests: |
+      SKILL = {"compile-heavy": 0.8, "small-fix": 0.9}
+      NEEDS = {"compile-heavy": 6}
+      base = {"model": "model-x-2026-09", "task_set": "suite-v3", "memory_limit_gb": 4, "cpus": 2, "timeout_s": 1800, "trials": 5}
+      ScriptedAgent.log.clear()
+      tight = run_eval({"A": ScriptedAgent("A", SKILL, NEEDS)}, list(SKILL), base)
+      roomy = run_eval({"A": ScriptedAgent("A", SKILL, NEEDS)}, list(SKILL), dict(base, memory_limit_gb=12))
+      assert sum(r["infra_error"] for r in tight["records"]) == 5, "the 4 GB limit must reach the sandbox"
+      assert sum(r["infra_error"] for r in roomy["records"]) == 0
+      assert mismatches(tight, roomy) == ["memory_limit_gb"]
+      assert mismatches(tight, tight) == []
+      base["cpus"] = 8
+      assert tight["config"]["cpus"] == 2, "the run keeps the configuration it ran with"
+    hidden: |
+      _hx_c = {"model": "m", "trials": 2, "memory_limit_gb": 16, "env": {"image": "img@sha256:aa"}}
+      _hx_r1 = run_eval({"A": ScriptedAgent("A", {"t": 0.5})}, ["t"], _hx_c)
+      _hx_c["env"]["image"] = "img@sha256:bb"
+      _hx_r2 = run_eval({"A": ScriptedAgent("A", {"t": 0.5})}, ["t"], _hx_c)
+      assert mismatches(_hx_r1, _hx_r2) == ["env"]
+      assert mismatches(_hx_r1, _hx_r2, ignore=("env",)) == []
+      _hx_r3 = {"config": {"model": "m", "trials": 2, "memory_limit_gb": 16}, "records": []}
+      assert mismatches(_hx_r1, _hx_r3) == ["env"] and mismatches(_hx_r3, _hx_r1) == ["env"]
+      assert len(_hx_r1["records"]) == 2 and _hx_r1 == run_eval({"A": ScriptedAgent("A", {"t": 0.5})}, ["t"], {"model": "m", "trials": 2, "memory_limit_gb": 16, "env": {"image": "img@sha256:aa"}})
+    solution: |
+      import copy
+
+
+      def run_eval(agents, tasks, config):
+          frozen = copy.deepcopy(config)
+          sandbox = {"memory_limit_gb": frozen["memory_limit_gb"]} if "memory_limit_gb" in frozen else {}
+          records = run_trials(agents, tasks, frozen["trials"], lambda: dict(sandbox))
+          return {"config": frozen, "records": records}
+
+
+      def mismatches(run_a, run_b, ignore=()):
+          a, b = run_a["config"], run_b["config"]
+          missing = object()
+          keys = (set(a) | set(b)) - set(ignore)
+          return sorted(k for k in keys if a.get(k, missing) != b.get(k, missing))
+  - title: Compare the variants task by task
+    brief: |
+      Both variants ran the same tasks, so compare them task by task. For each task both have usable trials for, take B's pass^k estimate minus A's; diff is the mean of those differences and half_width is 1.96 times their sample standard deviation divided by the square root of the number of shared tasks. Pairing removes task difficulty from the noise: if B gains the same amount on every task, the half-width is zero however different the tasks are. Raise ValueError with fewer than two shared tasks, since one task has no spread to measure.
+    starter: |
+      def paired(records_a, variant_a, records_b, variant_b, k=1):
+          """Compare variant_b with variant_a on the tasks both have usable trials for.
+
+          Return {"tasks": number of shared tasks, "diff": mean over shared tasks of (B's pass^k minus A's),
+          "half_width": the half-width of a 95% interval on that mean, treating tasks as the pairs}.
+          Raise ValueError with fewer than two shared tasks.
+          """
+          raise NotImplementedError
+    tests: |
+      def fixed(variant, rates, n=10):
+          return [{"variant": variant, "task": t, "trial": i, "ok": i < round(p * n), "infra_error": False, "turns": []}
+                  for t, p in rates.items() for i in range(n)]
+      A_RATES = {"t1": 0.1, "t2": 0.3, "t3": 0.5, "t4": 0.7}
+      same = paired(fixed("A", A_RATES), "A", fixed("B", A_RATES), "B")
+      assert same["tasks"] == 4 and same["diff"] == 0 and same["half_width"] == 0
+      shifted = paired(fixed("A", A_RATES), "A", fixed("B", {t: p + 0.2 for t, p in A_RATES.items()}), "B")
+      assert abs(shifted["diff"] - 0.2) < 1e-9
+      assert shifted["half_width"] < 1e-9, "every task moved by the same amount; task difficulty is not noise"
+      mixed = paired(fixed("A", A_RATES), "A", fixed("B", {"t1": 0.3, "t2": 0.3, "t3": 0.5, "t4": 0.9}), "B")
+      assert abs(mixed["diff"] - 0.1) < 1e-9 and abs(mixed["half_width"] - 1.96 * (0.04 / 3 / 4) ** 0.5) < 1e-9
+    hidden: |
+      import random
+      _hx_rng = random.Random(5)
+      _hx_ra = {f"t{i}": _hx_rng.random() for i in range(12)}
+      _hx_A = fixed("A", _hx_ra, n=8)
+      _hx_B = fixed("B", {t: min(1.0, p + _hx_rng.uniform(-0.2, 0.3)) for t, p in _hx_ra.items()}, n=8)
+      _hx_ab, _hx_ba = paired(_hx_A, "A", _hx_B, "B"), paired(_hx_B, "B", _hx_A, "A")
+      assert abs(_hx_ab["diff"] + _hx_ba["diff"]) < 1e-12 and abs(_hx_ab["half_width"] - _hx_ba["half_width"]) < 1e-12
+      _hx_extra = _hx_B + fixed("B", {"only-b": 1.0})
+      assert paired(_hx_A, "A", _hx_extra, "B") == _hx_ab
+      try:
+          paired(fixed("A", {"x": 0.5}), "A", fixed("B", {"x": 0.5}), "B")
+          raise AssertionError
+      except ValueError:
+          pass
+      _hx_k2 = paired(_hx_A, "A", _hx_B, "B", k=2)
+      assert _hx_k2["tasks"] == 12 and _hx_k2["half_width"] >= 0
+      ScriptedAgent.log.clear()
+      _hx_run = run_eval({"A": ScriptedAgent("A", _hx_ra), "B": ScriptedAgent("B", _hx_ra)}, list(_hx_ra), {"trials": 4})
+      assert paired(_hx_run["records"], "A", _hx_run["records"], "B")["tasks"] == 12
+    solution: |
+      import math
+
+
+      def paired(records_a, variant_a, records_b, variant_b, k=1):
+          a, b = counts(records_a, variant_a), counts(records_b, variant_b)
+          shared = sorted(set(a) & set(b))
+          if len(shared) < 2:
+              raise ValueError("need at least two tasks with usable trials in both")
+          d = [pass_hat_k({t: b[t]}, k) - pass_hat_k({t: a[t]}, k) for t in shared]
+          mean = sum(d) / len(d)
+          var = sum((x - mean) ** 2 for x in d) / (len(d) - 1)
+          return {"tasks": len(shared), "diff": mean, "half_width": 1.96 * math.sqrt(var / len(d))}
+  - title: Refuse to call noise a win
+    brief: |
+      verdict is the line the report leads with. It is "confounded" when the two runs' configs differ outside the keys the caller ignores, or when either variant's infra-error rate is above max_infra_error_rate, because then the gap may belong to the cluster. It is "inside_noise" when the gap is not wider than the half-width. Only otherwise does it name the better variant. Return the diff, the half-width, the differing keys and both infra-error rates with it, so the reader can see why. The tests run two variants with identical skill and expect no winner, and the hidden tests repeat that over many seeds.
+    starter: |
+      def verdict(run_a, variant_a, run_b, variant_b, max_infra_error_rate, k=1, ignore=()):
+          """Decide what the comparison supports. Return {"verdict", "diff", "half_width", "differs", "infra_error_rates"}.
+
+          verdict is "confounded" when the two runs' configs differ outside ignore, or when either variant's infra-error
+          rate is above max_infra_error_rate; "inside_noise" when the gap is not wider than the half-width; otherwise the
+          name of the better variant.
+          """
+          raise NotImplementedError
+    tests: |
+      import random
+      rng = random.Random(2026)
+      SKILL = {f"task-{i:02d}": rng.uniform(0.2, 0.8) for i in range(40)}
+      CONFIG = {"model": "model-x-2026-09", "task_set": "suite-v3", "memory_limit_gb": 8, "trials": 5}
+      ScriptedAgent.log.clear()
+      null_run = run_eval({"old": ScriptedAgent("old", SKILL), "new": ScriptedAgent("new", SKILL)}, list(SKILL), CONFIG)
+      v = verdict(null_run, "old", null_run, "new", max_infra_error_rate=0.03)
+      assert v["verdict"] == "inside_noise", f"same skill, gap {v['diff']:+.3f} with half-width {v['half_width']:.3f}: not a win"
+      better = {t: min(1.0, p + 0.3) for t, p in SKILL.items()}
+      win_run = run_eval({"old": ScriptedAgent("old", SKILL), "new": ScriptedAgent("new", better)}, list(SKILL), CONFIG)
+      assert verdict(win_run, "old", win_run, "new", max_infra_error_rate=0.03)["verdict"] == "new"
+      last_month = run_eval({"old": ScriptedAgent("old", SKILL)}, list(SKILL), dict(CONFIG, memory_limit_gb=4))
+      v = verdict(last_month, "old", win_run, "new", max_infra_error_rate=0.03)
+      assert v["verdict"] == "confounded" and v["differs"] == ["memory_limit_gb"]
+    hidden: |
+      _hx_wins = 0
+      for _hx_seed in range(30):
+          _hx_r = random.Random(_hx_seed)
+          _hx_sk = {f"t{i}": _hx_r.choice([0.0, 1.0, _hx_r.uniform(0.1, 0.9)]) for i in range(60)}
+          _hx_run = run_eval({"a": ScriptedAgent("a", _hx_sk, seed=_hx_seed), "b": ScriptedAgent("b", _hx_sk, seed=_hx_seed)}, list(_hx_sk), {"trials": 5})
+          if verdict(_hx_run, "a", _hx_run, "b", max_infra_error_rate=0.05)["verdict"] not in ("inside_noise",):
+              _hx_wins += 1
+      assert _hx_wins <= 5
+      _hx_heavy = {t: 9 for t in list(SKILL)[:4]}
+      _hx_ir = run_eval({"old": ScriptedAgent("old", SKILL), "new": ScriptedAgent("new", better, memory_gb=_hx_heavy)}, list(SKILL), CONFIG)
+      _hx_v = verdict(_hx_ir, "old", _hx_ir, "new", max_infra_error_rate=0.03)
+      assert _hx_v["verdict"] == "confounded" and abs(_hx_v["infra_error_rates"]["new"] - 0.1) < 1e-9 and _hx_v["infra_error_rates"]["old"] == 0
+      assert verdict(_hx_ir, "old", _hx_ir, "new", max_infra_error_rate=0.2)["verdict"] == "new"
+      _hx_w1, _hx_w2 = verdict(win_run, "old", win_run, "new", 0.03), verdict(win_run, "new", win_run, "old", 0.03)
+      assert _hx_w1["verdict"] == _hx_w2["verdict"] == "new" and abs(_hx_w1["diff"] + _hx_w2["diff"]) < 1e-12
+      _hx_lm = verdict(last_month, "old", win_run, "new", 0.03, ignore=("memory_limit_gb",))
+      assert _hx_lm["differs"] == [] and _hx_lm["verdict"] in ("new", "inside_noise")
+    solution: |
+      def verdict(run_a, variant_a, run_b, variant_b, max_infra_error_rate, k=1, ignore=()):
+          def infra_rate(run, variant):
+              mine = [r for r in run["records"] if r["variant"] == variant]
+              return sum(1 for r in mine if r["infra_error"]) / len(mine) if mine else 0.0
+
+          differs = mismatches(run_a, run_b, ignore)
+          rates = {variant_a: infra_rate(run_a, variant_a), variant_b: infra_rate(run_b, variant_b)}
+          p = paired(run_a["records"], variant_a, run_b["records"], variant_b, k)
+          if differs or max(rates.values()) > max_infra_error_rate:
+              call = "confounded"
+          elif abs(p["diff"]) <= p["half_width"]:
+              call = "inside_noise"
+          else:
+              call = variant_b if p["diff"] > 0 else variant_a
+          return {"verdict": call, "diff": p["diff"], "half_width": p["half_width"], "differs": differs, "infra_error_rates": rates}
+---
+
+This lab builds the comparison the lessons in this module argue for, as one program. Each step adds functions to the same file and runs its tests against everything you have written so far, so step 6 calls the `run_trials` you wrote in step 1.
+
+There is no model in the lab. `ScriptedAgent` stands in for a model plus one harness variant: each task has a success probability, outcomes come from a seeded generator, and the agent reproduces two failures real runs have. It needs a stated amount of memory for some tasks and ends the trial as an infra error when the sandbox has less, and it copies the answer when it finds an earlier trial's notes in its sandbox. The tests check behaviour (fresh sandboxes, interleaving, configurations that travel with results, statistics that match their definitions, verdicts that hold up on many seeds), never a particular sequence of outcomes beyond what the seed fixes.
+
+Steps 1 to 3 are the runner and its report: trials, pass@k and pass^k, cost and turns. Step 4 records the configuration so a comparison across runs can be refused. Steps 5 and 6 compare two variants paired by task and decide whether the gap is a win, noise, or confounded.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

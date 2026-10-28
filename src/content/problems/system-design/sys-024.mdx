@@ -1,0 +1,109 @@
+---
+id: sys-024
+title: Three times over the latency budget
+subtitle: an in-editor fix suggestion
+track: system-design
+module: capacity
+type: design
+difficulty: hard
+seniority: [senior, staff]
+minutes: 40
+core: false
+tags: [latency, latency-budget, output-length, precompute, prompt-caching]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: NVIDIA NIM, LLM benchmarking metrics
+    url: https://docs.nvidia.com/nim/benchmarking/llm/latest/metrics.html
+    note: end-to-end latency = TTFT + generation time; ITL = (e2e − TTFT) / (output tokens − 1); TTFT includes queueing, prefill and network; checked 2026-10-28
+  - title: Anthropic docs, prompt caching
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: cached prefixes generally improve time to first token for long prompts, with no published figure; minimum cacheable prompt 512 tokens on the 5.x models; checked 2026-10-28
+  - title: Anthropic, pricing
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: fast mode on Opus 5.5 at $8 input and $40 output against $4 and $20 standard; checked 2026-10-28
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Our editor plugin suggests a fix for a failing build. The patch is shown as a diff preview, so it has to be complete before it appears. Product wants it within 1.5 seconds at P95; traces say we are at 4.8. You have two engineers for six weeks, the shared model gateway belongs to the platform team and will not change this half, and one of our staff engineers wants to fine-tune a small model instead. Where do you cut, and what does each cut cost?"
+</Callout>
+
+Per-hop latencies from traces of the same requests (scenario numbers):
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Hop</th><th>P50</th><th>P95</th></tr></thead>
+<tbody>
+<tr><td>Shared model gateway</td><td>40 ms</td><td>120 ms</td></tr>
+<tr><td>Gather context: error, open file, symbol lookup</td><td>90 ms</td><td>250 ms</td></tr>
+<tr><td>Retrieve related files</td><td>60 ms</td><td>150 ms</td></tr>
+<tr><td>Model time to first token, 7,500-token prompt (4,500 static), uncached</td><td>600 ms</td><td>1,300 ms</td></tr>
+<tr><td>Generation: the model rewrites the whole function, 380 tokens on average</td><td>3,000 ms</td><td>3,600 ms</td></tr>
+<tr><td>Validate: parse, apply, quick type-check</td><td>120 ms</td><td>300 ms</td></tr>
+<tr><td>End to end, measured</td><td>3,950 ms</td><td>4,800 ms</td></tr>
+</tbody>
+</table>
+</div>
+
+Other facts on request: 70 percent of suggested fixes touch fewer than 10 lines; users click "Suggest fix" on about a third of the build errors the plugin sees; the median time from an error appearing to a click is 4 seconds.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Which hop scales with something the design chose rather than with the model or the network?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>When does the information needed for the request first exist, and when does the clock start?</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask for the apply-failure rate and the acceptance rate by fix size; those are the quality signals each cut moves.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Generation is 3 of the 4.8 seconds and its length is a design choice: the model rewrites a whole function to change a few lines. I would switch the output to edit blocks of only the changed lines, cache the static 4,500-token prefix, and start the request when the error appears rather than on click. The costs are apply failures from edit blocks that no longer match the file, and model spend on the two thirds of errors nobody clicks. The fine-tune does not fit six weeks and attacks the smaller term.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>Rank by tail contribution.</b> Generation 3.6 s at P95, time to first token 1.3 s, then three hops of 120 to 300 ms each. The gateway is fixed. Per-hop P95s add to 5.7 s against a measured 4.8 s, so every cut is checked by replaying traces with the hop replaced, not by subtraction.</p>
+<p><b>Cut 1, output format.</b> From the trace, 3,000 ms for 380 tokens is about 7.9 ms per token. An edit block for a fix under 10 lines is on the order of 60 tokens (estimate from the fix-size data; measure it), about 0.5 s. This removes roughly 2.5 s. Cost: edit blocks must match the file exactly; a stale or ambiguous match fails to apply, and fixes that touch several sites need several blocks. The quality signal is apply-failure rate, which the validate hop already measures.</p>
+<p><b>Cut 2, cache the static prefix.</b> 4,500 tokens of system prompt and repository conventions are identical across requests from the same repository. Time to first token falls by a measured amount; the provider publishes no figure. Cost: a layout rule and a write premium for repositories used rarely.</p>
+<p><b>Cut 3, change when the clock starts.</b> The error exists a median of 4 seconds before the click. Starting the request on error appearance hides most of the remaining latency for a median user. Cost: about three times the model calls, since only a third of errors are clicked, and wasted work when the user edits the file before clicking. Cap it to error classes with high click rates and cancel on edit.</p>
+<p><b>What I would not do.</b> Fine-tuning a smaller model shortens time per token and needs data, training and an eval that two engineers will not finish in six weeks; it is a follow-on if cuts 1 to 3 miss. Fast mode on Opus 5.5 lists at twice the standard price with no published speedup, so it is a measurement, not a plan.</p>
+<p><b>Two defensible plans.</b> Edit-block output plus caching, which keeps spend flat and risks apply failures. Or precompute with full-function output, which keeps fix quality and roughly triples model spend. I would ship edit blocks and caching first, because they meet the budget for clicks after the median 4 seconds without new spend, and add precompute only for the error classes whose P95 still misses.</p>
+<p><b>What I give up.</b> Some multi-site fixes that a full rewrite handled in one pass, and spend on precomputed fixes nobody opens.</p>
+<p><b>Written down.</b> A rollout plan: edit-block output behind a flag for 10 percent of users; rollback if apply failures exceed the full-rewrite baseline by an agreed margin or acceptance drops on fixes over 10 lines; precompute enabled per error class with a spend ceiling per active user and cancel-on-edit.</p>
+<p><b>Failure mode of the recommended plan.</b> Edit blocks against a file the user changed during generation fail to apply exactly when the user is fastest; the validate hop must detect a mismatch and fall back to regenerating against the current file, which costs a second round trip on the tail.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Edit blocks cut latency but apply failures double on fixes over 10 lines. Which half do you ship, and what risk do you accept in writing?</em></li>
+<li><em>What would you need to see in production to turn precompute off again?</em></li>
+<li><em>The staff engineer and you disagree on the fine-tune. How do you decide without deciding by rank?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+### Check your answer
+
+- [ ] Ranks hops by their contribution to the P95 and does not add per-hop P95s
+- [ ] Identifies output length as a design choice and estimates the saving from the trace
+- [ ] States the quality cost of each cut and the metric that would show it
+- [ ] Moves work off the critical path (precompute on error appearance) and prices the wasted calls
+- [ ] Leaves the gateway alone and says so
+- [ ] Answers the fine-tune proposal against the six-week, two-engineer constraint
+- [ ] Gives a "what we give up" statement
+- [ ] Writes a rollout plan with rollback triggers
+- [ ] Names a failure mode of the recommended plan
+
+## Follow-ups
+
+- *Product now wants the fix explained in prose as well. Where does that go in the budget?* After the diff preview, streamed, with its own target; it does not belong on the 1.5-second path.
+- *The gateway team offers a priority lane that cuts its P95 by 80 ms if you pay their chargeback. Worth it?* Only after the trace replay shows what is left; 80 ms matters at the margin, not at 3 seconds.
+- *How do you keep the budget from regressing?* A trace-replay test in CI on a fixed set of requests, failing on the replayed P95, plus an alert on generation tokens per request.
+
+## Common mistakes
+
+- Treating the model as a fixed hop and cutting the 60 to 250 ms hops first.
+- Subtracting a hop's P95 from the end-to-end P95 to estimate a saving.
+- Proposing a smaller or fine-tuned model without pricing the time to build and evaluate it.
+- Leaving out what happens when the patch no longer applies to the file.

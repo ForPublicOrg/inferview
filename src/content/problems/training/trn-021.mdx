@@ -1,0 +1,129 @@
+---
+id: trn-021
+title: NaN two days after the BF16 switch
+subtitle: rank the defects in a mixed-precision migration
+track: training
+module: numerics
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+tags: [numerics, mixed-precision, bf16, normalization, debugging]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Micikevicius et al., Mixed Precision Training (ICLR 2018, arXiv 1710.03740)
+    url: https://arxiv.org/abs/1710.03740
+    note: "FP32 master copy of the weights accumulates the updates; loss scaling preserves small gradients in FP16. Checked 2026-10-28."
+  - title: PyTorch 2.14, Automatic Mixed Precision package (torch.amp)
+    url: https://docs.pytorch.org/docs/2.14/amp.html
+    note: "On CUDA, cross_entropy, log_softmax, layer_norm, norm, pow, sum and rsqrt autocast to float32; elementwise mul and mean are not on either list; GradScaler defaults init_scale 65536, growth_factor 2, growth_interval 2000; GradScaler is described for float16. Checked 2026-10-28."
+  - title: Hugging Face, The Ultra-Scale Playbook, mixed precision training
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "BF16 1/8/7 bit layout; accumulate sums and averages in FP32 and cast the result; FP32 copy of the weights because small updates are lost. Checked 2026-10-28."
+choices:
+  - text: The parameters were cast to BF16 with no FP32 copy, so small AdamW updates round away and the weights stop tracking the gradients
+    correct: false
+    why: It is a real defect and it explains the plateau after step 1,500, but lost updates leave weights where they were; they do not produce a NaN in the forward pass.
+  - text: GradScaler was kept for BF16 and its scale has grown to 524,288, so the scaled gradients overflow during the backward pass
+    correct: false
+    why: BF16's largest value is about 3.4 × 10^38, so a scale near 5 × 10^5 overflows nothing, and the first non-finite value appeared in the forward pass, before any scaling.
+  - text: The norm now forms its variance from two BF16 means, and on rows with a large mean the difference rounds to zero or below
+    correct: true
+    why: E[x²] and μ² are each rounded to 8 significant bits before the subtraction, so when the mean is more than about 16 standard deviations the variance is lost, and rsqrt of a negative number is NaN.
+  - text: Cross-entropy over the 128k vocabulary now runs under BF16 autocast, so its log-sum-exp loses precision and turns into NaN
+    correct: false
+    why: cross_entropy is on autocast's float32 list, so it runs in FP32 under a BF16 autocast region, and the first NaN appeared in a norm layer, not in the loss.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Scenario">
+A 1.3B decoder trained on FP16 autocast for months. To drop loss scaling and its skipped steps, an engineer moved it to BF16 in one change. Two days into the new run, the loss is NaN. You have the diff, the run's logs and one anomaly-detection replay.
+</Callout>
+
+The change, as merged:
+
+```diff
+ model = Transformer(cfg).cuda()
++model = model.to(torch.bfloat16)
+ opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
+ scaler = torch.amp.GradScaler("cuda")
+
+ class CenteredNorm(nn.Module):
+     def forward(self, x):
+-        x_dtype = x.dtype
+-        with torch.autocast("cuda", enabled=False):
+-            x = x.float()
+-            mu = x.mean(-1, keepdim=True)
+-            var = (x * x).mean(-1, keepdim=True) - mu * mu
+-            y = (x - mu) * torch.rsqrt(var + self.eps)
+-        return (y * self.weight).to(x_dtype)
++        mu = x.mean(-1, keepdim=True)
++        var = (x * x).mean(-1, keepdim=True) - mu * mu
++        y = (x - mu) * torch.rsqrt(var + self.eps)
++        return y * self.weight
+
+ for step, batch in enumerate(loader):
+-    with torch.autocast("cuda", dtype=torch.float16):
++    with torch.autocast("cuda", dtype=torch.bfloat16):
+         logits = model(batch.inputs)
+         loss = F.cross_entropy(logits.view(-1, V), batch.targets.view(-1))
+     scaler.scale(loss).backward()
+     scaler.step(opt)
+     scaler.update()
+```
+
+What the logs show (synthetic run):
+
+| Step | Loss, BF16 run | Loss, last FP16 run at the same step | Scaler scale |
+|---|---|---|---|
+| 500 | 4.91 | 4.90 | 65,536 |
+| 1,500 | 3.62 | 3.60 | 65,536 |
+| 3,000 | 3.31 | 3.22 | 131,072 |
+| 6,000 | 3.27 | 3.05 | 524,288 |
+| 6,212 | NaN | 3.05 | 524,288 |
+
+A replay from the step-6,000 checkpoint with `torch.autograd.detect_anomaly()` and forward hooks reports the first non-finite tensor at step 6,212 in the forward pass: the output of `layers.21.norm2`, NaN in 3 of 2,048 rows and values above 300 in 11 others. A second replay from the same checkpoint with the whole model in FP32 ran 400 steps with no NaN. No activation statistics were logged in the original run.
+
+Which defect explains the NaN? Then rank the others by how much each matters after it is fixed, and say what you would collect before shipping a fix and what you would ship without it.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the mean and standard deviation of the 14 bad rows at the input of `layers.21.norm2`, and of a few healthy rows beside them.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>For each tensor in the new `forward`, ask what dtype it is stored in under the BF16 autocast region, and which ops autocast lists as float32.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask when the BF16 loss curve first separated from the FP16 one, and whether anything else changed at that step.</p></details>
+
+## Answer
+
+**The cause is the norm.** The old `forward` disabled autocast and cast to FP32 before computing anything. The new one runs on BF16 tensors: `x * x` is an elementwise multiply and `mean` is a reduction, neither on autocast's float32 list, so `(x * x).mean(...)` and `mu * mu` are BF16 tensors, each rounded to 8 significant bits, and the variance is their difference. `rsqrt` is on the float32 list, which is what made the change look safe in review; it receives a variance that was already destroyed.
+
+The arithmetic: for a row with mean μ and standard deviation σ, E[x²] = μ² + σ², and BF16 rounds each of E[x²] and μ² by up to half a unit in the last place, 2^−8 relative. When σ² is smaller than about 2^−8 × μ², roughly |μ| / σ above 16, the rounding error is as large as the variance itself. With μ = 300 and σ = 1, E[x²] = 90,001 and μ² = 90,000; between 65,536 and 131,072 BF16 values are 512 apart, so both round to 90,112 and the variance is 0. The norm then multiplies (x − μ) by 1/√eps, which is the rows above 300. When the rounding goes the other way the variance is −512, and `rsqrt` returns NaN, which is the 3 NaN rows.
+
+The condition is a row whose mean is large relative to its spread, and the FP32 replay shows the model state itself is fine: the same weights and data produce no NaN when the subtraction happens in FP32.
+
+**The others, ranked.**
+
+1. *Parameters cast to BF16 with no master copy* is the next most important. `model.to(torch.bfloat16)` makes AdamW update BF16 weights in place: a step of order 3 × 10^−4 on a weight near 1 is below half of BF16's 2^−8 spacing just under 1.0 and is rounded away. That is the gap that opens after step 1,500 and reaches 0.22 by step 6,000. It does not cause the NaN, and fixing the norm alone leaves a run that quietly underperforms. The fix is to keep the parameters in FP32 and let autocast cast them for the matrix multiplies.
+2. *GradScaler under BF16* is unnecessary, not harmful here. Its scale doubled every 2,000 steps without an overflow, which is what the defaults do when nothing overflows; BF16 has FP32's range. It costs a multiply and leaves a code path that will skip steps if a gradient ever does go non-finite, which hides the next problem rather than reporting it. Remove it.
+3. *Cross-entropy under BF16 autocast* is the tempting non-defect: `cross_entropy` autocasts to float32, and the anomaly replay places the first NaN in a norm, upstream of the loss.
+
+**What to collect, and what to ship without it.** Collect the per-row mean and standard deviation at the input of each norm for the bad rows and a sample of good ones, and which tokens those rows belong to; if |μ| / σ is in the hundreds on those rows, the mechanism is confirmed, and if it is near 1, look elsewhere. Without it, ship the FP32 norm today: restore the autocast-disabled block, and compute the variance as the mean of (x − μ)² in FP32, which has no cancellation at all. It costs one cast per norm and changes nothing for healthy rows.
+
+**The quantity you choose: the alert threshold.** Log |μ| / σ per norm input, sampled every few hundred steps. The cancellation bound is about 16 for this formula in BF16; an alert at 8 gives a factor of two of warning, and an alert at 16 fires only when the damage has begun. A threshold below 4 alerts on healthy layers in many models and will be muted within a week.
+
+**How the fix fails.** FP32 statistics fix the norm, not the cause of the large offsets. A residual stream whose per-row mean keeps growing will eventually hurt the BF16 matrix multiplies that read it, where nothing is recomputed in FP32. The alert above is there to catch that drift, and an offset that keeps growing is a modelling problem to take to the people who own the architecture, not a numerics patch.
+
+## Follow-ups
+
+- *The FP32 norm costs 2% of step time on your profile, and the team that owns the kernel wants to keep the BF16 version with a two-pass variance instead.* Which do you accept, what does each give up, and what test would you require before merging either?
+- *After the fix, the BF16 run is still 0.04 above the FP16 run at step 20,000.* What would you need to see to conclude BF16 is worse for this model and go back to FP16 with loss scaling?
+- *Two engineers disagree: one wants every custom op wrapped in an FP32 block, the other wants a numerics review only for reductions.* How do you decide without deciding by rank, and what do you write down?
+
+## Common mistakes
+
+- Blaming the loss function, which autocast already runs in FP32.
+- Fixing the NaN and missing the plateau, which is a separate defect with a separate cause.
+- Reading `rsqrt` on the float32 list as protection for the whole norm.
+- Raising `eps` in the norm, which turns NaN rows into rows scaled by a smaller but still wrong factor.

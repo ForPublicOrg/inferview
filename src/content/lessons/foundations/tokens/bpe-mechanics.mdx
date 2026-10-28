@@ -1,0 +1,128 @@
+---
+title: BPE training versus encoding, and the edge cases that follow
+track: foundations
+module: tokens
+order: 2
+kind: lesson
+level: senior
+minutes: 14
+summary: BPE training is a greedy loop over pair counts and encoding is a rank lookup over the text, so the two have different costs, and pre-splitting rules for digits and whitespace decide most of the visible failures.
+prerequisites: [foundations/tokens/tokenizer-surface]
+updated: 2026-10-28
+sources:
+  - title: Neural Machine Translation of Rare Words with Subword Units (Sennrich, Haddow and Birch, ACL 2016)
+    url: https://arxiv.org/abs/1508.07909
+    note: subword units by iterative merging of the most frequent pair; the toy dictionary low 5, lower 2, newest 6, widest 3 used in the stepper; checked 28 Oct 2026
+  - title: openai/tiktoken, encoding definitions (openai_public.py)
+    url: https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_public.py
+    note: encodings ship as a table of token bytes to rank; the cl100k_base and o200k_base patterns cap digit runs with \p{N}{1,3}; checked 28 Oct 2026
+  - title: tiktoken 0.13.0, local measurement
+    url: https://github.com/openai/tiktoken
+    note: rank counts (100,256 and 199,998), the digit and strawberry splits and the reconsiders split were measured on 28 Oct 2026
+  - title: The Llama 3 Herd of Models (Meta, 2024)
+    url: https://arxiv.org/html/2407.21783
+    note: 128K-token vocabulary from 100K tiktoken tokens plus 28K non-English tokens; English compression from 3.17 to 3.94 characters per token against the Llama 2 tokenizer; checked 28 Oct 2026
+  - title: Meta Llama 3.1 8B Instruct, config.json (unsloth mirror of the Meta release)
+    url: https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct/blob/main/config.json
+    note: hidden_size 4096, vocab_size 128256, tie_word_embeddings false, torch_dtype bfloat16; checked 28 Oct 2026
+  - title: Gemma 3 Technical Report (Google DeepMind, 2025)
+    url: https://arxiv.org/html/2503.19786v1
+    note: SentencePiece with split digits, preserved whitespace and byte-level encodings; checked 28 Oct 2026
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import BpeStepper from '../../../../components/widgets/BpeStepper.astro';
+
+## Two loops, two cost models
+
+BPE has two algorithms that share one artefact. Training is a greedy loop: count every adjacent pair in the corpus, merge the most frequent into a new symbol, record it, repeat until the vocabulary reaches its target. Encoding never repeats that search. It looks up each adjacent pair of the input in a table from pair to rank, merges the lowest-ranked pair present, and repeats until no adjacent pair has a rank. tiktoken ships an encoding as exactly that table, token bytes to rank; o200k_base has 199,998 entries.
+
+The costs follow. A naive trainer rescans the corpus for every merge, so its cost is merges times corpus size, which is why production trainers keep pair counts incrementally, touching only the words that contain the pair just merged, and pick the next merge from a priority queue. The encoder's cost depends on the length of each pre-tokenised chunk and not on the size of the table, which is what lets a 200,000-entry vocabulary encode at request time. An encoder that replays the merge list in order gives the same output on ordinary tables and costs one pass per merge per word: correct in a notebook, unusable in a gateway.
+
+The failure modes differ as well. Training failures are silent and permanent: a tie-break that depends on dictionary order produces a different vocabulary from the same counts, and every token id after the first divergence shifts, invalidating embeddings and anything keyed by id. Encoding failures are visible and per request: a chunk boundary in the wrong place, a special-token string parsed as control, a multi-byte character split across a streaming boundary.
+
+## The training loop on the paper's toy corpus
+
+The stepper runs the training loop on the dictionary from Sennrich et al.: low 5, lower 2, newest 6, widest 3, with an end-of-word marker shown as a dot. The first merges are `e+s`, `es+t` and `est+·`, because the pairs inside "est" occur 9 times (6 from newest plus 3 from widest) and nothing else reaches 9. Note that `e+s` and `s+t` tie at 9 on the first step; the result depends on the tie-break, and a production trainer has to make that choice explicit.
+
+<BpeStepper />
+
+Each merge makes the corpus shorter and the vocabulary larger by one. The stopping point is a resource decision, covered below.
+
+## Encoding by rank, and predicting a split
+
+```python
+def encode_chunk(symbols, ranks):
+    """symbols: list of base symbols for one pre-tokenised chunk; ranks: pair -> merge position."""
+    symbols = list(symbols)
+    while len(symbols) > 1:
+        candidates = [(ranks[p], i) for i, p in enumerate(zip(symbols, symbols[1:])) if p in ranks]
+        if not candidates:
+            break
+        _, i = min(candidates)
+        symbols[i:i + 2] = [symbols[i] + symbols[i + 1]]
+    return symbols
+```
+
+That loop is quadratic in the chunk length and independent of the table, and it is the specification: when a merged symbol can be built by two paths (a table that learned `a+bc` and later `ab+c`), rank order and replay order can disagree, and tiktoken's behaviour is rank order.
+
+To predict how an unseen word splits, apply the two layers in order. First the regex decides the chunks; then, inside each chunk, the earliest-learned merges win. On the toy corpus, "lowest" never appears in training but encodes as `low` and `est·`, because both pieces were learned. In cl100k_base the fox sentence ends with ` re`, `cons`, `iders`: the leading space stays with `re` because the pattern attaches an optional space to a letter run, and ` re` is an early merge.
+
+## Bytes underneath: byte-level and byte fallback
+
+The tiktoken encodings start from the 256 byte values, so nothing is out of vocabulary and the only cost of unfamiliar text is length. Llama 3 inherits that base by reusing 100K tiktoken tokens. SentencePiece tokenizers start from characters and fall back to bytes for characters outside the vocabulary; the Gemma 3 report describes its tokenizer as SentencePiece with byte-level encodings. Either way, a single token can end in the middle of a multi-byte character. Decoding the full id sequence is fine; decoding token by token, which is what a naive streaming client does, emits replacement characters the full text never had. Streaming decoders hold back an incomplete UTF-8 suffix until the next token completes it.
+
+## Pre-splitting decides the visible failures
+
+**Digits.** cl100k_base and o200k_base both match `\p{N}{1,3}`: digit runs are cut into groups of at most three, left to right, before any merge. Measured, `1234567` is `123`, `456`, `7` in both encodings, and `7654321` is `765`, `432`, `1`. Grouping from the left means the last token of a seven-digit number is the units digit alone and the token before it spans thousands to tens, while the last token of a six-digit number spans hundreds to units. Token positions carry no consistent place value across operands of different lengths. Gemma 3 takes the other choice and splits digits individually, which costs more tokens per number and gives every digit its own position.
+
+**Whitespace.** The pattern attaches one leading space to a letter run, so ` strawberry` with its space is a single token in both encodings, while `strawberry` alone is three: `str`, `aw`, `berry` in cl100k_base and `st`, `raw`, `berry` in o200k_base. A model asked to count letters sees one id for the common form and must answer from what it learned about that id's spelling. Tokenization is one cause of letter-counting failures, not the whole explanation, but it is the one you can show from the encoder's output.
+
+## Vocabulary size against embedding and softmax cost
+
+A larger vocabulary compresses text into fewer tokens, so each document costs fewer forward passes. Each entry also adds a row to the input embedding and a column to the output projection, and the output projection runs for every generated token.
+
+<Predict id="tokens-bpe-vocab-params" question="How many parameters do the input embedding and output projection of Llama 3.1 8B hold together?" answer={1050673152} tolerance={2000000} unit="parameters">
+<Fragment slot="prompt">
+<p>Llama 3.1 8B's config: <code>vocab_size</code> 128,256, <code>hidden_size</code> 4,096, <code>tie_word_embeddings</code> false.</p>
+</Fragment>
+<p>Untied means two matrices of 128,256 × 4,096 = 525,336,576 each: <b>1,050,673,152 parameters</b>, about an eighth of the model. In bfloat16 that is 2.1 GB of weights that scale linearly with vocabulary size. The output projection also costs about 2 × 4,096 × 128,256 = 1.05 billion floating-point operations per generated token before the softmax.</p>
+</Predict>
+
+The other side of the ledger is compression. Meta reports that moving from the Llama 2 tokenizer to Llama 3's 128K vocabulary raised English compression from 3.17 to 3.94 characters per token. The same English text then needs 3.17 / 3.94 = 0.80 times the tokens, about 20% fewer forward passes through every layer, which is why a 128K vocabulary pays for its larger embedding at 8B parameters. At much smaller model sizes the embedding share grows and the trade can reverse. Rare tokens are a separate cost: an entry's embedding is trained only on that token's occurrences, so a vocabulary grown to cover rare strings carries rows that saw few updates.
+
+## In the room
+
+<Callout kind="interview" label="Staff question">
+"We are training a 1B-parameter model for code review in English and Hindi. The research lead wants a 256K vocabulary for Hindi coverage; the serving team has a latency budget per generated token and a memory cap per replica. You have two weeks to decide before the tokenizer is frozen. What do you choose?"
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Compute both sides before choosing. At 1B parameters and a hidden size around 2,048, a 256K untied vocabulary is about a billion parameters of embedding and projection alone, so it does not fit the budget; tying the embeddings halves it and still leaves it dominant. I would train two or three candidate tokenizers on a held-out mix of code and Hindi, measure tokens per document for each, and pick the smallest vocabulary whose Hindi compression is within an agreed margin of the largest, with digit splitting and byte fallback fixed up front because they cannot change after training starts.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The constraint conflict is coverage against per-token cost. A large vocabulary cuts Hindi sequence length, which helps latency per document and context capacity; it also grows the output projection that runs on every generated token and the memory per replica. At this model size the embedding share is large, so the vocabulary is a parameter-budget decision as much as a tokenizer decision.</p>
+<p>Two answers are defensible. A 256K vocabulary with tied embeddings: best Hindi compression, at the cost of a large share of parameters in embeddings and a slower output projection. A 64K to 128K vocabulary trained on a corpus weighted toward Hindi and code: more tokens per Hindi document, more parameters in the layers that do the work. The measurement that decides it is tokens per document on held-out Hindi and code for each candidate, multiplied through to latency per request and to the parameter split.</p>
+<p>The failure mode of choosing the smaller vocabulary is that the Hindi skew lands on users and on the context window, and cannot be fixed without retraining. Write down the tokens-per-document target for Hindi now, so the decision is judged against it rather than against a later preference.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The research lead disagrees with your smaller vocabulary. How do you settle it without deciding by rank?</li>
+<li>Code review inputs are full of long hexadecimal hashes and numbers. Does that change the digit-splitting choice?</li>
+<li>After launch, Hindi users report truncated context. What do you measure to decide whether the tokenizer was the cause?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+This lesson's model is byte-level BPE behind a regex pre-tokenizer, the tiktoken family. SentencePiece tokenizers preserve whitespace as part of the text and have no regex step, so the leading-space and digit examples behave differently there; the Gemma 3 report's split digits are a choice made inside that model, not a property of BPE.
+
+The rank-order encoder equals replay only when every merged symbol has one construction path. Tables trained with unusual tie-breaks, or edited by hand to add tokens, can break that, and then the two encoders disagree on a small set of strings. If two systems must agree on ids, they must share the encoder, not just the table.
+
+The vocabulary arithmetic assumes untied embeddings and a dense output projection. Tied embeddings halve the parameter cost; serving tricks that sample from a restricted vocabulary change the per-token compute. And compression gains measured on one corpus do not transfer: Meta's 3.17 to 3.94 is for a sample of English data, and your traffic may be code, tables or another script.
+
+<SelfRate id="lesson:foundations/tokens/bpe-mechanics" />

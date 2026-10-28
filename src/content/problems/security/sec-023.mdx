@@ -1,0 +1,187 @@
+---
+id: sec-023
+title: A laptop runs whoami after a user adds an MCP server
+subtitle: rank the defects from one EDR alert and the client's last release
+track: security
+module: mcp-security
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [mcp, oauth, command-injection, url-handling, windows, incident-response]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: CVE-2025-6514 (mcp-remote), CVE record
+    url: https://cveawg.mitre.org/api/cve/CVE-2025-6514
+    note: "OS command injection (CWE-78) in mcp-remote 0.0.5 to 0.1.15 when connecting to untrusted MCP servers, from crafted input in the authorization_endpoint response URL; CVSS 3.1 score 9.6; assigned by JFrog, published 2025-07-09"
+  - title: JFrog, Critical RCE vulnerability in mcp-remote, CVE-2025-6514
+    url: https://jfrog.com/blog/2025-6514-critical-mcp-remote-rce-vulnerability
+    note: "vendor research: the endpoint from /.well-known/oauth-authorization-server reached the open npm package, which on Windows runs PowerShell with Start; $( ) subexpressions in the URL ran commands; a made-up scheme without a backslash avoided URL encoding, giving the payload a:$(cmd.exe /c whoami > c:\\temp\\pwned.txt); on macOS and Linux open and xdg-open run without a shell, so only argument-less executables were shown; fixed in 0.1.16"
+  - title: mcp-remote commit 607b226 (sanitizeUrl)
+    url: https://github.com/geelen/mcp-remote/commit/607b226a356cb61a239ffaba2fb3db1c9dea4bac
+    note: "the commit the CVE record lists as the patch adds percent-encoding of the URL's username and password to sanitizeUrl, after the hostname check, with a test for $(calc) in the user and password parts"
+  - title: MCP specification 2026-07-28, Security Best Practices, OAuth Authorization URL Validation
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/security_best_practices
+    note: "clients MUST only allow http and https for authorisation URLs (http only for loopback in development), MUST reject javascript:, data:, file: and other schemes, SHOULD use allowlists, MUST NOT open URLs with shell commands, SHOULD use non-shell platform mechanisms; SSRF guidance says to validate each redirect hop. Checked 2026-10-28."
+  - title: MCP specification 2026-07-28, Authorization Server Discovery
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/authorization-server-discovery
+    note: "the metadata issuer must be identical to the issuer the well-known URL was built from. Checked 2026-10-28."
+  - title: Python documentation, os.startfile
+    url: https://docs.python.org/3/library/os.html
+    note: "Windows only; acts like double-clicking the file in Windows Explorer and opens it with the associated application, through ShellExecute. Checked 2026-10-28; CPython 3.12's webbrowser.WindowsDefault.open calls os.startfile(url)."
+  - title: RFC 8252, OAuth 2.0 for Native Apps (October 2017), section 7.1
+    url: https://datatracker.ietf.org/doc/html/rfc8252
+    note: "private-use URI schemes such as com.example.app:/oauth2redirect/example-provider are a redirect URI option; the authorisation request itself goes to an external user-agent, the browser"
+choices:
+  - text: The sanitiser hands back any URL whose scheme is not http or https untouched, and the Windows opener puts that string inside a PowerShell command
+    correct: true
+    why: "The endpoint in the alert has the scheme a:, so sanitize_url returned it as received; open_browser, changed in 1.9.0, embeds it in a double-quoted PowerShell string, where $( ) runs as a subexpression."
+  - text: The sanitiser rebuilds netloc without encoding its user and password part, so a $( ) placed before the @ of an https URL reaches the opener unchanged
+    correct: false
+    why: "A real hole that the same opener turns into code execution, and the one mcp-remote's patch commit closes, but the URL in the alert has no userinfo and is not https, so this is not the path it took."
+  - text: Discovery never compares the issuer inside the metadata with the issuer it was fetched for, so the client trusted a document the server had forged
+    correct: false
+    why: "A real violation of the discovery rules, but the server named its own authorisation server, so its document could carry a matching issuer and pass the check that is missing."
+  - text: Metadata fetches follow redirects since 1.9.0, so the server could steer the client to an internal host that served the hostile endpoint instead
+    correct: false
+    why: "A real SSRF exposure added in the same release, but the attacker already controls the authorisation server it named and needs no redirect to serve a hostile document."
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Debug round">
+You own `mcp-desk`, a desktop MCP client used across the company. Yesterday the endpoint detection system raised an alert on a Windows laptop a few seconds after its user added a community MCP server. Using the evidence below, which defect explains what ran on that laptop? Rank the others, say what you would collect next, and decide what ships today.
+</Callout>
+
+The client code, the release and the alert are constructed for this problem, modelled on the code path of CVE-2025-6514.
+
+The authorisation module of `mcp-desk` 1.9.0 (excerpt):
+
+```python
+import re, secrets, subprocess, sys, webbrowser
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
+import httpx
+
+HOST_RE = re.compile(r"[A-Za-z0-9.-]+")
+PENDING = {}
+
+def fetch_as_metadata(issuer):
+    for url in well_known_urls(issuer):
+        r = httpx.get(url, timeout=10, follow_redirects=True)
+        if r.status_code == 200:
+            return r.json()
+    raise DiscoveryError(issuer)
+
+def sanitize_url(raw):
+    parts = urlsplit(raw)
+    if parts.scheme in ("http", "https"):
+        if not HOST_RE.fullmatch(parts.hostname or ""):
+            raise ValueError("bad host in authorization URL")
+        return urlunsplit((parts.scheme, parts.netloc, quote(parts.path, safe="/"),
+                           quote(parts.query, safe="=&"), quote(parts.fragment)))
+    return raw
+
+def start_authorization(server_url, issuer, meta, client_id, scope):
+    verifier, challenge = make_pkce()
+    state = secrets.token_urlsafe(32)
+    PENDING[state] = (issuer, meta["token_endpoint"], verifier, server_url)
+    query = urlencode({"response_type": "code", "client_id": client_id, "redirect_uri": REDIRECT_URI,
+                       "code_challenge": challenge, "code_challenge_method": "S256",
+                       "state": state, "resource": server_url, "scope": scope})
+    open_browser(sanitize_url(meta["authorization_endpoint"]) + "?" + query)
+    return state
+
+def open_browser(url):
+    if sys.platform == "win32":
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                        f'Start-Process "{url}"'], check=False)
+    elif sys.platform == "darwin":
+        subprocess.run(["open", url], check=False)
+    else:
+        subprocess.run(["xdg-open", url], check=False)
+```
+
+The 1.9.0 release, against 1.8.2 (commit message: "Fix sign-in on the packaged Windows build, where webbrowser.open did nothing; follow redirects in discovery for servers behind a CDN; raise the token timeout"):
+
+```diff
+ def fetch_as_metadata(issuer):
+     for url in well_known_urls(issuer):
+-        r = httpx.get(url, timeout=10)
++        r = httpx.get(url, timeout=10, follow_redirects=True)
+         if r.status_code == 200:
+             return r.json()
+@@
+ def open_browser(url):
+     if sys.platform == "win32":
+-        webbrowser.open(url)
++        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
++                        f'Start-Process "{url}"'], check=False)
+@@
+ def redeem(code, pending):
+-    return httpx.post(pending.token_endpoint, data=..., timeout=10)
++    return httpx.post(pending.token_endpoint, data=..., timeout=30)
+```
+
+`sanitize_url` has not changed since 1.4.0, when the non-http branch was added "so customers whose sign-in uses a custom app scheme can connect".
+
+The alert (process tree and file events, command line as recorded):
+
+```text
+mcp-desk.exe 1.9.0
+  powershell.exe -NoProfile -NonInteractive -Command Start-Process "a:$(cmd.exe /c whoami > c:\temp\pwned.txt)?response_type=code&client_id=https%3A%2F%2Fmcp-desk.example%2Fclient.json&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback&code_challenge=..."
+    cmd.exe /c whoami
+      whoami.exe
+file created: C:\temp\pwned.txt   by powershell.exe
+```
+
+The server the user added was `https://mcp.forecast-tools.example/mcp`, from a community list. A macOS user who added the same server on the same day reports an error dialog saying no application can open a URL starting with `a:`, and nothing else.
+
+What you do not have: the metadata documents the server returned (it now answers 404 to everything, and the client does not log discovery URLs or responses), the client version on each laptop, and whether anyone else on Windows added the server.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which of the release's three changes runs on the Windows laptop and not on the macOS one.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the exact string <code>open_browser</code> received on the Windows laptop, and ask how much of it the server chose.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>For each candidate defect, ask whether the attacker needed it, given that the attacker operates both the MCP server and the authorisation server it names.</p></details>
+
+## Answer
+
+The server's protected-resource metadata named an authorisation server the attacker controls, and its metadata set `authorization_endpoint` to `a:$(cmd.exe /c whoami > c:\temp\pwned.txt)`. `sanitize_url` parses that as scheme `a`, skips the only branch that checks anything, and returns it unchanged. `start_authorization` appends the query. `open_browser`, rewritten in 1.9.0, formats the URL into `Start-Process "..."` and hands it to PowerShell, where a double-quoted string expands `$( )` subexpressions: PowerShell runs `cmd.exe /c whoami` and redirects its output to the file before `Start-Process` ever sees a URL. The alert's tree matches that order: PowerShell is the parent of `cmd.exe` and the creator of the file.
+
+The defect is a pair, which is why neither changed line looks wrong alone. The passthrough branch in `sanitize_url` has been there since 1.4.0 and was harmless under `webbrowser.open`, which on Windows calls `os.startfile`, where the string is never parsed by a shell and an unknown scheme simply fails. The 1.9.0 opener is harmless for a clean `https` URL. Together they make any endpoint the server chooses into a PowerShell expression. The macOS report fits: `open` receives the URL as one argument with no shell, and nothing handles `a:`.
+
+The ranking:
+
+1. **Non-http schemes pass through, into a shell.** Explains the alert, the timing (1.9.0), and the platform split.
+2. **Userinfo is not encoded.** `parts.netloc` goes back in raw, so `https://x$(calc)@login.example/authorize` passes the host check and reaches PowerShell. Not the path this attacker used, but with the 1.9.0 opener it is a second working payload, and an `https`-only hotfix leaves it open. mcp-remote's patch commit for the CVE closes exactly this gap in its own `sanitizeUrl`.
+3. **Redirects followed in discovery.** A real SSRF exposure: the specification asks clients to validate every redirect hop against the same rules. Not needed here, since the attacker serves the document directly.
+4. **No issuer check on metadata.** A violation of a MUST in the discovery rules and worth fixing, but useless against this attacker, who names its own authorisation server and can put a matching `issuer` in the document. Smaller still: `PENDING` never expires entries.
+
+**What to collect.** First, search the detection system for `powershell.exe` children of `mcp-desk.exe` across all Windows machines since 1.9.0 shipped, which tells you who else ran something and what. Second, the version inventory: 1.8.2 and earlier are not exposed to this payload. Third, ask the community list's maintainers for anything they hold about the server, since its documents are gone. Without the first, treat every Windows user on 1.9.0 who added that server as compromised: the payload ran `whoami`, but the same expression could have run anything as the user, so rotate the tokens `mcp-desk` stores and anything else on those laptops the user could read.
+
+### What ships today
+
+The specification has two separate rules here: only `http` and `https` for authorisation URLs (and `http` only on loopback), and never open a URL through a shell. Both are small, but the release that rewrote the opener did so to fix sign-in on the packaged Windows build, and reverting it brings that bug back. Two hotfixes are defensible.
+
+- **Allowlist only, today.** `sanitize_url` rejects everything but `https` (and `http` on loopback), and rejects any URL with a user or password part, since an authorisation endpoint has no use for one. Cost: PowerShell is still the opener, so the next gap in validation is code execution again; this answer depends on the validator being perfect.
+- **Remove the shell, today.** Call `os.startfile(url)` directly, which is what `webbrowser.open` did, and find out why the packaged build broke it. Cost: Windows sign-in may stay broken for packaged installs until that is understood, and `os.startfile` still behaves like a double-click, so without the allowlist a `file:` URL to an executable launches it.
+
+I would ship both in one release today, because each is a few lines, and if only one can be tested in time, ship the allowlist with the userinfo rejection and disable the PowerShell path behind a flag that defaults off, accepting that packaged-build users sign in by copying the URL the client prints. The custom-scheme branch goes away: private-use schemes belong in redirect URIs for native apps (RFC 8252 section 7.1), not in authorisation endpoints, so that 1.4.0 feature was built on a misreading. The failure mode of this fix is a validator and an opener that see different strings. Today `start_authorization` validates the endpoint and then appends the query, so whatever is appended after validation was never checked. The query is built by the client here, but the pattern invites the next change to append something the server supplied. Build the complete URL first, validate that exact string, and open only it.
+
+## Follow-ups
+
+- *Pushback: the customer with the custom-scheme sign-in is your largest account, and its renewal is this month. Do you keep the branch behind an allowlist of their scheme, and what do you write down if you do?*
+- *Reversal: what would make you allow plain `http` authorisation endpoints beyond loopback?*
+- *The detection search finds three more laptops with the same tree. Who do you notify first, and which credentials do you rotate before you know what the payloads were?*
+- *Two senior engineers disagree: one wants the client to stop opening browsers and print the URL, the other says users will paste it into the wrong browser profile. How do you decide without deciding by rank?*
+
+## Common mistakes
+
+- Blaming the PowerShell line alone; a clean URL through it is harmless, and the passthrough branch is older.
+- Fixing only the scheme check and leaving userinfo, which keeps a working payload.
+- Ranking the missing issuer check first because it is a MUST; it does nothing against a server that names its own authorisation server.
+- Treating `os.startfile` as safe for any string.
+- Closing the incident at "upgrade the client" without searching for other machines and rotating stored tokens.

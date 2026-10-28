@@ -1,0 +1,148 @@
+---
+title: Training FLOPs, MFU and the budget equation
+track: training
+module: compute-scaling
+order: 1
+kind: lesson
+level: senior
+minutes: 13
+summary: Training compute is close to 6 times parameters times tokens, and dividing it by GPUs, the dense peak and an MFU you can defend gives days; the same arithmetic makes Llama 3 405B and DeepSeek-V3 comparable and shows when attention breaks the approximation.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: How to Scale Your Model, All the Transformer Math You Need to Know (JAX scaling book, checked 2026-10-28)
+    url: https://jax-ml.github.io/scaling-book/transformers/
+    note: "a matmul costs 2NPM FLOPs forward and 4NPM backward, so training is well approximated by 6 x params x tokens for reasonable context lengths; attention FLOPs over matmul FLOPs is T/(8D) assuming F = 4D and as many KV heads as query heads, so attention dominates only once T > 8D (about 64K tokens for D near 8K); block rematerialisation repeats nearly all forward FLOPs, about 8 x params x tokens"
+  - title: Chowdhery et al., PaLM, Scaling Language Modeling with Pathways (2022)
+    url: https://arxiv.org/abs/2204.02311
+    note: "defines model FLOPs utilization as observed tokens per second over the theoretical maximum at peak FLOPs, counting forward and backward FLOPs and not rematerialisation; PaLM 540B on 6,144 TPU v4 chips at 275 peak TFLOP/s per chip, 238.3K tokens/s, MFU 45.7% without attention and 46.2% with it, hardware FLOPs utilization 57.8%; Megatron-Turing NLG 530B 65.43K tokens/s on 2,240 A100s at 312 TFLOP/s, MFU 29.7% (appendix B)"
+  - title: NVIDIA H100 Tensor Core GPU product page (checked 2026-10-28)
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: "H100 SXM BFLOAT16 Tensor Core 1,979 teraFLOPS and FP8 3,958 teraFLOPS, both footnoted 'With sparsity'"
+  - title: NVIDIA Hopper Architecture In-Depth (NVIDIA developer blog, 2022)
+    url: https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/
+    note: "preliminary H100 SXM5 specs list peak BF16 as 1000 TFLOPS dense and 2000 with sparsity; the sparsity feature exploits fine-grained structured sparsity, doubling the performance of standard Tensor Core operations"
+  - title: Llama Team, The Llama 3 Herd of Models (2024)
+    url: https://arxiv.org/html/2407.21783
+    note: "405B parameters, 15.6T text tokens, 3.8e25 FLOPs; Table 4: 8,192 GPUs at 430 TFLOPs/GPU and 43% BF16 MFU, 16,384 GPUs at 400 and 41% (sequence 8,192), 16,384 GPUs at 380 and 38% (sequence 131,072, context parallelism 16); model dimension 16,384, FFN 53,248, 128 heads, 8 KV heads; 8K pre-training context then about 800B tokens of long-context training ending at 128K; higher than 90% effective training time; 466 job interruptions in a 54-day snapshot, 419 unexpected, GPU issues 58.7% of unexpected"
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (2024)
+    url: https://arxiv.org/html/2412.19437v2
+    note: "671B total parameters, 37B activated per token, 14.8T tokens; 180K H800 GPU hours per trillion tokens, 3.7 days on 2,048 H800 GPUs; pre-training 2,664K GPU hours, context extension 119K, post-training 5K, total 2.788M; FP8 mixed precision; costs exclude prior research and ablations"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+<Callout kind="aside" label="Before reading">
+[Problem trn-001](/problems/trn-001) asks for the number this lesson computes. Attempt it first, then compare.
+</Callout>
+
+## The budget equation
+
+A dense transformer's training cost is dominated by matrix multiplies against its weights. The JAX scaling book counts them per matmul: multiplying an N by P activation with a P by M weight costs 2NPM FLOPs in the forward pass, and the backward pass needs two products of the same size (the gradient with respect to the activation and the gradient with respect to the weight), 4NPM. PM is the weight's parameter count and N is the number of tokens, so each parameter costs 6 FLOPs per token. Summed over the model:
+
+```text
+C    = 6 * N_params * D_tokens
+days = C / (GPUs * peak * MFU * goodput * 86,400)
+```
+
+The first line is the part everyone agrees on. Every term in the second line is a choice: which peak, which utilisation, and how much of the wall clock the job spends producing steps. An estimate that is off by a factor of two almost always traces to one of those three, not to the 6.
+
+<Predict id="trn-flops-days-8b" question="An 8B dense model on 15T tokens, 1,024 H100 SXM GPUs, dense BF16 peak 989.5 TFLOP/s, MFU 40%, no downtime. How many days?" answer={20.6} tolerance={1.5} unit="days">
+<p>C = 6 × 8e9 × 15e12 = 7.2e23 FLOPs. The cluster delivers 1,024 × 989.5e12 × 0.40 = 4.05e17 FLOP/s. 7.2e23 / 4.05e17 = 1.78e6 seconds, <b>20.6 days</b>.</p>
+<p>With the sparse peak (1,979) in the denominator the same arithmetic gives 10.3 days, and the plan misses its date by half.</p>
+</Predict>
+
+## What MFU measures
+
+PaLM introduced model FLOPs utilization because hardware FLOPs utilization, the FLOPs the chip executed over its peak, depends on the implementation. Rematerialisation (recomputing activations in the backward pass instead of storing them) adds FLOPs the chip really executes; those FLOPs raise the hardware number while making the run slower. MFU fixes the numerator to what the model requires: observed tokens per second times the forward-plus-backward FLOPs per token, over the published peak of the system. Recomputed FLOPs never enter it.
+
+The PaLM appendix shows the arithmetic for two runs, and it is the whole metric:
+
+- Megatron-Turing NLG 530B: 65.43K tokens/s × 6 × 530e9 / (312e12 × 2,240 A100s) = 29.7%.
+- PaLM 540B: 238.3K tokens/s × 6 × 540e9 / (275e12 × 6,144 TPU v4 chips) = 45.7% without attention FLOPs, 46.2% with them. Hardware FLOPs utilization, which counts the rematerialised FLOPs, was 57.8%.
+
+The gap between 46.2% and 57.8% is the recompute. A dashboard that multiplies by 8 instead of 6 because the job uses full activation checkpointing (the scaling book puts block rematerialisation at about 8 × params × tokens) reports something close to hardware utilisation and calls it MFU. That number is not comparable with PaLM's or Llama 3's, and it rewards turning checkpointing on.
+
+## Which peak goes underneath
+
+The denominator is where published comparisons quietly diverge. NVIDIA's H100 product page lists BF16 Tensor Core throughput for the SXM part as 1,979 teraFLOPS, with an asterisk: "With sparsity". NVIDIA's Hopper architecture post says the sparsity feature exploits fine-grained structured sparsity and doubles standard Tensor Core throughput; its preliminary table lists BF16 at 1000 dense and 2000 sparse. Dense pre-training does not use structured sparsity, so the peak that applies is half the listed figure, 989.5 TFLOP/s.
+
+Llama 3's own table shows which one it used. The 16,384-GPU row reports 400 TFLOPs per GPU at 41% BF16 MFU: 400 / 0.41 = 976. The 8,192-GPU row: 430 / 0.43 = 1,000. Both denominators are the dense peak, to the rounding of the percentages. Against 1,979 the same 400 TFLOPs would be 20%.
+
+FP8 moves the peak again. The H100 FP8 figure is 3,958 with sparsity, so 1,979 dense, which equals the sparse BF16 number. A report that says "1,979" without naming the precision and whether sparsity is included cannot be checked.
+
+## Llama 3 405B and DeepSeek-V3 on one scale
+
+Both reports publish enough to put them on the same axis, but they publish different things. Llama 3 gives model size, tokens and per-GPU throughput; DeepSeek-V3 gives GPU hours.
+
+Llama 3 405B first. 6 × 405e9 × 15.6e12 = 3.79e25 FLOPs, which matches the 3.8e25 the paper states for the flagship, so 6ND is the accounting Meta used. At 400 TFLOPs per GPU on 16,384 GPUs, 3.8e25 / (16,384 × 400e12) = 5.80e6 seconds, 67 days of compute with no interruptions. Per trillion tokens, 6 × 405e9 × 1e12 / 400e12 = 6.08e9 GPU-seconds, about 1.69M GPU hours.
+
+DeepSeek-V3 reports 180K H800 GPU hours per trillion tokens, 3.7 days on its 2,048-GPU cluster (180,000 / 2,048 / 24 = 3.66). The model has 671B parameters but activates 37B per token, and for a mixture of experts 6ND counts activated parameters, because only the routed experts' weights multiply a given token. 6 × 37e9 × 1e12 = 2.22e23 FLOPs per trillion tokens, over 180,000 × 3,600 GPU-seconds, is 343 TFLOP/s achieved per GPU.
+
+<Predict id="trn-flops-ratio" question="Llama 3 405B needs about 1.69M GPU hours per trillion tokens and DeepSeek-V3 180K. What ratio of FLOPs per token (405B dense over 37B activated) sits behind that gap?" answer={10.9} tolerance={0.3} unit="x">
+<p>405 / 37 = <b>10.9</b>. The GPU-hour ratio is 1,690,000 / 180,000 = 9.4. Most of the gap is that DeepSeek-V3 does about a tenth of the arithmetic per token; per-GPU throughput (343 against 400 TFLOP/s) moves it slightly the other way.</p>
+<p>Neither figure is an MFU yet. 343 TFLOP/s is a numerator. Whether it is good utilisation depends on whether you divide by an FP8 or a BF16 peak, on what you take the H800's peak to be, and on whether the GPU hours include restarts. That is problem trn-002.</p>
+</Predict>
+
+The comparison changes how to read "the cost of a model". The headline gap between the two reports is mostly architecture (dense against sparse activation), then precision (DeepSeek-V3 trains with FP8 mixed precision; Llama 3 reports BF16 MFU), and only then systems efficiency. DeepSeek's report also says its figures exclude prior research and ablations, which are not in Llama 3's 3.8e25 either.
+
+## When attention stops being a rounding error
+
+6ND leaves out the attention score and value products, which do not multiply weights. The scaling book compares them with the weight matmuls and gets a ratio of T / (8D), where T is sequence length and D the model dimension, assuming an FFN width of 4D and as many key-value heads as query heads. Attention FLOPs match the weight FLOPs only at T = 8D.
+
+For Llama 3 405B, D = 16,384, so 8D = 131,072: its full 128K context. During the 8K pre-training phase the ratio is 8,192 / 131,072 = 6.25%, and 6ND undercounts by about that much. In the long-context stage (about 800B tokens, ending at 128K) the two terms become comparable, and Table 4 shows 38% MFU for the 131,072-token configuration against 41% at 8,192. Llama 3 does not match the book's assumptions exactly (its FFN is 53,248, which is 3.25D, and it uses 8 key-value heads for 128 query heads), so treat the ratio as a scale, not a measurement. The paper does not say whether its MFU counts attention FLOPs. PaLM reports both, and the difference at its sequence length was half a point.
+
+The rule in practice: for pre-training at 4K to 8K tokens on a model with D in the thousands, 6ND is within a few percent. For long-context training of a small model (D = 2,048 at T = 32,768 gives T / 8D = 2), attention FLOPs are twice the weight FLOPs and 6ND underestimates the run by a factor of about three.
+
+## The estimator
+
+```python
+def train_days(n_params, tokens, gpus, peak_tflops, mfu, goodput=1.0):
+    flops = 6 * n_params * tokens
+    per_second = gpus * peak_tflops * 1e12 * mfu * goodput
+    return flops / per_second / 86_400
+
+def attention_ratio(seq_len, d_model):
+    # attention FLOPs over weight-matmul FLOPs under the scaling book's assumptions (F = 4D, no GQA)
+    return seq_len / (8 * d_model)
+
+print(round(train_days(8e9, 15e12, 1024, 989.5, 0.40), 1))         # 20.6
+print(round(train_days(70e9, 15e12, 2048, 989.5, 0.38, 0.90), 1))  # 105.2
+print(attention_ratio(8192, 16384))                                  # 0.0625
+```
+
+The `goodput` argument is the one most estimates omit. Llama 3 reports higher than 90% effective training time, and 466 job interruptions in a 54-day snapshot, 419 of them unexpected, with GPU issues the largest category at 58.7%. MFU is measured over steps that ran; goodput is the share of wall clock that produced steps. A plan built on MFU alone is the plan for a cluster that never fails.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You have 2,048 H100s for 50 days. Research wants a 70B dense model on 15T tokens. The best MFU this team has measured on this cluster is 38%. Does it fit, and if not, what do you cut?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>It does not fit. 6 × 70e9 × 15e12 = 6.3e24 FLOPs; the cluster delivers 2,048 × 989.5e12 × 0.38 = 7.7e17 FLOP/s, so 95 days of pure compute and about 105 at 90% goodput, twice the window. In 50 days at 90% goodput the cluster does 3.0e24 FLOPs: 70B on about 7.1T tokens, or about 33B on 15T. I would take the smaller model on the full token count if it will serve heavy traffic, and the 70B on fewer tokens if it is a research checkpoint, and I would not plan on an MFU gain to close a 2x gap.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>The arithmetic.</b> 6ND = 6.3e24. Throughput at 38% of the dense BF16 peak: 7.7e17 FLOP/s. 6.3e24 / 7.7e17 = 8.2e6 s, 95 days. With Llama 3's reported goodput (above 90%), 105 days.</p>
+<p><b>Three ways to close it, each with a cost.</b> Fewer tokens: 70B on about 7.1T keeps the parameter count research asked for and ends near 100 tokens per parameter, but halves the data, and the loss cost has to come from a scaling fit on your own data. A smaller model: about 33B on 15T fits and is cheaper to serve, but research may need 70B for the capability it is testing. Higher throughput: FP8 doubles the GEMM peak, but this team has never run it, and a numerics problem found on day 30 costs more than the time saved.</p>
+<p><b>What I would write down.</b> The option, the MFU and goodput assumed, and a checkpoint: at day 10, if measured tokens per day project past day 50, cut tokens then rather than extend. The failure mode of the token cut is the learning-rate schedule. A decay planned for 15T that is cut at 7T ends with the rate still high, so the schedule has to be set for the shorter run from the start, which means deciding before launch.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Research says 70B on 7T tokens will be worse than 33B on 15T. How would you settle that before committing the cluster, and what does settling it cost?</li>
+<li>Someone proposes FP8 to close the gap. What would you need to see in a two-day test to accept it, and what would make you switch back mid-run?</li>
+<li>Measured MFU drops from 38% to 31% when the job scales from 512 to 2,048 GPUs. Which number do you plan on, and what do you measure next?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+6ND is a weights-only count. It undercounts long-context training, where attention FLOPs approach or exceed the weight FLOPs. For a mixture of experts it holds with activated parameters, but routing and all-to-all communication cost time that appears in no FLOP count, so a sparse model's achievable MFU is a separate measurement, not a dense number transferred.
+
+MFU is a ratio against a datasheet. It does not say whether the job is compute-bound; a run bound by the interconnect or the data loader shows low MFU, and the fix is not in the kernels. It is also defined per configuration: Llama 3's three rows differ by scale and sequence length, and quoting "43%" without the row is quoting the best one. A days estimate is only as good as its goodput term, and that comes from your cluster's failure history, not from the paper you are comparing with.
+
+<SelfRate id="lesson:training/compute-scaling/flops-mfu" />

@@ -1,0 +1,189 @@
+---
+title: Determinism and changing code while runs are in flight
+track: workflows
+module: durable-execution
+order: 2
+kind: lesson
+level: staff
+minutes: 14
+summary: A deploy changes the code that replays every in-flight run, so each change is either replay-safe, patched, pinned to old workers, or shipped as a new workflow type, and long runs need continue-as-new before the history limit.
+prerequisites: [workflows/durable-execution/replay-engines]
+updated: 2026-10-28
+sources:
+  - title: Temporal docs, Workflow Definition
+    url: https://docs.temporal.io/workflow-definition
+    note: same API calls in the same sequence; safe changes (activity parameters, return values, timeouts, timer durations except to or from 0 in Java, Python and Go); timer then activity swapped fails when the timer fires; replay-safe APIs for time and random
+  - title: Temporal docs, Python versioning
+    url: https://docs.temporal.io/develop/python/workflows/versioning
+    note: workflow.patched and deprecate_patch; deprecate and remove only after pre-patch workflows have left retention; a patched marker the code no longer produces fails the workflow task; new workflow type names do not version running workflows; replay testing recommended to decide whether a change needs a patch; callout at the top states pre-2025 experimental Worker Versioning was scheduled for removal from Temporal Server in March 2026 (checked 2026-10-28)
+  - title: Temporal docs, Worker Versioning
+    url: https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning
+    note: Pinned and Auto-Upgrade behaviours; recommendations by workflow duration; upgrade at the continue-as-new boundary; minimum Python SDK 1.11 and self-hosted server 1.29.1
+  - title: Temporal docs, Continue-As-New
+    url: https://docs.temporal.io/workflow-execution/continue-as-new
+    note: same Workflow Id, new Run Id, fresh Event History, state passed as arguments; periodic continue-as-new keeps few code versions running
+  - title: Temporal docs, Python Continue-As-New
+    url: https://docs.temporal.io/develop/python/workflows/continue-as-new
+    note: workflow.continue_as_new and info().is_continue_as_new_suggested(); do not call it from signal or update handlers; let handlers finish first
+  - title: Temporal docs, Events and Event History
+    url: https://docs.temporal.io/workflow-execution/event
+    note: three events per completed activity; warning after 10,240 events; terminated above 51,200 events
+  - title: Temporal Cloud docs, limits (checked 2026-10-28)
+    url: https://docs.temporal.io/cloud/limits
+    note: Event History limited to 51,200 events or 50 MB with a warning at 10,240 events or 10 MB; non-configurable for Temporal Cloud
+  - title: Inngest docs, versioning and function evolution
+    url: https://www.inngest.com/docs/learn/versioning
+    note: added steps run when reached; completed steps return saved results by ID; a changed ID is a new step; reordering may log a warning; rewrites get a new function ID
+  - title: Temporal blog, Of course you can build dynamic AI agents with Temporal (Egger and Androulakis, 2025-11-12)
+    url: https://temporal.io/blog/of-course-you-can-build-dynamic-ai-agents-with-temporal
+    note: replay uses the LLM decisions recorded in Event History, so a dynamic agent loop is deterministic in execution
+  - title: Anthropic, How we built our multi-agent research system (2025-06-13)
+    url: https://www.anthropic.com/engineering/multi-agent-research-system
+    note: rainbow deployments that shift traffic gradually while old and new versions run; resume from where errors occurred; multi-agent systems use about 15 times the tokens of chat
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The deploy is a code change to every running workflow
+
+A replay engine runs new code against old history. On a stateless service a deploy affects requests that arrive after it. On a durable workflow engine it also affects every run that is waiting on a timer, an approval or a model call, because the next time any of those runs wakes up, the worker replays the run's history through whatever code it has now. If that code emits a different sequence of commands, Temporal stops the run with a non-determinism error.
+
+Temporal's rule is that workflow code must make the same workflow API calls in the same sequence given the same input. On replay each emitted command is compared with the next event in history: an activity call emits ScheduleActivityTask, which must match an ActivityTaskScheduled event with the same activity name at the same position. The docs list what can change without breaking that match and what cannot.
+
+<div class="tablewrap">
+
+| Change | Replay-safe? | Why |
+|---|---|---|
+| Activity or child workflow arguments, return values, timeouts | Yes | The command type and name at each position are unchanged |
+| Timer duration | Yes, except to or from 0 (Java, Python, Go) or to or from -1 (.NET) | A zero timer emits no command |
+| Rename an activity type or child workflow type or ID | No | The name at that position no longer matches |
+| Add, remove or reorder command-producing calls | No, without versioning | Positions shift |
+| Timer then activity becomes activity then timer | No | The docs' own example: the run fails when the timer fires |
+| Branch on the local clock or `random` | No | Replay can take the other branch; use the SDK's replay-safe time and random APIs |
+
+</div>
+
+Two rows matter more than the rest for model workflows. A model call made from workflow code is a branch on an unrecorded value, so every replay re-asks the model and may take a different path; that is why model calls are activities. And the change teams ship most often, a new prompt, is in the first row: the prompt is an activity argument or lives inside the activity, the old run's recorded model output is replayed as-is, and the new prompt only affects calls that have not happened yet.
+
+## What a prompt, a tool and a guardrail change actually touch
+
+The Temporal post on dynamic agents (2025-11-12) makes the point that resolves most of the confusion: the loop is deterministic in execution even though the model is not, because replay feeds back the model's recorded decisions from the event history instead of asking again. A loop that calls a `decide` activity, then executes the tool it chose, emits the same commands on replay as it did live. That splits the changes you will ship into three groups.
+
+**Prompt and model changes** go inside the model activity or into its arguments. Replay-safe. The risk is behavioural, not mechanical: runs that are halfway through a plan made under the old prompt continue it under the new one. That is a product decision (do mixed-prompt runs make sense?), and if the answer is no, pin those runs to the old workers.
+
+**Tool changes** depend on how tools map to activities. If one `execute_tool(name, args)` activity dispatches every tool, adding a tool changes activity code only and is safe, and removing one breaks only runs that later choose it. If each tool is its own activity type, adding a type is safe for old runs because their recorded decisions never chose it; renaming or removing a type breaks every in-flight run whose history contains it.
+
+**New orchestration steps**, such as a policy check before every tool call or a human approval before refunds, insert commands. That is the "add" row, and in-flight runs fail at the first position where the new command appears, unless the change is versioned.
+
+The sketch below replays a recorded history through two versions of a workflow: one swaps the timer and the model activity, the other wraps the same change in a patch.
+
+```python
+class NonDeterminism(Exception):
+    pass
+
+class Replayer:
+    """Replays workflow code against a recorded history of commands, as Temporal does on every resume."""
+    def __init__(self, history):
+        self.history, self.pos, self.markers = history, 0, {e[1] for e in history if e[0] == "patch"}
+
+    def emit(self, kind, name):
+        if self.pos < len(self.history):
+            if self.history[self.pos] != (kind, name):
+                raise NonDeterminism(f"event {self.pos}: history {self.history[self.pos]}, code {(kind, name)}")
+            self.pos += 1
+
+    def activity(self, name): self.emit("activity", name)
+    def timer(self, name): self.emit("timer", name)
+
+    def patched(self, patch_id):
+        replaying = self.pos < len(self.history)
+        if replaying and patch_id not in self.markers:
+            return False                    # this run started on old code: keep the old path
+        self.emit("patch", patch_id)
+        return True
+
+def v1(w):
+    w.timer("wait-for-reply")
+    w.activity("call_model")
+
+def v2_unsafe(w):
+    w.activity("call_model")                # model first, then wait: reordered commands
+    w.timer("wait-for-reply")
+
+def v2_patched(w):
+    if w.patched("model-before-wait"):
+        w.activity("call_model")
+        w.timer("wait-for-reply")
+    else:
+        v1(w)
+
+old_run = [("timer", "wait-for-reply")]    # in flight: the timer is recorded, the model call is not
+for code in (v2_unsafe, v2_patched):
+    try:
+        code(Replayer(old_run))
+        print(code.__name__, "replays")
+    except NonDeterminism as e:
+        print(code.__name__, "fails:", e)
+```
+
+It prints that `v2_unsafe` fails at event 0 and `v2_patched` replays. Temporal's own check is the same comparison done by the SDK; its docs recommend replay tests against recorded histories to decide whether a change needs a patch at all, and that test belongs in CI with histories exported from production runs that are still open.
+
+## Four ways to ship the change
+
+**Patching.** `workflow.patched("id")` records a marker in history for new runs and returns false for runs replaying without one, so both paths live in the code. Removal is three deploys: patch in the new path, then replace it with `workflow.deprecate_patch("id")` once the pre-patch workflows have left retention, then remove the call once workflows on the old code path have left retention as well. Removing it earlier brings back the non-determinism error. Cost: every behavioural change stays as a branch for at least the longest run plus the retention period.
+
+**Worker Versioning.** Workers are tagged with a deployment version (a build ID within a worker deployment). A Pinned workflow is guaranteed to complete on the version it started on and needs no patching; an Auto-Upgrade workflow moves to the current version as it rolls out and must be kept replay-safe with patches. Temporal's guidance by duration: runs that finish before the next deploy, Pinned; runs spanning deploys without continue-as-new, Auto-Upgrade with patching; long runs that continue-as-new, Pinned with an upgrade at each continue-as-new boundary. The cost of Pinned is capacity: every version with open runs needs workers until Temporal reports it drained. Minimum versions on the page are Python SDK 1.11 and self-hosted server 1.29.1. A callout at the top of the Python versioning page states that the experimental Worker Versioning method from before 2025 was scheduled for removal from Temporal Server in March 2026, so older tutorials do not apply.
+
+**A new workflow type name.** Register `TicketWorkflowV2` next to `TicketWorkflow` and start new runs on V2. Simple and obvious in dashboards, and the docs name its limit: it does not version runs that are still running, so the old type's code is frozen until its last run ends.
+
+**Continue-as-new.** The run ends and a new run starts with the same workflow ID, a new run ID, a fresh history and the state you pass as arguments. Besides resetting history size, it is a version boundary: a pinned run upgrades to the current version when it continues as new, and the docs suggest continuing periodically so that only a couple of code versions are ever running.
+
+Anthropic's research-agent post (2025-06-13) describes the same problem outside Temporal. Their agents are long-running and stateful, so a deploy that updates everything at once breaks runs mid-process; they use rainbow deployments, shifting traffic gradually from old to new versions while both run. Restarting a broken run is not free either: the same post reports multi-agent systems using about 15 times the tokens of a chat interaction, so a forced restart of every in-flight run is a token bill as well as a user-visible failure. Pinned workers are the rainbow deployment expressed in Temporal's terms.
+
+## The history limit is a turn budget
+
+<Predict id="wfl-history-turns" question="Ignoring every event except activity events, how many turns can the loop run before Temporal terminates it?" answer={8533} tolerance={1} unit="turns">
+<Fragment slot="prompt">
+<p>An agent loop makes one model activity and one tool activity per turn. A completed activity adds three events to history (ActivityTaskScheduled, ActivityTaskStarted, ActivityTaskCompleted), and retries add none until an attempt reaches a terminal event. Temporal logs a warning after 10,240 events and terminates the execution above 51,200.</p>
+</Fragment>
+<p>Six events a turn, so 51,200 / 6 = <b>8,533 turns</b> at most, and the warning comes at 10,240 / 6 = 1,706 turns. Workflow-task events, signals, timers and approval waits all add to the count, so the real ceiling is lower; measure it from one production history rather than trusting the bound. Size limits arrive separately: Temporal Cloud warns at 10 MB and caps history at 50 MB, a limit its docs call non-configurable on Cloud, and a loop whose turns each record 20 KB of model output (a scenario figure) reaches 50 MB in about 2,500 turns (50,000 KB / 20 KB), well before the event count.</p>
+</Predict>
+
+The safe pattern is to check `workflow.info().is_continue_as_new_suggested()` at the top of each turn, and when it is true, let any signal and update handlers finish in the main workflow (the Python docs say not to continue-as-new from inside a handler), then call `workflow.continue_as_new()` with the state the next run needs. What to carry over is a design decision: the goal, the plan, a summary of the conversation rather than the full transcript, the IDs of pending approvals, and any idempotency keys still in use. The transcript itself belongs in blob storage referenced by ID, because carrying it forward as an argument puts the size problem into the first event of the next run.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"About 6,000 refund-agent runs are open on Temporal, some waiting up to 30 days for a customer document. Compliance requires a policy-check activity before every refund tool call, effective Friday, including for open runs. Product also wants a new system prompt and a new partial-refund tool. You may run at most two worker versions at once. Plan the deploy."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Three changes, three mechanisms. The prompt is an activity argument, so it is replay-safe and ships to everyone. The partial-refund tool is a new activity type that old histories never chose, so it is replay-safe too, but old runs only see it if they replay through the new decide activity, which is a product call. The policy check inserts a command, so it has to be a patch with Auto-Upgrade, because compliance needs it in open runs and Pinned would keep 30-day runs on old code past Friday. Replay-test against exported histories of open runs before the deploy.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Classify each change against the replay rules. Prompt: changes only the arguments of the model activity; recorded outputs replay unchanged. Partial-refund tool: if tools dispatch through one activity, only activity code changes; if each tool is its own type, adding one is safe because no old history contains it. The policy check is the only non-deterministic change: it adds an activity before each refund call.</p>
+<p>Versioning choice. Pinned would avoid patching but keeps open runs on the old build for up to 30 days, which violates the Friday requirement and pins a second version for a month against a two-version budget. So the workflow type runs Auto-Upgrade and the policy check goes behind <code>workflow.patched("policy-check")</code>. Old runs replay their past refund calls without the check (their history has no marker) and every refund decided after the deploy gets it. If compliance reads the requirement as "no refund executes without a check", the question to settle in writing is whether a refund already scheduled before Friday and retrying after it counts; the patch cannot retroactively insert a check before an activity already in history.</p>
+<p>Rollout. Export histories of a sample of open runs, including the longest waiting ones, and run replay tests in CI against the patched build. Ramp new workers, watch for non-determinism errors (the rollback trigger is any), then shift. Plan the deprecate step for after the longest open run closes plus retention, and record that date in the ticket so the branch does not outlive anyone's memory of it.</p>
+<p>What I give up: a permanent branch in the workflow until the patch can be removed, and mixed behaviour for runs that started under the old prompt. Written down: the risk note for refunds scheduled before the deploy and the date the patch is deprecated.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The replay test passes on the sample, and two hours after the deploy 40 runs fail with non-determinism errors. What did the sample miss, and do you roll back?</em> A path the sample did not cover, such as a run inside an approval wait. Rolling back to the old build fails every run that has already recorded the patch marker, because the docs say a <code>patched</code> marker the code does not produce fails the workflow task, so the fix goes forward.</li>
+<li><em>Compliance says the policy check must also run before refunds already scheduled and retrying. Is that possible?</em> Not inside the same activity; it means a check inside the refund activity itself, which is replay-safe because it changes activity code, at the cost of mixing policy logic with the payment call.</li>
+<li><em>An engineer argues for a new workflow type and letting old runs finish on old code. What would make you agree?</em> A requirement that applies only to new runs, or open runs short enough to drain before the deadline.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The rules above are Temporal's, because Temporal is the engine that checks command order on every replay. Engines that match steps by ID are lenient where Temporal is strict. Inngest's versioning docs say an added step runs when the new code reaches it, completed steps return their saved results by ID even if reordered (the SDK may log a warning), and a changed ID is a new step that runs again. Cloudflare treats step names as cache keys, which gives the same shape. No error is raised, so an inserted policy check simply starts applying, which is what you wanted, and a renamed email step sends a second email, which is not. Read each engine's matching rule before assuming either strictness or leniency.
+
+Replay safety says nothing about semantic safety. A prompt change is replay-safe and can still break a run whose plan, written by the old prompt, refers to a tool the new prompt tells the model never to use. Pinning old runs is the only mechanism that removes that class of problem, and it costs workers for as long as the longest run.
+
+The turn budget assumes a loop in one workflow. Designs that run each tool call or each sub-agent as a child workflow move most events into child histories and change the arithmetic, at the cost of more executions to track and a parent that must handle child failures.
+
+<SelfRate id="lesson:workflows/durable-execution/determinism-versioning" />

@@ -1,0 +1,485 @@
+---
+id: sec-021
+title: Audience and issuer checks for an MCP client and server
+subtitle: a flow store, a token check, and callbacks from servers you do not trust
+track: security
+module: mcp-security
+type: code
+difficulty: hard
+seniority: [staff]
+minutes: 50
+core: false
+tags: [mcp, oauth, rfc-9207, mix-up, token-audience, pkce, resource-indicators, bounded-memory]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: MCP specification 2026-07-28, Authorization
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization
+    note: "the client records the issuer from validated metadata in the same per-request record as the PKCE verifier; the four-row iss table (present: compare by simple string comparison; absent and advertised: reject; absent and not advertised: proceed); no case folding, trailing-slash or port normalisation before comparing; on mismatch the client must not act on error, error_description or error_uri; resource parameter in authorisation and token requests, canonical URI without fragment; servers validate audience, answer invalid tokens with 401 and insufficient scope with 403 and error=\"insufficient_scope\" in one challenge, and account for scope hierarchies. Checked 2026-10-28."
+  - title: MCP specification 2026-07-28, Authorization Server Discovery
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/authorization-server-discovery
+    note: "the issuer in a metadata document must be identical to the issuer used to build its well-known URL, otherwise the client must not use it; example: a document from https://attacker.example naming https://honest.example is rejected; well-known paths for protected resource metadata with path insertion. Checked 2026-10-28."
+  - title: MCP specification 2026-07-28, Authorization Security Considerations
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/security-considerations
+    note: "clients must use S256 and must refuse to proceed when code_challenge_methods_supported is absent; authorisation server endpoints must be served over HTTPS. Checked 2026-10-28."
+  - title: MCP specification 2026-07-28, Security Best Practices
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/security_best_practices
+    note: "PKCE alone does not stop mix-up because the client sends the code_verifier to the attacker's token endpoint; the iss check gives no protection against an honest server that does not emit iss; authorisation URLs must be http(s), https in production, never opened through a shell; state values single-use with a short expiry, for example 10 minutes. Checked 2026-10-28."
+  - title: RFC 9207, OAuth 2.0 Authorization Server Issuer Identification (March 2022)
+    url: https://datatracker.ietf.org/doc/html/rfc9207
+    note: "clients that talk to only one authorisation server are not vulnerable to mix-up; iss is compared by simple string comparison (RFC 3986 section 6.2.1)"
+  - title: RFC 9700, Best Current Practice for OAuth 2.0 Security (January 2025), section 4.4
+    url: https://datatracker.ietf.org/doc/html/rfc9700
+    note: "mix-up attack steps; the client must store per request the issuer it sent the request to; distinct redirect URIs per issuer as the fallback countermeasure, to be used only when issuer identification is unavailable"
+  - title: CVE-2025-6514 (mcp-remote)
+    url: https://cveawg.mitre.org/api/cve/CVE-2025-6514
+    note: "OS command injection in mcp-remote 0.0.5 to 0.1.15 from a crafted authorization_endpoint; CVSS 3.1 score 9.6; published 2025-07-09"
+code:
+  starter: |
+    import base64
+    import hashlib
+    import secrets
+    import time
+    from urllib.parse import urlencode, urlsplit
+
+
+    class AuthError(Exception):
+        """Raise this for every rejection. The tests check that it is raised, not the message."""
+
+
+    class FlowStore:
+        """Client side: the authorisation flows this client has started and not yet finished.
+
+        clock returns seconds and only moves forward. A flow lives for ttl seconds.
+        """
+
+        def __init__(self, client_id, redirect_uri, ttl=600.0, clock=time.monotonic):
+            self.client_id = client_id
+            self.redirect_uri = redirect_uri
+            self.ttl = ttl
+            self.clock = clock
+
+        def __len__(self):
+            """How many flow records the store holds in memory right now."""
+            raise NotImplementedError
+
+        def begin(self, resource, issuer, metadata, scope=None):
+            """Start a flow for the MCP server `resource` with the authorisation server `issuer`.
+
+            issuer is the identifier you built the metadata URL from; metadata is the document that URL returned.
+            Return (state, url): the URL to open in the browser. Raise AuthError if you would not start this flow.
+            """
+            raise NotImplementedError
+
+        def complete(self, params):
+            """params: the query parameters of the callback, as a dict of strings (state, code, iss, error).
+
+            Return a dict with token_endpoint, code, code_verifier, resource, redirect_uri and client_id:
+            everything the token request needs. Raise AuthError if the code must not be redeemed.
+            """
+            raise NotImplementedError
+
+
+    class ResourceServer:
+        """Server side: the MCP server at `resource`, which trusts tokens from `issuer` only.
+
+        implies maps a scope to the narrower scopes it includes, for example {"files:write": {"files:read"}}.
+        """
+
+        def __init__(self, resource, issuer, implies=None):
+            self.resource = resource
+            self.issuer = issuer
+            self.implies = implies or {}
+
+        def check(self, claims, required=(), now=None):
+            """claims: the payload of a token whose signature has already been verified, or None if no token was sent.
+
+            required: the scopes this operation needs. now: seconds since the epoch (default time.time()).
+            Return (status, www_authenticate, subject): (200, None, sub) to serve the request, otherwise
+            (401 or 403, the WWW-Authenticate header value, None). A token without sub is not served.
+            """
+            raise NotImplementedError
+  tests: |
+    import base64, hashlib
+    from urllib.parse import urlsplit, parse_qs
+
+    H = "https://auth.example.com"
+    H_META = {"issuer": H, "authorization_endpoint": H + "/authorize", "token_endpoint": H + "/token",
+              "code_challenge_methods_supported": ["S256"], "authorization_response_iss_parameter_supported": True}
+    A = "https://login.attacker.example"
+    MCP = "https://mcp.example.com/mcp"
+    NOW = 1_900_000_000
+
+    def raises(fn, *args):
+        try:
+            fn(*args)
+        except AuthError:
+            return True
+        return False
+
+    rs = ResourceServer(MCP, H, implies={"files:write": {"files:read"}})
+    good = {"iss": H, "aud": MCP, "sub": "user-1", "exp": NOW + 600, "scope": "files:read"}
+    assert rs.check(good, {"files:read"}, now=NOW) == (200, None, "user-1")
+    assert rs.check(dict(good, aud="https://api.example.com"), {"files:read"}, now=NOW)[0] == 401
+    status, header, _ = rs.check(good, {"files:write"}, now=NOW)
+    assert status == 403 and 'error="insufficient_scope"' in header and "files:write" in header
+
+    clock = [1000.0]
+    store = FlowStore("https://agent.example.com/oauth/client.json", "https://agent.example.com/callback", clock=lambda: clock[0])
+    state, url = store.begin(MCP, H, H_META, "files:read")
+    q = parse_qs(urlsplit(url).query)
+    assert url.startswith(H + "/authorize?") and q["resource"] == [MCP] and q["code_challenge_method"] == ["S256"]
+    done = store.complete({"state": state, "code": "c-1", "iss": H})
+    assert q["code_challenge"][0] == base64.urlsafe_b64encode(hashlib.sha256(done["code_verifier"].encode()).digest()).rstrip(b"=").decode()
+    assert done["token_endpoint"] == H + "/token" and done["resource"] == MCP
+    state, _ = store.begin(MCP, H, H_META, "files:read")
+    assert raises(store.complete, {"state": state, "code": "c-2", "iss": A})
+    assert raises(store.begin, MCP, "https://attacker.example", dict(H_META))
+  hidden: |
+    import time as _t
+    from urllib.parse import urlsplit as _split, parse_qs as _qs
+
+    _H = "https://auth.example.com"
+    _A = "https://login.attacker.example"
+    _MCP = "https://mcp.example.com/mcp"
+    _NOW = 1_900_000_000
+
+    def _meta(issuer, iss_supported=True, **extra):
+        m = {"issuer": issuer, "authorization_endpoint": issuer + "/authorize", "token_endpoint": issuer + "/token",
+             "code_challenge_methods_supported": ["S256"], "authorization_response_iss_parameter_supported": iss_supported}
+        m.update(extra)
+        return m
+
+    def _raises(fn, *args):
+        try:
+            fn(*args)
+        except AuthError:
+            return True
+        return False
+
+    _rs = ResourceServer(_MCP, _H, implies={"files:admin": {"files:write"}, "files:write": {"files:read"}})
+    _tok = {"iss": _H, "aud": _MCP, "sub": "user-1", "exp": _NOW + 600, "scope": "files:read"}
+    assert _rs.check(dict(_tok, aud="https://mcp.example.com.attacker.net"), {"files:read"}, now=_NOW)[0] == 401
+    assert _rs.check(dict(_tok, aud="https://mcp.example.com/mcp-admin"), {"files:read"}, now=_NOW)[0] == 401
+    assert _rs.check(dict(_tok, aud=["https://api.example.com", "https://mail.example.com"]), {"files:read"}, now=_NOW)[0] == 401
+    assert _rs.check({k: v for k, v in _tok.items() if k != "aud"}, {"files:read"}, now=_NOW)[0] == 401
+    assert _rs.check(dict(_tok, iss=_H + "/"), {"files:read"}, now=_NOW)[0] == 401
+    assert _rs.check(dict(_tok, iss="https://login.partner.example"), {"files:read"}, now=_NOW)[0] == 401
+    assert _rs.check(dict(_tok, exp=_NOW - 3600), {"files:read"}, now=_NOW)[0] == 401
+    assert _rs.check({k: v for k, v in _tok.items() if k != "sub"}, {"files:read"}, now=_NOW)[0] == 401
+    _s, _hdr, _ = _rs.check(None, {"files:read"}, now=_NOW)
+    assert _s == 401 and 'resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource' in _hdr
+    assert _rs.check(dict(_tok, scope="files:admin"), {"files:read"}, now=_NOW) == (200, None, "user-1")
+
+    def _single_challenge():
+        s, hdr, _ = _rs.check(dict(_tok, scope="mail:read"), {"files:read", "calendar:read", "mail:read"}, now=_NOW)
+        challenged = set(hdr.split('scope="', 1)[1].split('"', 1)[0].split())
+        return s == 403 and {"files:read", "calendar:read"} <= challenged
+    assert _single_challenge()
+
+    _clock = [5000.0]
+    _store = FlowStore("https://agent.example.com/oauth/client.json", "https://agent.example.com/callback", ttl=600, clock=lambda: _clock[0])
+    assert _raises(_store.begin, _MCP, _H, _meta(_H, code_challenge_methods_supported=["plain"]))
+    assert _raises(_store.begin, _MCP, _H, {k: v for k, v in _meta(_H).items() if k != "code_challenge_methods_supported"})
+    assert _raises(_store.begin, _MCP, _H, _meta(_H, authorization_endpoint="javascript:alert(document.cookie)"))
+    assert _raises(_store.begin, _MCP, _H, _meta(_H, authorization_endpoint="a:$(cmd.exe /c whoami > c:\\temp\\pwned.txt)"))
+    assert _raises(_store.begin, _MCP, _H, _meta(_H, authorization_endpoint="file:/c:/windows/system32/calc.exe"))
+    assert _raises(_store.begin, _MCP, _H, _meta(_H, token_endpoint="http://10.0.0.7/token"))
+    assert _raises(_store.begin, _MCP, _H + "/", _meta(_H))
+    assert _raises(_store.begin, "mcp.example.com", _H, _meta(_H))
+    assert _raises(_store.begin, _MCP + "#frag", _H, _meta(_H))
+
+    # Mix-up: the user starts a flow with the attacker's server, which bounces the browser to the honest one.
+    _sa, _ = _store.begin(_MCP, _A, _meta(_A), "files:read")
+    _sh, _ = _store.begin(_MCP, _H, _meta(_H), "files:read")
+    assert _raises(_store.complete, {"state": _sa, "code": "honest-code", "iss": _H})
+    assert _raises(_store.complete, {"state": _sh, "code": "x", "iss": _A})
+    _sh, _ = _store.begin(_MCP, _H, _meta(_H), "files:read")
+    assert _store.complete({"state": _sh, "code": "c", "iss": _H})["token_endpoint"] == _H + "/token"
+    _sh, _ = _store.begin(_MCP, _H, _meta(_H), "files:read")
+    assert _raises(_store.complete, {"state": _sh, "code": "c"})
+    _sh, _ = _store.begin(_MCP, _H, _meta(_H, iss_supported=False), "files:read")
+    assert _store.complete({"state": _sh, "code": "c"})["code"] == "c"
+    _sh, _ = _store.begin(_MCP, _H, _meta(_H), "files:read")
+    assert _raises(_store.complete, {"state": _sh, "error": "access_denied", "iss": _A})
+    _sh, _ = _store.begin(_MCP, _H, _meta(_H), "files:read")
+    _store.complete({"state": _sh, "code": "c", "iss": _H})
+    assert _raises(_store.complete, {"state": _sh, "code": "c", "iss": _H})
+    _sh, _ = _store.begin(_MCP, _H, _meta(_H), "files:read")
+    _clock[0] += 601
+    assert _raises(_store.complete, {"state": _sh, "code": "c", "iss": _H})
+    assert _raises(_store.complete, {"code": "c", "iss": _H})
+
+    def _verifier_ok():
+        st, url = _store.begin(_MCP, _H, _meta(_H), None)
+        q = _qs(_split(url).query)
+        v = _store.complete({"state": st, "code": "c", "iss": _H})["code_verifier"]
+        ok_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+        return 43 <= len(v) <= 128 and set(v) <= ok_chars and len(q["state"][0]) >= 16 and q["client_id"] == ["https://agent.example.com/oauth/client.json"]
+    assert _verifier_ok()
+
+    def _states_unique():
+        seen = set()
+        for _ in range(200):
+            st, _u = _store.begin(_MCP, _H, _meta(_H), None)
+            seen.add(st)
+        return len(seen) == 200
+    assert _states_unique()
+
+    # Abandoned flows: 40,000 starts, one every 0.1 s, with a 600 s lifetime, so about 6,000 are live at the end.
+    def _bounded_and_fast():
+        c = [0.0]
+        s = FlowStore("https://agent.example.com/oauth/client.json", "https://agent.example.com/callback", ttl=600, clock=lambda: c[0])
+        m = _meta(_H)
+        t0 = _t.perf_counter()
+        for _i in range(40_000):
+            c[0] += 0.1
+            s.begin(_MCP, _H, m, "files:read")
+        elapsed = _t.perf_counter() - t0
+        return len(s) <= 12_000 and elapsed < 8.0
+    assert _bounded_and_fast()
+  solution: |
+    import base64
+    import hashlib
+    import secrets
+    import time
+    from collections import deque
+    from urllib.parse import urlencode, urlsplit
+
+
+    class AuthError(Exception):
+        pass
+
+
+    def _is_https(url):
+        p = urlsplit(url) if isinstance(url, str) else None
+        return bool(p) and p.scheme == "https" and bool(p.hostname)
+
+
+    def check_metadata(issuer, doc):
+        # RFC 8414 3.3: the document's issuer must be identical to the identifier the URL was built from.
+        # Identical means string equality: no case folding, no trailing-slash or default-port normalisation.
+        if not isinstance(doc, dict) or doc.get("issuer") != issuer:
+            raise AuthError("metadata issuer does not match the issuer it was fetched for")
+        p = urlsplit(issuer)
+        if p.scheme != "https" or not p.hostname or p.query or p.fragment:
+            raise AuthError("issuer must be an https URL without query or fragment")
+        for key in ("authorization_endpoint", "token_endpoint"):
+            if not _is_https(doc.get(key)):
+                raise AuthError(key + " must be an https URL")
+        if "S256" not in (doc.get("code_challenge_methods_supported") or []):
+            raise AuthError("authorization server does not advertise S256 PKCE")
+        return doc
+
+
+    def _check_resource(resource):
+        p = urlsplit(resource) if isinstance(resource, str) else None
+        if not p or p.scheme != "https" or not p.hostname or p.fragment or "#" in resource:
+            raise AuthError("resource must be the server's canonical https URI")
+
+
+    class FlowStore:
+        def __init__(self, client_id, redirect_uri, ttl=600.0, clock=time.monotonic):
+            self.client_id = client_id
+            self.redirect_uri = redirect_uri
+            self.ttl = ttl
+            self.clock = clock
+            self._flows = {}          # state -> (expires_at, issuer, metadata, verifier, resource)
+            self._expiry = deque()    # (expires_at, state) in begin order; ttl is fixed, so this is sorted
+
+        def __len__(self):
+            return len(self._flows)
+
+        def _purge(self, now):
+            q = self._expiry
+            while q and q[0][0] <= now:
+                _, state = q.popleft()
+                self._flows.pop(state, None)
+
+        def begin(self, resource, issuer, metadata, scope=None):
+            check_metadata(issuer, metadata)
+            _check_resource(resource)
+            now = self.clock()
+            self._purge(now)
+            verifier = secrets.token_urlsafe(48)
+            challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
+            state = secrets.token_urlsafe(32)
+            expires = now + self.ttl
+            self._flows[state] = (expires, issuer, metadata, verifier, resource)
+            self._expiry.append((expires, state))
+            params = {
+                "response_type": "code",
+                "client_id": self.client_id,
+                "redirect_uri": self.redirect_uri,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "state": state,
+                "resource": resource,
+            }
+            if scope:
+                params["scope"] = scope
+            endpoint = metadata["authorization_endpoint"]
+            sep = "&" if urlsplit(endpoint).query else "?"
+            return state, endpoint + sep + urlencode(params)
+
+        def complete(self, params):
+            now = self.clock()
+            self._purge(now)
+            # Single use: the record is removed whatever the outcome, so a rejected response cannot be retried.
+            record = self._flows.pop(params.get("state"), None)
+            if record is None or record[0] <= now:
+                raise AuthError("unknown, used or expired state")
+            _, issuer, metadata, verifier, resource = record
+            iss = params.get("iss")
+            if iss is not None:
+                if iss != issuer:
+                    raise AuthError("response came from a different authorization server")
+            elif metadata.get("authorization_response_iss_parameter_supported") is True:
+                raise AuthError("iss is advertised but missing")
+            if "error" in params:
+                raise AuthError("authorization failed")
+            if not params.get("code"):
+                raise AuthError("no authorization code")
+            return {
+                "token_endpoint": metadata["token_endpoint"],
+                "code": params["code"],
+                "code_verifier": verifier,
+                "resource": resource,
+                "redirect_uri": self.redirect_uri,
+                "client_id": self.client_id,
+            }
+
+
+    class ResourceServer:
+        def __init__(self, resource, issuer, implies=None):
+            self.resource = resource
+            self.issuer = issuer
+            self.implies = implies or {}
+            p = urlsplit(resource)
+            self.metadata_url = "%s://%s/.well-known/oauth-protected-resource%s" % (p.scheme, p.netloc, p.path.rstrip("/"))
+
+        def _challenge(self, error=None, scope=None):
+            parts = ['resource_metadata="%s"' % self.metadata_url]
+            if error:
+                parts.insert(0, 'error="%s"' % error)
+            if scope:
+                parts.append('scope="%s"' % scope)
+            return "Bearer " + ", ".join(parts)
+
+        def _effective(self, granted):
+            seen = set(granted)
+            stack = list(granted)
+            while stack:
+                for narrower in self.implies.get(stack.pop(), ()):
+                    if narrower not in seen:
+                        seen.add(narrower)
+                        stack.append(narrower)
+            return seen
+
+        def check(self, claims, required=(), now=None):
+            now = time.time() if now is None else now
+            required = set(required)
+            if not isinstance(claims, dict):
+                return 401, self._challenge(scope=" ".join(sorted(required)) or None), None
+            aud = claims.get("aud")
+            audiences = [aud] if isinstance(aud, str) else aud if isinstance(aud, list) else []
+            exp = claims.get("exp")
+            if (
+                claims.get("iss") != self.issuer
+                or self.resource not in audiences
+                or isinstance(exp, bool) or not isinstance(exp, (int, float)) or exp <= now
+                or not claims.get("sub")
+            ):
+                return 401, self._challenge(error="invalid_token"), None
+            missing = required - self._effective(str(claims.get("scope") or "").split())
+            if missing:
+                return 403, self._challenge(error="insufficient_scope", scope=" ".join(sorted(missing))), None
+            return 200, None, claims["sub"]
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Coding, 50 minutes">
+Your company runs a hosted agent. Users connect it to MCP servers by pasting a URL, so over a week it talks to authorisation servers you have never seen, some run by people who want your users' codes. The company also runs its own MCP server in front of internal data. Write both halves of the authorisation checks in the starter: the client's flow store, which starts each authorisation request and decides whether a callback's code may be redeemed, and the server's token check, which serves a request, refuses it with 401, or asks for more scope with 403.
+</Callout>
+
+The contract follows the MCP authorisation specification, revision 2026-07-28, the current revision on 2026-10-28. Token signatures are out of scope: `check` receives claims that were already verified against the issuer's keys.
+
+Part of the policy is yours, and the tests do not pin it down: whether `http` on a loopback address is allowed for local development, whether a token whose `aud` lists this server and other resources is served, which scopes a 403 names beyond the missing ones, whether a callback that fails the issuer check uses up its flow, and how much clock skew you tolerate. You also choose the default `ttl` for a flow and defend it. The tests check invariants: a token not issued for this server by its issuer is never served, a code is never handed to a token endpoint other than the one recorded for its flow, every scope an operation lacks appears in a single challenge, and a flow is redeemed at most once.
+
+One constraint is not in the visible tests. Users abandon flows: they close the tab at the consent screen, or never find their security key. In this scenario a busy hour starts a flow every tenth of a second, most of them abandoned, and the store must not grow with the abandoned ones or slow down as they pile up. A hidden test starts 40,000 flows on a fake clock with a 600-second `ttl`.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how many authorisation servers your client will talk to over its lifetime, and who operates each of them.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what each authorisation server's metadata says about the <code>iss</code> response parameter, and what your client should do when a response arrives without it.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request production counts of flows started and flows completed per hour; then ask what holds the records of the ones that never complete.</p></details>
+
+## Answer
+
+The reference solution has four parts: metadata checks before anything opens, one record per flow, a server check built on string equality, and an expiry queue.
+
+**Metadata, before a URL is opened.** `begin` refuses a document whose `issuer` is not identical to the issuer the client built the metadata URL from. Identical means `==`: the specification forbids case folding, trailing-slash or default-port normalisation, so `https://auth.example.com/` and `https://auth.example.com` are different issuers. Both endpoints must parse as `https` with a host. The scheme is checked by parsing and comparing against an allowlist of one, not by looking for bad characters: `javascript:`, `file:` and a made-up scheme such as `a:` all fail the same test. That last one is the shape of the `authorization_endpoint` behind CVE-2025-6514, where mcp-remote passed a crafted endpoint to an opener that reached a shell on Windows. PKCE must be advertised as `S256` in `code_challenge_methods_supported`; when the field is absent the client must refuse, even for an OpenID provider, whose discovery format does not define the field. The resource must be an `https` URI without a fragment, sent unchanged as `resource`.
+
+**One record per flow.** The state value is the key, and the record holds everything the callback must not be allowed to choose: the issuer, the metadata (and so the token endpoint), the verifier and the resource.
+
+```python
+record = self._flows.pop(params.get("state"), None)
+if record is None or record[0] <= now:
+    raise AuthError("unknown, used or expired state")
+_, issuer, metadata, verifier, resource = record
+iss = params.get("iss")
+if iss is not None:
+    if iss != issuer:
+        raise AuthError("response came from a different authorization server")
+elif metadata.get("authorization_response_iss_parameter_supported") is True:
+    raise AuthError("iss is advertised but missing")
+if "error" in params:
+    raise AuthError("authorization failed")
+```
+
+This is what stops a mix-up. The user starts a flow with the attacker's authorisation server; it bounces the browser to the honest one with the client's honest client id; the user approves; the honest server returns a code with `iss` set to itself. Without the check, the client looks up its flow, sees the attacker's server, and posts the code and the PKCE verifier to the attacker's token endpoint. PKCE does nothing here, because the verifier travels with the code to whichever token endpoint the client believes in. With the check, the response names the honest server, the record names the attacker, and the code is never sent. The issuer is checked before `error`, because the specification says a mismatched error response must not be acted on or displayed. The record is popped before any check, so a rejected response cannot be retried, and a replayed callback finds nothing.
+
+The fourth row of the specification's table is the gap that stays: if the honest server neither advertises nor sends `iss`, the client proceeds and a mix-up succeeds. The specification says so, and RFC 9700 offers per-issuer redirect URIs as the fallback.
+
+**The server check.** `aud` may be a string or a list; the server's canonical URI must be a member by equality. A prefix match accepts `https://mcp.example.com.attacker.net` and `https://mcp.example.com/mcp-admin`, both of which are in the hidden tests. `iss` must equal the one issuer this server trusts, which is also what rejects a token minted by a downstream API's own authorisation server. A missing token gets 401 with `resource_metadata` pointing at `/.well-known/oauth-protected-resource/mcp`. A valid token without the needed scope gets 403 with `error="insufficient_scope"` and every missing scope at once, after expanding the token's scopes through `implies` transitively, so `files:admin` satisfies `files:read`. Answering missing scope with 401 would send a well-behaved client into re-authorisation with the same scopes.
+
+**Bounded memory.** With a fixed `ttl` and a clock that only moves forward, flows expire in the order they began. A deque of `(expires_at, state)` therefore stays sorted, and each call pops expired entries from the left: amortised constant work per flow, and the store never holds more than the flows begun within one `ttl`.
+
+```python
+def _purge(self, now):
+    q = self._expiry
+    while q and q[0][0] <= now:
+        _, state = q.popleft()
+        self._flows.pop(state, None)
+```
+
+In the hidden test, one flow starts every 0.1 seconds for 40,000 starts with a 600-second `ttl`, so 600 / 0.1 = 6,000 flows are live at the end. A store that never purges holds 40,000 records. A purge that rebuilds the dictionary on every `begin` does about 6,000 checks per call, roughly 40,000 × 6,000 = 240 million checks; on the machine used to check this problem, the 40,000-flow test took about 19 seconds in CPython 3.12 with that purge and about 1 second with the deque. Purging with a scan every few thousand calls also passes; the test allows up to twice the live count.
+
+**The `ttl` you choose.** The specification's example for a single-use `state` is 10 minutes. Anything from 5 to 15 minutes is defensible: long enough for a sign-in, a security-key prompt and a consent screen. A minute fails users who go looking for their key. A day is unreasonable: at this scenario's rate the store would hold 24 × 3,600 / 0.1 = 864,000 records, and a leaked `state` stays redeemable that long.
+
+### The decision: where flow records live
+
+The reference keeps records in process memory. For a hosted client with more than one instance, the callback can land on an instance that never saw the flow, and two answers are defensible.
+
+- **A shared store** with per-key expiry. Single use is enforced by an atomic delete. Cost: the store is now on the sign-in path, so its outage is an outage of every new connection, and a store configured to evict under memory pressure silently drops live flows.
+- **A sealed state.** Encrypt and authenticate the record into the `state` value (or a cookie set at `begin`), so any instance can complete the flow and nothing is stored. Cost: single use is gone unless you keep a replay cache of used states until they expire, which brings back storage for completed flows, plus key rotation and long URLs.
+
+I would choose the shared store, with eviction disabled for that keyspace and an alert on the rate of "unknown state" rejections, because single use is part of what the code relies on and a replay cache is a shared store anyway. The constraint it trades: strictness against availability. The failure mode of this choice is that the rejection alert also fires when users simply take longer than the `ttl`, so the alert threshold has to be set from the completion-time distribution, not from zero.
+
+## Follow-ups
+
+- *Pushback: security wants every authorisation server that does not emit `iss` refused outright. Product measures how many of the servers users add would break. Which do you ship, and what do you write down?*
+- *Reversal: what would you need to see in production to move from the shared store to sealed state?*
+- *Two senior engineers disagree about serving a token whose `aud` lists your server and two other APIs. How do you decide without deciding by rank?*
+- *What changes to run this in a real client and server: key-set fetching and rotation for signatures, a clock shared across hosts, refresh tokens, credentials keyed by the issuer that issued them (the 2026-07-28 changelog requires re-registration when the authorisation server changes), and opening the URL without a shell?*
+
+## Common mistakes
+
+- Normalising issuers before comparing them, which turns a rejected mix-up into an accepted one.
+- Storing "the current issuer" on the client object instead of per flow, so two interleaved flows overwrite each other.
+- Showing the `error_description` from a response whose `iss` did not match.
+- Matching `aud` with `startswith` or `in` on a string.
+- Returning 401 for missing scope.
+- A dictionary of pending flows with no expiry, which passes every functional test and grows forever.

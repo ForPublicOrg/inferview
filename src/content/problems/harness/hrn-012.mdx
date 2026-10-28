@@ -1,0 +1,143 @@
+---
+id: hrn-012
+title: Twenty-four installs and an empty budget
+subtitle: rank the causes
+track: harness
+module: tools-aci
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 25
+core: false
+tags: [error-messages, sandboxing, tool-results, retries, coding-agents]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Cursor, Implementing a secure sandbox for local agents (2026-02-18)
+    url: https://cursor.com/blog/agent-sandboxing
+    note: "vendor report: the agent would repeatedly retry the same terminal command without changing permissions until Shell results surfaced the sandbox constraint responsible for the failure, in some cases recommending escalation; sandboxed agents stop 40% less often than unsandboxed ones; Seatbelt on macOS, Landlock and seccomp on Linux"
+  - title: Claude Agent SDK docs, How the agent loop works (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/agent-sdk/agent-loop
+    note: "max_budget_usd stops the loop with error_max_budget_usd; spend is compared with the cap after each response arrives, so it can pass the cap by up to one response"
+  - title: Model Context Protocol specification 2025-11-25, Tools
+    url: https://modelcontextprotocol.io/specification/2025-11-25/server/tools
+    note: "tool execution errors carry actionable feedback that models can use to self-correct; clients should pass them to the model"
+  - title: Claude Code tools reference, Bash output limits (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/tools-reference
+    note: "a failed command's output is inline up to roughly 10,000 characters, past that a head-and-tail excerpt"
+choices:
+  - text: The loop guard compares the description field as well, so repeated install commands never matched
+    correct: false
+    why: "A real defect: the model rewords the description on every call, so the guard never fires. Fixing it stops the loop sooner, but the run still fails, because the next result is as uninformative as the last."
+  - text: The resolver inside the container is misconfigured, so every name lookup in the workspace times out
+    correct: false
+    why: "The setup script in the same image resolved and downloaded from the same registry before the sandbox started; the lookups fail only inside the sandboxed shell."
+  - text: The budget cap is checked only after each response, so the run kept going past the limit it was given
+    correct: false
+    why: "That is how the SDK documents the cap, and the overshoot is at most one response; it explains a few cents past the limit, not 24 attempts at the same install."
+  - text: The result reports a temporary DNS failure and nothing in it says the sandbox refused the connection
+    correct: true
+    why: "EAI_AGAIN is the resolver's code for a temporary failure, so retrying is the reasonable reading of the only evidence the model receives; the denial the sandbox recorded in proc.denials never reaches the result."
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Debug round">
+Last week your team moved the coding agent's shell tool into a sandbox. Since then, about one run in eight on a repository without a lockfile ends with <code>error_max_budget_usd</code>. In those runs the agent runs the same install command over and over and tries nothing but waiting and rerunning it. Which defect explains why the agent keeps rerunning the install instead of changing its approach? Rank the others.
+</Callout>
+
+The trace of one failed run, turns 14 to 37 (constructed for this problem; the error lines follow npm's format):
+
+```text
+turn 14  Bash {"command": "npm install", "description": "Install dependencies"}
+         -> Exit code 1
+            npm error code EAI_AGAIN
+            npm error syscall getaddrinfo
+            npm error errno EAI_AGAIN
+            npm error request to https://registry.npmjs.org/zod failed, reason: getaddrinfo EAI_AGAIN registry.npmjs.org
+turn 15  "The registry lookup hit a temporary DNS failure. Retrying."
+         Bash {"command": "npm install", "description": "Retry dependency install"}
+         -> (same output)
+turn 16  Bash {"command": "sleep 20 && npm install", "description": "Wait, then retry the install"}
+         -> (same output)
+  ...    turns 17 to 36: 20 more calls, each "npm install" with a reworded description, same output
+turn 37  Bash {"command": "npm install", "description": "Retry install after transient DNS error"}
+         -> (same output)
+result   subtype error_max_budget_usd, num_turns 37, total_cost_usd 2.04 (cap 2.00)
+```
+
+The shell tool after the sandbox change:
+
+```python
+# harness/tools/shell.py
+def run_shell(call, session):
+    proc = session.sandbox.run(
+        ["bash", "-lc", call.args["command"]],
+        cwd=session.workdir,
+        network="deny",
+        writable=[session.workdir, "/tmp"],
+        timeout=call.args.get("timeout", 120),
+    )
+    output = proc.stdout + proc.stderr
+    if proc.returncode != 0:
+        return ToolResult(text=f"Exit code {proc.returncode}\n{head_tail(output, 10_000)}", is_error=True)
+    return ToolResult(text=shape_valid(output, session))
+```
+
+```python
+# harness/sandbox.py (excerpt)
+@dataclass
+class Completed:
+    returncode: int
+    stdout: str
+    stderr: str
+    denials: list          # one entry per call the sandbox blocked, e.g. {"op": "socket", "detail": "network=deny"}
+```
+
+```python
+# harness/loop_guard.py
+def repeated(history, call, window=6, limit=3):
+    same = [c for c in history[-window:] if c.name == call.name and c.args == call.args]
+    return len(same) >= limit      # True: replace the result with a warning and end the turn
+```
+
+What you also know: the image's setup script, which runs before the sandbox starts, installed packages from `registry.npmjs.org` at the start of the same run. You do not have the sandbox's own records for this run; the tracing pipeline stores only tool inputs and the results the model received.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Read only the tool result the model received on turn 14. What would you do next if that were all you knew?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask which of the fields the sandbox returns end up in the text the model sees.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>For each candidate defect, ask whether fixing only that one would have made this run succeed.</p></details>
+
+## Answer
+
+The model behaved sensibly on the evidence it had. `EAI_AGAIN` is the resolver's code for a temporary failure, and "temporary" invites a retry. The sandbox knew better: it blocked the socket and recorded the block in `proc.denials`, but `run_shell` builds the result from the exit code and the output alone, so the one fact that would have changed the model's plan never reached it. Cursor reported the same pattern after shipping its sandbox: agents retried the same command without changing permissions until the Shell result named the sandbox constraint behind the failure.
+
+The ranking. The loop guard is a real second defect: it compares the whole argument dict, the model rewrites `description` on every call, so three identical commands never count as repeats. Fixing it would have stopped the loop at turn 18, the first call with three plain `npm install` calls already in its window, instead of turn 37, which saves money and still fails the task, because the agent still does not know what is wrong. The resolver theory is ruled out by the setup script, which reached the same registry from the same image before the sandbox started. The budget overshoot is documented behaviour: the cap is checked when each response arrives, so a run can pass it by one response.
+
+The evidence is incomplete. Without the denial records you are inferring the block from the setup script and the timing of the change. The first thing to collect is `proc.denials` for one failing call, or to rerun the same command in the same sandbox with `network="allow"` in a throwaway workspace. Without either, ship the result fix anyway: it is cheap and harmless when there are no denials to report.
+
+The fix is a decision with more than one defensible answer.
+
+- **Name the constraint in the result.** When `proc.denials` is not empty, append one line: what was blocked, by which rule, and how to proceed (request network access, or use the vendored packages). This keeps the sandbox strict and makes the error instruct. Cost: every network need becomes an approval request, and approval prompts pile up for the person watching.
+- **Allow the registry through an egress proxy for install commands.** The install succeeds without a prompt. Cost: an open egress path that a prompt-injected agent can also use, plus a proxy and allowlist to run and audit; security has to sign off.
+- **Install dependencies when the environment is built.** No network at run time at all. Cost: it fails exactly on the repositories in this incident, the ones without a lockfile, and goes stale when dependencies change mid-task.
+
+The constraint conflict is autonomy against egress. My recommendation is the first fix everywhere, because a tool result that hides the reason for a failure is wrong whatever the policy, plus build-time installs for repositories with a lockfile; the proxy only with a written security review. Fix the loop guard as well, comparing `command` only, so the next uninformative result ends the loop within four calls instead of twenty-four.
+
+Failure mode of the recommendation. Attaching denials to results depends on attributing each denial to the right command. With background processes or two commands in flight, a denial can land on the wrong result and send the model chasing a network problem in a command that failed for another reason. And once results suggest escalation, the model may request it for every network error, including a registry that is genuinely down. Only suggest escalation when a denial was recorded for that call, and track escalation requests per run after the change.
+
+## Follow-ups
+
+- *Security objects that naming the blocked operation in the result teaches the model how the sandbox works. Do you hide it, and which failure rate do you accept in writing in exchange?*
+- *After the fix, approval requests per run triple and the people watching start approving without reading. What would you need to see in a week of traces to switch to the registry proxy instead?*
+- *Two senior engineers disagree: one wants the loop guard to end the run, the other wants it to inject a warning and continue. How do you decide without deciding by rank?*
+- *The tracing pipeline drops `proc.denials`. What else do you lose for incident review, and what is the smallest change that keeps it?*
+
+## Common mistakes
+
+- Blaming the model for retrying. The result told it the failure was temporary.
+- Fixing the loop guard and calling it done. The run fails sooner and costs less; it still fails.
+- Mapping every `EAI_AGAIN` or connection error to "sandbox" in the result text. A real outage then looks like a policy block, and the model asks for permissions it does not need.
+- Granting the network to the whole shell tool to make the symptom go away, which removes the reason for the sandbox.

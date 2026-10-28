@@ -1,0 +1,149 @@
+---
+id: wfl-018
+title: Review a refund activity before it ships
+subtitle: a model decides the amount, Stripe moves the money
+track: workflows
+module: retries-flow-control
+type: critique
+difficulty: hard
+seniority: [senior, staff]
+minutes: 25
+core: false
+tags: [idempotency, stripe, temporal, retries, side-effects, approvals]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Stripe API reference, idempotent requests (checked 2026-10-28)
+    url: https://docs.stripe.com/api/idempotent_requests
+    note: API v1 saves the status code and body of the first request once execution begins, including 500 errors; keys may be pruned once at least 24 hours old, after which reuse creates a new request; parameters are compared with the original and a mismatch errors; validation failures and concurrent conflicts are not saved; V4 UUIDs suggested; no sensitive data in keys
+  - title: Temporal docs, retry policies (checked 2026-10-28)
+    url: https://docs.temporal.io/encyclopedia/retry-policies
+    note: activities retry under the policy; non-retryable error types; Schedule-To-Close bounds total retry time
+  - title: Temporal docs, detecting activity failures (checked 2026-10-28)
+    url: https://docs.temporal.io/encyclopedia/detecting-activity-failures
+    note: a Start-To-Close timeout is retried under the policy and the timer resets; heartbeat timeout
+  - title: AWS Builder Center, Timeouts, retries and backoff with jitter (published 2019-12-05)
+    url: https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter
+    note: retry only idempotent operations or those carrying an idempotency token
+checklist:
+  - Names the fresh key per attempt as the cause of double refunds, and the database insert or the customer email failing after Stripe succeeded as the most likely trigger
+  - Moves the model decision into its own step whose result is recorded, because a retry re-asks the model and a different amount under a stable key fails Stripe's parameter check
+  - Derives the key from the workflow and step (for example workflow ID plus "refund"), or generates it once in workflow code and passes it in
+  - Gates approval on the decided refund amount, after the decision, not on the ticket's charge amount before it
+  - Splits the email and the database write out of the activity that calls Stripe, or makes each one idempotent on the ticket ID
+  - Treats a Stripe 500 as an unknown outcome to reconcile against the payment intent's refunds, since the same key returns the saved 500
+  - Keeps a durable record of its own (a pending row unique per ticket, written before the call) because Stripe may prune keys after 24 hours
+  - Checks the decided amount in code against the charge, earlier refunds and the policy cap before calling Stripe
+  - Raises the 30-second Start-To-Close or adds heartbeats, because a timed-out attempt can still be running when its retry starts
+  - "Judgement call: a UUID key is acceptable if it is created once outside the retried step and persisted, for example with workflow.uuid4() in workflow code"
+  - "Judgement call: the ticket ID in the key is acceptable if ticket IDs carry no personal data, since Stripe advises against sensitive data in keys"
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Here is the pull request for our refund agent. It uses Temporal and Stripe idempotency keys, so retries are safe. Review it."
+</Callout>
+
+A support team ships an agent that reads a refund ticket, decides whether to refund and how much under the written policy, and issues the refund. The description in the pull request says: "Model calls are retried by Temporal; Stripe calls use idempotency keys, so a retry can never refund twice. Refunds over $500 wait for a human."
+
+```python
+# refunds/activities.py
+REFUND_RETRY = RetryPolicy(
+    initial_interval=timedelta(seconds=2),
+    maximum_attempts=6,
+)
+
+@activity.defn
+async def decide_and_refund(ticket: Ticket) -> RefundResult:
+    decision = await llm.decide_refund(          # Claude Sonnet 5.5, structured output
+        ticket=ticket,
+        policy=load_policy_text(),
+    )
+    if decision.action != "refund":
+        return RefundResult(status="declined", reason=decision.reason)
+
+    key = f"refund-{uuid.uuid4()}"
+    refund = stripe.Refund.create(
+        payment_intent=ticket.payment_intent_id,
+        amount=decision.amount_cents,
+        idempotency_key=key,
+        metadata={"ticket_id": ticket.id},
+    )
+    await db.execute(
+        "INSERT INTO refunds (ticket_id, stripe_refund_id, amount_cents) VALUES ($1, $2, $3)",
+        ticket.id, refund.id, decision.amount_cents,
+    )
+    await notify_customer(ticket, refund)
+    return RefundResult(status="refunded", refund_id=refund.id)
+
+
+# refunds/workflow.py
+@workflow.defn
+class RefundWorkflow:
+    def __init__(self) -> None:
+        self.approved = False
+
+    @workflow.signal
+    def approve(self) -> None:
+        self.approved = True
+
+    @workflow.run
+    async def run(self, ticket: Ticket) -> RefundResult:
+        if ticket.charge_amount_cents > 50_000:
+            await workflow.wait_condition(lambda: self.approved, timeout=timedelta(days=3))
+        return await workflow.execute_activity(
+            decide_and_refund,
+            ticket,
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=REFUND_RETRY,
+        )
+```
+
+List every flaw you would raise, ranked by the money or trust it can lose, before opening the checklist.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>List every line after the Stripe call that can raise, and ask what the next attempt does when one of them does.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what Stripe does when it sees the same key a second time: with the same parameters, with different ones, and a week later.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>What does the approver see when they approve, and what is decided after they do?</p></details>
+
+## Answer
+
+**1. A fresh key per attempt makes every retry a new refund.** The key is created inside the activity, so each of the six attempts sends a different one, and Stripe treats each as a new request. The trigger is rarely Stripe itself. If the database insert fails, the customer email times out, or the 30-second timeout expires after Stripe accepted the refund, Temporal retries the activity and refunds again. Retrying is only safe for operations that carry a token that survives the retry.
+
+**2. A stable key alone would not fix it, because the model runs again.** The decision is made inside the same activity, so every retry asks the model again, and the amount can differ between attempts. Stripe compares parameters with the original request and errors on a mismatch, so a stable key turns a double refund into an activity that fails on every retry. The decision belongs in its own activity, whose result Temporal records; the refund activity takes the amount as an argument and never calls the model.
+
+**3. The approver approves the wrong thing.** The gate checks the charge amount and runs before the decision, so a human approves a ticket and the model then picks the amount. A $600 charge is approved before anyone knows whether the refund will be $20 or the full $600, and the approver never sees the model's reason. Decide first, then gate on the decided amount, and show the approver the amount and the reason.
+
+**4. The email and the insert are inside the retried step.** Even with points 1 and 2 fixed, a failing email repeats the insert, and a failing insert repeats the email. Split them into their own activities, or make each idempotent on the ticket ID (a unique constraint with ON CONFLICT DO NOTHING; a sent-notification record checked before sending).
+
+**5. A 500 is an unknown outcome, and the same key repeats it.** For API v1, Stripe saves the first response once execution begins, including a 500, and returns it for every retry with that key. With a stable key, the retry loop sees the same 500 six times and gives up without knowing whether money moved. The right handling is to stop and reconcile: list the payment intent's refunds and look for this ticket's metadata.
+
+**6. Stripe's memory is shorter than the workflow's.** Keys may be pruned once they are at least 24 hours old, after which the same key creates a new request. A workflow reset, a manual re-run, or a replay of failed workflows next week is outside that window. Dedupe that must last needs a record of its own: insert a pending row unique per ticket before calling Stripe, mark it done after, and reconcile pending rows past an age you choose and defend: longer than the Stripe step's Start-To-Close times its attempts plus backoff, so the reconciler never races a live attempt, and short enough that a customer waiting on a refund hears within the support team's response target.
+
+**7. The amount is never checked in code.** Structured output guarantees a field called amount_cents, not a sane value. Before the call, check it against the charge, the refunds already issued and the policy's cap; the model's reason goes in the record.
+
+**8. Thirty seconds bounds a model call plus three side effects.** A long ticket can push the model call alone past it. When Start-To-Close expires, Temporal schedules a retry, and the first attempt may still be running on its worker, so two attempts can reach Stripe at once. Give the model step its own timeout and the Stripe step a short one, with heartbeats where the work is long.
+
+**9. Nothing is non-retryable.** A Stripe error that says the amount exceeds what is left on the charge is retried six times. Classify card and validation errors as non-retryable, and add a Schedule-To-Close timeout.
+
+**Where the dedupe lives is a real decision.** Stripe's key, derived from workflow ID and step, costs nothing and covers the common case: a retry within minutes with the same parameters. Your own ledger row costs a write and a reconciliation job, but it survives the 24-hour window and manual re-runs and gives finance one place to look. For money, use both. The failure mode of that recommendation is the pending row whose Stripe call crashed mid-flight: the reconciler must look the refund up rather than retry it, and it must ignore a refund an agent made by hand in the dashboard instead of "correcting" it.
+
+The two judgement calls in the checklist are where reviewers disagree. A UUID is a fine key if it is generated once outside the retried step and persisted: `workflow.uuid4()` in workflow code is deterministic and recorded, so passing it into the activity is equivalent to deriving it from the workflow ID. A key built from the ticket ID is fine if ticket IDs are opaque; if they embed an email address, Stripe's guidance against sensitive data in keys applies.
+
+## Follow-ups
+
+- *Pushback: splitting into decide, approve, refund, record and notify activities doubles the workflow's code and adds history events per ticket. Which split would you give up first, and what risk do you accept in writing?* Notify can stay with record if the notification is idempotent on the ticket ID; the split that cannot go is the model decision from the Stripe call, since that is the one that makes a stable key fail.
+- *Reversal: what would you need to see in production to drop your own ledger and rely on Stripe's key alone?* Evidence that nothing re-runs a refund after 24 hours: no workflow resets, no manual replays, and a Schedule-To-Close well under a day, plus a reconciliation report showing zero duplicates over a quarter.
+- *Operating: the model is retired in sixty days and the replacement decides 8% of last month's tickets differently. Which ship, and who signs off?* Replay last month's tickets through the new model and route every changed decision above a chosen amount to the approval queue for the first month; finance signs the amount.
+- *The payments team wants Stripe API v2. What changes in this review?* Under v2 a retry with the same key does not repeat a successful operation, and Stripe retries failed work to completion where it can; point 5 changes, while points 1, 2, 3 and 6 do not.
+
+## Common mistakes
+
+- Reading the word idempotency_key in the diff and approving the retry story.
+- Fixing the key and leaving the model call in the retried step, which trades double refunds for refunds that never complete.
+- Approving on the charge instead of on the decision.
+- Treating a 500 as a reason to retry rather than to reconcile.
+- Assuming the provider remembers a key as long as the workflow remembers the ticket.

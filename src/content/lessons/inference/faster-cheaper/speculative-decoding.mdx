@@ -1,0 +1,150 @@
+---
+title: "Speculative decoding: why it preserves the distribution and when it hurts"
+track: inference
+module: faster-cheaper
+order: 2
+kind: lesson
+level: senior
+minutes: 14
+summary: A cheap draft proposes tokens and the target verifies them in one pass with an acceptance rule that leaves the output distributed exactly as the target's, which buys latency while decode is bound by memory reads and costs throughput once the batch makes the step compute bound, unless long contexts keep it memory bound.
+prerequisites: [inference/inference-anatomy/roofline-serving]
+updated: 2026-10-28
+sources:
+  - title: "Leviathan, Kalman and Matias, Fast Inference from Transformers via Speculative Decoding (arXiv 2211.17192, ICML 2023)"
+    url: https://arxiv.org/abs/2211.17192
+    note: "Verification of draft tokens in parallel without changing the output distribution; Equation 1 gives expected tokens per target pass as (1 - alpha^(gamma+1)) / (1 - alpha); Theorem 3.8 gives walltime improvement as that over (gamma c + 1); the paper reports 2X to 3X on T5-XXL with identical outputs. Checked 2026-10-28."
+  - title: "Chen, Borgeaud, Irving, Lespiau, Sifre and Jumper, Accelerating Large Language Model Decoding with Speculative Sampling (arXiv 2302.01318, 2023)"
+    url: https://arxiv.org/abs/2302.01318
+    note: "Modified rejection sampling preserves the target distribution within hardware numerics; the paper reports a 2 to 2.5x decoding speedup for Chinchilla 70B in a distributed setup. Checked 2026-10-28."
+  - title: "Li, Wei, Zhang and Zhang, EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test (arXiv 2503.01840, 2025)"
+    url: https://arxiv.org/abs/2503.01840
+    note: "Predicts tokens directly from fused features of several layers; the paper reports up to 6.5x speedup, about 1.4x over EAGLE-2, and 1.38x throughput at batch size 64 in SGLang. Checked 2026-10-28."
+  - title: vLLM docs, Speculative Decoding (latest, page dated 2026-10-23)
+    url: https://docs.vllm.ai/en/latest/features/speculative_decoding/
+    note: "Methods: EAGLE, MTP, draft model, PARD, n-gram, suffix decoding, custom proposer, dynamic speculative decoding; aimed at memory-bound workloads at medium to low QPS; gains drop at high QPS for most model-based methods; theoretically lossless up to hardware numerics with the standard rejection sampler; FLy verification is not distribution preserving; batch size changes may vary logprobs; n-gram prompt_lookup_min and max default to 5; pipeline parallelism not composable with speculation in vllm 0.15.0 and earlier. Checked 2026-10-28."
+  - title: SGLang docs, Speculative Decoding
+    url: https://docs.sglang.io/advanced_features/speculative_decoding.html
+    note: "LLaMA-Instruct 3.1 8B, one H100, MT-Bench: 158.34 tokens/s without speculation, 244.10 with EAGLE-2, 373.25 with EAGLE-3; no batch size stated. Project's own measurement. Checked 2026-10-28."
+  - title: "Sadhukhan et al., MagicDec: Breaking the Latency-Throughput Tradeoff for Long Context Generation with Speculative Decoding (arXiv 2408.11049, 2024)"
+    url: https://arxiv.org/abs/2408.11049
+    note: "Speculation helps high-throughput serving for moderate to long sequences; the bottleneck shifts with batch size and sequence length; draft with a sparse KV cache; up to 2.51x for Llama3.1-8B at batch sizes 32 to 256. Checked 2026-10-28."
+  - title: How to Scale Your Model, All About Rooflines (Google DeepMind, JAX team)
+    url: https://jax-ml.github.io/scaling-book/roofline/
+    note: "H100 about 9.89e14 dense BF16 FLOPs/s and 3.35 TB/s, a critical intensity of about 295 FLOPs per byte. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import InferenceSpecSim from '../../../../components/widgets/InferenceSpecSim.astro';
+
+## Draft, verify, keep a prefix
+
+A decode step at small batch reads every weight to produce one token per sequence, and the tensor cores sit mostly idle while it does. Speculative decoding spends that idle compute. A cheap draft proposes gamma tokens. The target runs one forward pass over all gamma positions at once, which costs about the same as a one-token step because the step was bound by the weight read, not the arithmetic. The target keeps the longest prefix of draft tokens that passes verification, replaces the first rejected one with a token of its own, and discards the rest. If every draft token passes, it samples one bonus token from the last position. Every pass therefore produces between 1 and gamma + 1 tokens.
+
+The systems analogy is branch prediction with a pipeline flush: guess ahead cheaply, verify, throw away the work after the first miss. The difference is that the verification here is probabilistic, and the rule that decides acceptance is what makes the output identical in distribution to running the target alone.
+
+## Why the distribution is exactly the target's
+
+Let p be the target's next-token distribution and q the draft's at the same position. The draft samples x from q. The target accepts x with probability min(1, p(x) / q(x)). On rejection it samples a replacement from the residual distribution, max(0, p − q) normalised.
+
+The proof is two lines. The probability of emitting token x through acceptance is q(x) · min(1, p(x)/q(x)) = min(p(x), q(x)). Let beta = Σ min(p, q), the total acceptance probability. The probability of emitting x through rejection is (1 − beta) times the residual, and the residual's normaliser is Σ max(0, p − q) = 1 − beta, so that term is max(0, p(x) − q(x)). The two add to min(p, q) + max(0, p − q) = p(x). Applied position by position along the draft, each emitted token is distributed as the target's, which is the result both Leviathan et al. and Chen et al. prove.
+
+```python
+import random
+
+def verify(p, q, rng):
+    """Draft one token from q, verify against target p. The result is distributed as p."""
+    vocab = range(len(p))
+    x = rng.choices(vocab, weights=q)[0]
+    if rng.random() < min(1.0, p[x] / q[x]):
+        return x, True
+    residual = [max(0.0, pi - qi) for pi, qi in zip(p, q)]
+    return rng.choices(vocab, weights=residual)[0], False
+
+rng = random.Random(42)
+p = [0.5, 0.3, 0.2, 0.0]          # target
+q = [0.25, 0.25, 0.25, 0.25]      # draft
+n = 200_000
+out = [verify(p, q, rng) for _ in range(n)]
+print("output freq ", [round(sum(1 for x, _ in out if x == i) / n, 3) for i in range(4)])
+print("accept rate ", round(sum(a for _, a in out) / n, 3), "expected", sum(min(a, b) for a, b in zip(p, q)))
+# output freq  [0.5, 0.301, 0.199, 0.0]
+# accept rate  0.699 expected 0.7
+```
+
+The acceptance rate is the overlap of the two distributions, beta = 0.25 + 0.25 + 0.2 = 0.7 here. Everything about draft design is an attempt to raise that overlap at low cost. Under greedy decoding the rule reduces to accepting a draft token if and only if it equals the target's argmax.
+
+"Exact" has two qualifications in practice. vLLM describes its standard rejection sampler as "theoretically lossless up to the precision limits of hardware numerics", tests it with convergence tests and a greedy-equality test, and notes that a change in batch size can shift logprobs, so the same request can produce different text with and without speculation. And some engines ship lossy verifiers on purpose: vLLM's FLy verification option is documented as not distribution preserving. Which verifier is configured is a release decision, not an implementation detail.
+
+## Tokens per pass and walltime
+
+If each draft token is accepted independently with probability alpha, Leviathan et al.'s Equation 1 gives the expected tokens per target pass as (1 − alpha^(gamma+1)) / (1 − alpha). The ceiling, with an infinitely long draft, is 1 / (1 − alpha).
+
+<Predict id="inf-spec-expected" question="Each draft token is accepted with probability 0.8, independently. With 4 draft tokens per round, how many tokens does one target pass produce on average?" answer={3.36} tolerance={0.3} unit="tokens">
+<p>(1 − 0.8^5) / (1 − 0.8) = (1 − 0.328) / 0.2 = <b>3.36</b>. The target always contributes at least one token, the replacement or the bonus. However long the draft, the ceiling at alpha 0.8 is 1 / 0.2 = 5.</p>
+</Predict>
+
+Drafting is not free. If one draft step costs c of a target pass, Theorem 3.8 gives the walltime improvement as the expected tokens divided by (gamma · c + 1). Computed from that formula: at alpha 0.8 and c 0.05, gamma 4 gives 2.80 and gamma 8 gives 3.09, the best in the range; at alpha 0.6 and c 0.2, the best is gamma 2 at 1.40, and gamma 8 is a loss at 0.95. The ninth draft token is used only if the first eight were accepted, so long drafts pay only when acceptance is high and drafting is cheap.
+
+<InferenceSpecSim />
+
+The formula assumes the target pass costs the same whatever gamma is. That holds only while the step is bound by memory reads, which is the subject of the next section but one.
+
+## Where drafts come from
+
+The original design is a separate small model from the same family, sharing the tokenizer. It needs no training, but it has its own weights and KV cache to hold, and its acceptance depends on how close the two models are on your traffic.
+
+EAGLE-style drafters are small heads trained on the target's own hidden states, so they see what the target is about to do. EAGLE-3 predicts tokens directly and fuses features from several layers rather than the top layer alone; its paper reports up to 6.5 times speedup, about 1.4 times over EAGLE-2, and 1.38 times throughput at batch 64 in SGLang. SGLang's docs report LLaMA-Instruct 3.1 8B on one H100 on MT-Bench at 158.34 tokens per second without speculation, 244.10 with EAGLE-2 and 373.25 with EAGLE-3, which is 1.54 and 2.36 times; the page does not state the batch size, so these are low-concurrency numbers until shown otherwise.
+
+Multi-token prediction (MTP) heads ship inside some models and serve as a built-in draft; vLLM rates MTP best when the target supports it natively. N-gram drafting looks up the last few tokens in the prompt and proposes what followed them there (vLLM's `prompt_lookup_min` and `prompt_lookup_max` default to 5), and suffix decoding does the same against a cache of earlier outputs. Neither needs a model, and both do well when the output copies the input, as in code edits, retrieval answers that quote sources, and structured rewrites. vLLM's own table rates them low to medium at low QPS and medium at high QPS, where its model-based drafters fall from high to medium or medium to high, because they add almost no load while drafting.
+
+## The batch size at which it stops paying
+
+Verification computes gamma + 1 positions per sequence. At batch B, a speculative step pushes B(gamma + 1) tokens through every weight, against B for a normal step. On an H100 in BF16 the linear layers turn compute bound at about 295 tokens per step, the ratio of 9.89e14 FLOP/s to 3.35 TB/s. Below that, a step costs the weight read whatever the token count; above it, the step costs time in proportion to its tokens.
+
+<Predict id="inf-spec-breakeven-batch" question="Linear layers only, BF16 on an H100 (compute bound above 295 tokens per step), gamma 4, alpha 0.8, draft cost ignored. A normal step at batch B is memory bound. At what batch B does a speculative step's extra cost cancel its 3.36 tokens per pass?" answer={198} tolerance={12} unit="sequences">
+<p>Once B × 5 passes 295 (B about 59), the speculative step costs B × 5 / 295 times the normal step, while it yields 3.36 tokens per sequence instead of 1. Break-even is 3.36 = 5B / 295, so B = 3.36 × 295 / 5 = <b>198</b>. Past that, and once the normal step is itself compute bound above 295, the ratio settles at 3.36 / 5 = 0.67: a third of the throughput is spent verifying tokens that get thrown away. A draft cost above zero moves the break-even lower.</p>
+</Predict>
+
+That is the textbook reason speculation hurts at large batch. It is incomplete, because a decode step also reads every sequence's KV cache, and that read is not shared across the batch. It is, however, shared across the gamma + 1 positions of one sequence: verifying five positions reads the same cached keys and values once. At long contexts the KV term dominates the step, the step stays memory bound at batch sizes where the linear layers alone would be compute bound, and verification stays cheap. MagicDec builds on this and reports up to 2.51 times for Llama3.1-8B at batch sizes 32 to 256 for moderate to long sequences, with a draft that uses a sparse KV cache so the draft's own KV reads do not cancel the gain. The answer to "does speculation help at batch 128" is therefore a question back: at what context length, and where does the step sit on the roofline at that length.
+
+## Operating it
+
+Speculation is a load-dependent setting, and engines now treat it that way. vLLM documents dynamic speculative decoding for fluctuating QPS and adaptive verification that sizes the verified set from drafter confidence. Without those, the policy is a function of load: speculate at full depth when the batch is small, shorten the draft as the batch grows, turn it off above the measured break-even for the traffic class.
+
+The metrics are acceptance rate and mean accepted length per step, reported per traffic class, next to time per output token and throughput at the same concurrency. vLLM exposes per-request acceptance metrics, which matters because a fleet average hides the class that pulls it down: a code-editing tenant with long copied spans and a creative-writing tenant at high temperature can sit on opposite sides of break-even on the same deployment. Version constraints also apply; vLLM's docs state that pipeline parallelism did not compose with speculation in version 0.15.0 and earlier.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your code-assistant fleet runs EAGLE-3 on every request. Median time per output token is good, but at peak the batch reaches 96 sequences and the capacity review shows throughput 15% below the same fleet without speculation. Finance wants the GPUs back before next month's renewal; product says latency is the reason users stayed. What do you change?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>I would make speculation depend on load: full draft depth below a batch threshold, shorter drafts above it, off above the measured break-even for each traffic class. That keeps the latency gain off-peak, where most sessions are interactive, and recovers the peak throughput finance is paying for. The threshold comes from measuring acceptance and step time per class at peak, not from the formula.</p>
+</Fragment>
+<Fragment slot="long">
+<p>A 15% loss at batch 96 says the speculative step is past break-even at peak for this traffic. The linear-layer model puts that crossover in the low hundreds at alpha 0.8 and gamma 4, so either acceptance at peak is lower than the fleet average, the draft is longer than it needs to be, or contexts are short enough that the KV term does not keep the step memory bound. All three are measurable: acceptance by class and by hour, step time against batch size with and without speculation, and the context-length distribution at peak.</p>
+<p>The change is a policy, not a switch. Dynamic speculation in the engine, or a batch-size threshold in our own control loop, drops draft depth as the batch grows. For a code assistant the long-context, high-copy requests are the ones most likely to stay above break-even, so the policy can be per class rather than global. I would ship it behind the capacity metric, with the rollback trigger written down: p95 time per output token for interactive sessions above the agreed bound at off-peak.</p>
+<p>What we give up: some latency at peak for the classes that lose speculation, and a more complex configuration whose behaviour depends on load, which makes performance incidents harder to reproduce. If finance needs more than the peak recovery, the next lever is the draft itself, n-gram drafting for edit-heavy traffic costs almost nothing to run.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Product says any latency regression at peak loses users and finance says the GPUs go back regardless. You can measure for one week. Which number decides it, and what do you write down if the decision goes against your recommendation?</em></li>
+<li><em>Acceptance at peak is 0.55 against 0.8 off-peak. What explains a time-of-day difference in acceptance, and does it change the policy?</em></li>
+<li><em>What would you need to see in production to turn speculation off entirely?</em> For example, peak and off-peak step times converging after a move to longer batches, with acceptance stable, so the latency gain no longer exists anywhere.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Equation 1 assumes each draft token is accepted independently with the same alpha. Real acceptance is correlated: a draft that goes wrong on a hard token tends to stay wrong for the rest of the span, and easy spans (boilerplate, copied text) accept in long runs. Averages of alpha overstate gains when acceptance comes in bursts with long failures between them. Tree-structured drafts, where the target verifies several candidate continuations at once, change both the expected tokens and the verification cost, so the formula is a guide for linear drafts only.
+
+The break-even calculation counts linear-layer FLOPs and ignores draft cost, the draft's KV memory and the scheduler's overhead. A separate draft model takes KV capacity from the target, which lowers the maximum batch, which is a throughput cost the per-step model does not show. Sampling settings matter too: higher temperature flattens p and usually lowers the overlap with the draft, so a policy tuned at temperature 0 does not hold for a tenant that samples at 1.0.
+
+Published speedups are each method's authors measuring their method on their hardware, models and prompts, mostly at low concurrency. They establish that the mechanism works. The number for your fleet comes from acceptance and step time measured on your traffic at your batch sizes.
+
+<SelfRate id="lesson:inference/faster-cheaper/speculative-decoding" />

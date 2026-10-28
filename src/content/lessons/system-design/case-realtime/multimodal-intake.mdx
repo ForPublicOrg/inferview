@@ -1,0 +1,156 @@
+---
+title: "Multimodal intake: uploads, OCR and VLMs"
+track: system-design
+module: case-realtime
+order: 3
+kind: lesson
+level: senior
+minutes: 14
+summary: A chat file uploader is an ingestion pipeline with a person waiting, and its central decision is per file type, between extracted text, page images and retrieval, made against a token budget computed before the model is called.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Claude API docs, PDF support (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/build-with-claude/pdf-support
+    note: 32 MB request limit; 600 pages per request, 100 when the context window is under 1M tokens; each page is converted to an image and its text extracted alongside; text typically 1,500 to 3,000 tokens per page, plus image tokens per page; dense PDFs can fill the context before the page limit; .xlsx and .docx are not accepted in document blocks; Files API file_id keeps payloads small
+  - title: Claude API docs, Vision (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/build-with-claude/vision
+    note: "visual tokens = ceil(width/28) x ceil(height/28); high-resolution tier (Claude 4.7 and later) 2,576 px long edge and 4,784 tokens, standard tier 1,568 px and 1,568 tokens; 2000x1500 is 3,888 tokens on the high tier and 1,564 after downscaling on the standard tier; up to 600 images per request (100 on 200k-context models), 8000x8000 px max, a stricter per-image limit above 20 images (resize to 2,000 px to stay under it); 10 MB per image base64; base64 images are resent every turn, file_id avoids that"
+  - title: Claude API docs, API errors (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/errors
+    note: request size limits, Messages API 32 MB, Files API 500 MB; 413 request_too_large
+  - title: Claude API docs, Pricing (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: Claude Sonnet 5 base input $2 per million tokens
+  - title: Gemini API docs, Understand and count tokens (checked 2026-10-28)
+    url: https://ai.google.dev/gemini-api/docs/tokens
+    note: images up to 384 px on both sides count as 258 tokens; larger images are tiled into 768x768 tiles at 258 tokens each; audio 32 tokens per second; video figures differ within the page (263 per second, or about 100 and 300 per second at low and high resolution)
+  - title: Faysse et al., ColPali, Efficient Document Retrieval with Vision Language Models (arXiv 2407.01449, ICLR 2025)
+    url: https://arxiv.org/abs/2407.01449
+    note: multi-vector embeddings computed directly from page images with late interaction; the abstract reports that it outperforms text-extraction retrieval pipelines on the ViDoRe benchmark and is simpler and faster to index; the abstract gives no figures
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision per file: text, page images or retrieval
+
+A file attached to a chat ends up in the model's context in one of three forms. Extracted text is cheap and loses layout, figures and anything in a scan. Page images keep all of that and cost image tokens per page. Retrieval keeps neither in context: the file is indexed once and each question pulls the pages it needs. The pipeline's job is to choose one per file, from the file's type and a token estimate, before the model is called, and to tell the person what is happening while it works.
+
+The choice depends on the model family, because each one counts the same file differently. On the Claude API, a PDF in a document block is sent both ways at once: each page is converted to an image and its text is extracted alongside, so a page costs its text tokens (the docs give 1,500 to 3,000 for typical pages) plus its image tokens. Gemini counts an image up to 384 px on both sides as 258 tokens and tiles anything larger into 768 × 768 tiles at 258 tokens each. A per-page figure without the model family attached is not a number you can plan with.
+
+## Image tokens are arithmetic
+
+Claude reads images in 28 × 28 px patches, so an image costs ⌈width / 28⌉ × ⌈height / 28⌉ visual tokens, up to a per-model limit. Claude 4.7 and later models are on a high-resolution tier (2,576 px on the long edge, 4,784 tokens); other models are on a standard tier (1,568 px, 1,568 tokens). Above either limit the API downscales the image before counting.
+
+<Predict id="sys-intake-photo-tokens" question="A user attaches a 2,000 × 1,500 px phone photo to a chat on Claude Sonnet 5, which is on the high-resolution tier. How many visual tokens does it cost?" answer={3888} tolerance={10} unit="tokens">
+<p><b>3,888 tokens.</b> ⌈2000 / 28⌉ = 72 and ⌈1500 / 28⌉ = 54; 72 × 54 = 3,888, under both high-tier limits, so nothing is downscaled. At Sonnet 5's $2 per million input tokens that is about $0.0078 per photo per request. On a standard-tier model the same photo is downscaled to 1,269 × 952 and costs 1,564 tokens, which is what the Vision docs list. If the question does not need the extra detail, resizing before upload cuts the cost by about 2.5 times on the high tier and the upload time with it.</p>
+</Predict>
+
+The per-request figure is the one that compounds. Every request in a conversation resends the history, so a photo attached at turn one is paid for again at every later turn unless the prefix is cached. The Vision docs add a payload point: base64 images go over the wire on every turn, while a Files API `file_id` keeps the request small.
+
+## Limits that shape the pipeline
+
+The provider's limits decide where the pipeline has to split work, and they are hard failures, not slow paths.
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Limit (Claude API, checked 28 Oct 2026)</th><th>Value</th><th>Consequence</th></tr></thead>
+<tbody>
+<tr><td>Messages API request size</td><td>32 MB</td><td>Large files go through the Files API (500 MB per request) and are referenced by ID</td></tr>
+<tr><td>PDF pages per request</td><td>600, or 100 when the context window is under 1M tokens</td><td>Long documents are split, or indexed for retrieval</td></tr>
+<tr><td>PDF text per page</td><td>typically 1,500 to 3,000 tokens, plus page image tokens</td><td>Dense documents fill the context before the page limit</td></tr>
+<tr><td>Images per request</td><td>600, or 100 on 200k-context models</td><td>Above 20 images a stricter per-image size applies; resizing to 2,000 px avoids it</td></tr>
+<tr><td>Image file</td><td>10 MB base64, 8000 × 8000 px</td><td>Resize on the client before upload</td></tr>
+<tr><td>Document block formats</td><td>PDF and plain text; not .xlsx or .docx</td><td>Office files are converted to text or PDF in the pipeline</td></tr>
+</tbody>
+</table>
+</div>
+
+A 200-page contract on a model with a 200k-token window shows how these combine. At 1,500 to 3,000 text tokens a page it is 300,000 to 600,000 tokens of text before any page images, and the page limit for that window is 100. It cannot be attached whole; it has to be split or retrieved. The 1,500 figure is the docs' typical low end, so a sparse document may fit where a dense one does not, and the token-counting endpoint gives the real number for a given file.
+
+## The pipeline
+
+**Upload.** The client uploads straight to object storage with a short-lived signed URL, in parts for large files so a dropped connection resumes rather than restarts. The application server never proxies the bytes. The client resizes images to the model tier's long edge before upload, because the provider would downscale them anyway and the bytes cost upload time on a phone.
+
+**Identify.** On the storage completion event, a worker reads the file's magic bytes rather than trusting its extension, records type, size and page count, and rejects what the pipeline cannot route. A PDF with a text layer and one without are different types for routing purposes.
+
+**Route.** Born-digital PDFs and text files go to text extraction, with page images kept for pages that carry figures or tables. Scans go to page images or to OCR, chosen by what the questions will be (layout and handwriting favour page images; long scanned text favours OCR, which is cheaper per page and searchable). Office files are converted. Audio becomes a transcript; Gemini counts raw audio at 32 tokens a second, which is the comparison to make before sending audio as audio.
+
+**Budget.** Before the file is attached, the worker estimates tokens per file and for the conversation. Under the budget, the file goes into context, cached so follow-up questions read it from the cache. Over it, the file is indexed and each question retrieves pages. For visually rich documents, retrieval can run over page images instead of extracted text: ColPali embeds page images directly, and its authors report that it beats text-extraction pipelines on their ViDoRe benchmark while being simpler to index. The cost is a multi-vector index, many vectors per page rather than one per chunk, which is larger to store.
+
+**Progress.** Each stage emits an event (uploaded, identified, pages processed out of total, ready), streamed to the client. A person who sees "page 31 of 120" waits; a person who sees a spinner re-uploads, and a re-upload is a second copy of the file going through every stage unless uploads are deduplicated by content hash.
+
+```python
+import math
+
+# Claude vision, checked 2026-10-28: 28 px patches; (max long edge px, max visual tokens) per tier.
+TIERS = {"high": (2576, 4784), "standard": (1568, 1568)}
+
+def image_tokens(w, h, tier):
+    edge, cap = TIERS[tier]
+    tokens = math.ceil(w / 28) * math.ceil(h / 28)
+    if max(w, h) > edge or tokens > cap:
+        return None          # the API downscales it; count with the token-counting endpoint
+    return tokens
+
+def route(kind, pages=0, text_layer=False, size=(0, 0), budget=100_000, tier="high"):
+    if kind == "image":
+        t = image_tokens(*size, tier)
+        return f"inline image, {t} tokens" if t else "resize client-side, then count"
+    if kind == "pdf" and text_layer:
+        low, high = 1_500 * pages, 3_000 * pages      # Claude PDF text range per page, before page images
+        if high <= budget:
+            return f"whole document, {low:,}-{high:,} text tokens plus page images"
+        return f"extract and index; retrieve pages per question ({low:,}-{high:,} text tokens is over budget)"
+    return "page images or OCR in a background job, then the same budget check"
+
+print(route("image", size=(1400, 1000)))
+print(route("image", size=(1400, 1000), tier="standard"))
+print(route("pdf", pages=20, text_layer=True))
+print(route("pdf", pages=40, text_layer=True))
+print(route("pdf", pages=12, text_layer=False))
+```
+
+```text
+inline image, 1800 tokens
+resize client-side, then count
+whole document, 30,000-60,000 text tokens plus page images
+extract and index; retrieve pages per question (60,000-120,000 text tokens is over budget)
+page images or OCR in a background job, then the same budget check
+```
+
+The 100,000-token attachment budget is a choice, not a limit. It leaves room in a 200k window for the system prompt, the conversation and the reply; a team on a 1M-token model could set it higher and pay for every token on every turn that is not served from the cache.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+Design the file uploader for a chat product. Scenario mix: 60 percent PDFs (half scanned), 30 percent phone photos and screenshots, 10 percent spreadsheets; files up to 200 MB. The product team wants an answer about any file within 10 seconds of upload, and finance has capped attachment spend per conversation. Two engineers, six weeks.
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Direct-to-storage resumable upload, a worker that identifies type by content, and a router: photos resized on the client and sent inline, text PDFs extracted and attached when under the token budget, scans and long documents indexed in the background with page-level retrieval, spreadsheets converted to text per sheet. The 10-second target holds for photos and short text PDFs; for a 200-page scan it cannot, so the first answer comes from the pages processed so far, labelled as partial, with progress shown. With two engineers I build the router and the budget check first and buy OCR rather than building it. What I give up is complete answers on large scans in the first minute.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The 10-second target and the spend cap conflict on large files: attaching a whole document is fastest to first answer and most expensive per turn; indexing is cheap per turn and slow to first answer. I would choose per file by the token estimate and tell the person which path their file took.</p>
+<p>Spreadsheets are the trap. Converted to text, a 10,000-row sheet can exceed any budget and the model will summarise numbers it cannot add; I would route questions that need arithmetic over a sheet to a code-execution tool on the parsed data rather than into context.</p>
+<p>Failure mode: retrieval over a scan misses the answer when OCR quality is poor on the relevant page, and the model answers confidently from neighbouring pages. I would show the pages an answer used and log retrieval misses reported by users as the eval set for the OCR choice.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Finance halves the per-conversation spend cap. Which file types lose inline handling, and what do you tell the product team in writing?</em></li>
+<li><em>What would you need to see in production to switch scanned documents from OCR to page-image retrieval?</em></li>
+<li><em>The model is replaced by one on the standard image tier. Which numbers in your design change, and which files now get worse answers?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The token figures are Claude's and Gemini's as documented on 28 October 2026, and they change with model tiers; a new tier can triple the cost of the same photo. Count with the provider's token-counting endpoint on a sample of your own files before committing to a budget, because the PDF text range is the docs' "typical" and your documents may not be.
+
+The routing above treats the model's own document understanding as the expensive path and extraction as the cheap one. For layout-heavy documents (forms, invoices, slides) extracted text can be wrong in ways that are hard to detect, and page images may be the only reliable input; the cheaper path then costs more in wrong answers than it saves in tokens. ColPali's reported advantage is on its authors' benchmark, and a multi-vector index has a storage and serving cost to measure before adopting it.
+
+<SelfRate id="lesson:system-design/case-realtime/multimodal-intake" />

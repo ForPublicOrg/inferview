@@ -1,0 +1,207 @@
+---
+// A small HNSW built in the browser: 2,000 clustered 8-dimension points (16 clusters, seeded, so every visit sees the
+// same graph), M 8, layer-0 cap 16, efConstruction 40, mL 1/ln(M). The reader picks the neighbour-selection rule, a
+// filter, the filter strategy and efSearch; the widget runs 40 fixed queries and reports recall@10 against brute force
+// over the rows that pass the filter, rows returned and distance computations per query. Props: title.
+interface Props {
+  title?: string;
+}
+const { title = 'HNSW recall against brute force' } = Astro.props;
+---
+<div class="widget" data-rvshnsw>
+  <header><h4>{title}</h4><span class="tiny">2,000 points, 40 queries, k = 10</span></header>
+  <div class="row" style="margin-bottom: 10px; flex-wrap: wrap; gap: 8px">
+    <span class="label">Neighbour selection</span>
+    <span class="toggle" role="group" aria-label="Neighbour selection">
+      <button type="button" data-sel="h" aria-pressed="true">Heuristic</button>
+      <button type="button" data-sel="n" aria-pressed="false">Nearest M</button>
+    </span>
+  </div>
+  <div class="row" style="margin-bottom: 10px; flex-wrap: wrap; gap: 8px">
+    <span class="label">Filter keeps</span>
+    <span class="toggle" role="group" aria-label="Filter selectivity">
+      <button type="button" data-filt="100" aria-pressed="true">All rows</button>
+      <button type="button" data-filt="10" aria-pressed="false">10%</button>
+      <button type="button" data-filt="1" aria-pressed="false">1%</button>
+    </span>
+  </div>
+  <div class="row" style="margin-bottom: 10px; flex-wrap: wrap; gap: 8px">
+    <span class="label">Filter applied</span>
+    <span class="toggle" role="group" aria-label="Filter strategy">
+      <button type="button" data-mode="post" aria-pressed="true">After the search</button>
+      <button type="button" data-mode="walk" aria-pressed="false">During traversal</button>
+    </span>
+  </div>
+  <label class="kv" for="rvs-ef"><span>efSearch</span><b data-ef-out>40</b></label>
+  <input type="range" id="rvs-ef" min="10" max="160" step="10" value="40" data-ef />
+  <div class="meter" style="grid-template-columns: repeat(auto-fit, minmax(130px, 1fr))" aria-live="polite">
+    <div><b data-recall>...</b><span>mean recall@10</span></div>
+    <div><b data-rows>...</b><span>rows returned per query</span></div>
+    <div><b data-comps>...</b><span>distance computations per query (brute force: 2,000)</span></div>
+  </div>
+  <p class="tiny" style="margin: 10px 0 0" data-note></p>
+</div>
+
+<script>
+  type Pair = [number, number];
+  const N = 2000, D = 8, Q = 40, K = 10, M = 8, M0 = 16, EFC = 40, ML = 1 / Math.log(M);
+
+  function mulberry(seed: number) {
+    return () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const r = mulberry(7);
+  const gauss = () => Math.sqrt(-2 * Math.log(r() + 1e-12)) * Math.cos(2 * Math.PI * r());
+  const centres = Array.from({ length: 16 }, () => Array.from({ length: D }, () => gauss() * 4));
+  const point = () => centres[Math.floor(r() * 16)]!.map((x) => x + gauss());
+  const X = Array.from({ length: N }, point);
+  const cat = X.map(() => Math.floor(r() * 100));
+  const QS = Array.from({ length: Q }, point);
+  const levelDraws = X.map(() => Math.floor(-Math.log(r() + 1e-12) * ML));
+
+  let comps = 0;
+  const dist = (a: number[], b: number[]) => {
+    comps++;
+    let s = 0;
+    for (let i = 0; i < D; i++) { const d = a[i]! - b[i]!; s += d * d; }
+    return s;
+  };
+  const byDist = (a: Pair, b: Pair) => a[0] - b[0];
+
+  type Graph = { nb: number[][][]; ep: number; top: number };
+
+  function searchLayer(g: Graph, q: number[], eps: number[], ef: number, lc: number, pass?: (i: number) => boolean): Pair[] {
+    const seen = new Set(eps);
+    const C: Pair[] = eps.map((e) => [dist(q, X[e]!), e]);
+    let W: Pair[] = C.filter((c) => !pass || pass(c[1]));
+    while (C.length) {
+      C.sort(byDist);
+      const c = C.shift()!;
+      if (W.length >= ef && c[0] > W[W.length - 1]![0]) break;
+      for (const e of g.nb[c[1]]![lc] ?? []) {
+        if (seen.has(e)) continue;
+        seen.add(e);
+        const d = dist(q, X[e]!);
+        const far = W.length ? W[W.length - 1]![0] : Infinity;
+        if (W.length < ef || d < far) {
+          C.push([d, e]);
+          if (!pass || pass(e)) {
+            W.push([d, e]);
+            W.sort(byDist);
+            if (W.length > ef) W.pop();
+          }
+        }
+      }
+    }
+    return W.sort(byDist);
+  }
+
+  function build(heuristic: boolean): Graph {
+    const g: Graph = { nb: [], ep: -1, top: -1 };
+    const select = (cands: Pair[], m: number) => {
+      if (!heuristic) return cands.slice(0, m).map((c) => c[1]);
+      const out: number[] = [];
+      for (const [d, id] of cands) {
+        if (out.length >= m) break;
+        if (out.every((o) => dist(X[id]!, X[o]!) > d)) out.push(id);
+      }
+      return out;
+    };
+    for (let i = 0; i < N; i++) {
+      const l = levelDraws[i]!;
+      g.nb.push(Array.from({ length: l + 1 }, () => []));
+      if (g.ep < 0) { g.ep = i; g.top = l; continue; }
+      let eps = [g.ep];
+      for (let lc = g.top; lc > l; lc--) eps = [searchLayer(g, X[i]!, eps, 1, lc)[0]![1]];
+      for (let lc = Math.min(g.top, l); lc >= 0; lc--) {
+        const W = searchLayer(g, X[i]!, eps, EFC, lc);
+        const cap = lc === 0 ? M0 : M;
+        const chosen = select(W, M);
+        g.nb[i]![lc] = chosen;
+        for (const e of chosen) {
+          const list = g.nb[e]![lc]!;
+          list.push(i);
+          if (list.length > cap) g.nb[e]![lc] = select(list.map((o): Pair => [dist(X[e]!, X[o]!), o]).sort(byDist), cap);
+        }
+        eps = W.map((w) => w[1]);
+      }
+      if (l > g.top) { g.top = l; g.ep = i; }
+    }
+    return g;
+  }
+
+  function query(g: Graph, q: number[], ef: number, pass: ((i: number) => boolean) | undefined, mode: string): Pair[] {
+    let ep = g.ep;
+    for (let lc = g.top; lc > 0; lc--) ep = searchLayer(g, q, [ep], 1, lc)[0]![1];
+    if (!pass || mode === 'post') return searchLayer(g, q, [ep], ef, 0).filter((w) => !pass || pass(w[1])).slice(0, K);
+    return searchLayer(g, q, [ep], ef, 0, pass).slice(0, K);
+  }
+
+  const graphs = new Map<string, Graph>();
+  const truth = new Map<number, Set<number>[]>();
+  const truthFor = (sel: number) => {
+    if (!truth.has(sel)) {
+      truth.set(sel, QS.map((q) => {
+        const rows: Pair[] = [];
+        for (let i = 0; i < N; i++) if (cat[i]! < sel) rows.push([dist(q, X[i]!), i]);
+        return new Set(rows.sort(byDist).slice(0, K).map((p) => p[1]));
+      }));
+    }
+    return truth.get(sel)!;
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-rvshnsw]').forEach((root) => {
+    const state = { sel: 'h', filt: 100, mode: 'post' };
+    const ef = root.querySelector<HTMLInputElement>('[data-ef]')!;
+    const out = (s: string) => root.querySelector<HTMLElement>(s)!;
+
+    const render = () => {
+      const efv = Number(ef.value);
+      out('[data-ef-out]').textContent = String(efv);
+      if (!graphs.has(state.sel)) graphs.set(state.sel, build(state.sel === 'h'));
+      const g = graphs.get(state.sel)!;
+      const sel = state.filt;
+      const pass = sel === 100 ? undefined : (i: number) => cat[i]! < sel;
+      const want = truthFor(sel);
+      let recall = 0, rows = 0;
+      comps = 0;
+      QS.forEach((q, qi) => {
+        const res = query(g, q, efv, pass, state.mode);
+        const t = want[qi]!;
+        recall += res.filter((p) => t.has(p[1])).length / t.size;
+        rows += res.length;
+      });
+      out('[data-recall]').textContent = (recall / Q).toFixed(2);
+      out('[data-rows]').textContent = (rows / Q).toFixed(1);
+      out('[data-comps]').textContent = Math.round(comps / Q).toLocaleString('en-US');
+      const passing = cat.filter((c) => c < sel).length;
+      out('[data-note]').textContent =
+        sel === 100
+          ? 'No filter: the strategy buttons have no effect.'
+          : `${passing.toLocaleString('en-US')} of 2,000 rows pass the filter, which is independent of position. ` +
+            (state.mode === 'post'
+              ? `The search keeps ${efv} candidates, then drops those that fail.`
+              : 'Failing nodes are still walked through but never enter the result list, so the walk lasts until 10 passing rows are found.');
+    };
+
+    const wire = (attr: string, set: (v: string) => void) => {
+      const btns = [...root.querySelectorAll<HTMLButtonElement>(`[${attr}]`)];
+      btns.forEach((b) =>
+        b.addEventListener('click', () => {
+          btns.forEach((o) => o.setAttribute('aria-pressed', String(o === b)));
+          set(b.getAttribute(attr)!);
+          render();
+        }),
+      );
+    };
+    wire('data-sel', (v) => { state.sel = v; });
+    wire('data-filt', (v) => { state.filt = Number(v); });
+    wire('data-mode', (v) => { state.mode = v; });
+    ef.addEventListener('input', render);
+    render();
+  });
+</script>

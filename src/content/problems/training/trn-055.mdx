@@ -1,0 +1,123 @@
+---
+id: trn-055
+title: Responses keep getting longer and accuracy has stopped moving
+subtitle: rank the explanations, then pick the fix and its cost
+track: training
+module: rl
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 25
+core: false
+tags: [grpo, dr-grpo, dapo, loss-normalisation, response-length]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Liu et al., Understanding R1-Zero-Like Training, A Critical Perspective (v2, 2025-10-06)
+    url: https://arxiv.org/abs/2503.20783
+    note: "GRPO's 1/|o_i| term penalises long incorrect responses less per token, so incorrect responses lengthen; std normalisation gives prompts with near-constant reward more weight; Dr. GRPO removes both and divides by a constant such as the generation budget; trl, OpenRLHF, verl and others normalised by response length. The paper reports 43.3% on AIME 2024 with a 7B base. Checked 2026-10-28 (HTML version read for the mechanism)."
+  - title: Yu et al., DAPO (2025)
+    url: https://arxiv.org/html/2503.14476
+    note: "token-level loss so longer sequences carry more weight and unhealthy growth in length and entropy is penalised; overlong reward shaping with a 16,384-token expected maximum and a 4,096-token soft penalty band, penalty ((L_max - L_cache) - |y|) / L_cache inside the band and -1 beyond L_max; overlong filtering masks truncated samples. Checked 2026-10-28."
+  - title: Hugging Face TRL, GRPO Trainer (main branch docs)
+    url: https://huggingface.co/docs/trl/main/en/grpo_trainer
+    note: "on main as of 2026-10-28: loss_type defaults to 'dapo'; 'grpo' averages each sequence by its length; 'dr_grpo' divides by the maximum completion length; scale_rewards defaults to 'group', with False and 'batch' as alternatives."
+choices:
+  - text: Dividing each response's loss by its own length shrinks the per-token penalty on long wrong answers, so wrong answers grow
+    correct: true
+    why: Only the incorrect responses lengthen, and they are exactly the ones whose negative advantage is spread thinner the longer they run.
+  - text: Dividing advantages by the group's standard deviation over-weights nearly solved prompts, and those prompts reward long answers
+    correct: false
+    why: The difficulty weighting is a real defect in this code, but correct responses barely lengthen, which a push toward long rewarded answers would show first.
+  - text: With no KL term nothing ties the policy to the base model, so its length drifts upward as it wanders away from the start
+    correct: false
+    why: A missing anchor allows drift in any direction; it does not explain why the drift is confined to wrong answers.
+  - text: Reasoning RL lengthens outputs by design; the model is learning to think for longer, so there is no defect in this run at all
+    correct: false
+    why: Useful thinking would lengthen correct answers and lift accuracy; here accuracy is flat and the growth is in wrong and truncated responses.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The round">
+"Our GRPO run's responses have quadrupled in length over 400 steps and accuracy stopped improving at step 200. What is going on, and what do you change?"
+</Callout>
+
+As a scenario: R1-Zero-style GRPO from a 7B base model on maths prompts, G = 8, generation cap 4,096 tokens, no KL term, a binary reward from a boxed-answer checker. The loss and reward, from an internal fork of an open-source trainer:
+
+```python
+def advantages(rewards_by_group):
+    out = []
+    for r in rewards_by_group:                 # r: tensor of shape [G]
+        out.append((r - r.mean()) / (r.std() + 1e-4))
+    return torch.cat(out)
+
+def policy_loss(logp, old_logp, adv, mask, eps=0.2):
+    ratio = torch.exp(logp - old_logp)
+    surr = torch.minimum(ratio * adv[:, None], ratio.clamp(1 - eps, 1 + eps) * adv[:, None])
+    per_seq = (surr * mask).sum(dim=1) / mask.sum(dim=1)
+    return -per_seq.mean()
+
+def reward(text, gold):
+    ans = extract_boxed(text)                  # None when the response hit the cap first
+    return 1.0 if ans is not None and ans == gold else 0.0
+```
+
+Training metrics on a fixed probe set:
+
+| step | accuracy | mean length, correct | mean length, incorrect | truncated at the cap |
+|---|---|---|---|---|
+| 0 | 28% | 610 | 820 | 1% |
+| 100 | 39% | 690 | 1,350 | 4% |
+| 200 | 42% | 720 | 2,100 | 11% |
+| 300 | 43% | 740 | 2,900 | 22% |
+| 400 | 42% | 760 | 3,500 | 31% |
+
+Nobody has read transcripts or split the metrics by prompt difficulty. Pick the explanation, rank the rest, and say what you change for the next run.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for twenty truncated transcripts from step 400 and what fills their last thousand tokens.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the length curves split by the prompt's pass rate at step 0.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what share of each batch's tokens come from responses scored wrong, at step 0 and at step 400.</p></details>
+
+## Answer
+
+**The cause is the per-response length normaliser.** `per_seq` divides each response's summed token loss by its own length before averaging over the batch. For a wrong answer the advantage is negative, and the push-down per token is that advantage divided by length. Computed for a group with one correct answer out of eight: `r.std()` in PyTorch uses the n - 1 denominator, so the group std is 0.354 and the wrong samples' advantage is (0 - 0.125) / 0.354 = -0.354. At 400 tokens each token of a wrong answer carries -0.354 / 400 = -0.00088; at 3,000 tokens, -0.00012, 7.5 times less. The policy is pushed away from short wrong answers far harder than from long ones, so the wrong answers that survive are long. Liu et al. name this bias and show it lengthens incorrect responses in particular, which is the signature in the table: correct responses grow by 150 tokens, incorrect ones by 2,680.
+
+**Why the others are tempting, and how they rank.**
+
+1. *The standard-deviation scaling* is a real defect and ranks second. A prompt the policy solves seven times in eight has a group std of 0.354, the same as a prompt solved once in eight, while a prompt solved four times in eight has 0.535; dividing by it gives nearly solved and nearly failed prompts more weight than their information warrants. Liu et al. call this a difficulty bias. It distorts which prompts drive learning but does not single out wrong answers for lengthening.
+2. *Truncated responses scored as wrong* compound the main defect. A response cut at 4,096 tokens gets the same 0 as a wrong answer but carries the smallest per-token penalty of any response in the batch, so running to the cap is the cheapest way to be wrong. The truncation rate going from 1% to 31% is that effect.
+3. *No KL term* is TRL's current default and DAPO's choice for reasoning RL. It removes an anchor but has no reason to act on wrong answers only.
+4. *Reasoning RL lengthens outputs* is true of runs where length grows with accuracy. Here accuracy is flat from step 200 while length keeps growing, and the growth is in the wrong answers.
+
+**What to collect.** Truncated transcripts, to see whether the tail is repetition or genuine work; length by difficulty bucket; and a short A/B of the same run under a fixed normaliser. Without them, change the normaliser anyway: the bias is a property of the code, not a hypothesis.
+
+**The fix: two defensible normalisers, plus a decision on truncation.**
+
+- *A constant denominator (Dr. GRPO).* Divide the summed token loss by a constant such as the generation cap. Every token of every response gets the same weight. Cost: the gradient's scale now depends on the cap, so changing the cap from 4,096 to 8,192 halves the effective learning rate unless you retune it.
+- *A token mean over the batch (DAPO, TRL's default on main).* Divide by the total number of tokens in the batch. Every token weighs the same within a batch. Cost: the gradient scale changes with batch composition, so a batch of long responses takes smaller steps per token than a batch of short ones.
+
+For truncation, choose between DAPO's soft overlong penalty and masking truncated samples out of the loss. The quantity to choose is the penalty band. DAPO used a 4,096-token band below a 16,384-token maximum, a quarter of the budget; a band of a quarter to an eighth of the cap is reasonable. A band that starts below the length of typical correct answers (about 760 tokens here) is unreasonable, because it penalises answers the task needs. Masking truncated samples avoids penalising long correct work but throws away the signal that running out of budget is a failure.
+
+The constraint conflict is token cost against accuracy on the hardest prompts: the old normaliser is buying length that costs inference money on every future query, and any fix that shortens responses risks cutting the long reasoning that hard prompts need.
+
+My pick: the token-mean loss with the soft overlong penalty, std scaling turned off or moved to batch level, and per-bucket length tracking.
+
+**Failure mode of the recommendation.** Removing the bias also removes its accidental benefit of letting hard prompts run long. If the hardest bucket's accuracy falls after the change while the easy buckets hold, the overlong penalty is too tight for that bucket, and a single band for all prompts is the wrong shape.
+
+## Follow-ups
+
+- Switching normaliser costs a restart from step 0 and two weeks of compute; the team wants to patch the running job at step 400. What do you lose by patching mid-run, and what do you put in the run log?
+- What would you need to see to keep length normalisation per response for this task?
+- The serving team wants a hard 1,500-token cap in RL to control inference cost; the research lead says that caps capability. How do you settle it with data rather than rank?
+- Your token-mean run's length stops growing, but the step-400 transcripts still end in repeated lines. Which part of the setup do you inspect next?
+
+## Common mistakes
+
+- Reading longer responses as more reasoning without splitting by correctness.
+- Blaming the missing KL term, which acts on all responses equally.
+- Fixing the normaliser and leaving truncated responses indistinguishable from wrong answers.
+- Changing the normaliser and the cap at once, then misreading the change in effective learning rate as a change in the method.

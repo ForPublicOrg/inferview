@@ -1,0 +1,161 @@
+---
+title: "Serving generation models: steps, distillation and batching by resolution"
+track: multimodal
+module: generation
+order: 2
+kind: lesson
+level: senior
+minutes: 13
+summary: An image request's latency is set by steps times guidance passes times the cost of one pass at its resolution, so the serving levers rank as fewer steps, then distillation, then text-encoder and batching work, and this lesson prices each on a stated model.
+prerequisites: [multimodal/generation/generation-models]
+updated: 2026-10-28
+sources:
+  - title: "Esser et al., Scaling Rectified Flow Transformers for High-Resolution Image Synthesis (arXiv 2403.03206, 2024-03-05)"
+    url: https://arxiv.org/abs/2403.03206
+    note: "Largest model 8B at depth 38, hidden size 64 times depth; autoencoder f = 8, 16 channels; text encoders CLIP-L/14, CLIP-G/14 and T5-XXL (4.7B parameters); dropping T5 at inference gives human preference win rates of 50% aesthetics, 46% prompt following and 38% typography against the full model; Table 6 relative CLIP score drop against 50 steps for depth 38: 2.71% at 5, 0.14% at 10, 0.08% at 20; fine-tuned at 1024 px with timestep shift 3.0. Checked 2026-10-28."
+  - title: "Lipman et al., Flow Matching for Generative Modeling (arXiv 2210.02747, v2 2023-02-08)"
+    url: https://arxiv.org/abs/2210.02747
+    note: "With fixed-step solvers the OT model needs roughly 60% of the function evaluations of diffusion models to reach the same numerical error, measured against 1,000-NFE solutions on ImageNet 32x32. Checked 2026-10-28."
+  - title: "Rombach et al., High-Resolution Image Synthesis with Latent Diffusion Models (arXiv 2112.10752, v2 2022-04-13)"
+    url: https://arxiv.org/abs/2112.10752
+    note: "Diffusion in a pretrained autoencoder's latent space; the decoder runs once per sample; LDM-4 and LDM-8 give the best quality and throughput trade in the paper's sweep. Checked 2026-10-28."
+  - title: "Salimans and Ho, Progressive Distillation for Fast Sampling of Diffusion Models (arXiv 2202.00512, ICLR 2022)"
+    url: https://arxiv.org/abs/2202.00512
+    note: "Each distillation round halves the sampling steps; from samplers of up to 8,192 steps down to 4, with FID 3.0 on CIFAR-10 in 4 steps. Checked 2026-10-28."
+  - title: "Sauer, Lorenz, Blattmann and Rombach, Adversarial Diffusion Distillation (arXiv 2311.17042, 2023-11-28)"
+    url: https://arxiv.org/abs/2311.17042
+    note: "Samples in 1 to 4 steps; the authors (Stability AI) report reaching SDXL's performance in four steps. A vendor's own evaluation. Checked 2026-10-28."
+  - title: "NVIDIA H100 product page, specifications"
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: "H100 SXM: BF16 Tensor Core 1,979 TFLOPS with sparsity (dense is half), 80 GB, 3.35 TB/s memory bandwidth. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+An image product has a latency target and a GPU budget, and generation cost scales with three things the request controls: sampling steps, resolution (and frames, for video), and whether guidance runs. The serving path is the choice of which of those to cut, in which order, and what quality evidence each cut needs. Language-model serving intuition transfers badly here: there is no per-token decode, a single request at 1024² already fills the GPU, and the expensive lever is a training run, not a cache.
+
+## Cost one request
+
+The model for this lesson is the shape the Stable Diffusion 3 paper publishes for its largest model: 8B parameters, 38 layers, hidden size 64 × 38 = 2,432, a 16-channel latent at downsampling factor 8. At 1024 × 1024 the latent is 128 × 128; in 2 × 2 patches that is 4,096 tokens. Text tokens add a little and are left out here.
+
+One forward pass, with the cost model from the previous lesson:
+
+- Weight multiplies: 2 × 8 × 10⁹ × 4,096 ≈ 65.5 TFLOP.
+- Attention: 4 × 38 × 4,096² × 2,432 ≈ 6.2 TFLOP.
+- Total ≈ 71.7 TFLOP per pass.
+
+The request, as a scenario: 28 steps with guidance on every step is 56 passes, 56 × 71.7 ≈ 4.0 PFLOP. To turn that into time you need a sustained throughput, and that is a measurement, not a datasheet number. NVIDIA lists the H100 SXM at 1,979 BF16 TFLOPS with sparsity, so about 990 dense. Assume, as a scenario, that your denoiser sustains 400 TFLOP/s on one H100; then the denoiser alone takes 4.0 × 10¹⁵ / 4 × 10¹⁴ ≈ 10 s.
+
+Everything else runs once per request. T5-XXL, the largest of the three text encoders, has 4.7B parameters; for a 256-token prompt its forward pass is 2 × 4.7 × 10⁹ × 256 ≈ 2.4 TFLOP, 0.06% of the denoiser's 4.0 PFLOP. The autoencoder's decoder at 1024² is a convolutional network over the full-resolution output; it is cheap in FLOPs relative to the denoiser and often memory-bound, so profile it rather than estimate it.
+
+So with a 2 s p50 target, the denoiser is the whole problem, and inside it the step count and the guidance factor multiply each other.
+
+## Lever 1: fewer steps on the model you have
+
+If the model was trained with flow matching or rectified flow, steps are a config value. The Stable Diffusion 3 paper's Table 6 gives the depth-38 model's relative CLIP score drop against 50 steps: 0.08% at 20 steps, 0.14% at 10 and 2.71% at 5. The flow matching paper found its OT model needed roughly 60% of a diffusion model's function evaluations for the same numerical error with fixed-step solvers.
+
+<Predict id="mml-gen-serving-10-steps" question="Same 8B model at 1024² (71.7 TFLOP per pass). Cut from 28 to 10 steps, guidance still on every step. Denoiser compute per request, in PFLOP?" answer={1.43} tolerance={0.05} unit="PFLOP">
+<p>10 steps × 2 passes × 71.7 TFLOP = <b>1.43 PFLOP</b>, 2.8 times less than at 28 steps. At the scenario's 400 TFLOP/s that is about 3.6 s, still over a 2 s target. Steps alone do not get there; the next cut is either guidance or a distilled model.</p>
+</Predict>
+
+What CLIP score does not measure: text rendered in the image, hands, fine texture. The evidence for a step cut is a paired comparison on your prompts with fixed seeds (same noise, two step counts), scored by CLIP for adherence and by a blind human preference sample for what CLIP misses. The paper's numbers tell you where to look, not what to ship.
+
+For a model trained as DDPM-style diffusion, the same cut with the same sampler degrades much faster; a better ODE solver recovers some of it, and beyond that you are in lever 2.
+
+## Lever 2: distillation
+
+Distillation trains a student that takes fewer steps to reach what the teacher reaches in many. Progressive distillation (Salimans and Ho) halves the step count each round, going from samplers of up to 8,192 steps down to 4 and reporting FID 3.0 on CIFAR-10 at 4 steps. Adversarial diffusion distillation (Sauer and colleagues, Stability AI) samples in 1 to 4 steps and reports matching SDXL at four steps; that is the vendor's own evaluation.
+
+Costs, which are of a different kind from lever 1:
+
+- **A training run** per base model, repeated whenever the base model changes. If you fine-tune the base model monthly for new styles, distillation becomes a monthly pipeline stage, not a one-off.
+- **A new quality sign-off.** Few-step students trade something: diversity, prompt adherence on long prompts, or detail. Which one depends on the method and the prompt set; the published numbers come from benchmarks that may not contain your users' prompts.
+- **Guidance behaviour changes.** Whether the student still needs two passes per step depends on how it was distilled. Check it on the checkpoint you deploy; it decides whether 4 steps means 4 passes or 8.
+
+At 4 steps without guidance the scenario request is 4 × 71.7 ≈ 287 TFLOP, about 0.7 s at 400 TFLOP/s; with guidance, double that. That is the only lever in this lesson that reaches a sub-second denoiser on one GPU at 1024².
+
+## Lever 3: what runs once
+
+**Text encoders.** Caching the encoder output by prompt is cheap to build and saves 0.06% of compute for a unique prompt, so its value is the hit rate on repeated prompts (templates, retries, variations of one prompt with new seeds). Variations are the common case in image products: one prompt, four seeds. Encode once and batch the four.
+
+The bigger text-encoder decision is memory. T5-XXL's 4.7B parameters are about 9.4 GB in 16-bit weights, next to 16 GB for the 8B denoiser. The Stable Diffusion 3 paper tested dropping T5 at inference: against the full model, human raters preferred the no-T5 model 50% of the time on aesthetics, 46% on prompt following and 38% on typography. Dropping it is a defensible trade for a product without text in images and a bad one for a poster generator.
+
+**Negative prompts.** The unconditional pass usually runs on an empty or fixed negative prompt; encode it once at startup, not per request.
+
+## Lever 4: batching by resolution
+
+Language-model serving batches to raise arithmetic intensity during decode. A 1024² image does not need that: each weight matrix multiplies 4,096 token rows per pass, about 4,096 FLOP per byte of 16-bit weight read (2 × 4,096 FLOP per two-byte weight). The H100's ratio of dense compute to memory bandwidth is about 990 / 3.35 ≈ 295 FLOP per byte, so a single 1024² request is already compute-bound. Batching four of them raises throughput only marginally and multiplies each one's latency by about four.
+
+Batching does pay at small resolutions: a 256² image in this latent is 16 × 16 = 256 tokens, 256 FLOP per weight byte, under the 295 ratio, so batching thumbnails or previews raises throughput.
+
+The trap is mixing resolutions in one batch. The transformer runs over a sequence; requests of different lengths must be padded to the longest or run in separate batches.
+
+<Predict id="mml-gen-padding-waste" question="A batch holds one 1024² request (4,096 tokens) and three 512² requests (1,024 tokens each), all padded to 4,096 tokens. Counting the weight-multiply term only, what percentage of the batch's compute is spent on padding?" answer={56.25} tolerance={1} unit="%">
+<p>Computed tokens: 4 × 4,096 = 16,384. Useful: 4,096 + 3 × 1,024 = 7,168. Padding: 9,216 / 16,384 = <b>56.25%</b>. Attention wastes more, since it scales with the square of the padded length. Bucket by token count: aspect ratios that share a token count can share a batch.</p>
+</Predict>
+
+Requests in a batch also step in lockstep, so mixing step counts means the short ones either wait or leave the batch early. Batch keys for a generation queue are therefore (model, resolution bucket, step count, guidance on or off), and the scheduler can admit new requests at step boundaries the way an LLM server admits at token boundaries.
+
+## Lever 5: more GPUs per request
+
+Tensor or sequence parallelism over two to eight GPUs cuts the latency of one request, because the denoiser is a transformer and the same parallel kernels apply. It does not cut cost: the FLOPs are the same, now spread over more GPUs with communication added. Use it when the latency target cannot be met any other way and the budget allows more GPU-seconds per image; it is the usual path for video, where one clip's passes are far too large for one GPU.
+
+## The ranking, on the scenario
+
+| Change | Passes | PFLOP | Denoiser at 400 TFLOP/s |
+|---|---|---|---|
+| 28 steps, guided | 56 | 4.02 | 10.0 s |
+| 10 steps, guided | 20 | 1.43 | 3.6 s |
+| 4 steps, distilled, guided | 8 | 0.57 | 1.4 s |
+| 4 steps, distilled, unguided | 4 | 0.29 | 0.7 s |
+
+Every row is computed from 71.7 TFLOP per pass; the 400 TFLOP/s is a scenario assumption. Text-encoder caching and batching change none of these rows for a single 1024² request.
+
+```python
+PASS_TFLOP = 2 * 8e9 * 4096 / 1e12 + 4 * 38 * 4096**2 * 2432 / 1e12   # 71.7
+
+def denoiser_seconds(steps, guided, sustained_tflops=400):
+    passes = steps * (2 if guided else 1)
+    return passes * PASS_TFLOP / sustained_tflops
+
+for steps, guided in [(28, True), (10, True), (4, True), (4, False)]:
+    print(steps, guided, round(denoiser_seconds(steps, guided), 1))
+```
+
+## In the room
+
+<Callout kind="interview" label="Design round">
+"Design the serving path for an image product: 1024² images, p95 under 3 seconds, a fixed pool of 64 H100s for launch in eight weeks. Marketing wants text in images to work. Research has an 8B rectified-flow model and no distilled checkpoint."
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Measure sustained throughput and quality at 10, 15 and 20 steps on our prompts in week one. If the scenario's 400 TFLOP/s holds, 10 guided steps is about 3.6 s of denoiser on one GPU, over the target, so launch on two-way tensor parallelism at 10 to 15 steps, keep T5 because of the text requirement, and start a distillation run in parallel as the path to one GPU per request. Batch keys are resolution bucket, steps and guidance; single 1024² requests are not batched.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The conflict is latency against text quality against fleet size. Fewer steps help latency and may hurt text; dropping T5 saves memory and costs typography, which marketing asked for; tensor parallelism meets the latency at twice the GPU-seconds, which halves the requests the 64 GPUs can serve.</p>
+<p>Capacity check on the launch design: at 15 guided steps on two GPUs, each request takes about 30 × 71.7 TFLOP ≈ 2.2 PFLOP, roughly 5.4 GPU-seconds at 400 TFLOP/s per GPU. 64 GPUs then serve about 12 images per second at full utilisation, less once p95 headroom is kept. If expected peak traffic is above that, the launch needs the distilled model or a lower resolution default, and that is the decision to escalate in week two, not week eight.</p>
+<p>Written down: a risk note that text rendering at 15 steps was checked on a named prompt set, and rollback triggers for the distilled model when it arrives (human preference loss on the text subset beyond an agreed margin, or complaint rate on text prompts above the baseline).</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Distillation lands in week six and loses on the text subset. Do you ship it for prompts without text and route text prompts to the slow path, and how do you classify prompts reliably enough?</li>
+<li>Your measured throughput is 250 TFLOP/s, not 400. Which part of the design breaks first?</li>
+<li>What would you need to see after launch to drop tensor parallelism and go back to one GPU per request?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+- **The scenario throughput is a guess.** 400 TFLOP/s sustained is a placeholder for your measurement; attention kernels, small-batch inefficiency and the decoder can each move it a lot. Every seconds figure above scales with it.
+- **The FLOP count leaves out the decoder and safety checks.** At 4 steps they can be a large share of latency, and step cuts stop paying when they are.
+- **Quality is not one number.** The CLIP figures are relative drops on the paper's prompt set; the no-T5 win rates are against the paper's own full model. Neither predicts your text-heavy prompts.
+- **Guidance factors vary.** A distilled checkpoint may not need guidance, or may use it on some steps; the table assumes all or nothing.
+- **Queueing is outside this lesson.** At high utilisation, queueing delay dominates p95 regardless of per-request compute; size the fleet with that in view.
+
+<SelfRate id="lesson:multimodal/generation/serving-generation" />

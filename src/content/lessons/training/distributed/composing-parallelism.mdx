@@ -1,0 +1,134 @@
+---
+title: "Playbook: composing 4D and 5D parallelism"
+track: training
+module: distributed
+order: 7
+kind: playbook
+level: staff
+minutes: 14
+summary: Compose parallel dimensions in a fixed order, first fit one model replica, then reach the global batch, then maximise throughput, placing each dimension on the fabric its communication frequency demands, and the published Llama 3 and DeepSeek-V3 layouts show how far apart two correct answers can land.
+prerequisites: [training/distributed/zero-fsdp, training/distributed/tensor-sequence, training/distributed/pipeline-schedules, training/distributed/context-parallel]
+updated: 2026-10-28
+sources:
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: three-step procedure, fit a training step in memory, achieve the target global batch, optimise throughput; under 10B a single technique such as TP or ZeRO-3 with full recompute across 8 GPUs; 10B to 100B TP 8 with PP, TP 8 with ZeRO-3, or pure ZeRO-3; at 512+ GPUs pure DP/ZeRO-3 becomes inefficient, at 1024+ TP 8 with ZeRO-2 DP and PP; GPU-poor case uses full recomputation and gradient accumulation; scale TP to near node size, increase DP with ZeRO-3, switch to PP when DP communication bottlenecks; ZeRO-3 and PP can be combined but rarely are, because it needs a much larger global batch; ZeRO-1 and ZeRO-2 combine easily with PP, DeepSeek-V3 used PP with ZeRO-1; TP+SP combines with both PP and ZeRO-3; EP is usually combined with DP; benchmarks on 1 to 64 nodes of 8 H100s at sequence 4,096 and 1M-token batch, over 4,000 experiments on up to 512 GPUs. Checked 2026-10-28.
+  - title: Dubey et al., The Llama 3 Herd of Models (arXiv 2407.21783)
+    url: https://arxiv.org/html/2407.21783
+    note: 405B on up to 16K H100s; TP 8, CP 1, PP 16, DP 64 on 8,192 GPUs at 43% MFU; DP 128 on 16,384 GPUs at 41%; TP 8, CP 16, PP 16, DP 8 at 131,072 tokens at 38%; order TP, CP, PP, DP to match bandwidth and latency; FSDP for DP; 466 job interruptions in a 54-day snapshot, 419 unexpected, over 90% effective training time. Checked 2026-10-28.
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: 2,048 H800 GPUs, PP 16, EP 64 over 8 nodes, ZeRO-1 DP, avoids costly TP; at most 4 nodes per token; DualPipe; NVLink 160 GB/s and IB 50 GB/s per GPU. Checked 2026-10-28.
+  - title: Liang et al., TorchTitan (arXiv 2410.06511v3)
+    url: https://arxiv.org/html/2410.06511v3
+    note: Llama 3.1 405B on 512 GPUs with FSDP 4, TP 8, PP 16; TP shards within nodes and FSDP across; 70B on 256 GPUs with FSDP 32 and TP 8. Checked 2026-10-28.
+  - title: Korthikanti et al., Reducing Activation Recomputation in Large Transformer Models (arXiv 2205.05198)
+    url: https://arxiv.org/html/2205.05198
+    note: 530B MT-NLG configuration, t = 8, p = 35, 280 GPUs per replica; 1T configuration t = 8, p = 64, 512 GPUs. Checked 2026-10-28.
+  - title: NVIDIA A100 Tensor Core GPU
+    url: https://www.nvidia.com/en-us/data-center/a100/
+    note: A100 80GB SXM, 312 TFLOPS dense BF16, NVLink 600 GB/s. Checked 2026-10-28.
+  - title: PracHub, Design a scalable MoE pretraining pipeline (posted 2025-09-06)
+    url: https://prachub.com/interview-questions/design-a-scalable-moe-pretraining-pipeline
+    note: candidate report naming Meta, machine learning engineer onsite, ML system design; bilingual MoE LLM on about 1T tokens; 256 A100-80GB, 32 nodes of 8 with NVLink/NVSwitch, 200-400 Gbps inter-node; then scale to 1,024 GPUs while controlling cost and stability. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+Given a model, a cluster and a global batch, choose the degree of each parallel dimension (data with a ZeRO stage, tensor with sequence, pipeline with a schedule, context, expert) and the mesh order that maps each onto the hardware. The product of the degrees is the GPU count; everything else is a trade between memory, communication on each fabric, and the pipeline bubble.
+
+The Playbook's procedure is the right skeleton because it orders the constraints by how hard they are:
+
+1. **Fit one replica.** Find the smallest set of model-parallel degrees and recomputation that makes one training step fit in GPU memory. Memory is a wall, not a cost.
+2. **Reach the global batch.** Fill the rest of the GPUs with data parallelism and gradient accumulation (or context parallelism for long sequences) until micro-batch x accumulation x DP equals the batch optimization asked for.
+3. **Maximise throughput.** Only now trade dimensions against each other: raise TP toward the node size, raise DP with ZeRO-3, move to PP when DP communication becomes the bottleneck, tune the micro-batch.
+
+## The inputs that change it
+
+**Parameter count, and for MoE, active against total.** Model states at 16 bytes per parameter decide step 1. For MoE, total parameters set memory and active parameters set compute, so the two can point in different directions.
+
+**Sequence length.** Activations grow with it; past about 128K tokens, context parallelism is the only lever that divides one sequence's activations.
+
+**Scale-up domain size.** The number of GPUs on the fast fabric, 8 per node in every published configuration in this lesson, caps TP and decides whether EP can stay on NVLink.
+
+**Per-GPU scale-out bandwidth.** Sets whether ZeRO-3's per-layer gathers and cross-node EP all-to-all hide. Read the spec carefully: a figure per node and a figure per GPU differ by the node size.
+
+**Global batch.** Fixed by the optimization team. It bounds data parallelism times micro-batches, so it sets the pipeline bubble and how far DP can scale.
+
+**Team and stack.** DualPipe, zero-bubble schedules and ring attention exist in some stacks and not others. A schedule nobody on the team has debugged is a risk with a cost.
+
+## The options and when each wins
+
+**ZeRO-3 / FSDP alone.** Wins below about 10B parameters, and up to more when micro-batches are large enough to hide per-layer gathers. Zero model code changes. The Playbook reports that at 512 GPUs and above, pure DP/ZeRO-3 becomes inefficient.
+
+**TP 8 inside the node plus FSDP across.** The 10B to 100B default for dense models. TorchTitan's 70B run on 256 GPUs was FSDP 32 with TP 8. Loses when the per-node shard of model states plus activations still does not fit.
+
+**TP 8, PP across nodes, ZeRO-1 or ZeRO-2 DP.** The large dense default, and the Playbook's suggestion at 1,024 GPUs and above. Llama 3's 405B used TP 8, PP 16 and DP 64 to 128 at 41 to 43% MFU. Korthikanti's 530B configuration used TP 8 and PP 35. Pays the bubble, so needs a large global batch.
+
+**PP with ZeRO-3.** The Playbook says the combination is possible but rarely used, because it needs a much larger global batch to amortise both PP's bubble and ZeRO-3's weight traffic. Choose it only when neither alone fits.
+
+**PP and EP with ZeRO-1, no TP.** DeepSeek-V3's choice for a 671B-total MoE on 2,048 H800s: PP 16, EP 64 over 8 nodes, ZeRO-1. It avoided TP by aggressive memory work and paid for cross-node EP with node-limited routing, custom kernels and DualPipe.
+
+**Add CP.** Only when one sequence's activations do not fit at TP 8. Llama 3 added CP 16 for its 131,072-token stage and took it out of DP, which fell from 128 to 8.
+
+The two big published layouts are worth reading side by side. Llama 3 is a dense model with TP on NVLink and everything else across nodes. DeepSeek-V3 is an MoE with no TP at all and its expert all-to-all on InfiniBand. Both are correct for their models; a layout copied from one to the other's model would not be.
+
+## Worked decision: the reported Meta prompt
+
+The reported prompt: design an MoE pretraining pipeline for a bilingual model on about 1T tokens with 256 A100-80GB GPUs, 32 nodes of 8 with NVLink, 200 to 400 Gbps between nodes, then scale to 1,024 GPUs. Everything below except those facts is a scenario choice, stated as such.
+
+**Model, chosen to fit the budget.** Take 60B total parameters, 10B active, of which 4B are dense (attention, embeddings, shared parts) and 56B are experts. Training compute is 6 x 10e9 x 1e12 = 6e22 FLOPs. At an assumed 35% MFU on 312 TFLOP/s A100s, the cluster delivers 256 x 312e12 x 0.35 = 2.8e16 FLOP/s, so the run takes 2.15e6 seconds, 24.8 days. That number is the sanity check every other choice must respect: a layout that costs 20% throughput adds five days.
+
+**Read the network.** The prompt gives 200 to 400 Gbps without saying per GPU or per node. Per GPU at 400 Gbps is 50 GB/s; per node at 200 Gbps is 25 GB/s shared by 8 GPUs, 3.1 GB/s each. That is a 16 times range, and the plan must work at the bottom of it or the interviewer's first question breaks it.
+
+**Step 1, fit a replica. Layout A: EP 8 inside each node, DP 32 across nodes.** Each GPU holds the full 4B dense part and one eighth of the experts, 7B expert parameters. Parameters and gradients in BF16: 4B x 4 bytes = 16 GB dense plus 7B x 4 = 28 GB expert. Optimizer states sharded ZeRO-1 style, the dense part over all 256 GPUs (12 x 4B / 256 = 0.19 GB) and each expert shard over its 32 replicas (12 x 7B / 32 = 2.6 GB). Total 46.8 GB, leaving about 33 GB for activations and buffers. With 4,096-token micro-batches, h = 4096 and 24 layers (scenario), Korthikanti's sbh x 34 under selective recomputation gives 13.7 GB as a dense approximation; MoE layers differ, so measure one layer.
+
+**Communication of layout A.** The all-to-all, on the critical path of every MoE layer, stays on NVLink. Cross-node traffic is gradient synchronisation once per step: the dense part, reduced hierarchically, puts 2 x 31/32 x 8 GB / 8 = 1.9 GB per GPU on the network; each expert shard is all-reduced across its 32 replicas, 2 x 31/32 x 14 GB = 27.1 GB per GPU. With an assumed 4M-token global batch, a step is 6 x 10e9 x 4e6 = 2.4e17 FLOPs, 8.6 seconds on the cluster. At 50 GB/s per GPU, 27.1 GB is 0.54 s and overlaps with backward. At 3.1 GB/s per GPU it is 8.7 s, longer than the step.
+
+**Layout B: EP 32 across 4 nodes, DP 8.** Each GPU holds 1.75B expert parameters: 25.8 GB of model states, expert gradient sync 6.1 GB per GPU. But the all-to-all now crosses nodes in every MoE layer. With top-2 routing and 24 MoE layers (scenario), each token sends 2 x 4096 x 2 bytes for dispatch and the same for combine, doubled for backward: 1.57 MB per token per step, 25.8 GB per GPU at 16,384 tokens per GPU, three quarters of it crossing nodes under uniform routing. That is 19 GB on the critical path instead of 27 GB off it.
+
+**Decision.** Layout A, if the network is 50 GB/s per GPU: the critical-path exchange stays on NVLink and the cross-node traffic overlaps. If the network turns out to be the per-node reading, neither layout works as stated, and the fix is not a parallelism change: it is ZeRO-2 for the experts (reduce-scatter instead of all-reduce, halving the 27.1 GB), a larger global batch to lengthen the step, or both. What A gives up: 46.8 GB of model states leaves less room for longer sequences, and every expert's weights are replicated 32 times, which makes checkpoints larger.
+
+**Scale to 1,024 GPUs.** Layout A becomes EP 8, DP 128. Per-GPU expert gradient traffic barely moves, 2 x 127/128 x 14 GB = 27.8 GB, because a ring's per-GPU bytes do not grow with ring size. But at a fixed 4M-token batch, each GPU processes a quarter of the tokens and the step falls to 2.1 s, so the same 27.8 GB is now a quarter of the step at 50 GB/s and no longer hides as easily. The levers, in order: ask optimization for a larger batch; move experts to ZeRO-2; then EP 16 across two nodes to halve the replicated expert state. Llama 3's report gives the reliability term at this scale: 466 interruptions in 54 days on its 16K-GPU cluster, 419 of them unexpected. Checkpoint interval and restart time belong in the plan at 1,024 GPUs, not as an afterthought.
+
+## What to measure after deciding
+
+Measure tokens per second per GPU and MFU against the 35% assumption, because the 24.8-day schedule rests on it. Measure exposed communication per step, split by collective, from a profile, not inferred from MFU. Track all-to-all imbalance as the most-loaded expert's token count over the mean, per layer, because the exchange finishes at the slowest receiver. Record peak memory per GPU at the worst stage or rank, with the headroom left. Log time to checkpoint and time to restart, and loss spikes with the step and data shard that produced them. Set a written trigger for each: for example, exposed communication above a stated fraction of the step for a day triggers the ZeRO-2 change.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your layout A plan is approved. On day two, the cluster team says the inter-node network is 200 Gbps per node, not per GPU. Training cannot slip more than a week and the optimization lead will not raise the batch. What changes?"**
+</Callout>
+
+<p class="tiny">The follow-on constraints are a scenario built on the reported prompt.</p>
+
+<Depth>
+<Fragment slot="short">
+<p>At 3.1 GB/s per GPU, expert gradient all-reduce at 27.1 GB per GPU takes 8.7 s against an 8.6 s step, so it cannot hide. Switch experts to ZeRO-2 style reduce-scatter, which halves it, and cut replicated expert state by moving to EP 16 over two nodes, accepting that half the all-to-all crosses a node boundary. Then re-measure; if still exposed, ask for gradient reduction in BF16 for experts only, written down as a risk.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The cross-node budget per step is now 8.6 s x 3.1 GB/s = 27 GB per GPU if nothing else used the link, and the plan used all of it. Reduce-scatter instead of all-reduce on expert gradients halves it to about 13.6 GB, with an all-gather of updated expert parameters that can overlap with the next forward. EP 16 halves the expert state per GPU again, to 3.5B parameters, so gradient sync drops to 15/16 x 7 GB = 6.6 GB with reduce-scatter over 16 replicas, while each token's all-to-all now reaches the second node for about half its experts. With top-2 routing, that is about 12.9 GB per GPU per step across the node boundary, also on a 3.1 GB/s link, and on the critical path.</p>
+<p>So EP 16 trades an overlappable cost for a blocking one, and is only right if node-limited routing, DeepSeek-V3's device, keeps most tokens in-node. I would ship reduce-scatter first, measure, and run EP 16 with node-limited routing as a one-day experiment rather than a default. The week of slack covers roughly a 28% throughput loss on a 24.8-day run, which is the line for every option.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>BF16 expert-gradient reduction would close the gap today. What evidence over the first 50B tokens would make you reverse it?</li>
+<li>The modelling lead offers top-1 routing to halve the all-to-all. What does that cost the model, and who decides?</li>
+<li>Two senior engineers disagree on EP 16 against a larger batch. Neither has data. What one-day experiment settles it?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The procedure assumes memory is the binding constraint first. On some clusters it is the network, and a layout that fits easily but saturates the scale-out links loses to one that barely fits.
+
+The worked case uses an assumed MFU, uniform routing and a dense activation formula for MoE layers. Each is a place the real numbers will differ. Uniform routing in particular understates the all-to-all, because the exchange finishes when the most loaded GPU finishes.
+
+Published layouts are evidence about their clusters, not rules. Llama 3 and DeepSeek-V3 were trained on 8-GPU nodes; larger scale-up domains move the boundary where TP and EP leave the fast fabric, and the right composition moves with it.
+
+<SelfRate id="lesson:training/distributed/composing-parallelism" />

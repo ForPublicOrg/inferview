@@ -1,0 +1,156 @@
+---
+title: Parallel tool calls
+track: harness
+module: tools-aci
+order: 5
+kind: lesson
+level: senior
+minutes: 11
+summary: Most of the speed from parallel tool calls comes from fewer model turns, and the harness can only run calls concurrently when the tools' read-only claims are true.
+prerequisites: [harness/tools-aci/errors-as-instructions]
+updated: 2026-10-28
+sources:
+  - title: Claude Agent SDK docs, how the agent loop works (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/agent-sdk/agent-loop
+    note: "read-only tools (Read, Glob, Grep, MCP tools marked read-only) can run concurrently; Edit, Write and Bash run sequentially; custom tools default to sequential; readOnlyHint in the tool's annotations enables parallel execution"
+  - title: Anthropic, How we built our multi-agent research system (2025-06-13)
+    url: https://www.anthropic.com/engineering/multi-agent-research-system
+    note: "the lead agent starts 3 to 5 subagents in parallel and subagents use 3 or more tools in parallel, cutting research time by up to 90% for complex queries; multi-agent systems use about 15 times the tokens of chat; lead agents run subagents synchronously"
+  - title: Cognition, SWE-grep and SWE-grep-mini (2025-10-16)
+    url: https://cognition.com/blog/swe-grep
+    note: "trained to issue 8 parallel tool calls per turn over at most 4 turns (3 exploring, 1 answering); restricted tool set including grep, read and glob; agent trajectories often spent more than 60% of their first turn retrieving context; scored with F-beta, beta 0.5"
+  - title: Model Context Protocol specification 2025-11-25, tools
+    url: https://modelcontextprotocol.io/specification/2025-11-25/server/tools
+    note: "clients MUST consider tool annotations untrusted unless they come from trusted servers"
+  - title: Git documentation, git (GIT_OPTIONAL_LOCKS)
+    url: https://git-scm.com/docs/git
+    note: "setting GIT_OPTIONAL_LOCKS to false prevents git status from refreshing the index as a side effect, to avoid lock contention for background processes"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Two decisions, made in two places
+
+A parallel tool call involves two separate choices. The model decides to emit several tool calls in one response instead of one call per turn. The harness then decides whether to execute those calls concurrently or one after another. The first is a property of the model and its prompt; the second is a scheduling policy in your code, and it is only safe if the harness knows which calls can interfere.
+
+The Claude Agent SDK documents its policy plainly. Read-only tools (Read, Glob, Grep, and MCP tools marked read-only) can run concurrently. Tools that modify state (Edit, Write, Bash) run sequentially to avoid conflicts. Custom tools default to sequential, and a custom tool opts into concurrency by setting `readOnlyHint` in its annotations, the field name from the MCP SDK. The rule is stated per tool, so Bash sits in the sequential group even when the command is `ls`: the tool name says nothing about what a given command will do.
+
+This is a readers-writer lock decided per call, with one difference: the lock's knowledge of who is a reader comes from metadata the tool declares about itself, and nothing checks the declaration at run time.
+
+## Where the time goes
+
+<Predict id="parallel-tool-calls-serial-time" question="How many seconds does the one-call-per-turn version take?" answer={54.4} tolerance={3} unit="seconds">
+<Fragment slot="prompt">
+<p>Scenario inputs, shaped like SWE-grep's published budget of 8 calls per turn over 4 turns: the agent needs 32 read-only tool calls. Each model turn takes 1.5 seconds and each tool call takes 0.2 seconds. Version A makes one call per turn. Version B makes 8 calls per turn for 4 turns and the harness runs each turn's calls concurrently.</p>
+</Fragment>
+<p>Version A: 32 turns × (1.5 + 0.2) seconds = <b>54.4 seconds</b>. Version B: 4 × (1.5 + 0.2) = 6.8 seconds, since 8 concurrent calls finish in the time of one. Now separate the two effects. If the model batches 8 calls per turn but the harness runs them one after another, each turn takes 1.5 + 8 × 0.2 = 3.1 seconds and the run takes 12.4 seconds. Batching alone took 54.4 seconds to 12.4; concurrent execution took 12.4 to 6.8. Most of the gain is fewer model round trips.</p>
+</Predict>
+
+That split decides where engineering effort goes. If tool latency is small next to model latency (local file reads, grep), getting the model to batch matters far more than the scheduler. If tool latency is large (network calls, test runs, subagents), the scheduler matters too. The same split explains the token side: batching removes model turns, and every removed turn is one fewer re-send of the whole context.
+
+## What the published systems did
+
+**Anthropic's research system (June 2025)** used both levels. The lead agent starts 3 to 5 subagents in parallel rather than one after another, and each subagent uses 3 or more tools in parallel. Anthropic reports these two changes cut research time by up to 90% for complex queries. Two costs come in the same post: multi-agent systems use about 15 times the tokens of a chat interaction, and the lead agent runs subagents synchronously, waiting for each set to finish, so one slow subagent blocks the rest and the lead cannot steer them mid-flight.
+
+**Cognition's SWE-grep (October 2025)** is a retrieval subagent trained for this shape: 8 parallel tool calls per turn, at most 4 turns (3 to explore, 1 to answer), over a restricted tool set that includes grep, read and glob. The motivation was latency: Cognition observed agent trajectories spending more than 60% of their first turn just retrieving context. The tool set is restricted for cross-platform compatibility and safety, according to the post. It is also a set where every call is a read, which is what makes 8-way concurrency free of ordering questions. The post scores retrieval with F-beta at beta 0.5, weighting precision over recall, because irrelevant context pushed into the main agent hurt more than missing some.
+
+## When a tool lies about being read-only
+
+A tool declared read-only that writes anything breaks the scheduler's assumption, and the failure is intermittent, since it depends on which calls the model happens to batch together. A lint tool that updates a cache file is enough:
+
+```python
+import asyncio
+
+async def run_turn(calls, tools):
+    """Run one turn's tool calls: consecutive read-only calls run together,
+    anything else runs alone. Results come back in the order the model asked."""
+    results, batch = [], []
+
+    async def flush():
+        results.extend(await asyncio.gather(*(tools[n]["fn"](**a) for n, a in batch)))
+        batch.clear()
+
+    for name, args in calls:
+        if tools[name]["read_only"]:
+            batch.append((name, args))
+        else:
+            await flush()
+            results.append(await tools[name]["fn"](**args))
+    await flush()
+    return results
+
+state = {"lint_runs": 0}
+
+async def lint(path):            # declared read-only, but it updates a cache file
+    seen = state["lint_runs"]    # read
+    await asyncio.sleep(0)       # the tool awaits I/O here
+    state["lint_runs"] = seen + 1  # write: a lost update when two run at once
+    return f"{path}: ok"
+
+tools = {"lint": {"fn": lint, "read_only": True}}
+asyncio.run(run_turn([("lint", {"path": "a.py"}), ("lint", {"path": "b.py"})], tools))
+print("declared read-only:", state)
+
+state["lint_runs"] = 0
+tools["lint"]["read_only"] = False
+asyncio.run(run_turn([("lint", {"path": "a.py"}), ("lint", {"path": "b.py"})], tools))
+print("declared mutating:", state)
+# declared read-only: {'lint_runs': 1}
+# declared mutating: {'lint_runs': 2}
+```
+
+Two calls, one recorded run: a lost update. The scheduler here is one reasonable policy (batch consecutive reads, run writes alone, keep result order); the SDK docs state the read and write rule but not the batching details, so do not assume they match this sketch.
+
+What actually breaks in production, from most to least obvious:
+
+- **Races on shared state.** Cache files, lock files, generated artefacts, a shared temp directory. Real tools do this without looking like writers: `git status` refreshes the index as a side effect, which is why git provides `GIT_OPTIONAL_LOCKS` for background processes that want to avoid lock contention. Two concurrent git invocations from an agent can fail on the index lock, and the model sees an error it did not cause.
+- **Order the model assumed.** A model that emits "run the formatter" and "read the file" in one response expects to read the formatted file. If both are marked read-only and run concurrently, it may read either version, and its next edit's `old_string` then fails to match.
+- **Retries that duplicate.** Read-only calls are usually treated as safe to retry on a timeout. A "read-only" tool that creates a ticket, sends a message or starts a job does it twice.
+- **Approval and audit.** If the same hint feeds the permission layer (reads auto-approved), a false read-only claim skips the prompt as well as the lock. The MCP specification says clients must treat tool annotations as untrusted unless the server is trusted, which covers exactly this case: a third-party MCP server can set `readOnlyHint` on anything.
+
+## Deciding whether a tool is read-only
+
+A tool is read-only for scheduling only if running it twice concurrently, in any interleaving with other read-only tools, leaves the same state and returns what a sequential run would have. That excludes writes to the workspace, to caches, to lock files, and any external side effect. Three practical checks:
+
+1. **Test it.** In a sandbox, snapshot the filesystem, run the tool twice concurrently with representative arguments, and diff. Any change outside a declared scratch area fails the claim.
+2. **Own the hint.** For third-party MCP servers, the harness keeps its own allow list of tools it will run concurrently, rather than trusting the server's annotation.
+3. **Make reads quieter.** Where a common command has optional writes, turn them off in the tool's environment (for git, `GIT_OPTIONAL_LOCKS=0`), so the tool earns its read-only status instead of claiming it.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your agent's p50 task time is too slow and product wants it halved this quarter. Traces show turns of one tool call each, mostly file reads and searches, plus a set of third-party MCP tools whose read-only annotations you do not control. What do you change, and what do you refuse to parallelise?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>First get the model to batch: most of the time is model turns, not tool execution. Then run reads concurrently for tools the harness has verified as read-only, keep everything else sequential, and ignore third-party read-only annotations unless the tool is on our own allow list. Refuse to parallelise Bash and anything with external side effects.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The conflict is latency against correctness. The latency budget says parallelise; the unverified annotations say some of the "reads" may write.</p>
+<p>From the traces, split task time into model time and tool time. If reads take tens of milliseconds and turns take seconds, the target is fewer turns: prompt and tool descriptions that encourage several independent reads in one response, or a retrieval subagent that does wide parallel search in a few turns and returns a short result, the SWE-grep shape. That alone can halve p50 if retrieval dominates early turns.</p>
+<p>Concurrency comes second, for our own verified read-only tools. Third-party tools stay sequential until they pass the concurrent-run diff test and join our allow list, whatever their annotations say.</p>
+<p>What I give up: some third-party calls stay slow, and a retrieval subagent costs extra tokens per task. The failure mode of the recommendation is a verified tool that later changes behaviour in a server update; the allow list is pinned to server versions and re-tested on upgrade.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The retrieval subagent halves p50 but raises tokens per task by half. Which do you report to product as the cost, and who decides whether it ships?</em></li>
+<li><em>A vendor says its MCP server's annotations are accurate and refuses your test harness. Do you run it sequentially forever, and what would change your mind?</em></li>
+<li><em>What production signal would tell you a tool you verified as read-only has started writing?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Read-only is not the same as independent of time. A read that runs while a background build is writing the same file returns a torn or stale view regardless of the scheduler. Concurrency among reads assumes nothing else is writing, which is false in a session with background processes.
+
+Concurrent reads against external APIs share rate limits. Eight parallel calls to one service can turn into rate-limit errors that a sequential run would never hit, and the model then sees failures that look like its own mistakes.
+
+Batching raises the size of a single turn's results. Eight file reads in one turn can put tens of thousands of tokens into the context at once, which interacts with the output budgets from the earlier lesson: per-call budgets need a per-turn ceiling too.
+
+The headline numbers are vendor measurements on their own systems: Anthropic's "up to 90%" is a best case for complex research queries, and Cognition's design is a model trained for one retrieval shape. A general-purpose model asked to batch may batch less, or batch calls that depend on each other, and the harness cannot detect a dependency the model did not state.
+
+<SelfRate id="lesson:harness/tools-aci/parallel-tool-calls" />

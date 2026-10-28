@@ -1,0 +1,121 @@
+---
+id: sec-031
+title: Secure a self-hosted serving tier that tenants share
+subtitle: engine-killing requests, prefix-cache oracles and a gateway full of keys
+track: security
+module: output-data
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 50
+core: false
+tags: [vllm, litellm, gateway, denial-of-service, prefix-caching, credentials, patching]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: ombharatiya, AI system design guide, interview question bank (Q135, checked 2026-10-28)
+    url: https://github.com/ombharatiya/ai-system-design-guide/blob/main/00-interview-prep/01-question-bank.md
+    note: "a synthesised question bank asking for the security architecture of a multi-tenant self-hosted serving tier after the 2026 vLLM and LiteLLM advisories; no company named; the facts below come from the advisories themselves"
+  - title: OSV, CVE-2026-93592 (GHSA-25q3-v2hm-8vpf), vLLM denial of service via negative token ID (published 2026-09-18)
+    url: https://osv.dev/vulnerability/CVE-2026-93592
+    note: "before 0.28.0, /v1/embeddings and /pooling did not check the lower bound of token IDs; one unauthenticated request with a negative ID triggers a CUDA device-side assertion that poisons the GPU context, and every later request fails until the process restarts; CVSS 4.0 8.7"
+  - title: GHSA-935w-9g4m-p28p, CVE-2026-105752, vLLM Harmony tool continuations drop cache_salt (published 2026-09-28)
+    url: https://github.com/advisories/GHSA-935w-9g4m-p28p
+    note: "continuation turns after a tool call on /v1/responses were resubmitted without the caller's cache_salt, and cached_tokens_per_turn gave exact cached-token counts, a cross-tenant membership oracle; fixed in 0.30.0; rated low, CVSS 3.1"
+  - title: GHSA-3cv6-jpf6-8222, CVE-2026-84377, LiteLLM authenticated SSRF and provider-credential exfiltration (2026-08-26)
+    url: https://github.com/BerriAI/litellm/security/advisories/GHSA-3cv6-jpf6-8222
+    note: "any authenticated proxy user could redirect a provider call through api_base, base_url, model_list, fallbacks or credential fields, and the proxy sent its stored provider credentials there; the root cause was a denylist that missed parameters, including nested ones; fixed in 1.96.2 with backports down to 1.88.6; workarounds: allow_client_side_credentials false, restrict proxy keys, block the parameters at a reverse proxy"
+  - title: OSV, CVE-2026-84377 (checked 2026-10-28)
+    url: https://osv.dev/vulnerability/CVE-2026-84377
+    note: "affected ranges before 1.88.6 and from 1.89.0 before 1.96.2; CVSS 3.1 6.5"
+  - title: vLLM docs, Automatic prefix caching design (checked 2026-10-28)
+    url: https://docs.vllm.ai/en/latest/design/prefix_caching.html
+    note: "cache_salt is injected into the first block's hash; sha256 is the default block hash and a non-cryptographic hash raises collision risk in multi-tenant deployments"
+  - title: GHSA-4qjh-9fv9-r85r, CVE-2025-46570, timing side channel in vLLM prefix caching (2025-05-28)
+    url: https://github.com/advisories/GHSA-4qjh-9fv9-r85r
+    note: a prefix hit is visible as a faster time to first token; fixed in 0.9.0
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"We run our own inference. Between late August and late September, vLLM published an advisory for a single request that kills the engine for every tenant and another for a cross-tenant prefix-cache oracle, and LiteLLM published one that let any authenticated user send our stored provider keys to their own server. Design the security architecture for the serving tier. Then tell the CISO whether we should keep self-hosting."
+</Callout>
+
+The operating constraints are a scenario, given by the interviewer:
+
+- vLLM 0.27 on 16 replicas, serving one open-weights model to 40 internal product teams and 12 external API customers, who reach the engines through a LiteLLM proxy. The proxy also holds the company's keys for two hosted model providers, used as fallbacks.
+- External customers can call `/v1/chat/completions`, `/v1/responses` and `/v1/embeddings`, and send about a quarter of the traffic.
+- The platform team is four engineers and patches the stack monthly. A replica takes about four minutes to come back after a restart, measured last quarter.
+- The CISO wants a written recommendation within the quarter: harden and keep self-hosting, or move to managed inference.
+
+Write the architecture, choose the patch target and the replica layout and defend them, and end with the recommendation memo, a rollout plan and rollback triggers.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which network paths reach an engine's HTTP port today without passing the proxy, including health checks and internal batch jobs.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the list of request-body fields the proxy accepts from external callers today, and which of them it forwards.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask how long each of the three advisories took, from publication to a patched version running in production, under the current monthly cycle.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Treat the serving tier as an internet-facing application that runs untrusted input on shared hardware. Four controls: a gateway that is the only path to an engine and accepts an allowlist of fields and value ranges, never routing or credential parameters; engine pools split by trust, so an external request cannot take down internal traffic; a cache salt set by the gateway per tenant, with cached-token counts kept internal and tested per endpoint; and provider keys behind an egress allowlist so that even a vulnerable proxy cannot send them anywhere but the provider. Then a patch target measured in days, which is the control everything else depends on. If the team cannot staff that, managed inference is the safer option.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>One path to the engines.</strong> Network policy lets only the gateway reach engine ports. The negative-token-ID crash needed no authentication; an engine reachable without the gateway is reachable by anyone on that network.</p>
+<p><strong>Validate before the device.</strong> The gateway checks token IDs against the model's vocabulary range, input lengths and media sizes, and exposes only the endpoints each caller class needs. External customers who do not use embeddings lose <code>/v1/embeddings</code>, which removes the endpoint the crash used. This is a filter for known classes of bad input, not a guarantee; the next crash will come through a field nobody validated.</p>
+<p><strong>Shrink shared fate.</strong> A poisoned CUDA context fails every request on that replica until restart. External callers get their own pool, so a crash they cause cannot fail an internal team's request. Health checks detect a replica whose requests all fail and restart it.</p>
+<p><strong>Cache isolation.</strong> The gateway sets <code>cache_salt</code> from the authenticated tenant and overwrites any client value; internal teams share one salt. Cached-token counts are stripped from external responses, because the counter was the oracle in the 0.30.0 advisory. A regression test per endpoint sends a probe under a second salt and asserts zero cached tokens, the test the advisory itself suggests. Block hashes stay sha256.</p>
+<p><strong>Keys.</strong> The proxy accepts no <code>api_base</code>, <code>base_url</code>, model list, fallback or credential fields from callers: an allowlist of request fields at the edge, because LiteLLM's own root cause was a denylist that missed nested parameters. Until patched, <code>allow_client_side_credentials</code> is false. The proxy's egress is allowlisted to the two providers' API hosts, so a forged destination fails at the network even on an unpatched version. Provider keys are scoped to a project with a spend limit, and rotated after this advisory, since the fix does not tell you whether they already left.</p>
+<p><strong>Patching.</strong> Floors of vLLM 0.30.0 and a LiteLLM release at or above its patched line, advisories routed to the on-call engineer, and an upgrade path through a canary with an eval gate, because an engine upgrade can change outputs and is shipped like a model change.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The eval gate blocks the vLLM 0.30.0 upgrade because outputs shifted on 9 of 200 golden prompts, and the cache-oracle advisory is public. Do you ship degraded, hold, or mitigate at the gateway, and who signs off?</em></li>
+<li><em>Your gateway validation and per-tenant pools cost more engineering time this quarter than the managed-inference migration would. Which half do you cut, and what do you accept in writing?</em></li>
+<li><em>What would you need to see over the next two quarters to reverse a decision to keep self-hosting?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+### The numbers you were asked to choose
+
+**Why restart speed is not the answer to the crash.** A replica that one request can poison stays down for four minutes. An attacker who sends one such request per replica every four minutes holds the whole fleet down with 16 requests per four minutes, four a minute. Halving the restart time to two minutes raises that to eight a minute, still far below anything a rate limit would notice. Faster restarts bound the damage of an accidental crash; only the gateway path, the validation and the patch stop a deliberate one.
+
+**Replica layout.** Splitting 16 replicas into an external pool and an internal pool trades utilisation for blast radius. With external customers at a quarter of the traffic in this scenario, 4 external and 12 internal replicas is a reasonable starting point, sized from measured peak load per pool plus one replica of headroom for a restart. One shared pool is defensible only if every external endpoint is behind validation and the patch target is met, because then a crash is a bug, not an attack surface. Per-customer pools for 12 customers are unreasonable at this fleet size: each pool needs its own headroom, and most would sit idle.
+
+**Patch target.** Three days from publication to production for advisories rated high or critical, two weeks for the rest. Under monthly patching, an advisory published at a random point in a 30-day cycle waits 15 days on average for the next window, and the engine crash was unauthenticated and needs one request; a monthly target is unreasonable for that class. Shorter than three days needs an on-call rota and an eval gate fast enough to finish in hours, which four engineers can run for one engine and one proxy, not for more components.
+
+### Two defensible recommendations
+
+| | Keep self-hosting, hardened | Move to managed inference |
+|---|---|---|
+| What it fixes | All three advisory classes, if the patch target holds | Engine and cache bugs become the provider's; their patch cadence is not yours to staff |
+| What it costs | Most of the team's quarter on the gateway and pools, then on-call for patches | Data leaves your perimeter, so residency and retention terms move to contracts; model choice and fine-tuned weights depend on what the provider hosts; price per token |
+| What remains | The next unknown bug in a component you run | The proxy and its keys, which you still run, and the provider's own cache isolation, which you take on trust |
+
+**Recommendation memo.** Keep self-hosting for internal teams, harden the gateway and split the pools this quarter, and set a three-day patch target with a named on-call. Re-decide external API access at the end of the quarter on one measure: whether every high or critical advisory in that quarter was in production within three days. If not, move external customers to managed inference and keep the self-hosted pool internal-only.
+
+**Rollout.** Weeks 1 and 2: network policy so only the gateway reaches engines, field allowlist at the edge, egress allowlist on the proxy, key rotation, `allow_client_side_credentials` false. Weeks 3 to 6: vLLM 0.30.0 through the canary and eval gate, per-tenant salts, counters stripped, the per-endpoint salt test in CI. Weeks 7 to 10: split pools, token-ID and size validation, health-check restarts.
+
+**Rollback triggers.** Any engine reachable without the gateway in the weekly scan stops new external onboarding. A salt test failure blocks the upgrade that caused it. A high or critical advisory not in production within three days goes to the CISO, and two in a quarter trigger the managed-inference migration for external traffic.
+
+**The failure mode of this design.** It concentrates trust in the gateway. Validation, salting, field allowlists and counter stripping all live there, so a gateway bug or a route someone adds without them reopens every hole at once, and the LiteLLM advisory shows that a gateway is itself software with advisories. The per-endpoint tests have to run against the gateway's real route table on every deploy, and the gateway gets the same three-day patch target as the engines.
+
+## Follow-ups
+
+- *An external customer needs `/v1/embeddings` next month. What do you add before turning it back on for them?*
+- *Two senior engineers disagree: one wants per-tenant salts, the other wants external customers on dedicated replicas and no salt. How do you decide without deciding by rank?*
+- *Your eval gate takes two days, so the three-day patch target leaves one day for everything else. What do you change: the gate, the target, or the process?*
+
+## Common mistakes
+
+- Treating the engine as a library behind the application rather than a network service that parses attacker input.
+- Relying on fast restarts against a crash that one request can trigger again.
+- Adding more fields to the proxy's denylist after the advisory instead of switching to an allowlist.
+- Patching the proxy and not rotating keys that may already have left.
+- Letting customers set the cache salt, or returning cached-token counts that turn the cache into an oracle.

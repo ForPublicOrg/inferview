@@ -1,0 +1,158 @@
+---
+title: Sagas and compensation for steps that cannot be undone
+track: workflows
+module: durable-execution
+order: 3
+kind: paper
+level: staff
+minutes: 12
+summary: Garcia-Molina and Salem's sagas trade isolation for progress with compensating steps run in reverse order; a model workflow inherits the trade, and the steps with no compensation go last, behind an approval.
+prerequisites: [workflows/durable-execution/replay-engines]
+updated: 2026-10-28
+sources:
+  - title: "Garcia-Molina and Salem, Sagas, SIGMOD 1987, pages 249 to 259"
+    url: https://doi.org/10.1145/38713.38742
+    note: definition of a saga and its guarantee; compensation as semantic undo; backward, backward/forward and pure forward recovery; parallel sagas; failing compensations; sagas on an existing DBMS with saga tables and a saga daemon; the funds-in-transit design
+  - title: Garcia-Molina and Salem, SAGAS, Princeton technical report TR-070-87 (1987-01-07), the full text used for this walkthrough
+    url: https://www.cs.princeton.edu/techreports/1987/070.pdf
+    note: the saga guarantee for 0 <= j < n with compensations C1 to Cn-1; seat example; recovery sections 4 to 7; parallel sagas section 8; letter, cheque and missile examples, funds in transit and minimising data passed through local storage in section 9; the fourth-power deadlock relation is its citation of Gray, Homan, Obermarck and Korth, A Straw Man Analysis of Probability of Waiting and Deadlock (IBM RJ3066, 1981); checked 2026-10-28
+  - title: DBOS docs, workflow tutorial
+    url: https://docs.dbos.dev/python/tutorials/workflow-tutorial
+    note: steps are tried at least once and never re-executed after they complete; transactions commit exactly once; a workflow ID acts as an idempotency key; uncaught exceptions end the workflow in ERROR and it is not recovered
+  - title: OpenAI Agents SDK docs, human in the loop
+    url: https://openai.github.io/openai-agents-python/human_in_the_loop/
+    note: approval permits a tool call to execute and does not guarantee exactly-once execution; retry only after reconciliation shows no earlier attempt performed the action
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The problem the paper solves
+
+Hector Garcia-Molina and Kenneth Salem wrote "Sagas" (SIGMOD 1987) about long-lived transactions: a monthly statement run, an insurance claim, a booking that pauses for customer input after each seat. Run as one atomic transaction, such work holds its locks for hours or days, so every shorter transaction touching the same rows waits, and because long transactions touch many objects they also deadlock and abort more often, and lose more work when they do. The paper's answer is to give up atomicity for the whole and keep it for the parts. A long-lived transaction is a saga if it can be written as a sequence of ordinary transactions T1 to Tn that may interleave with anything else, each paired with a compensating transaction Ci. The system then guarantees one of two outcomes: T1, T2, ..., Tn all commit, or T1 ... Tj commit and then Cj ... C1 run, for some j below n.
+
+A model-driven workflow is in the same position for a different reason. It does not hold locks; it calls a payment provider, a CRM, an email service and a ledger that share no transaction at all, and some calls happen after a human waits two days. There is no transaction to hold even if you wanted one, so the saga's guarantee is the strongest one available, and the paper's design advice applies nearly unchanged.
+
+## The mechanism in engineering terms
+
+**Compensation is a semantic undo, not a restore.** The paper's example: if Ti reserves a seat, Ci cancels the reservation by subtracting one and running its checks. It must not write back the seat count from before Ti, because other transactions ran in between. In API terms, the compensation for a credit is a debit of the same amount referencing the credit, not a balance overwrite, and it has to be valid against whatever state the world is in by the time it runs.
+
+**There is no isolation.** At the outer level the paper gives up full atomicity, so sagas may view the partial results of other sagas, and the recovery procedures it describes compensate the saga's own transactions only. A customer may have seen the credit before it was reversed. Whether that is acceptable is a product decision, and the paper's database-design advice is the engineering lever: if a saga moves money out of one account in T1 and into another in T3, store the in-flight amount in the database (a funds-in-transit relation) so an audit running between them still balances. The general rule is to minimise data passed between steps through local variables; for a workflow, that means intermediate state such as "credit pending approval" lives in a table the rest of the system can read.
+
+**Backward recovery** runs the compensations of the committed transactions in reverse order. The saga execution component logs every saga command before acting on it, so a crash during rollback resumes the rollback. After a crash, a saga with a begin record and no end record is aborted by compensating the last committed, uncompensated transaction and every one before it.
+
+**Forward recovery** needs save-points: the system rolls back to the latest save-point and re-runs the missing transactions from there. If save-points are taken at the start of every transaction and the application never requests an abort, the system needs no compensations at all, provided every transaction eventually succeeds when retried enough times. The paper calls the resulting executor a "persistent" transaction executor, and in its simplest form a saga is a file of transaction calls whose state is the number of the transaction executing, which is a durable execution engine described in one sentence.
+
+**Parallel sagas** compensate each process in reverse order, and all compensations in a child process run before the compensations of parent transactions that executed before the child was forked.
+
+**Compensations can fail too.** The paper's answers are a recovery block (an alternative compensation tried after the primary aborts) or manual intervention: abort the failing transaction, give it to a person, fix it, rerun it. The saga holds no locks while it waits, so the delay costs little. That is the dead-letter queue with an operator runbook, in 1987 terms.
+
+**Sagas on an existing DBMS.** Without system support, saga commands become library calls that write saga state into ordinary tables inside each transaction, and a saga daemon, restarted by the operating system after a crash, scans those tables and issues the remaining compensating or forward transactions. That is close to the architecture of DBOS today: a library writing checkpoints into the application's Postgres, and a recovery pass at startup.
+
+## The number that motivated it
+
+The paper cites an analysis by Gray, Homan, Obermarck and Korth (IBM research report RJ3066, 1981) in which deadlock frequency grows with the fourth power of transaction size, measured as the number of objects a transaction touches. It is a straw-man model, and the paper uses it only to argue that long transactions are disproportionately expensive. It is still useful arithmetic for seeing why splitting pays.
+
+<Predict id="wfl-saga-deadlock" question="By what factor does the total deadlock frequency fall?" answer={125} tolerance={0} unit="times">
+<Fragment slot="prompt">
+<p>Take the model as given: a transaction's deadlock frequency is proportional to the fourth power of the number of objects it touches. A long-lived transaction touches 10 objects. Rewritten as a saga, it becomes five transactions of 2 objects each.</p>
+</Fragment>
+<p>The single transaction scores 10⁴ = 10,000. Each saga transaction scores 2⁴ = 16, and five of them score 80. 10,000 / 80 = <b>125 times</b> less. The price is the guarantee: the 125 is bought by letting other transactions see partial state and by writing four compensations (the last step needs none, as the next section shows).</p>
+</Predict>
+
+## What changed in practice
+
+Durable execution engines are the paper's saga daemon offered as a product: the log, the restart, and the "run what is missing" logic are theirs, and the compensations remain yours. Three of the paper's observations carry most of the weight for model workflows.
+
+**The last step needs no compensation.** The paper notes that when the end-saga command ends both the last transaction and the saga, the last transaction needs no compensating transaction; nothing runs after it, so no later failure can force a rollback. That is the placement rule for anything irreversible: an email, a payout, a message posted to a customer channel, a model-written reply sent to a regulator. Put it last, after every step that can fail, so no later failure ever needs to undo it.
+
+**Some actions only have a compensation in the loosest sense.** The paper's own examples: a letter is compensated by a second letter explaining the problem, a cheque by a stop-payment message, and a missile cannot be compensated at all. A model-written email to a customer sits between the letter and the missile, because the apology email is itself a new artefact the model writes. So the step gets two controls before it rather than a compensation after it: an approval gate (human or policy) placed immediately before it, and the forward-recovery property that the step eventually succeeds when retried, which means an idempotency key or an outbox the sender deduplicates on.
+
+**Approval and execution are separate guarantees.** The OpenAI Agents SDK docs state that approval permits a tool call to execute and does not guarantee exactly-once execution, and that a retry should happen only after reconciliation shows no earlier attempt performed the action. In saga terms, the approval decides whether Tn runs; the key decides how many times its effect lands. DBOS draws the same line in its own guarantees: steps are tried at least once and never re-executed after they complete, and only database transactions commit exactly once.
+
+The sketch below is the in-memory shape: steps with compensations pushed onto a stack, unwound in reverse on abort, compensations retried and then escalated, and the irreversible step last behind its gate. In a durable engine each action and each compensation is its own step, so a crash during unwinding resumes the unwinding, and each compensation needs its own idempotency key because it, too, runs at least once.
+
+```python
+class Saga:
+    """Runs steps in order; on failure, runs the compensations of finished steps in reverse order."""
+    def __init__(self, log):
+        self.log, self.undo = log, []
+
+    def step(self, name, action, compensate=None):
+        result = action()
+        self.log.append(f"did {name}")
+        if compensate:
+            self.undo.append((name, compensate))
+        return result
+
+    def abort(self):
+        while self.undo:
+            name, comp = self.undo.pop()
+            for attempt in range(3):            # compensations must eventually succeed: retry, then escalate
+                try:
+                    comp()
+                    self.log.append(f"undid {name}")
+                    break
+                except Exception:
+                    if attempt == 2:
+                        self.log.append(f"stuck on {name}: queued for an operator")
+
+def refund_case(fail_at, approved):
+    log = []
+    saga = Saga(log)
+    try:
+        saga.step("hold", lambda: None, compensate=lambda: None)          # place a hold on the order
+        saga.step("credit", lambda: None, compensate=lambda: None)        # credit; reversible by a debit
+        if fail_at == "ledger":
+            raise RuntimeError("ledger write failed")
+        saga.step("ledger", lambda: None, compensate=lambda: None)
+        if not approved:                                                  # the gate sits before the step with no undo
+            raise RuntimeError("approval denied")
+        saga.step("email", lambda: None)                                  # irreversible, so it runs last
+    except RuntimeError as e:
+        log.append(f"abort: {e}")
+        saga.abort()
+    return log
+
+print(refund_case("ledger", approved=True))
+# ['did hold', 'did credit', 'abort: ledger write failed', 'undid credit', 'undid hold']
+print(refund_case(None, approved=False))
+# ['did hold', 'did credit', 'did ledger', 'abort: approval denied', 'undid ledger', 'undid credit', 'undid hold']
+```
+
+A denied approval is an ordinary abort: the saga unwinds and nothing irreversible has happened. If the email ran before the ledger write, a ledger failure would leave a sent email describing a refund that the compensations then reversed.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"An agent workflow resolves billing disputes: it issues a provider credit, updates the ledger, posts a note to the CRM and emails the customer a model-written explanation. Legal wants every customer email reviewed by a person; support says review would add a day to a process customers expect in an hour. The CRM API has no idempotency key. Design the failure behaviour and decide where review goes."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Order the steps so the email is last and is the only step with no compensation: credit (compensated by a referenced debit), ledger (compensated by a reversing entry), CRM note (compensated by a correction note, deduplicated through our own outbox because the API has no key), then email. Review sits immediately before the email, and only for the cases where the model's explanation carries the risk, so the credit lands within the hour and the email waits for review when it has to.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Classify each step by its undo. The credit and the ledger entry have semantic compensations; each compensation references the original by its idempotency key so a retried compensation is harmless. The CRM note's compensation is a second note, and since the CRM has no key, the workflow writes an outbox row keyed by dispute id and step before calling it and checks the CRM for that row's marker before any retry. The email has no compensation worth the name (a second email is a new artefact), so it goes last, which the saga paper notes needs no compensation, since nothing after it can fail.</p>
+<p>Review placement is the constraint conflict. Legal's requirement attaches to the email, not to the credit, so the gate goes immediately before the email and the earlier steps run without waiting; the customer sees the credit within the hour and the explanation when review clears. If legal will accept a policy, review applies to a defined subset (disputes above an amount, explanations citing policy text, first contact with a customer) and a sample of the rest, with the sampling rate written down. If they will not, every email waits, and that cost is stated in the decision memo rather than hidden in a queue.</p>
+<p>What I give up: isolation. Between the credit and the email, the customer can see a credit with no explanation, and if the reviewer rejects the email, the credit stands with a human-written email instead. Written down: compensation for each step, the escalation path when a compensation fails three times, and the review policy with its owner.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The reviewer rejects the explanation and says the credit itself was wrong. Is that a compensation or a new workflow?</em> A new, linked workflow with its own approval: the saga already committed its forward steps, and reversing a credit days later is a business decision, not an abort.</li>
+<li><em>Review adds cost equal to a third of the support team's time. Which half of the review do you cut, and what risk do you accept in writing?</em> Cut review on the lowest-risk class and keep sampled audits; name the class and the sampling rate.</li>
+<li><em>Two senior engineers disagree: one wants the email first so customers hear quickly, the other wants it last. What evidence decides it without deciding by rank?</em> The rate at which steps after the email fail in production; if it is near zero and each failure is fixable forward, the order matters less than the review gate.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The paper assumes compensations can be written and will eventually succeed, and it concedes that writing them is hard in general. Many external APIs offer no inverse at all (a sent message, a published post, an action already taken by a downstream system that consumed a webhook). For those, the only controls are before the step: gate it, put it last, and make its execution idempotent.
+
+The saga guarantee is weaker than it reads. Between Ti and Ci other readers act on Ti's effects, and the paper's recovery procedures offer no mechanism for them. If a downstream system has already acted on the credit, compensating the credit does not compensate that action. Tracing who consumed each effect is part of the design, not an edge case.
+
+Forward recovery assumes every step eventually succeeds when retried. A model step that keeps returning invalid output, or a tool call rejected for policy reasons, will not, and an engine that retries it forever is a stuck saga with a growing bill. Cap retries per step, then treat exhaustion as an abort that runs the compensations, or as the paper's manual intervention with an owner and a deadline.
+
+<SelfRate id="lesson:workflows/durable-execution/sagas" />

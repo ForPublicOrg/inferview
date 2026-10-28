@@ -1,0 +1,120 @@
+---
+title: "Playbook: cost and runaway controls"
+track: harness
+module: cache-cost-latency
+order: 3
+kind: playbook
+level: senior
+minutes: 12
+summary: Turn caps, dollar caps, auto mode's denial fallback, the Stop-hook block cap and per-task budgets each stop a different runaway, and which ones a run needs depends on whether anyone is watching, who pays, and what a stopped run costs to resume.
+prerequisites: [harness/cache-cost-latency/harness-costs]
+updated: 2026-10-28
+sources:
+  - title: Claude Code docs, How the agent loop works (Agent SDK, checked 2026-10-28)
+    url: https://code.claude.com/docs/en/agent-sdk/agent-loop
+    note: "max_turns counts each turn with tool calls plus one for the final response; max_budget_usd stops the loop at estimated spend; both default to no limit; error_max_turns and error_max_budget_usd results carry no result field but do carry total_cost_usd, num_turns and session_id; the budget is checked after each response, so spend can pass the cap by one response plus running subagents; the cap covers subagents from v2.1.217; usage covers only the main loop, modelUsage the whole tree"
+  - title: Claude Code docs, Best practices (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/best-practices
+    note: "spend controls listed as --max-turns or --max-budget-usd with -p, or a spend limit; a Stop hook that blocks eight stops in a row with no tool call between them is overridden, cap raised with CLAUDE_CODE_STOP_HOOK_BLOCK_CAP; the scripted loop example with --permission-mode dontAsk and --max-turns 20; try three files first; Opus 5.5, Sonnet 5.5 and Haiku 5.5 default to medium effort"
+  - title: Claude Code docs, Permission modes (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/permission-modes
+    note: "auto mode pauses and resumes prompting after 3 blocks in a row or 20 in total, not configurable; in -p mode there is no prompt to fall back to, the blocked action does not run and Claude keeps working, and the run is not stopped unless --permission-prompt-tool is passed; classifier calls count toward token usage on Enterprise and API-based accounts"
+  - title: Anthropic, An update on recent Claude Code quality reports (2026-04-23)
+    url: https://www.anthropic.com/engineering/april-23-postmortem
+    note: "default effort changed from high to medium on March 4 for Sonnet 4.6 and Opus 4.6 to cut latency, reverted April 7 as the wrong tradeoff; a change on March 26 meant to clear old thinking once from sessions idle over an hour cleared it every turn, causing cache misses and faster usage-limit drain, fixed April 10 in v2.1.101; a 25-word and 100-word verbosity limit cost 3% on one eval and was reverted April 20; commitments to per-model evals for every system prompt change, soak periods and gradual rollouts"
+  - title: "Yang et al., SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering (arXiv 2405.15793v3)"
+    url: https://arxiv.org/html/2405.15793v3
+    note: "a $4 per-instance budget after which existing edits were submitted; the cap corresponds to roughly 30 to 40 turns; 93.0% of resolved instances were submitted before exhausting the budget against 69.0% of all instances"
+  - title: Claude API docs, Pricing (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: "Opus 5.5: $5 per million tokens for 5-minute cache writes, $20 per million output tokens"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+An agent loop with no limits runs until the model decides it is done. The Agent SDK documents that this is the default: `max_turns` and `max_budget_usd` both default to no limit, which the docs call fine for well-scoped tasks and a risk on open-ended ones. The decision is which stops to put around a run, and the trap is assuming one stop covers the others. Each control below stops one kind of runaway and lets the rest through.
+
+**Turn cap** (`max_turns`, `--max-turns`). Stops a loop that keeps calling tools. A turn is one round trip with tool calls, plus one for the final text-only response; a cap that leaves no room for that last turn ends with `error_max_turns` and no answer. It does not bound cost per turn, so twenty turns over a large context can cost more than a hundred over a small one.
+
+**Dollar cap** (`max_budget_usd`, `--max-budget-usd` with `-p`). Stops spend directly. Claude Code checks the estimate after each response arrives, so the response that crosses the cap completes and counts; spend can exceed the cap by one response plus whatever running subagents spend before they stop. Since v2.1.217 the cap covers subagents: once reached, spawning another fails with `Budget limit reached`. With streaming input the budget accumulates across messages in a conversation and `/clear` resets it.
+
+**Denial fallback** (auto mode). After 3 classifier blocks in a row or 20 in total, interactive auto mode pauses and resumes prompting; the thresholds are not configurable. This stops an agent that keeps attempting blocked actions, but only when a person can answer the prompt. In `-p` mode there is nothing to fall back to: the blocked action does not run, Claude keeps working, and Claude Code does not stop the run unless you pass `--permission-prompt-tool`. Headless, the denial thresholds are not a stop at all.
+
+**Stop-hook block cap.** A `Stop` hook that exits with code 2 sends Claude back to work, which is how a harness enforces "tests pass before done". If the hook blocks eight stops in a row with no tool call between them, Claude Code overrides the next block and ends the turn (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` raises the cap). This stops the loop where the model has given up and keeps trying to stop. It does not stop the loop where the model keeps editing and the check keeps failing, because each edit is a tool call that resets the count. That loop needs a turn or dollar cap.
+
+**Per-task budget with partial submission.** SWE-agent capped each benchmark instance at $4, roughly 30 to 40 turns, and submitted whatever edits existed when the cap hit. The paper reports that 93.0% of resolved instances were submitted before the budget ran out, against 69.0% of all instances: the cap fell mostly on runs that were failing anyway, and the authors expected a larger budget to add little. The design point is what happens at the cap. SWE-agent turned it into a partial result; the Agent SDK's error results carry no `result` field but do carry `session_id`, so the run can be resumed with a higher limit.
+
+## The inputs that change it
+
+**Is anyone watching?** Attended sessions have a human stop: interrupting, `/clear`, and auto mode's fallback to prompting. Headless runs have only what the configuration enforces. Claude Code's best-practices page reduces the unattended checklist to five questions, one of which is "What stops it?", answered with `--max-turns`, `--max-budget-usd` or a spend limit.
+
+**Who pays, and in what unit?** On an API key the runaway is dollars, and a dollar cap is the direct control. On a subscription the runaway is usage-limit drain, and cache misses are the hidden multiplier. Anthropic's April 2026 postmortem is the example: a change meant to clear old thinking once from sessions idle for over an hour instead cleared it on every turn from March 26 until the fix on April 10, causing cache misses that Anthropic believes drove reports of usage limits draining faster than expected. No per-run cap would have caught that; a fleet-level cache-read ratio would.
+
+**What does a stopped run cost to resume?** Resuming an SDK session restores its context, but a resume after the cache TTL re-reads the whole history at the write price, and a run that stopped mid-edit leaves a working tree to inspect. If resuming is cheap and the task is valuable, set caps tight and resume the stragglers by hand. If resuming means re-reading a large context cold, set caps looser and stop fewer runs.
+
+## Effort is a cost lever that costs quality
+
+Effort reduces tokens per turn and latency, which makes it tempting as a default-level cost control. The postmortem records what happened when Anthropic used it that way. On March 4, 2026, Claude Code's default effort for Sonnet 4.6 and Opus 4.6 changed from high to medium, because some users saw thinking times long enough that the UI appeared frozen. On April 7 it was reverted; Anthropic called the change "the wrong tradeoff" after users said they preferred higher intelligence with the option to lower effort themselves. A separate system-prompt instruction limiting text between tool calls to 25 words and final responses to 100 words, shipped April 16, cost 3% on one evaluation for Opus 4.6 and 4.7 in an ablation and was reverted April 20.
+
+The process commitments that followed are the transferable part: per-model evals for every system prompt change, and soak periods, broader evals and gradual rollouts for any change that could trade against intelligence. A cost lever that changes what the model does is a model change and ships like one. Defaults have moved again since: as of October 2026, Claude Code's best-practices page says Opus 5.5, Sonnet 5.5 and Haiku 5.5 default to medium.
+
+## Worked decision
+
+A scenario, with pilot numbers invented to make the arithmetic concrete. A nightly CI job runs `claude -p` over 200 files to migrate them to a new logger API, on an API key with Opus 5.5, following the loop in Claude Code's best-practices page: `--bare`, `--allowedTools` limited to read, edit and the two git commands, `--permission-mode dontAsk`. A pilot on three files cost $0.40, $0.55 and $1.30 and took 9, 11 and 17 turns.
+
+The choices. `--max-turns 20` gives room above the pilot's worst case and matches the docs' example. `--max-budget-usd 2.00` sits above the pilot's worst case. `dontAsk` instead of auto mode, because headless auto mode's denial thresholds do not stop anything, while `dontAsk` refuses everything outside the allow list up front. No Stop hook: the job's acceptance check is the CI run on the resulting branch, outside the agent.
+
+Then the bound. Per-run caps do not bound the night. Suppose the largest single response the job can produce is a cold request with 150,000 input tokens written at Opus 5.5's $5 per million (a cache miss after a slow tool call) plus 8,000 output tokens at $20 per million.
+
+<Predict id="hrn-runaway-fleet-bound" question="With no subagents, what is the most the 200-run job can spend, in dollars, if every run hits its cap and then overshoots by that largest response?" answer={582} tolerance={5} unit="$">
+<p>The largest response costs 150,000 × $5 / 1,000,000 + 8,000 × $20 / 1,000,000 = $0.75 + $0.16 = $0.91. Each run can reach $2.00 and overshoot by $0.91, so the bound is 200 × $2.91 = <b>$582</b>.</p>
+<p>The pilot's mean of $0.75 predicts about $150 for the night. The gap between $150 and $582 is what the per-run caps allow, and it is the reason for a fleet cap: the loop sums <code>total_cost_usd</code> from each result and stops launching runs past a nightly budget set from the pilot, for example twice the expected $150.</p>
+</Predict>
+
+Runs that end with `error_max_turns` or `error_max_budget_usd` are recorded with their `session_id` and file name and reported as failures, not retried in the same night. Retrying capped runs automatically would undo the caps.
+
+What you give up: some files that would have succeeded at turn 25 are reported as failures, and the fleet cap can stop the job with files untouched. Both show up in the morning report, which is the point.
+
+## What to measure after deciding
+
+The dashboard that shows a runaway before the invoice does is per run and per fleet. Per run: `total_cost_usd`, `num_turns`, the result subtype, the ratio of cache reads to cache writes, classifier denials, and Stop-hook blocks. Use `modelUsage` rather than `usage` for cost, because `usage` covers only the main loop and misses subagents. Per fleet: cost per successful run rather than per run, the distribution of run cost (watch the upper tail, not the mean), the share of runs ending in `error_max_turns` or `error_max_budget_usd`, and spend rate against the expected rate for the time of day.
+
+Two alerts earn their noise. A cache-write share that jumps across many sessions at once means a harness or configuration change broke the prefix, which is the postmortem's failure. And a rising share of capped runs means either the task got harder or the agent got worse; both need a person before the next night's run.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your company is about to let a headless agent fix failing CI on every pull request across 300 repositories. Engineering wants high success, finance wants a hard monthly ceiling, and security wants no prompts that block the pipeline. You have one week to propose the controls. What are they?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Per run: <code>dontAsk</code> with a narrow allow list, a turn cap and a dollar cap sized from a pilot, and a Stop hook that re-runs the failing job with a block cap. Per fleet: an orchestrator that sums run cost and stops dispatching past a daily budget derived from the monthly ceiling, plus alerts on cache-write share and capped-run share. Capped runs post a failure with the session ID instead of retrying.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Start with what stops what. Headless means auto mode's denial fallback stops nothing, so permission control is <code>dontAsk</code> and an allow list, which never blocks on a prompt. The Stop hook keeps the agent working until the CI job passes, and its block cap ends runs where the agent has given up, but an agent that keeps editing resets the count, so the turn and dollar caps are what end that case.</p>
+<p>Size the caps from a pilot on a sample of real failures, and translate the monthly ceiling into a daily budget at the orchestrator, because per-run caps multiplied by 300 repositories bound nothing useful. Add the overshoot of one response per run to the bound.</p>
+<p>What you give up is success on the hard tail, and the risk note says so: capped runs leave the failure for a person, with the session ID so they can resume it. Ship to a few repositories first and compare cost per fixed pull request against the pilot before widening.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Finance's ceiling is reached by the 20th of the month and CI fixes stop. Engineering says the ceiling is wrong; finance says the agent is wasteful. What data settles it, and who decides?</li>
+<li>Your dollar cap is cutting 15% of runs, and half of those would have succeeded with twice the budget. Do you raise the cap, and what would you need to see to lower it again?</li>
+<li>Security asks for auto mode instead of <code>dontAsk</code> so the agent can run unanticipated commands safely. What changes in your runaway controls if you agree?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The controls are Claude Code and Agent SDK mechanisms at the versions cited, and the thresholds (3 and 20 denials, 8 Stop-hook blocks) are documented defaults that change between releases. Another harness has different stops and different gaps; map each runaway to a control before trusting an equivalent.
+
+The SWE-agent evidence that caps mostly cut failing runs is from a 2024 model on SWE-bench, where the task ends with a submission. On open-ended work there is no submission, and a capped run's partial output may be worth nothing.
+
+A dollar cap is an estimate from the usage the API returns. It does not include costs outside the model bill, such as CI minutes triggered by the agent's pushes or a sandbox's runtime, and those can be the larger runaway.
+
+<SelfRate id="lesson:harness/cache-cost-latency/runaway-controls" />

@@ -1,0 +1,386 @@
+---
+id: sec-027
+title: A SQL tool the model can call but cannot rewrite
+subtitle: registered templates, typed arguments and a bounded result
+track: security
+module: output-data
+type: code
+difficulty: hard
+seniority: [senior, staff]
+minutes: 50
+core: false
+tags: [output-handling, sql-injection, tool-design, multi-tenancy, parameterised-queries, like-wildcards]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: OWASP Top 10 for LLM Applications 2025, LLM05 Improper Output Handling
+    url: https://genai.owasp.org/llmrisk/llm052025-improper-output-handling/
+    note: "model-generated SQL run without parameterisation is listed as a vulnerability; the mitigations include parameterised queries or prepared statements for any database operation that involves model output"
+  - title: PEP 249, Python Database API Specification v2.0
+    url: https://peps.python.org/pep-0249/
+    note: "paramstyle qmark is WHERE name=?; fetchmany(size) returns the next group of rows, possibly fewer"
+  - title: PostgreSQL documentation, pattern matching with LIKE (version 18, checked 2026-10-28)
+    url: https://www.postgresql.org/docs/current/functions-matching.html
+    note: "_ matches one character and % any sequence; the default escape character is the backslash and ESCAPE selects another; the SQL standard says no escape character when ESCAPE is omitted"
+  - title: SQLite documentation, the LIKE operator and ESCAPE (checked 2026-10-28)
+    url: https://www.sqlite.org/lang_expr.html
+    note: an escape character exists only when the ESCAPE clause is present
+  - title: Psycopg 3 documentation, cursor types (checked 2026-10-28)
+    url: https://www.psycopg.org/psycopg3/docs/advanced/cursors.html
+    note: "a client-side cursor receives the whole result set on execute; server-side (named) cursors fetch rows as needed"
+code:
+  starter: |
+    class QueryTool:
+        def __init__(self, templates, execute, max_rows=100):
+            """templates: name -> {"sql": str, "params": {arg_name: spec}}, written by the team, never by the model.
+            execute(sql, params) runs one statement with ? placeholders and returns a DB-API cursor.
+            """
+            raise NotImplementedError
+
+        def call(self, session, name, args):
+            """session is set by the server: {"tenant_id": int, ...}. name and args come from the model.
+
+            Return {"rows": [[...], ...], "truncated": bool} or {"error": str}. Never raise.
+            """
+            raise NotImplementedError
+  tests: |
+    class Cursor:
+        def __init__(self, n):
+            self.n, self.pulled = n, 0
+        def __iter__(self):
+            return self
+        def __next__(self):
+            if self.pulled >= self.n:
+                raise StopIteration
+            self.pulled += 1
+            return (self.pulled, "open", 1000)
+        def fetchone(self):
+            return next(self, None)
+        def fetchmany(self, size=1):
+            return [row for _, row in zip(range(size), self)]
+        def fetchall(self):
+            return list(self)
+    class DB:
+        def __init__(self, rows=3):
+            self.rows, self.calls, self.cursors = rows, [], []
+        def __call__(self, sql, params):
+            self.calls.append((sql, list(params)))
+            self.cursors.append(Cursor(self.rows))
+            return self.cursors[-1]
+    TEMPLATES = {
+        "orders_by_status": {
+            "sql": "SELECT id, status, total_cents FROM orders WHERE tenant_id = :tenant_id AND status = :status ORDER BY {order} LIMIT :limit",
+            "params": {"status": ("enum", ["open", "shipped", "refunded"]),
+                       "order": ("order", {"newest": "created_at DESC", "largest": "total_cents DESC"}),
+                       "limit": ("int", 1, 100)}},
+        "orders_by_ids": {
+            "sql": "SELECT id, status, total_cents FROM orders WHERE tenant_id = :tenant_id AND id IN (:ids)",
+            "params": {"ids": ("int_list", 50)}},
+        "customers_by_name": {
+            "sql": "SELECT id, name, email FROM customers WHERE tenant_id = :tenant_id AND name LIKE :prefix ESCAPE '\\'",
+            "params": {"prefix": ("prefix", 64)}},
+        "customer_by_email": {
+            "sql": "SELECT id, name FROM customers WHERE tenant_id = :tenant_id AND email = :email",
+            "params": {"email": ("str", 254)}},
+    }
+    db = DB()
+    tool = QueryTool(TEMPLATES, db)
+    r = tool.call({"tenant_id": 7}, "orders_by_status", {"status": "open", "order": "newest", "limit": 20})
+    assert r == {"rows": [[1, "open", 1000], [2, "open", 1000], [3, "open", 1000]], "truncated": False}, r
+    assert db.calls[-1] == ("SELECT id, status, total_cents FROM orders WHERE tenant_id = ? AND status = ? ORDER BY created_at DESC LIMIT ?", [7, "open", 20]), db.calls[-1]
+    tool.call({"tenant_id": 7}, "orders_by_ids", {"ids": [3, 1, 2]})
+    assert db.calls[-1] == ("SELECT id, status, total_cents FROM orders WHERE tenant_id = ? AND id IN (?, ?, ?)", [7, 3, 1, 2]), db.calls[-1]
+    tool.call({"tenant_id": 7}, "customer_by_email", {"email": "x' OR '1'='1"})
+    assert db.calls[-1] == ("SELECT id, name FROM customers WHERE tenant_id = ? AND email = ?", [7, "x' OR '1'='1"]), db.calls[-1]
+    n = len(db.calls)
+    assert "error" in tool.call({"tenant_id": 7}, "orders_by_status", {"status": "open", "order": "created_at; DROP TABLE orders", "limit": 5})
+    assert "error" in tool.call({"tenant_id": 7}, "customer_by_email", {"email": "a@b.example", "tenant_id": 8})
+    assert len(db.calls) == n, "a rejected call never reaches the database"
+    r = QueryTool(TEMPLATES, DB(rows=500)).call({"tenant_id": 7}, "orders_by_ids", {"ids": [1]})
+    assert len(r["rows"]) == 100 and r["truncated"] is True
+    try:
+        QueryTool({"all_orders": {"sql": "SELECT id FROM orders", "params": {}}}, DB())
+        unscoped = "accepted"
+    except ValueError:
+        unscoped = "refused"
+    assert unscoped == "refused", "a template that does not filter on :tenant_id is refused when the tool is built"
+  hidden: |
+    import re
+
+    def _like(pattern, s, esc="\\"):
+        rx, i = "", 0
+        while i < len(pattern):
+            ch = pattern[i]
+            if ch == esc and i + 1 < len(pattern):
+                rx, i = rx + re.escape(pattern[i + 1]), i + 2
+                continue
+            rx, i = rx + (".*" if ch == "%" else "." if ch == "_" else re.escape(ch)), i + 1
+        return re.fullmatch(rx, s, re.S) is not None
+
+    def _run(name, args, tenant=7, rows=3):
+        d = DB(rows)
+        out = QueryTool(TEMPLATES, d).call({"tenant_id": tenant}, name, args)
+        return out, d
+
+    def _well_formed(out, d, tenant=7):
+        if not isinstance(out, dict) or ("error" in out) == ("rows" in out):
+            return False
+        for sql, params in d.calls:
+            if sql.count("?") != len(params) or params[0] != tenant or type(params[0]) is not int:
+                return False
+        return True
+
+    _BAD_INTS = [True, False, "20", 20.0, None, [20], 10**9, 0, -1, 2**63, float("nan")]
+    for _v in _BAD_INTS:
+        _out, _d = _run("orders_by_status", {"status": "open", "order": "newest", "limit": _v})
+        assert _well_formed(_out, _d), _v
+        assert "error" in _out or all(type(p[-1]) is int and 1 <= p[-1] <= 100 for _, p in _d.calls), _v
+    _BAD_LISTS = [[], list(range(51)), ["1"], [True], [[1]], "1,2,3", None, {"a": 1}, [1.0], [1, "2 OR 1=1"]]
+    assert all("error" in _run("orders_by_ids", {"ids": _v})[0] for _v in _BAD_LISTS), [_run("orders_by_ids", {"ids": _v})[0] for _v in _BAD_LISTS]
+    _out, _d = _run("orders_by_ids", {"ids": [5, 5, 9, 5]})
+    assert _well_formed(_out, _d) and set(_d.calls[0][1][1:]) == {5, 9}
+    _base = _run("customer_by_email", {"email": "a@b.example"})[1].calls[0][0]
+    _EVIL = ["x' OR '1'='1", "'; DROP TABLE customers; --", "a@b.example' UNION SELECT api_key, 1 FROM keys --", "\\'; --",
+             "?", ":tenant_id", "{order}", "%", "1 OR tenant_id = 8", "ʼ OR 1=1 --", "a\nb", "\" OR \"\"=\""]
+    for _v in _EVIL:
+        _out, _d = _run("customer_by_email", {"email": _v})
+        assert _well_formed(_out, _d) and all(sql == _base for sql, _ in _d.calls), _v
+        assert all(_v not in sql for sql, _ in _d.calls if len(_v) > 2), _v
+    _out, _d = _run("customer_by_email", {"email": "a" * 1000000})
+    assert "error" in _out and not _d.calls
+    for _who in ["tenant_id", "TENANT_ID"]:
+        _out, _d = _run("customer_by_email", {"email": "a@b.example", _who: 8})
+        assert _well_formed(_out, _d) and all(8 not in p for _, p in _d.calls)
+    for _args in [None, [], "status=open", 5, {"status": "open"}, {"status": "open", "order": "newest", "limit": 5, "extra": 1}]:
+        _out, _d = _run("orders_by_status", _args)
+        assert "error" in _out and not _d.calls, _args
+    for _name in ["__init__", "orders_by_status; --", "", None, "ORDERS_BY_STATUS"]:
+        assert "error" in _run(_name, {"status": "open", "order": "newest", "limit": 5})[0], _name
+    for _order in ["newest ", "NEWEST", "__class__", "created_at DESC", "newest, (SELECT 1)", ["newest"], {"newest": 1}, None]:
+        _out, _d = _run("orders_by_status", {"status": "open", "order": _order, "limit": 5})
+        assert "error" in _out and not _d.calls, _order
+    for _status in ["OPEN", "open ", "open' OR '1'='1", ["open"], None]:
+        assert "error" in _run("orders_by_status", {"status": _status, "order": "largest", "limit": 5})[0], _status
+    for _prefix, _yes, _no in [("%", "%off", "bob"), ("a_c", "a_cme", "abcme"), ("\\", "\\x", "x"), ("Ann", "Annabel", "Bob"),
+                               ("100%", "100% cotton", "1000"), ("_", "_x", "x"), ("\\%", "\\%y", "%y")]:
+        _out, _d = _run("customers_by_name", {"prefix": _prefix})
+        assert _well_formed(_out, _d) and _d.calls and "ESCAPE" in _d.calls[0][0], _prefix
+        _bound = _d.calls[0][1][1]
+        assert _like(_bound, _yes) and not _like(_bound, _no), (_prefix, _bound)
+    for _tid in [None, "7", True, "7 OR 1=1"]:
+        _out, _d = _run("customer_by_email", {"email": "a@b.example"}, tenant=_tid)
+        assert "error" in _out and not _d.calls, _tid
+    def _boom(sql, params):
+        raise RuntimeError("syntax error at or near " + sql)
+    _out = QueryTool(TEMPLATES, _boom).call({"tenant_id": 7}, "customer_by_email", {"email": "a@b.example"})
+    assert "error" in _out and "SELECT" not in _out["error"] and "customers" not in _out["error"]
+    for _bad in [{"t": {"sql": "SELECT id FROM orders WHERE id = :id", "params": {"id": ("int", 1, 9)}}},
+                 {"t": {"sql": "SELECT id FROM orders WHERE tenant_id = :tenant_id", "params": {"tenant_id": ("int", 1, 9)}}},
+                 {"t": {"sql": "SELECT id FROM orders WHERE tenant_id = :tenant_id AND id = :id", "params": {}}}]:
+        try:
+            QueryTool(_bad, DB())
+            _built = True
+        except ValueError:
+            _built = False
+        assert not _built, _bad
+    _d = DB(rows=1000000)
+    _out = QueryTool(TEMPLATES, _d, max_rows=50).call({"tenant_id": 7}, "orders_by_status", {"status": "open", "order": "newest", "limit": 100})
+    assert len(_out["rows"]) == 50 and _out["truncated"] is True
+    assert _d.cursors[0].pulled <= 51, f"{_d.cursors[0].pulled} rows were pulled from the driver to return 50"
+    _d = DB(rows=50)
+    _out = QueryTool(TEMPLATES, _d, max_rows=50).call({"tenant_id": 7}, "orders_by_ids", {"ids": [1]})
+    assert len(_out["rows"]) == 50 and _out["truncated"] is False
+  solution: |
+    import re
+
+    _SLOT = re.compile(r":([a-z_][a-z0-9_]*)|\{([a-z_][a-z0-9_]*)\}")
+    _KINDS = {"int", "str", "enum", "prefix", "int_list", "order"}
+
+
+    def _is_int(v):
+        return isinstance(v, int) and not isinstance(v, bool)
+
+
+    class QueryTool:
+        """Decisions: an out-of-range number is refused, not clamped, so the model learns the range instead of getting
+        a different answer than it asked for; duplicate ids in a list are dropped, keeping the first occurrence."""
+
+        def __init__(self, templates, execute, max_rows=100):
+            self.execute, self.max_rows = execute, max_rows
+            self.templates = {name: self._compile(name, t) for name, t in templates.items()}
+
+        @staticmethod
+        def _compile(name, t):
+            """Split the SQL once into literal text and slots, and refuse templates the tool cannot keep safe."""
+            sql, params = t["sql"], t["params"]
+            pieces, pos, used = [], 0, set()
+            for m in _SLOT.finditer(sql):
+                pieces.append(("text", sql[pos:m.start()]))
+                if m.group(1):
+                    pieces.append(("value", m.group(1)))
+                    used.add(m.group(1))
+                else:
+                    pieces.append(("order", m.group(2)))
+                    used.add(m.group(2))
+                pos = m.end()
+            pieces.append(("text", sql[pos:]))
+            if "tenant_id" not in used:
+                raise ValueError(f"template {name} does not filter on :tenant_id")
+            if "tenant_id" in params:
+                raise ValueError(f"template {name} declares tenant_id as a model argument")
+            for slot in used - {"tenant_id"}:
+                if slot not in params or params[slot][0] not in _KINDS:
+                    raise ValueError(f"template {name} uses {slot} without a known type")
+            for p, spec in params.items():
+                if p not in used:
+                    raise ValueError(f"template {name} declares {p} but never uses it")
+                if (spec[0] == "order") != (("order", p) in pieces):
+                    raise ValueError(f"template {name}: order slots are {{name}}, value slots are :name")
+            return pieces, params
+
+        @staticmethod
+        def _check(name, spec, v):
+            kind = spec[0]
+            if kind == "int":
+                lo, hi = spec[1], spec[2]
+                if not _is_int(v) or not lo <= v <= hi:
+                    return f"{name} must be an integer from {lo} to {hi}"
+            elif kind in ("str", "prefix"):
+                if not isinstance(v, str) or len(v) > spec[1] or "\x00" in v:
+                    return f"{name} must be text of at most {spec[1]} characters"
+            elif kind == "enum":
+                if not isinstance(v, str) or v not in spec[1]:
+                    return f"{name} must be one of {', '.join(spec[1])}"
+            elif kind == "order":
+                if not isinstance(v, str) or v not in spec[1]:
+                    return f"{name} must be one of {', '.join(spec[1])}"
+            elif kind == "int_list":
+                if not isinstance(v, list) or not 1 <= len(v) <= spec[1]:
+                    return f"{name} must be a list of 1 to {spec[1]} integers"
+                if not all(_is_int(x) for x in v):
+                    return f"{name} must contain integers only"
+            return None
+
+        def _bind(self, pieces, params, tenant_id, args):
+            sql, values = [], []
+            for kind, x in pieces:
+                if kind == "text":
+                    sql.append(x)
+                elif kind == "order":
+                    sql.append(params[x][1][args[x]])  # the fragment comes from the template author, never the model
+                elif x == "tenant_id":
+                    sql.append("?")
+                    values.append(tenant_id)
+                elif params[x][0] == "int_list":
+                    ids = list(dict.fromkeys(args[x]))
+                    sql.append(", ".join("?" * len(ids)))
+                    values.extend(ids)
+                elif params[x][0] == "prefix":
+                    escaped = args[x].replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                    sql.append("?")
+                    values.append(escaped + "%")
+                else:
+                    sql.append("?")
+                    values.append(args[x])
+            return "".join(sql), values
+
+        def call(self, session, name, args):
+            try:
+                if name not in self.templates:
+                    return {"error": f"unknown query {name!r}; available: {', '.join(sorted(self.templates))}"}
+                pieces, params = self.templates[name]
+                if not isinstance(args, dict):
+                    return {"error": "arguments must be an object"}
+                extra = sorted(set(args) - set(params))
+                missing = sorted(set(params) - set(args))
+                if extra or missing:
+                    return {"error": f"unexpected arguments {extra}, missing arguments {missing}"}
+                for p, spec in params.items():
+                    problem = self._check(p, spec, args[p])
+                    if problem:
+                        return {"error": problem}
+                tenant_id = session["tenant_id"]
+                if not _is_int(tenant_id):
+                    return {"error": "no tenant for this session"}
+                sql, values = self._bind(pieces, params, tenant_id, args)
+                cursor = self.execute(sql, values)
+                rows = cursor.fetchmany(self.max_rows + 1)
+                return {"rows": [list(r) for r in rows[:self.max_rows]], "truncated": len(rows) > self.max_rows}
+            except Exception as e:  # the model sees a short error, never a stack trace or the SQL text
+                return {"error": f"query failed: {type(e).__name__}"}
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Coding round, 50 minutes">
+Our support agent answers questions about a customer's orders by querying the production database. The model chooses the query and its arguments, and the model reads ticket text that customers write. Build the tool so that nothing the model sends can change what SQL runs or whose rows come back.
+</Callout>
+
+Write `QueryTool(templates, execute, max_rows=100)` with a method `call(session, name, args)`.
+
+**Templates are written by the team.** Each has `sql` and `params`. In the SQL, `:name` marks a value and `{name}` marks an ORDER BY slot. Each argument's spec is one of:
+
+| spec | the model sends | the query gets |
+|---|---|---|
+| `("int", lo, hi)` | an integer from lo to hi | that integer |
+| `("str", max_len)` | text of at most max_len characters | that text |
+| `("enum", values)` | one of values | that string |
+| `("prefix", max_len)` | text of at most max_len characters | a pattern matching values that start with exactly that text |
+| `("int_list", max_items)` | 1 to max_items integers | one placeholder per integer, for `IN (:name)` |
+| `("order", choices)` | a key of choices | the team's SQL fragment for that key, in `{name}` |
+
+**Tenancy.** Every template filters on `:tenant_id`, which is filled from `session["tenant_id"]`, never from the model. The constructor raises `ValueError` for a template the tool cannot keep inside one tenant.
+
+**Calls.** `call` sends one statement to `execute(sql, params)`, using `?` placeholders in order, and returns `{"rows": [[...], ...], "truncated": bool}`, with at most `max_rows` rows. Anything wrong with the call returns `{"error": str}` and runs nothing. The error goes to the model, which reads attacker-written text, so it must not echo SQL or driver messages. `call` never raises.
+
+**Scale.** The orders table holds tens of millions of rows and some templates can match most of a tenant's. The cursor streams rows; the hidden tests count how many you pull.
+
+**Your decisions, to state in a comment:** what an out-of-range number does (refuse or clamp), and what duplicate ids in a list do.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how the model's tool arguments are decoded before they reach <code>call</code>, and which Python type each JSON value becomes.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request a sample of the prefixes users and the model actually send to the name search, and the row count each one returned.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask the database team whether the driver's cursor holds the whole result in memory after <code>execute</code>, and measure what one broad template returns for the largest tenant.</p></details>
+
+## Answer
+
+The reference splits each template once, at construction, into literal text and slots, and refuses at that point any template that does not use `:tenant_id`, declares `tenant_id` as a model argument, uses a slot with no spec, or declares an argument it never uses. Mistakes in templates are the team's and fail at deploy, not in front of a customer.
+
+**The SQL text depends only on the template, the ORDER BY key and the length of each list.** Values never reach the SQL string; they go into the parameter list. The hidden tests check this as an invariant: for a battery of injection strings the SQL sent to `execute` is byte-identical to the SQL for a harmless value, the number of `?` equals the number of parameters, and the first parameter is always the session's tenant. ORDER BY cannot take a parameter, so the model picks a key and the fragment comes from the template author. A model-supplied `tenant_id` is an error, because silently ignoring it hides an attack from the logs.
+
+**Three type checks that parameterisation does not give you:**
+
+- **Booleans are integers in Python.** `isinstance(True, int)` is true, so a naive check binds `True` as 1. The reference rejects `bool` explicitly, and rejects `"20"` and `20.0`.
+- **LIKE wildcards survive binding.** A bound `%` is still a wildcard, so a prefix search for `%` returns every customer in the tenant. The reference escapes the escape character, `%` and `_`, then appends `%`, and the template says `ESCAPE '\'`. The clause matters for portability: PostgreSQL defaults to a backslash escape, while SQLite and the SQL standard have none without it.
+- **Lists are validated whole before any placeholder is built.** Empty, too long, strings, booleans and nested lists are refused.
+
+**My decisions.** Out-of-range numbers are refused, not clamped: a clamped `LIMIT` is a silent change to the model's question, and the error tells it what range to use. Duplicate ids are removed with order kept, which changes the placeholder count but not the meaning of `IN`.
+
+**The bounded result.** `cursor.fetchmany(max_rows + 1)` pulls at most one row more than it returns, and the extra row is how it knows to set `truncated`. `fetchall()` followed by a slice pulls everything: on the test's one-million-row cursor that is a million tuples in memory to return a hundred, 99.6 MiB at peak under `tracemalloc`, measured with CPython 3.12.6 on the laptop that checked this problem on 2026-10-28, against 16.4 KiB for the reference on the same cursor.
+
+**The decision with two defensible answers: templates or model-written SQL.**
+
+- **Registered templates** (the reference). Nothing the model sends changes the statement. Cost: the agent answers only questions someone anticipated, and each new one is a code change and a review.
+- **Model-written SELECT statements** run as a read-only role, with row-level security keyed on a tenant set per transaction, a statement timeout and a parser that allows one SELECT. Cost: the boundary is now the database's permissions. Every column the role can read is readable, a slow query is one prompt away, and an error in the row-level policy is a cross-tenant leak with no tool in front of it.
+
+The conflict is flexibility against blast radius. For a support agent whose questions are mostly "status of order X", I would ship templates and log refused calls, which tell you which template to write next.
+
+**Where the reference fails.** Tenancy is not authorisation. `customers_by_name` with prefix `""` returns the tenant's customers a hundred at a time, and nothing here asks whether this support agent may see all of them; the user's own entitlements belong in the template's WHERE clause, filled from the session like the tenant. The rows themselves are attacker-written text on the way back into the model's context, so a customer name such as "ignore previous instructions" arrives as a tool result. And the `:name` syntax collides with PostgreSQL's `::` casts: `created_at::date` in a template is refused as an undeclared slot called `date`, so authors write `CAST(created_at AS date)`.
+
+## Follow-ups
+
+- *What changes against a real PostgreSQL driver?* Psycopg's default client-side cursor receives the whole result at `execute`, so `fetchmany` no longer bounds memory: use a server-side cursor or put `LIMIT max_rows + 1` in the statement. Use the driver's own paramstyle, set a statement timeout, run as a read-only role, and set the tenant for row-level security in the same transaction as the query.
+- *Analysts want the model to write its own SELECT statements for a reporting assistant, with a quarter to ship. Which half of the safeguards do you build first, and which risk do you accept in writing until the rest lands?*
+- *What would you need to see in the refused-call log to retire the template approach for one product area?*
+- *A template author wants a free-text `("sql_fragment", ...)` spec for one hard query. What do you say, and what do you offer instead?*
+
+## Common mistakes
+
+- Formatting values into the SQL string after "sanitising" them.
+- Taking `tenant_id` from the model's arguments when present, or merging session and arguments into one dictionary.
+- Using `isinstance(v, int)` and accepting booleans.
+- Binding a LIKE prefix without escaping `%` and `_`.
+- `fetchall()` then slicing.
+- Returning driver errors to the model, which shows it the schema.

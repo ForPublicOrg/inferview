@@ -1,0 +1,117 @@
+---
+id: mml-024
+title: Callers cut off mid-sentence after a turn-detection change
+subtitle: rank the causes from a sample of recordings
+track: multimodal
+module: speech-voice
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 20
+core: false
+tags: [voice, turn-detection, vad, debugging, rollback]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: OpenAI docs, Realtime voice activity detection (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/guides/realtime-vad
+    note: "server_vad threshold from 0 to 1, where a higher value requires louder audio and can help in noisy environments; prefix_padding_ms; silence_duration_ms, where shorter values detect turns more quickly; example values 0.5, 300 and 500; semantic_vad with eagerness low, medium, high or auto (auto equals medium), low lets the user take their time; create_response and interrupt_response apply to speech-to-speech sessions"
+  - title: ElevenLabs, voice agent latency optimization (published 2026-06-23, updated 2026-10-09; vendor)
+    url: https://elevenlabs.io/blog/voice-agent-latency-optimization
+    note: "tighten the silence threshold and measure interruption rates in production; waiting 700 ms of silence adds 700 ms to every turn"
+  - title: pipecat-ai/smart-turn README (checked 2026-10-28)
+    url: https://github.com/pipecat-ai/smart-turn
+    note: "native audio turn detection that runs after a VAD such as Silero detects silence"
+choices:
+  - text: The higher threshold scores quiet trailing speech as silence, so the timer runs while callers are still talking
+    correct: true
+    why: Six of the eight sampled cut-offs happened during audible but quiet speech, which a silence timer only reaches if those frames were classed as silence.
+  - text: The shorter silence window ends turns in the pauses that callers leave between the groups of digits they read
+    correct: false
+    why: It is a real defect and explains the two cut-offs in long pauses, but not the six that happened while the caller was audibly speaking.
+  - text: server_vad cannot tell a pause from a finished turn, so the only fix for the cut-offs is moving to semantic_vad
+    correct: false
+    why: Semantic detection would help the pause cases, but the configuration that produced few cut-offs last week was also server_vad, so the type is not what changed.
+  - text: With interrupt_response on, echo of the agent's own playback ends the caller's turn before they have finished
+    correct: false
+    why: interrupt_response did not change in the deploy, and the sampled cut-offs happened on caller turns while the agent was silent.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Debug, 20 minutes">
+"Yesterday we shipped a turn-detection change to cut false barge-ins from background noise and to make turns faster. Today support says callers are being cut off mid-sentence. Here is the diff and a sample of recordings. Which change explains the symptom, what else is wrong, and what do you do in the next hour?"
+</Callout>
+
+The deploy (speech-to-speech session config; every line in the block is shown):
+
+```diff
+ session.audio.input.turn_detection:
+   type: server_vad
+-  threshold: 0.5
++  threshold: 0.75
+   prefix_padding_ms: 300
+-  silence_duration_ms: 800
++  silence_duration_ms: 500
+   create_response: true
+   interrupt_response: true
+```
+
+A reviewer listened to eight cut-off turns from today, chosen at random from turns where the caller kept talking after the agent started (scenario data):
+
+| Turn | Device | What the caller was doing when the turn ended | Audible pause before the cut | Speech level at the cut |
+|---|---|---|---|---|
+| 1 | speakerphone | finishing a sentence, trailing off | none | quiet |
+| 2 | handset | between two groups of an account number | about 550 ms | n/a |
+| 3 | speakerphone | mid-word on "September" | none | quiet |
+| 4 | speakerphone | finishing a sentence, trailing off | none | quiet |
+| 5 | handset | soft-spoken caller, mid-sentence | none | quiet |
+| 6 | handset | between two groups of an account number | about 600 ms | n/a |
+| 7 | speakerphone | mid-sentence | none | quiet |
+| 8 | handset | finishing a sentence, trailing off | none | quiet |
+
+You do not have per-frame speech probabilities from the provider, the cut-off rate before the deploy was not tracked, and nobody has measured how many false barge-ins the change prevented.
+
+Which change best explains the cut-offs callers are reporting?
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>For each sampled cut-off, ask whether a silence timer could have reached its limit if every audible frame had been scored as speech.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the false barge-in count per hundred turns from the week before the deploy.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask whether you can run a local VAD over the recordings at both thresholds.</p></details>
+
+## Answer
+
+**The threshold.** A silence timer only ends a turn after `silence_duration_ms` of frames scored as silence. In six of the eight samples there was no audible pause at all: the caller was speaking quietly, trailing off, or on a speakerphone far from the microphone. For the timer to reach 500 ms during audible speech, those frames had to score below the speech threshold. OpenAI's docs describe the trade directly: a higher threshold requires louder audio, which helps in noisy environments. Raising it from 0.5 to 0.75 is exactly the change that turns quiet speech into silence. Speakerphone turns are over-represented in the sample (four of six), which fits.
+
+**The silence window is the second defect.** Turns 2 and 6 ended in pauses of 550 and 600 ms between digit groups. Under the old 800 ms window they would have survived. The window explains a quarter of the sample and is worth fixing, but reverting it alone leaves most of the reported cut-offs.
+
+**Why the wrong answers are tempting.** "server_vad cannot tell a pause from a turn" is true and is the long-term argument for semantic or audio-native turn detection, but it does not explain a change in behaviour between yesterday and today. The echo theory is a real failure in speech-to-speech systems with poor echo cancellation, and the deploy notes mention barge-in, so it is the first thing many engineers check; the setting did not change and the agent was silent at each cut.
+
+**What to collect.** Run a local VAD over the eight recordings (and a few hundred more) at 0.5 and 0.75 to see which frames flip from speech to silence; tag every turn with device type so the cut-off rate can be split by speakerphone and handset; and recover the false barge-in rate from before the deploy from logs of agent responses cancelled within the first second.
+
+**What to do without it.** Revert the threshold now, as a single change, and keep the 500 ms window for a day with cut-offs tracked by device. Then decide the window with data.
+
+### Two defensible rollbacks
+
+**Revert both lines (safest).** Restores last week's behaviour in one step. Cost: the false barge-ins in noisy call centres come back, the faster turns go away, and you learn nothing about which line did what.
+
+**Revert the threshold only (recommended).** Fixes the largest share of the cut-offs and keeps the latency gain from the shorter window while you measure it. Cost: the digit-group cut-offs continue for a day, on a flow (account numbers) where a cut-off means a wrong lookup.
+
+The conflict is background-noise robustness against quiet speakers: the threshold was raised to stop noise interrupting the agent, and the same knob now drops quiet callers. A single global threshold cannot satisfy both; the durable fix separates them.
+
+**Failure mode of the recommendation.** Reverting the threshold brings back false barge-ins in noisy environments, which is why it was changed. If the noisy-centre traffic is large, the support queue swaps one complaint for another. The durable options are a per-channel threshold, a turn model that judges completeness after the VAD fires (Smart Turn runs after a VAD such as Silero detects silence), or `semantic_vad` with `eagerness: low` for flows where callers read numbers.
+
+## Follow-ups
+
+- *The noisy-centre customers are your largest account and they liked yesterday's change. Who decides the threshold, and on what numbers?*
+- *What would you need to see in a week of per-device data to move from server_vad to semantic_vad?*
+- *How do you make the next turn-detection change safe to ship: what runs before the deploy, and what triggers an automatic rollback?*
+
+## Common mistakes
+
+- Blaming the silence window because it is the change most obviously about turn ends.
+- Reverting both lines and declaring the incident closed without learning which one mattered.
+- Treating "switch to semantic VAD" as the incident fix rather than the follow-up project.
+- Measuring cut-offs without splitting by device or by the flow the caller was in.

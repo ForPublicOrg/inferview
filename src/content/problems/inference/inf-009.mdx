@@ -1,147 +1,412 @@
 ---
 id: inf-009
-title: Token-charged rate limiter
-subtitle: reserve, then settle
+title: A token-charged rate limiter shared by every gateway replica
+subtitle: conditional writes, lost races and a store that goes away
 track: inference
 module: gateways-finops
 type: code
 difficulty: medium
-seniority: [mid, senior]
-minutes: 30
-core: true
-tags: [rate-limiting, token-bucket, gateway, quotas, billing]
+seniority: [senior]
+minutes: 40
+core: false
+tags: [rate-limiting, token-bucket, gateway, distributed-state, failure-modes]
 companies: []
 updated: 2026-10-28
 sources:
+  - title: Claude API docs, Rate limits
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: "official: limits measured in RPM, ITPM and OTPM per model class; the API uses the token bucket algorithm, so capacity is continuously replenished up to the maximum rather than reset at fixed intervals; ITPM is estimated at the start of a request and adjusted during it; OTPM counts only tokens actually generated, and max_tokens does not factor into it; for most models only uncached input tokens count toward ITPM; a 429 says which limit was exceeded and may carry retry-after. Checked 2026-10-28."
+  - title: LiteLLM docs, Budgets and rate limits
+    url: https://docs.litellm.ai/docs/proxy/users
+    note: "vendor docs: tpm_limit, rpm_limit and max_parallel_requests per key, user or team; budget reservation is on by default and reserves the request's estimated maximum cost before the provider call, then replaces it with the actual cost; fail_closed_rate_limit_enforcement returns 503 rather than 429 when Redis is down, so clients can tell an outage from a limit; without it each instance falls back to in-memory counters and limits can be exceeded across instances. Checked 2026-10-28."
   - title: amitshekhariitbhu, AI engineering interview questions
     url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
-    note: "Implement a token-bucket rate limiter for an LLM API where cost scales with tokens, then make it distributed."
-  - title: LiteLLM docs, budgets and rate limits
-    url: https://docs.litellm.ai/docs/proxy/users
-    note: tpm_limit and rpm_limit per key; budget reservation estimates the request's maximum cost before the call and rejects it if the budget would be exceeded; fail_closed_rate_limit_enforcement returns 503 when counters cannot be verified against Redis
+    note: "community question bank, no company named: implement a token-bucket rate limiter for an LLM API where cost scales with tokens, then make it distributed. Checked 2026-10-28."
 code:
   starter: |
     import time
 
-    class TokenBudget:
-        """Per-tenant token bucket charged in tokens, refilled continuously at tokens_per_minute / 60 per second.
-        burst is the bucket size and defaults to tokens_per_minute; the bucket starts full."""
 
-        def __init__(self, tokens_per_minute, burst=None, clock=time.monotonic):
+    class StoreDown(Exception):
+        """Raised by the store when it cannot be reached."""
+
+
+    class Store:
+        """In-memory stand-in for the shared store (Redis, or a database with conditional writes).
+        get(key) returns (value, version); an absent key is (None, 0).
+        cas(key, version, value) writes only if the key is still at that version, and returns whether it wrote.
+        Every call is one round trip and is counted in self.ops. While self.down is True every call raises StoreDown."""
+
+        def __init__(self):
+            self.data, self.ops, self.down = {}, 0, False
+
+        def get(self, key):
+            self.ops += 1
+            if self.down:
+                raise StoreDown(key)
+            return self.data.get(key, (None, 0))
+
+        def cas(self, key, version, value):
+            self.ops += 1
+            if self.down:
+                raise StoreDown(key)
+            if self.data.get(key, (None, 0))[1] != version:
+                return False
+            self.data[key] = (value, version + 1)
+            return True
+
+
+    class TokenLimiter:
+        """One gateway replica's view of a tenant's token bucket. Every replica serving the tenant builds its own
+        TokenLimiter on the same store; replicas share nothing else."""
+
+        def __init__(self, store, tenant, tokens_per_minute, burst=None, replicas=1, clock=time.monotonic):
             raise NotImplementedError
 
         def available(self):
-            """Current level after refilling."""
+            """The tenant's shared level after refill, or None while the store is down."""
             raise NotImplementedError
 
         def try_reserve(self, prompt_tokens, max_tokens):
-            """Reserve the worst case, prompt_tokens + max_tokens. Return the amount reserved,
-            or None (and consume nothing) if the bucket does not hold that much right now."""
+            """Return the number of tokens reserved, or None to reject (the gateway answers 429)."""
             raise NotImplementedError
 
-        def settle(self, reserved, prompt_tokens, output_tokens):
-            """After the call: refund what was reserved but not used. If actual use exceeded
-            the reservation, charge the difference, even if that takes the level below zero."""
+        def settle(self, reserved, used_tokens):
+            """After the call: replace the reservation with what the provider reported."""
             raise NotImplementedError
   tests: |
     now = [0.0]
     clock = lambda: now[0]
 
-    b = TokenBudget(6_000, clock=clock)
-    assert b.available() == 6_000, "starts full at the burst size, which defaults to one minute of tokens"
-    r = b.try_reserve(1_000, 2_000)
-    assert r == 3_000 and b.available() == 3_000, "reserve prompt plus max_tokens up front"
-    b.settle(r, 1_000, 500)
-    assert b.available() == 4_500, "settle refunds the output tokens that were not used"
-    assert b.try_reserve(2_000, 3_000) is None and b.available() == 4_500, "a rejected request consumes nothing"
-    now[0] = 10.0
-    assert abs(b.available() - 5_500) < 1e-6, "refills at 100 tokens per second"
-    now[0] = 1_000.0
-    assert b.available() == 6_000, "refill is capped at the burst size"
-    assert b.try_reserve(1_000, 5_001) is None, "a request bigger than the burst is never admitted"
 
-    s = TokenBudget(600, burst=1_000, clock=clock)
-    r = s.try_reserve(200, 300)
-    s.settle(r, 900, 300)
-    assert abs(s.available() - (-200)) < 1e-6, "usage above the reservation drives the level negative"
-    assert s.try_reserve(1, 1) is None, "and blocks new work until it refills"
-    now[0] += 30.0
-    assert abs(s.available() - 100) < 1e-6, "30 s at 10 tokens per second pays the debt back"
+    class TStore:
+        """The Store interface, plus before_cas: a function run once just before the next conditional write, to stage a race."""
+
+        def __init__(self):
+            self.data, self.ops, self.down, self.before_cas = {}, 0, False, None
+
+        def get(self, key):
+            self.ops += 1
+            if self.down:
+                raise StoreDown(key)
+            return self.data.get(key, (None, 0))
+
+        def cas(self, key, version, value):
+            self.ops += 1
+            if self.down:
+                raise StoreDown(key)
+            hook, self.before_cas = self.before_cas, None
+            if hook:
+                hook()
+            if self.data.get(key, (None, 0))[1] != version:
+                return False
+            self.data[key] = (value, version + 1)
+            return True
+
+
+    store = TStore()
+    a = TokenLimiter(store, "acme", 6_000, replicas=2, clock=clock)
+    b = TokenLimiter(store, "acme", 6_000, replicas=2, clock=clock)
+    assert a.available() == 6_000, "starts full at the burst size, which defaults to one minute of tokens"
+    r = a.try_reserve(1_000, 2_000)
+    assert r is not None and 1_000 <= r <= 3_000, f"reserve at least the prompt and at most prompt plus max_tokens; got {r}"
+    assert b.available() == 6_000 - r, "a reservation made on one replica is visible on the other"
+    b.settle(r, 1_500)
+    assert a.available() == 4_500, "settling replaces the reservation with the tokens actually used"
+    assert a.try_reserve(4_600, 100) is None and b.available() == 4_500, "a rejected request takes nothing"
+    now[0] = 10.0
+    assert abs(a.available() - 5_500) < 1e-6, "refills at 100 tokens per second"
+    now[0] = 1_000.0
+    assert a.available() == 6_000, "refill stops at the burst size"
+    assert a.try_reserve(6_001, 0) is None, "a request bigger than the burst is never admitted"
+    store.before_cas = lambda: b.try_reserve(3_000, 0)
+    r1 = a.try_reserve(3_000, 0)
+    assert a.available() == 6_000 - 3_000 - (r1 or 0), "a write that lost a race must not overwrite the winner's reservation"
+    store.down = True
+    got = [a.try_reserve(100, 100) for _ in range(5)]
+    assert all(g is None or 100 <= g <= 200 for g in got), "while the store is down, each call returns a decision instead of raising"
+    store.down = False
+    quiet = TStore()
+    q = TokenLimiter(quiet, "solo", 600_000, clock=clock)
+    q.available()
+    quiet.ops = 0
+    for _ in range(1_000):
+        now[0] += 0.02
+        q.settle(q.try_reserve(100, 100), 150)
+    assert quiet.ops <= 4_000, f"at most two round trips per call when nobody else writes; used {quiet.ops} for 2,000 calls"
+    assert len(repr(quiet.data)) < 300, "the shared state per tenant stays the same size however many requests it has seen"
+  hidden: |
+    import random as _r
+
+    _rng = _r.Random(9)
+    now[0] = 5_000.0
+
+
+    class _Racy(TStore):
+        """Before a conditional write, sometimes lets another replica's queued operation land first."""
+
+        def __init__(self, rng, p):
+            super().__init__()
+            self.rng, self.p, self.queue, self.inside = rng, p, [], False
+
+        def cas(self, key, version, value):
+            if self.queue and not self.inside and self.rng.random() < self.p:
+                self.inside = True
+                try:
+                    self.queue.pop(0)()
+                finally:
+                    self.inside = False
+            return super().cas(key, version, value)
+
+
+    _hx = _Racy(_rng, 0.6)
+    _hx_reps = [TokenLimiter(_hx, "race", 60_000, burst=50_000, replicas=6, clock=clock) for _ in range(6)]
+    _hx_out, _hx_used = [], [0]
+
+
+    def _hx_reserve(rep):
+        got = rep.try_reserve(_rng.randrange(200, 1_500), _rng.randrange(0, 1_000))
+        if got is not None:
+            _hx_out.append(got)
+
+
+    def _hx_settle(rep):
+        if _hx_out:
+            got = _hx_out.pop(_rng.randrange(len(_hx_out)))
+            used = _rng.randrange(0, got + 1)
+            _hx_used[0] += used
+            rep.settle(got, used)
+
+
+    for _ in range(1_500):
+        _hx_op = _hx_reserve if _rng.random() < 0.6 else _hx_settle
+        _hx_rep = _rng.choice(_hx_reps)
+        if _rng.random() < 0.5:
+            _hx.queue.append(lambda op=_hx_op, rep=_hx_rep: op(rep))
+        else:
+            _hx_op(_hx_rep)
+    _hx.p = 0.0
+    _hx.queue.clear()
+    _hx_levels = [rep.available() for rep in _hx_reps]
+    _hx_final = _hx_reps[0].available()
+    assert abs(_hx_final - (50_000 - sum(_hx_out) - _hx_used[0])) < 1e-6
+    assert _hx_final >= -1e-6
+    _hx2 = TStore()
+    _hx2_reps = [TokenLimiter(_hx2, "outage", 6_000, burst=8_000, replicas=4, clock=clock) for _ in range(4)]
+    _hx2_seen = [rep.available() for rep in _hx2_reps]
+    _hx2.down = True
+    _hx2_start = now[0]
+    _hx2_admitted = [0, 0, 0, 0]
+    _hx2_raised = []
+    for _hx2_s in range(11):
+        now[0] = _hx2_start + _hx2_s
+        for _hx2_i, _hx2_rep in enumerate(_hx2_reps):
+            for _ in range(3):
+                try:
+                    _hx2_got = _hx2_rep.try_reserve(300, 200)
+                except Exception as e:
+                    _hx2_raised.append(e)
+                    _hx2_got = None
+                _hx2_admitted[_hx2_i] += _hx2_got or 0
+    assert not _hx2_raised
+    assert all(x <= 8_000 / 4 + 100 / 4 * 10 + 1e-6 for x in _hx2_admitted)
+    _hx2.down = False
+    _hx2_flush = [rep.available() for rep in _hx2_reps]
+    assert abs(_hx2_reps[0].available() - (8_000 - sum(_hx2_admitted))) < 1e-6
+    _hx3 = TStore()
+    _hx3_l = TokenLimiter(_hx3, "debt", 6_000, clock=clock)
+    _hx3_r = _hx3_l.try_reserve(1_000, 1_000)
+    _hx3.down = True
+    _hx3_l.settle(_hx3_r, 2_500)
+    _hx3.down = False
+    assert abs(_hx3_l.available() - 3_500) < 1e-6
+    _hx4 = TStore()
+    _hx4_l = TokenLimiter(_hx4, "drop", 6_000, clock=clock)
+    _hx4.before_cas = lambda: setattr(_hx4, "down", True)
+    _hx4_r = _hx4_l.try_reserve(1_000, 500)
+    _hx4.down = False
+    assert abs(_hx4_l.available() - (6_000 - (_hx4_r or 0))) < 1e-6
+    _hx5 = TStore()
+    _hx5_x = TokenLimiter(_hx5, "x", 6_000, clock=clock)
+    _hx5_y = TokenLimiter(_hx5, "y", 6_000, clock=clock)
+    _hx5_x.try_reserve(5_000, 1_000)
+    assert _hx5_y.available() == 6_000 and _hx5_y.try_reserve(5_000, 1_000) is not None
+    _hx6 = TStore()
+    _hx6_l = TokenLimiter(_hx6, "long", 600_000, clock=clock)
+    for _ in range(20_000):
+        now[0] += 0.01
+        _hx6_l.settle(_hx6_l.try_reserve(50, 50), 80)
+    assert len(repr(_hx6.data)) < 300 and len(_hx6.data) <= 2
+    _hx7 = TStore()
+    _hx7_l = TokenLimiter(_hx7, "big", 600, burst=1_000, clock=clock)
+    now[0] += 1e6
+    assert _hx7_l.try_reserve(900, 101) is None and _hx7_l.available() == 1_000
   solution: |
     import time
 
-    class TokenBudget:
-        def __init__(self, tokens_per_minute, burst=None, clock=time.monotonic):
-            self.rate = tokens_per_minute / 60.0
-            self.capacity = burst if burst is not None else tokens_per_minute
-            self.level = float(self.capacity)
-            self.clock = clock
-            self.last = clock()
 
-        def _refill(self):
+    class StoreDown(Exception):
+        """Raised by the store when it cannot be reached."""
+
+
+    class Store:
+        """In-memory stand-in for the shared store (Redis, or a database with conditional writes).
+        get(key) returns (value, version); an absent key is (None, 0).
+        cas(key, version, value) writes only if the key is still at that version, and returns whether it wrote.
+        Every call is one round trip and is counted in self.ops. While self.down is True every call raises StoreDown."""
+
+        def __init__(self):
+            self.data, self.ops, self.down = {}, 0, False
+
+        def get(self, key):
+            self.ops += 1
+            if self.down:
+                raise StoreDown(key)
+            return self.data.get(key, (None, 0))
+
+        def cas(self, key, version, value):
+            self.ops += 1
+            if self.down:
+                raise StoreDown(key)
+            if self.data.get(key, (None, 0))[1] != version:
+                return False
+            self.data[key] = (value, version + 1)
+            return True
+
+
+    class TokenLimiter:
+        MAX_ATTEMPTS = 8
+
+        def __init__(self, store, tenant, tokens_per_minute, burst=None, replicas=1, clock=time.monotonic):
+            self.store, self.key, self.clock = store, "tb:" + str(tenant), clock
+            self.rate = tokens_per_minute / 60.0
+            self.capacity = float(burst if burst is not None else tokens_per_minute)
+            self.replicas = replicas
+            self.pending = 0.0                 # change owed to the shared level: refunds positive, debts and outage spend negative
+            self.seen = self.capacity          # last shared level this replica read
+            self.local = None                  # [level, time] of this replica's share while the store is down
+
+        def _level(self, value, now):
+            if value is None:
+                return self.capacity
+            level, last = value
+            return min(self.capacity, level + max(0.0, now - last) * self.rate)
+
+        def _apply(self, decide):
+            """Read, decide, conditional write; retry on a lost race. decide(level) -> (charge, result).
+            Returns (written, result). Raises StoreDown."""
+            for _ in range(self.MAX_ATTEMPTS):
+                value, version = self.store.get(self.key)
+                now = self.clock()
+                level = min(self.capacity, self._level(value, now) + self.pending)
+                charge, result = decide(level)
+                if charge == 0 and self.pending == 0:
+                    self.seen = level
+                    return True, result
+                if self.store.cas(self.key, version, (level - charge, now)):
+                    self.pending, self.local, self.seen = 0.0, None, level - charge
+                    return True, result
+            return False, None
+
+        def _share(self):
             now = self.clock()
-            self.level = min(self.capacity, self.level + (now - self.last) * self.rate)
-            self.last = now
+            cap = self.capacity / self.replicas
+            if self.local is None:
+                self.local = [max(0.0, self.seen) / self.replicas, now]
+            level, last = self.local
+            self.local = [min(cap, level + (now - last) * self.rate / self.replicas), now]
+            return self.local
 
         def available(self):
-            self._refill()
-            return self.level
+            try:
+                return self._apply(lambda level: (0, level))[1]
+            except StoreDown:
+                return None
 
         def try_reserve(self, prompt_tokens, max_tokens):
-            self._refill()
             need = prompt_tokens + max_tokens
-            if need > self.level:
+            if need > self.capacity:
                 return None
-            self.level -= need
-            return need
+            try:
+                written, result = self._apply(lambda level: (need, need) if need <= level else (0, None))
+                return result if written else None
+            except StoreDown:
+                share = self._share()
+                if need > share[0]:
+                    return None
+                share[0] -= need
+                self.pending -= need
+                return need
 
-        def settle(self, reserved, prompt_tokens, output_tokens):
-            self._refill()
-            # Refund unused output; if actual use beat the reservation, the level goes negative and pays it back later.
-            self.level = min(self.capacity, self.level + reserved - (prompt_tokens + output_tokens))
+        def settle(self, reserved, used_tokens):
+            delta = reserved - used_tokens
+            self.pending += delta
+            if self.local is not None:
+                self.local[0] = min(self.capacity / self.replicas, self.local[0] + delta)
+            try:
+                self._apply(lambda level: (0, None))
+            except StoreDown:
+                pass
 ---
 import Callout from '../../../components/Callout.astro';
 
 ## Question
 
-<Callout kind="interview" label="As listed">
-"Implement a token-bucket rate limiter for an LLM API where cost scales with tokens, then make it distributed."
+<Callout kind="interview" label="Coding, 40 minutes">
+"Our gateway runs several replicas. Write the per-tenant token limiter they share, and tell me what it does when its store is down."
 </Callout>
 
-A request-count limit is the wrong unit for a model API: one request can use 50 tokens and the next 50,000. Implement a per-tenant limiter charged in tokens.
+Each tenant has a token bucket: `tokens_per_minute` refilled continuously, up to `burst` (default one minute's worth), starting full. Every gateway replica that serves the tenant builds its own `TokenLimiter` over the same `Store`, and the replicas share nothing else: no messages, no leader. The store offers only `get` and a conditional write, `cas`, the way a database with versioned rows or Redis under `WATCH` does. The clock is injected and is the same for every replica in the tests.
 
-- The bucket refills continuously at `tokens_per_minute / 60` tokens per second, up to `burst` (default: one minute's worth). It starts full.
-- The output length is unknown when the request arrives, so `try_reserve(prompt_tokens, max_tokens)` reserves the worst case. If the bucket does not hold that much, return `None` and take nothing; the gateway answers 429.
-- After the call, `settle(reserved, prompt_tokens, output_tokens)` refunds what was not used. Token counts reported by the provider can exceed your estimate (your prompt count may have been approximate), in which case settle charges the difference even if the level goes below zero, and the tenant waits for the refill.
-- The clock is injected so tests can control time.
-
-Then be ready to talk through the distributed version.
+- `try_reserve(prompt_tokens, max_tokens)` returns the number of tokens it reserved, or `None` to reject. You choose the reservation size, between the prompt alone and the prompt plus `max_tokens`. A rejected request takes nothing.
+- `settle(reserved, used_tokens)` replaces the reservation with what the provider reported. Usage above the reservation is charged even if it takes the level below zero.
+- `available()` returns the shared level after refill, or `None` while the store is down.
+- Two replicas can read the same version and both try to write. Neither may lose the other's charge.
+- When the store raises `StoreDown`, the gateway still needs an answer for every request; no exception reaches the caller. Across all replicas, the tenant must not get more than its limit would have allowed, and usage during the outage is still owed when the store comes back. How a replica decides during the outage is yours to choose and defend; `replicas` tells you how many share the tenant.
+- When no other replica is writing, `try_reserve` and `settle` each make at most two round trips to the store (every `get` and `cas` counts), and the state stored per tenant stays the same size however many requests the tenant has made.
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>Refill lazily: on every call, add elapsed seconds times the rate, cap at the burst, and remember the time.</p></details>
-<details class="hint"><summary>Hint 2</summary><p>Settle is one formula: level plus reserved minus actual, capped at the burst.</p></details>
-<details class="hint"><summary>Hint 3</summary><p>A request larger than the burst can never be admitted, however long it waits. That is a correct outcome, not a bug to work around.</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask for the distribution of max_tokens against reported output tokens for one busy tenant over a day.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the product owner and finance each want to happen to a tenant's requests during a five-minute store outage, and whether they agree.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask whether a tenant's traffic is spread evenly across replicas or pinned to one by long-lived connections.</p></details>
 
 ## Answer
 
-The reference solution stores the rate per second, the capacity, the current level and the time of the last refill. `_refill` runs at the start of every public method, so the level is always current without a background thread. `try_reserve` compares the worst case with the level and either subtracts it or returns `None` without side effects, so a rejected request costs the tenant nothing. `settle` adds back the reservation and subtracts the real usage in one step, capped at the capacity; when usage beat the reservation the result is negative, and the next reservations fail until the refill pays the debt back, which is what the last tests check.
+**State.** The store holds one value per tenant, `(level, time of last write)`. Refill is computed on read: `min(burst, level + elapsed × rate)`. Nothing runs in the background, and the value holds two numbers whatever the traffic, which is what the size test checks. A sliding log of recent requests answers the same question with state that grows with the request rate, and it fails that test.
 
-Reserving the worst case is conservative. If tenants set `max_tokens` far above what they use, the limiter admits fewer concurrent requests than the true usage would allow. Two common fixes: cap `max_tokens` at the gateway, or reserve an estimate (for example the tenant's recent p95 output length) and accept occasional overshoot that settle charges back.
+**Atomic update without a lock.** Every change is read, decide, conditional write. `_apply` gets `(value, version)`, computes the refilled level, decides the charge, and writes with `cas(key, version, ...)`. If another replica wrote first, the version moved, the write is refused, and the loop starts again from the new level. A rejection that changes nothing skips the write, so it costs one round trip; an admitted request costs two. After eight lost races in a row the reference rejects the request rather than spinning, which is a choice: a very hot tenant sees some 429s under contention instead of unbounded latency. The visible race test stages the case a read-then-write limiter gets wrong: replica B reserves 3,000 between replica A's read and A's write, and A's write must not erase B's charge.
 
-**Distributed.** With several gateway replicas, the bucket has to live in shared state. The usual design keeps level and last-refill time in Redis and runs refill-and-reserve as one atomic operation (a Lua script or a transaction), with settle as another. Each call then costs a round trip to Redis. The alternative is to split the rate: each of N replicas gets 1/N of it locally, with no coordination, at the price of unfairness when load is uneven across replicas. Either way, decide what happens when the shared store is down. LiteLLM's docs, for example, describe the global budget failing open without its database and offer fail-closed options; for a spend limit, failing open is the risky choice.
+**How much to reserve.** The reference reserves the worst case, prompt plus `max_tokens`, as LiteLLM's budget reservation does for cost. Anthropic's own limiter does something different: it estimates input at the start and counts output only as it is generated, and `max_tokens` does not count at all. Both are defensible:
+
+- *Worst case.* Requests in flight can never overdraw the bucket. The cost is admission: a tenant that sends 2,000-token prompts with `max_tokens` 4,096 and gets 300 tokens back holds 6,096 per request, so a 60,000 bucket admits 60,000 / 6,096 = 9 requests in flight where real usage of 2,300 each would allow 26.
+- *Prompt only, or prompt plus an estimate such as the tenant's recent p95 output.* More requests are admitted, and settle charges the overshoot afterwards, so the level can go negative and the tenant waits. The cost: a burst of long answers overdraws the bucket before any limit applies, which matters when the bucket protects a provider quota rather than a fairness target.
+
+Anything between the two is reasonable if settle charges the difference. Reserving less than the prompt is not: the prompt is known on arrival.
+
+**Settle.** One delta, `reserved − used`, added to the level and capped at the burst. Usage above the reservation drives the level negative and the tenant pays it back through refill; clamping at zero would forgive tokens the provider billed.
+
+**The store is down.** Two choices pass the tests, and they serve different owners.
+
+- *Fail closed.* Reject everything until the store answers. The limit holds exactly; every tenant is down for the length of the outage, so the limiter's store becomes part of the product's availability. LiteLLM's fail-closed mode answers 503, not 429, so clients and load balancers can tell an outage from a limit.
+- *A local share.* Each replica keeps admitting from its own bucket of `last seen level / replicas`, refilled at `rate / replicas`, and records what it admitted as a debt. When the store answers, the first successful write folds the debt, and any settlements made during the outage, into the shared level. Summed over replicas, admission during the outage is at most what the shared bucket would have allowed. LiteLLM's default is the risky version of this: each instance falls back to in-memory counters, and its docs say limits can then be exceeded across instances.
+
+The reference takes the local share, because this bucket protects capacity and fairness, and an outage of a counter store should not be an outage of every tenant. For a dollar budget on a prepaid account the same reasoning points the other way.
+
+**Where the local share fails.** It assumes load is spread evenly. A tenant whose traffic arrives over one long-lived connection lands on one replica and gets a quarter of its limit for the length of an outage on four replicas, while the other three shares go unused. It also trusts each replica's clock for refill: a replica whose clock runs ahead refills its share faster, and the level it writes after recovery is stamped with a time the others have not reached. The reference uses the injected clock everywhere; a real deployment takes the store's clock.
 
 ## Follow-ups
 
-- *What should the 429 carry?* A Retry-After computed from the shortfall divided by the refill rate.
-- *How do you handle streaming responses?* Count output tokens as they stream and stop at the reservation, or settle at the end and accept a bounded overshoot.
-- *How do reservations leak, and how do you stop it?* A gateway crash between reserve and settle; store reservations with an expiry so they return to the bucket.
-- *Tokens per minute or dollars per month?* Both: the bucket protects capacity in the short term, and a dollar budget per period protects spend.
+- *What changes to run this against Redis?* The read-decide-write loop becomes one Lua script run by `EVAL`, which is atomic on the server, so an admitted request is one round trip instead of two and there are no lost races to retry. Take the time from Redis `TIME` inside the script, not from the replica. Store reservations with an expiry so a replica that dies between reserve and settle does not hold tokens forever.
+- *Pushback: finance says the local share lets a tenant overspend during an outage and wants fail closed; the product owner says a counter-store outage must not take every customer down. What do you ship, and what do you write down?*
+- *Reversal: what would you need to see to switch from worst-case reservations to prompt-only reservations?* The distribution of reported output against `max_tokens` per tenant, and how often a burst of long outputs would have overdrawn the bucket by more than the provider's own limit allows.
+- *How should a 429 compute `retry-after` when the level is negative?* The debt plus the next request's reservation, divided by the refill rate, rounded up.
 
 ## Common mistakes
 
-- Charging requests instead of tokens.
-- Charging only after the call, which lets one burst of large requests overshoot the limit by a wide margin.
-- Letting a rejected `try_reserve` consume tokens.
-- Refilling past the burst size after a long idle period.
-- Clamping the level at zero in settle, which forgives usage the tenant really consumed.
+- Reading the level, deciding, and writing unconditionally, so two replicas that read the same version both admit against it.
+- Raising the store's exception to the caller, which turns a store outage into 500s with no decision.
+- Falling back to the full limit on every replica during an outage, which multiplies the limit by the replica count.
+- Dropping debts and refunds recorded while the store was down when it returns.
+- Keeping a log of recent requests in the store, whose size grows with traffic and whose every update rewrites it.
+- Clamping at zero in settle, which forgives tokens the provider billed.

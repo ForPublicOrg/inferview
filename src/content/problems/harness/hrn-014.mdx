@@ -1,0 +1,140 @@
+---
+id: hrn-014
+title: A memory policy for a six-hour run
+subtitle: what is pinned, summarised and re-read
+track: harness
+module: context-management
+type: workflow
+difficulty: hard
+seniority: [staff]
+minutes: 45
+core: true
+tags: [compaction, memory-files, progress-files, long-running-agents, prompt-caching, coding-agents]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Anthropic Engineering, Effective context engineering for AI agents (2025-09-29)
+    url: https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents
+    note: "compaction passes the history to the model to keep architectural decisions, unresolved bugs and implementation details and discard redundant tool outputs; Claude Code continues with the summary plus the five most recently accessed files; tune the summary prompt for recall first, then precision; tool result clearing is the lightest form of compaction; structured note-taking such as a NOTES.md; subagents return condensed summaries, often 1,000 to 2,000 tokens"
+  - title: Anthropic Engineering, Effective harnesses for long-running agents (Justin Young, 2025-11-26)
+    url: https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents
+    note: "compaction alone was not sufficient; claude-progress.txt, a JSON feature list in which agents may only change the passes field (JSON because models are less likely to overwrite it than Markdown), init.sh, git commits; each session starts by reading the progress file and git log and running a basic end-to-end test"
+  - title: Anthropic Engineering, Harness design for long-running apps (Prithvi Rajasekaran, 2026-03-24)
+    url: https://www.anthropic.com/engineering/harness-design-long-running-apps
+    note: "with Sonnet 4.5, context anxiety made full resets with a structured handoff necessary; with Opus 4.5 resets were dropped and the SDK's automatic compaction was enough; every harness component encodes an assumption about what the model cannot do and should be re-tested as models change"
+  - title: Claude Code docs, Explore the context window, What survives compaction (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/context-window
+    note: "project-root CLAUDE.md, unscoped rules, auto memory and the plan re-injected from disk; path-scoped rules and nested CLAUDE.md summarised away and reloaded on demand; up to five recently modified files re-read, files over 5,000 tokens as path references; invoked skill bodies capped at 5,000 tokens each and 25,000 in total; SessionStart hooks matching the compact source add their output after compaction"
+  - title: Claude Code docs, How Claude Code uses prompt caching (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/prompt-caching
+    note: "compaction sends a separate request that repeats the system prompt, tools and the history being summarised; while the cache is warm it reads the prefix from cache, after the cache lifetime it reprocesses the history as uncached input; compaction requests fall in the five-minute TTL bucket by default"
+  - title: Claude API docs, Prompt caching, pricing (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: "five-minute cache writes 1.25x base input, one-hour writes 2x, reads 0.1x (0.05x on Opus 5.5 and Sonnet 5.5); default lifetime five minutes, refreshed on each hit"
+  - title: Chroma, Context Rot (Hong, Troynikov and Huber, 2025-07-14)
+    url: https://www.trychroma.com/research/context-rot
+    note: "18 models; performance grows less reliable as input length grows, even on simple tasks; on LongMemEval, focused prompts of about 300 tokens beat full prompts of about 113k tokens across all models"
+checklist:
+  - Puts the goal, scope, non-goals and definition of done in a file the agent cannot write, re-injected verbatim after every compaction instead of carried by the summary
+  - Enforces the zero-exception constraints (paths out of scope, deleting or skipping tests) as permission rules or hooks, so they do not depend on memory
+  - Keeps an agent-written progress file with decisions, dead ends and evidence links, and caps how much of it is re-injected
+  - Uses a JSON check list in which the agent may change only the status field
+  - Says what is summarised and what is dropped, clearing old tool outputs before summarising
+  - Chooses and defends a compaction threshold, with the number of compactions it implies over six hours
+  - Prices compaction as a request over the whole conversation, cheap while the cache is warm and full price after a long tool call lets it expire
+  - Moves noisy work such as test-log triage and broad search into subagents that return short summaries
+  - Decides between in-place compaction and resets with a handoff, states the cost of each, and re-tests the choice when the model changes
+  - Tests goal survival with forced compactions on replayed runs, probe questions and a seeded out-of-scope trap, with a stated pass bar
+  - Has drift signals in production and a rollout with rollback triggers
+  - States what is given up, and a failure mode of the policy such as the progress file carrying a wrong belief forward
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Workflow design, 45 minutes">
+"Our overnight agent runs for about six hours on one task. It compacts a dozen times or more, and by morning it has sometimes forgotten what it was asked to do. Design the compaction and memory policy: what is pinned, what is summarised, what is re-read from disk, and how you test that the goal survives."
+</Callout>
+
+The constraints, as a scenario:
+
+- The task is a framework upgrade across a 300,000-line Java service: about 40 modules, each with its own tests. A full test run takes 12 minutes.
+- The harness belongs to the platform team and is built on an agent SDK whose compaction you cannot replace. You can set the threshold at which it fires, give the summary instructions, run hooks after compaction, configure permission rules, define subagents and decide what lives in files.
+- The model has a 200,000-token window. Last month's runs averaged about 600 model requests, each adding about 2,500 tokens of new context, mostly tool output. After a compaction, the context is back to about 30,000 tokens.
+- Security requires that the agent cannot change its own permissions or its own task definition. The test owners require that no test is deleted or skipped.
+- Nobody watches the run. A human reads the result in the morning.
+
+Design the policy and the test. Choose a compaction threshold and defend it.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the condensation log and the progress notes of a run that went wrong, and find the hour where the goal changed.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>For each piece of state, ask whether a copy of it exists on disk that the harness could read again without asking the model.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the timing of tool calls in a typical run: how many gaps between requests are longer than the cache lifetime, and where do they fall?</p></details>
+
+## Answer
+
+### The policy
+
+| State | Where it lives | After each compaction |
+|---|---|---|
+| System prompt, tool definitions | the harness | unchanged |
+| Goal: task, scope, non-goals, definition of done, under 1,500 tokens | `GOAL.md`, written by a human, writes denied to the agent | re-injected verbatim by a post-compaction hook, with its hash logged |
+| Zero-exception rules: no edits outside the upgrade's modules, no deleted or skipped tests | permission deny rules and a hook that rejects diffs removing `@Test` methods or adding skips | enforced on every call; not memory |
+| Checks: one entry per module with a `passes` flag | `checks.json`; a hook rejects any change except to `passes` | the hook injects counts and the ids still failing |
+| Progress: done, in progress, decisions with reasons, dead ends with the evidence that ruled them out | `PROGRESS.md`, written by the agent, sections append-only | decisions, dead ends and the last ten log lines re-injected, capped at 3,000 tokens |
+| Repository state | git | `git log -15` and `git status` re-injected |
+| Files being edited | disk | the most recently modified few re-read, large ones as path references (Claude Code does five, with a 5,000-token cut-off) |
+| Conversation | the summary | old tool outputs cleared first, then summarised with instructions to keep the current hypothesis, failing test names and files touched |
+| Test-log triage, broad code search | subagents | only their summaries, a few thousand tokens at most, ever enter the main context |
+
+The rule behind the table: nothing the run cannot afford to lose is carried by a summary. Summaries are for the conversation, which is the one thing that has no copy on disk. Claude Code works the same way: it re-injects the project-root CLAUDE.md and the plan from disk after compaction and lets path-scoped rules be summarised away, so a goal that lives only in the conversation is the least protected thing in the session.
+
+### The threshold
+
+With 2,500 tokens added per request and 30,000 left after each compaction, the threshold sets the count. In input-token equivalents with five-minute caching (writes 1.25x, reads 0.1x), per run:
+
+| Threshold | Requests per cycle | Compactions in 600 requests | Ordinary requests | Compaction requests, warm | Rewriting the post-compaction context |
+|---|---|---|---|---|---|
+| 100,000 | (100,000 − 30,000) / 2,500 = 28 | about 21 | 600 × (65,000 × 0.1 + 2,500 × 1.25) ≈ 5.8M | 21 × 100,000 × 0.1 ≈ 0.2M | 21 × 30,000 × 1.25 ≈ 0.8M |
+| 160,000 | 52 | about 12 | 600 × (95,000 × 0.1 + 3,125) ≈ 7.6M | 12 × 16,000 ≈ 0.2M | 12 × 37,500 ≈ 0.45M |
+
+The lower threshold is cheaper overall (about 6.8M against 8.2M), because every ordinary request reads a shorter context, and Chroma's results argue that shorter context is also more reliable. Its cost is nearly twice as many compactions. That is only a risk if something important rides on the summary, which the table above prevents. I would set it around 100,000 to 120,000 tokens. A threshold near the window's limit is unreasonable here: it buys fewer compactions at the price of reasoning over 150,000 tokens of stale tool output for most of the run.
+
+The cold case matters more than the threshold. A 12-minute test run outlives the five-minute cache, so a compaction that fires on the request after a test run reprocesses the whole history at full price: 100,000 tokens instead of 10,000. The policy: compact before starting a full test run when the context is past half the threshold, so the summary is produced while the cache is warm, and run full tests from a subagent or in the background so the main context waits without growing.
+
+### Compaction or resets
+
+Two defensible answers. **In-place compaction** keeps continuity and is cheap while warm; its risk is that the model carries its own drift forward and, with some models, wraps up early as it believes it is near its limit. **Resets with a structured handoff** start a fresh agent from `GOAL.md`, `PROGRESS.md`, `checks.json` and git; they cost orchestration, latency and the re-reading at each reset, and they fail if the handoff omits something the conversation held. Anthropic needed resets with Sonnet 4.5 and dropped them with Opus 4.5. I would ship compaction with the disk re-reads, keep resets behind a flag, and rerun the goal-survival test whenever the model changes, because the right answer is a property of the model as much as of the harness.
+
+The constraint conflict is context budget against fidelity: about 6,000 tokens of goal, checks and progress in every request, against a goal that survives every compaction. At 600 requests and a 0.1x read price that is about 360,000 input-token equivalents a run, about 5% of the total above.
+
+### Testing that the goal survives
+
+1. **Hook test.** After every compaction, the logged hash of the injected `GOAL.md` matches the file. Deterministic, runs in CI on the hook itself.
+2. **Forced-compaction replay.** Take 20 recorded runs and replay them with compaction forced every 15 requests, about 40 compactions per replay, more than any real run. After each, ask fixed probes: what is out of scope, what counts as done, the last decision and its reason, one dead end. Grade against the files with exact checks, not a model judge. Pass bar: every scope and done answer correct in every replay.
+3. **Seeded trap.** A fixture repository with a failing check outside the scope and a tempting dead end already logged in `PROGRESS.md`. Pass bar: zero attempted writes outside the scope across 20 runs; any attempt is a failure even if the deny rule blocked it.
+
+### What you give up, and the written rollout
+
+Given up: the conversational detail of why approaches were tried, beyond what the agent wrote down; about 6,000 tokens on every request; and the agent's ability to adjust its own goal, so a scope change at 2am waits for a human.
+
+Rollout note, written into the runbook: replay tests pass; then five overnight runs behind a flag, each read in the morning against the old policy's runs on the same task. Rollback triggers: any deny-rule hit on an out-of-scope path in two runs out of five, a probe failure in production sampling, or cost per run more than 20% above the previous policy. Drift signals kept after launch: deny-rule hits per run, re-attempts of a logged dead end, and progress entries without an evidence link.
+
+### Where this fails
+
+The progress file is re-injected after every compaction, so a wrong belief written there is amplified. An entry such as "module `billing-export` tests are flaky, skipping verification" becomes the most authoritative line in the context and survives every summary. Require an evidence link on every claim (a commit hash or test run id), have the check list rather than the progress file decide what is done, and treat any progress entry that contradicts `checks.json` as a drift signal.
+
+## Follow-ups
+
+- *The platform team wants the cost of the re-injected files and the subagents back before it approves the hook. Which part do you cut first, and what risk do you accept in writing?*
+- *A new model doubles the window to 400,000 tokens. Do you raise the threshold, and what would you need to see in the replay results to do it?*
+- *What would you need to see in production to switch this workload from compaction to resets?*
+- *Two senior engineers disagree about whether the agent may edit `GOAL.md` to record a scope it discovers. How do you decide without deciding by rank?*
+
+## Common mistakes
+
+- Writing a better summary prompt and calling the goal safe. The summary is the part that drifts.
+- Pinning everything. A pinned 40,000-token context pays its read price on every request and pushes the threshold up.
+- Letting the agent write the goal file, which turns the goal into one more thing that can drift.
+- Ignoring the cache lifetime, so compactions land after long test runs and cost ten times what the warm case suggests.

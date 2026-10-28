@@ -1,0 +1,115 @@
+---
+id: rag-024
+title: A ranking stack over four indexes with an LLM at the end
+subtitle: BM25, dense and LLM reranking, with the latency budget split per stage and an LLM pool that cannot serve every query
+track: rag
+module: hybrid-search
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 45
+core: false
+tags: [hybrid-search, reranking, llm-reranker, latency-budget, fan-out, rrf, system-design]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: techinterview.org, Perplexity interview guide (published 2026-04-24, updated 2026-07-11)
+    url: https://www.techinterview.org/companies/perplexity/
+    note: "synthesised question bank that presents its items as sample prompts, not candidate reports, so no company tag: design the ranking system combining BM25, dense retrieval and LLM reranking across multiple indexes. Checked 2026-10-28."
+  - title: Sun et al., Is ChatGPT Good at Search? Investigating Large Language Models as Re-Ranking Agents (EMNLP 2023, arXiv 2304.09542 v3)
+    url: https://arxiv.org/abs/2304.09542
+    note: "sliding window of 20, step 10, over the top 100 BM25 passages, 10 API calls per query; TREC DL19 nDCG@10: BM25 50.58, monoT5 3B 71.83, GPT-4 permutation generation 75.59; a distilled 440M model outperforms a 3B supervised model on BEIR. Read in the HTML version. Checked 2026-10-28."
+  - title: Cormack, Clarke and Büttcher, Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods (SIGIR 2009)
+    url: http://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf
+    note: "RRF sums 1 / (k + rank), k = 60, and needs no score calibration across systems. Checked 2026-10-28."
+  - title: Elasticsearch docs, RRF retriever
+    url: https://www.elastic.co/docs/reference/elasticsearch/rest-apis/retrievers/rrf-retriever
+    note: "rank_window_size defaults to 10 and must be at least size; per-retriever weights from 9.2. Checked 2026-10-28."
+  - title: Qdrant docs, hybrid and multi-stage queries
+    url: https://qdrant.tech/documentation/concepts/hybrid-queries/
+    note: "multi-stage queries: prefetch a wide candidate set cheaply, rescore with a more expensive representation, return the top 10. Checked 2026-10-28."
+  - title: Dean and Barroso, The Tail at Scale (Communications of the ACM 56, 2013)
+    url: https://research.google/pubs/the-tail-at-scale/
+    note: "rare slowdowns that do not matter at small scale dominate at large scale; latency tail-tolerant systems build predictable responses from less predictable parts. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Design, 45 minutes">
+"Design the ranking system for an answer engine: BM25 and dense retrieval across several indexes, an LLM reranker at the end. Split the latency budget per stage and defend the split."
+</Callout>
+
+The operating constraints are a scenario, given by the interviewer:
+
+- Four indexes. Web: 400 million pages on an existing Elasticsearch cluster that serves BM25 and cannot be rewritten this half. News: 30 million articles, searchable within five minutes of publication, BM25 and dense. Papers: 60 million chunks, BM25 and dense. Files: each user's uploads, small, dense only.
+- The answer has to start streaming within 1.6 seconds at p95. Generation's time to first token is 600 ms at p95, so ranking gets 1,000 ms from the moment the query arrives.
+- 2,000 queries per second at peak.
+- Measured p95s (scenario): query understanding with a small model, 120 ms. Web BM25, 180 ms. Every other retrieval leg, 40 to 110 ms. A cross-encoder on the GPU pool, 30 ms plus 0.5 ms per candidate. An in-house 8B model ordering 20 candidates listwise in one prompt, 350 ms.
+- The GPU budget is fixed for the year. At the 20-candidate prompt, the LLM pool serves 600 reranking calls a second.
+- The product lead wants the LLM reranker on every query: in an offline side-by-side, answers built on its ordering won more often.
+- Five engineers.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for each retrieval leg's p99 as well as its p95, and whether their slow periods are correlated.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask which query classes the offline side-by-side wins came from, and whether any class lost.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the product does today when one index is down: answer without it, or fail.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Five stages inside 1,000 ms: query understanding and routing 120 ms, parallel retrieval across the routed indexes 250 ms, fusion 10 ms, a cross-encoder over the fused top 150 at 105 ms, and the LLM over the cross-encoder's top 20 at 350 ms, with 165 ms of headroom. Retrieval fans out to up to six legs, so each leg gets a hard timeout at the stage budget and the stage returns what arrived; a leg that has to be at p95 inside 250 ms on its own is not enough, because six legs each at their own p95 are all on time only 74 percent of the time. RRF merges legs across indexes, because their scores share no scale. The LLM pool serves 600 calls a second against 2,000 queries, so it cannot run on every query: I gate it to the 30 percent where the cross-encoder is least certain, with an admission controller that falls back to cross-encoder order when the pool is full. What I give up is the LLM's ordering on 70 percent of traffic, which the product lead will contest.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>The budget, written down.</strong></p>
+<table>
+<thead><tr><th>Stage</th><th>Budget (p95)</th><th>Basis</th></tr></thead>
+<tbody>
+<tr><td>Query understanding, rewrite and index routing</td><td>120 ms</td><td>measured</td></tr>
+<tr><td>Retrieval: routed legs in parallel, BM25 and dense</td><td>250 ms</td><td>web BM25 at 180 ms is the slowest leg; per-leg timeout at 250 ms</td></tr>
+<tr><td>Fusion: RRF within and across indexes</td><td>10 ms</td><td>in process</td></tr>
+<tr><td>Cross-encoder over the fused top 150</td><td>105 ms</td><td>30 + 0.5 × 150</td></tr>
+<tr><td>LLM listwise over the top 20, gated</td><td>350 ms</td><td>one window, measured</td></tr>
+<tr><td>Headroom</td><td>165 ms</td><td>1,000 − 835</td></tr>
+</tbody>
+</table>
+<p>Adding stage p95s overstates the end-to-end p95, which is the safe direction for a budget; the end-to-end p95 is what gets measured at launch.</p>
+<p><strong>Fan-out is where the tail comes from.</strong> A query routed to all four indexes runs six legs: BM25 only on web, BM25 and dense on news and papers, dense only on files. If each leg independently finishes inside its own p95 95 percent of the time, all six are inside it 0.95<sup>6</sup> ≈ 74 percent of the time. For the stage to make 250 ms at p95, each leg has to make it at about its p99.1 (0.95<sup>1/6</sup>), which web BM25 will not do on a cluster I cannot change. So: a hard timeout per leg at 250 ms, return what arrived, and log the leg as missing; send a hedged second request for the web BM25 leg to another replica if the first has not answered by its p95. That turns a slow leg into a missing leg, and the answer is built from three indexes instead of four. Routing helps as much as timeouts: most queries do not need papers or files, and every leg not sent is a leg that cannot be slow.</p>
+<p><strong>Fusion across indexes.</strong> BM25 scores from a 400-million-page index and from a 30-million-article one are not comparable, and neither is comparable to cosine similarity. RRF uses positions only, so it merges six legs without calibration, with the window set explicitly (Elasticsearch fuses only the top 10 of each leg unless rank_window_size is raised). Per-index weights encode the router's view: news weighted up for queries the router marks as time-sensitive. The cross-encoder then puts every candidate on one scale, which is what the LLM stage and the gate read.</p>
+<p><strong>Why the LLM gets one window over 20.</strong> The RankGPT recipe slides a window of 20 by 10 over 100 candidates, 10 calls per query. At 350 ms a call and sequential windows, that is seconds. One window over the cross-encoder's top 20 is the only LLM stage that fits; the cross-encoder decides what the LLM sees.</p>
+<p><strong>The decision, two defensible answers.</strong></p>
+<ul>
+<li><strong>LLM on every query, made smaller.</strong> Order 10 candidates instead of 20, or move to a smaller model, until the pool's calls per second exceed 2,000. What the product lead asked for, and no query is treated differently. The cost: every query gets a weaker LLM stage, and the offline wins were measured with 20 candidates and the 8B model, so they no longer apply until re-measured.</li>
+<li><strong>Full-strength LLM on the 30 percent that need it.</strong> 600 / 2,000 = 30 percent. Gate on the cross-encoder's margin between its first and second candidates, plus query classes the router marks as comparative or multi-part, and an admission controller that sends a query to the cross-encoder order when the pool is saturated rather than queueing it past the budget. The cost: 70 percent of queries never see the LLM, and a mistuned gate spends the pool on queries that did not need it.</li>
+</ul>
+<p>I take the gate, and I write down that the offline side-by-side has to be rerun on the gated system before it is used as an argument either way. The paper's numbers say why the gate is plausible: on DL19 a 3B cross-encoder reached 71.83 nDCG@10 against GPT-4's 75.59, so most of the ordering quality arrives at the cross-encoder, and the LLM's margin is a few points bought at a large multiple of the cost.</p>
+<p><strong>The constraint conflict.</strong> Latency against quality against a fixed GPU budget, with a stakeholder who has an offline win and a cluster that cannot change.</p>
+<p><strong>Rollout plan.</strong> Shadow the full stack for a week, logging per-leg timeouts, gate rate, admission fallbacks and end-to-end p95 without serving it. Then 5 percent of traffic by user hash, then 25, then all. Rollback triggers: end-to-end p95 over 1.6 s for 15 minutes; any index missing from more than 2 percent of the answers routed to it; admission fallbacks over 10 percent of gated queries for an hour, which means the gate and the pool disagree.</p>
+<p><strong>What I give up.</strong> The LLM ordering on most queries. Completeness when a leg is slow. Dense retrieval on the web index this half, since the cluster stays BM25-only; web results depend on lexical match until a dense web index exists.</p>
+<p><strong>Where this design fails.</strong> The LLM reads untrusted web text inside its ranking prompt, so a page that says it is the most relevant result is an injection aimed at the reranker; the prompt has to fence candidate text as data, and an eval set of planted pages has to run before launch. The gate reads cross-encoder margins that differ in distribution across indexes: paper chunks may score systematically higher, so the gate under-sends paper queries, and the per-index gate rate has to be watched. And timeouts hide outages: a news index that times out on every query degrades answers about today without any error.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Why not one merged index instead of four?</em> Freshness and ownership differ: news must be searchable in five minutes, web cannot be rewritten this half, and files are per user with their own access rules. Merging would tie every index to the slowest one's update path.</li>
+<li><em>Where does freshness enter the ranking?</em> In the router's per-index RRF weights for time-sensitive queries, and in the LLM prompt, which can take an instruction to prefer recent sources; the cross-encoder knows nothing about dates.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Pushback: the product lead shows the side-by-side again and says 30 percent coverage throws away the feature. The GPU budget does not move. Which half of your design do you cut to give the LLM more queries, and what risk do you accept in writing?*
+- *Reversal: what would you need to see in the gated rollout to move to the smaller LLM on every query instead?*
+- *The web cluster's p95 doubles during its own reindex every Sunday. The hedged requests double its load. Who decides whether Sunday answers go out without web results, and how?*
+- *Two staff engineers disagree: one wants per-leg timeouts at 250 ms, the other wants the stage to wait for web BM25 because answers without it are worse. How do you settle it without deciding by rank?*
+
+## Common mistakes
+
+- Budgeting each retrieval leg at p95 and expecting the fan-out stage to meet p95.
+- Merging BM25 and dense scores across indexes as if they shared a scale.
+- Running a sliding-window LLM reranker inside an interactive budget.
+- Letting the LLM pool queue when it is full instead of falling back.
+- Treating candidate text in the LLM's prompt as trusted.

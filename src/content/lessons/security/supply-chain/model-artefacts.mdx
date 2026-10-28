@@ -1,0 +1,201 @@
+---
+title: Loading model artefacts safely
+track: security
+module: supply-chain
+order: 1
+kind: lesson
+level: senior
+minutes: 13
+summary: Why loading a pickled checkpoint runs the publisher's code, what import scanning and weights_only actually guarantee given nullifAI and CVE-2025-32434, and how safetensors and Sigstore model signing split the rest of the job into "cannot execute" and "who produced these bytes".
+prerequisites: [security/secure-architecture/capability-matrix]
+updated: 2026-10-28
+sources:
+  - title: Hugging Face Hub docs, Pickle Scanning
+    url: https://huggingface.co/docs/hub/security-pickle
+    note: "pickle is the default format for PyTorch weights; GLOBAL and STACK_GLOBAL import, REDUCE calls; the Hub runs ClamAV and a pickle import scan built on pickletools.genops; disclaimer that the scan is not 100% foolproof and the safe and unsafe import lists are best-effort; a restricted Unpickler is defeated by a published CTF exploit; proposes an import allowlist; from_tf and from_flax as a workaround. Checked 2026-10-28."
+  - title: ReversingLabs, Malicious ML models discovered on Hugging Face platform (Karlo Zanki, 6 February 2025)
+    url: https://www.reversinglabs.com/blog/rl-identifies-malware-ml-model-hosted-on-hugging-face
+    note: "nullifAI: two models, 7z-compressed PyTorch files that torch.load cannot open by default; payload at the start of the pickle stream, a broken stream after it; Picklescan errored on the broken file without reporting the dangerous imports; platform-aware reverse shell; reported 20 January, removed by Hugging Face within 24 hours; Picklescan changed to handle broken files"
+  - title: PyTorch 2.14 docs, torch.load
+    url: https://docs.pytorch.org/docs/2.14/generated/torch.load.html
+    note: "signature shows weights_only=True as the default; one warning: torch.load uses an unpickler, never load data from an untrusted source; weights_only restricts the unpickler to tensors, primitive types, dictionaries and types added with add_safe_globals. Checked 2026-10-28."
+  - title: PyTorch 2.6 docs, Serialization semantics (notes/serialization)
+    url: https://docs.pytorch.org/docs/2.6/_sources/notes/serialization.rst.txt
+    note: "from 2.6, torch.load defaults to weights_only=True when pickle_module is not passed; TORCH_FORCE_WEIGHTS_ONLY_LOAD=1 forces it on every call; TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 only affects calls that do not pass the argument; get_unsafe_globals_in_checkpoint is static and can miss dynamically built types such as numpy dtypes"
+  - title: PyTorch dev-discuss, BC-breaking change, torch.load flipped to weights_only=True by default (4 November 2024)
+    url: https://dev-discuss.pytorch.org/t/bc-breaking-change-torch-load-is-being-flipped-to-use-weights-only-true-by-default-in-the-nightlies-after-137602/2573
+    note: "default flipped from False to True for 2.6 and later; warnings since 2.4; nn.Module checkpoints need weights_only=False"
+  - title: CVE-2025-32434 (CVE record, MITRE API)
+    url: https://cveawg.mitre.org/api/cve/CVE-2025-32434
+    note: "RCE in torch.load with weights_only=True in PyTorch 2.5.1 and earlier, patched in 2.6.0; CVSS 4.0 base score 9.3; CWE-502; published 18 April 2025"
+  - title: PyTorch security advisory GHSA-53q9-r3pm-6pq6 (17 April 2025)
+    url: https://github.com/pytorch/pytorch/security/advisories/GHSA-53q9-r3pm-6pq6
+    note: "affected <=2.5.1, patched 2.6.0; found by Ji'an Zhou; the reporter notes the docs had presented weights_only=True as the safe option"
+  - title: huggingface/safetensors README
+    url: https://github.com/huggingface/safetensors
+    note: "8-byte little-endian header size, JSON header with dtype, shape and data_offsets relative to the byte buffer; __metadata__ values must be strings; 100MB header limit; offsets may not overlap and the buffer may not have holes, which prevents polyglot files; tensor values are not checked, NaN and +/-Inf can be in the file. Checked 2026-10-28."
+  - title: Sigstore blog, Model Transparency v1.0 (Mihai Maruseac, 4 April 2025)
+    url: https://blog.sigstore.dev/model-transparency-v1.0
+    note: "model-signing 1.0 on PyPI, CLI and library; Sigstore signing with a short-lived certificate bound to an OIDC token, also PKI and self-signed certificates; Kaggle and Hugging Face named as hubs; verification binds the model to the workload identity that produced it"
+  - title: sigstore/model-transparency README
+    url: https://github.com/sigstore/model-transparency
+    note: "the bundle holds a DSSE envelope over an in-toto statement whose subjects are (file path, digest) pairs; hashing produces a manifest for every file or file shard; git paths ignored by default; key, certificate and PKCS #11 signing; signing events go to Sigstore's transparency log and signers should monitor it for their identity. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Loading is execution
+
+A PyTorch checkpoint saved the default way is a ZIP archive whose object graph is a pickle, and a pickle is a program for a small stack machine. Two kinds of opcode do the damage. `GLOBAL` and `STACK_GLOBAL` import any attribute of any importable module; `REDUCE` calls whatever is on the stack with the arguments under it. A checkpoint that imports `os.system` and reduces it with a string runs a shell command inside your loader process, with your loader's credentials, before a single tensor comes back. Hugging Face's own documentation says it directly: pickle is the default format for PyTorch weights, and loading one can execute arbitrary code.
+
+So the question for any model you did not train is not "is this file malicious" but "which of my loading paths can execute code, and what holds that shut". Four answers are in use. An import scanner reads the opcodes without running them. PyTorch's `weights_only=True` swaps in a restricted unpickler. safetensors replaces pickle with a format that has no code path. Signing says who produced the bytes. Each closes a different gap, and two of them lower a rate rather than hold by construction.
+
+## Scanning reads the program without running it
+
+The Hub scans every pushed file with ClamAV and with a pickle import scan built on `pickletools.genops`, which walks opcodes without executing them, and lists the imports next to the file with suspicious ones highlighted. The same page carries a disclaimer: the scan is not 100% foolproof, and the safe and unsafe import lists are maintained on a best-effort basis. It also explains why a static walk beats a restricted `Unpickler` subclass: a published CTF exploit escapes the subclass, while every import leaves a trace in the opcodes that a walk reads.
+
+The nullifAI models, reported by ReversingLabs on 6 February 2025, showed what "not foolproof" means. Two models on the Hub carried a platform-aware reverse shell, and two details let them through:
+
+- They were compressed with 7z instead of PyTorch's default ZIP, so `torch.load` could not open them by default.
+- The malicious calls sat at the start of the pickle stream, followed by a deliberately broken tail. Picklescan validated the file before scanning, hit the broken tail, and reported an error instead of the dangerous imports. `pickle.load` runs opcodes in order, so the payload had already executed by the time the loader raised.
+
+Hugging Face removed the models within 24 hours of the report and changed Picklescan to report threats in broken files. The transferable part is the failure mode: a scanner that treats "could not parse" as "nothing found" is a scanner an attacker can switch off with one byte.
+
+An allowlist scanner that fails closed fits on a screen. It tracks the strings pushed before `STACK_GLOBAL`, including through the memo, which protocol 4 uses for every string; it reports every import not on the list; and it returns a failure for any stream that does not parse, together with whatever it had already found.
+
+```python
+import io, os, pickle, pickletools
+
+ALLOW = {("collections", "OrderedDict"), ("torch._utils", "_rebuild_tensor_v2"),
+         ("torch", "FloatStorage"), ("torch", "HalfStorage"), ("torch", "BFloat16Storage")}
+STRINGS = {"SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8", "UNICODE",
+           "SHORT_BINSTRING", "BINSTRING", "STRING"}
+
+def scan(data: bytes):
+    """Return (verdict, imports not on the allowlist). A stream that does not parse fails."""
+    found, stack, memo = [], [], {}
+    try:
+        for op, arg, pos in pickletools.genops(io.BytesIO(data)):
+            if op.name in STRINGS:
+                stack.append(arg)
+            elif op.name == "MEMOIZE":
+                memo[len(memo)] = stack[-1] if stack else None
+            elif op.name in ("PUT", "BINPUT", "LONG_BINPUT"):
+                memo[arg] = stack[-1] if stack else None
+            elif op.name in ("GET", "BINGET", "LONG_BINGET"):
+                stack.append(memo.get(arg))
+            elif op.name in ("GLOBAL", "INST"):
+                found.append((pos, *arg.split(" ", 1)))
+            elif op.name == "STACK_GLOBAL":
+                found.append((pos, *(stack[-2:] if len(stack) >= 2 else [None, None])))
+            else:
+                stack.append(None)
+    except Exception as e:
+        return f"fail: stream does not parse ({type(e).__name__})", found
+    bad = [f for f in found if tuple(f[1:]) not in ALLOW]
+    return ("fail" if bad else "pass"), bad
+
+class Payload:
+    def __reduce__(self):
+        return (os.system, ("echo ran",))
+
+evil = pickle.dumps(Payload(), protocol=4)
+broken = evil[:-1] + b"X."   # BINUNICODE with no length bytes: the stream is truncated
+print(scan(pickle.dumps({"w": [1.0, 2.0]}, protocol=4)))
+print(scan(evil))
+print(scan(broken))
+pickle.loads(broken)         # runs the command, then raises UnpicklingError
+```
+
+Under Python 3.12 the plain dictionary passes, the payload fails with one finding (`os.system` is pickled under its defining module, `posix` or `nt`), and the broken stream fails with the same finding plus the parse error. The last line prints `ran` and then raises `pickle data was truncated`: the nullifAI property, reproduced with a one-byte insertion before `STOP`. An operand that is not a plain string push resolves to `None`, which is not on the list, so an obfuscated import name also fails closed.
+
+Two things the sketch leaves out. It reads a raw pickle; a real checkpoint is a container, so you open the ZIP (and refuse any other container, which would have stopped nullifAI at the door) and scan `data.pkl`. And the allowlist is a policy you own: every custom class a legitimate checkpoint references is a line someone has to approve, and the list is only as good as that review. The scanner lowers a rate. It is the right gate for a hub or an intake pipeline, and the wrong thing to rely on alone at load time. The module's lab, [A pickle import allowlist scanner](/labs/pickle-scanner), grows this sketch with tests, including the broken-stream case.
+
+## weights_only and its CVE
+
+PyTorch flipped the default of `torch.load` from `weights_only=False` to `True` in 2.6, after warning since 2.4 (dev-discuss, 4 November 2024). The restricted unpickler loads tensors, primitive types, dictionaries and the types you register with `torch.serialization.add_safe_globals`; anything else raises an "Unsupported global" error naming the class. Two details from the 2.6 serialization notes matter in code review:
+
+- The new default applies only when `pickle_module` is not passed. Code that supplies its own pickle module and no explicit `weights_only` is outside the flip, so lint for the explicit argument instead of trusting the default.
+- `TORCH_FORCE_WEIGHTS_ONLY_LOAD=1` forces the restricted path on every call, including third-party code that passes `weights_only=False`. It belongs in the inference image, not in application code someone can edit.
+
+Then CVE-2025-32434, published 18 April 2025: in PyTorch 2.5.1 and earlier, a crafted checkpoint gets remote code execution through `torch.load` with `weights_only=True`. CVSS 4.0 base score 9.3, CWE-502, fixed in 2.6.0. The advisory's reporter noted that PyTorch's own documentation had presented `weights_only=True` as the safe option. The `torch.load` page in the 2.14 documentation now carries a single warning: the function uses an unpickler, and you should never load data from an untrusted source.
+
+Read that as the maintainers' own classification. `weights_only=True` is a restricted parser for a format designed to execute code, and restricted parsers have bugs. It lowers the rate at which a malicious checkpoint gets code execution, and the version floor of 2.6.0 is part of the control. It does not hold by construction.
+
+## safetensors removes the code path
+
+A safetensors file is an 8-byte little-endian unsigned integer N, then N bytes of JSON, then a flat byte buffer. The JSON maps each tensor name to a `dtype`, a `shape` and `data_offsets` relative to the start of the buffer; an optional `__metadata__` map takes string values only. The README lists the guarantees: the header is capped at 100MB, offsets may not overlap, the buffer may not have holes (which also rules out polyglot files), and there is no instruction stream to execute. Loading is parsing JSON and slicing bytes.
+
+<Predict id="sec-supply-chain-offsets" question="What END offset must the header give for this tensor, in bytes?" answer={262144000} tolerance={0} unit="bytes">
+<Fragment slot="prompt">
+<p>A header entry reads <code>"embed.weight": dtype BF16, shape [32000, 4096], data_offsets [0, END]</code>. BF16 is 2 bytes per element.</p>
+</Fragment>
+<p>32,000 × 4,096 × 2 = <b>262,144,000 bytes</b>. Because a tensor's size is END minus BEGIN and the buffer has no holes, a loader can check each entry's byte count against shape and dtype, and check that the offsets tile the buffer exactly. A header that lies about either is rejected before any tensor is built, which is what makes the format safe to parse from an untrusted source.</p>
+</Predict>
+
+What the format does not check is the values. The README says so: tensor values are not validated, and NaN and plus or minus infinity can be in the file. A safetensors file can be a well-formed, poisoned model, or a model whose norm weights are all NaN and which fails only at the first forward pass. Converting to safetensors removes code execution by construction. It says nothing about who trained the weights or what they do.
+
+Hugging Face's pickle page still lists the older workaround of loading TensorFlow or Flax weights with `from_tf` or `from_flax`. That works where those checkpoints exist; for most PyTorch-first releases they do not, and safetensors is what the repository ships.
+
+## Signing says who, not what
+
+The provenance gap is what the Sigstore model-transparency project closes. Version 1.0 of `model-signing` (Sigstore blog, 4 April 2025) hashes every file in a model directory, or every shard of a large file, into a manifest, and signs an in-toto statement whose subjects are the (file path, digest) pairs. With Sigstore, the signer gets a short-lived certificate bound to an OIDC identity, typically the CI workload that ran the release, and the signing event goes into Sigstore's append-only transparency log. Key, certificate and PKCS #11 signing are also supported. Verification checks the signature, then recomputes every hash:
+
+```bash
+model_signing sign ./model
+model_signing verify ./model --signature model.sig \
+  --identity "https://github.com/acme/train/.github/workflows/release.yml@refs/heads/main" \
+  --identity-provider https://token.actions.githubusercontent.com
+```
+
+The identity and repository in that command are placeholders for your own release workflow. What verification establishes, by construction: every file in the directory has the bytes the named identity signed, nothing was added or swapped, and the signing event is in a public log the signer can watch for misuse of its identity. What it does not establish: that the training data was clean, that nothing upstream of the signing step was compromised, or that the identity you pinned deserves trust. A model trained on poisoned data and signed by the legitimate pipeline verifies. So does a model built by an attacker who controls the release workflow, with the right identity on it. The control that does the work is the pinned identity; verifying "signed by anyone" proves very little.
+
+## The loading policy, in one table
+
+| Artefact and path | Stops | Holds by construction or lowers a rate |
+|---|---|---|
+| safetensors via the safetensors library | code execution at load | by construction; values and provenance unchecked |
+| Pickle checkpoint, PyTorch 2.6.0 or later, `weights_only=True` forced by environment | most code execution | lowers a rate: a restricted parser with a 9.3 CVE in its history |
+| Allowlist scan that fails on parse errors, ZIP only | known-bad and unlisted imports | lowers a rate: the allowlist is a reviewed policy, not a proof |
+| `model_signing verify` with a pinned identity | substitution and tampering after signing | by construction, for identity and bytes only |
+| Pickle with `weights_only=False` | nothing | run only in a disposable sandbox with no credentials and no egress |
+
+The default that survives review, for anything from outside the team: accept safetensors only, verify a signature against a pinned identity where the publisher signs, and treat any pickle as a conversion job that runs once in a sandbox and emits safetensors plus a manifest you sign yourself.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Research wants 40 community fine-tunes from the Hub on the eval cluster by Friday. Eighteen ship only pickled `.bin` checkpoints, policy says no pickle on shared GPUs, and the platform team has two engineers this week. What do you build, and what do you refuse?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>A one-way conversion lane. The 22 safetensors models go straight through, with hashes recorded at intake. The 18 pickles go to a disposable container with no credentials and no egress that runs a fail-closed allowlist scan, loads with PyTorch 2.6.0 or later under forced <code>weights_only=True</code>, writes safetensors, and emits a manifest signed by our own CI identity. The eval cluster accepts only safetensors carrying our signature. Anything that fails the scan or needs <code>weights_only=False</code> is refused for this deadline.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The cluster is the asset: shared storage, service credentials, other teams' jobs. So the rule enforced there is format plus signature, both of which hold by construction, and every rate-lowering control moves upstream to a place where failure costs one throwaway container.</p>
+<p>Two engineers can build this in a week because every piece exists: <code>pickletools</code> for the scanner, a stock PyTorch image with <code>TORCH_FORCE_WEIGHTS_ONLY_LOAD=1</code>, the safetensors library for output, <code>model-signing</code> in CI. The conversion container gets no network and no mounted secrets and is destroyed after each model, because the working assumption is that a malicious pickle eventually gets code execution inside it.</p>
+<p>What I give up, in writing: models that need custom classes are refused or delayed until someone reviews each allowlist addition; our signature on a converted model means "converted by our pipeline from these input hashes", not "safe"; and none of it says anything about poisoned weights. The refused list goes in the ticket with a reason per model, so research picks which are worth a manual review.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Research says six of the refused models are the ones their paper depends on, and each needs one custom class. Which do you allowlist, who reviews the class, and what residual risk do you sign?</em></li>
+<li><em>A month later a model you converted is reported as backdoored, with your signature on it. What does the manifest let you answer that you could not answer without it, and what can it not answer?</em></li>
+<li><em>A second engineer argues the scanner is redundant once every load is forced to <code>weights_only=True</code> on 2.6.0 or later. What evidence would make you drop it, and what would make you keep both?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The table assumes the weights file is the only code that runs. Many model repositories ship Python next to the weights (custom modelling files that a library loads when told to trust remote code), and that path runs the publisher's code by design. No weights format helps there; it is a dependency review, and it belongs with the agent toolchain controls later in this module.
+
+Allowlists break legitimate artefacts. The PyTorch notes warn that some types, numpy dtypes among them, are built dynamically during unpickling, so `get_unsafe_globals_in_checkpoint` and any static scanner can miss or misreport them. A team that hits enough false positives adds `numpy.*` to the list, and a wildcard over a large package is close to no list.
+
+Format safety is a property of the parser. safetensors holds by construction in the library that enforces its rules; a hand-written loader that trusts the header's offsets without the overlap and size checks brings back the bugs the format was designed to rule out. The same applies to every other weights format your serving stack accepts.
+
+Signing moves trust from the bytes to an identity and to whoever controls that identity. A compromised release workflow signs malicious output with the correct identity, and the transparency log helps only if the signer watches it. Signing narrows the question to "do I trust this pipeline", and the next two lessons are about the two ways that trust fails: the data the pipeline trained on, and the tools the pipeline's engineers run.
+
+<SelfRate id="lesson:security/supply-chain/model-artefacts" />

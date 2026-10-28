@@ -1,0 +1,119 @@
+---
+id: trn-017
+title: MFU fell from 41% to 29% after a layout change
+subtitle: rank the causes from a config diff and one profile
+track: training
+module: distributed
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 25
+core: false
+tags: [tensor-parallelism, pipeline-parallelism, mfu, nccl, profiling]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Hugging Face, The Ultra-Scale Playbook, tensor and pipeline parallelism
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "significant drops when moving from TP=8 to TP=16 and an even steeper decline to TP=32; keep the TP degree under the number of GPUs per node, TP at most 8; pipeline parallelism dropped only 14% going from one node to two in their benchmark, against around 43% for TP in similar cross-node scenarios; sequence parallelism lowers the maximum activation size to b x s x h / tp. Checked 2026-10-28."
+  - title: Austin et al., How to Scale Your Model, GPUs chapter (JAX scaling book)
+    url: https://jax-ml.github.io/scaling-book/gpus/
+    note: "H100 NVLink 450 GB/s per direction per GPU; InfiniBand NDR 50 GB/s per GPU across nodes; TP compute-bound up to about 8-ways, generally intra-node or at most 2-node TP. Checked 2026-10-28."
+  - title: Korthikanti et al., Reducing Activation Recomputation in Large Transformer Models (arXiv 2205.05198)
+    url: https://ar5iv.labs.arxiv.org/html/2205.05198
+    note: "activation bytes per layer sbh(10 + 24/t + 5as/(ht)) with tensor parallelism only, and 34sbh/t with sequence parallelism and selective recomputation. Checked 2026-10-28."
+choices:
+  - text: Each GPU's matmul shards are half as wide at TP 16, so the GEMMs now run well below their peak rate
+    correct: false
+    why: It is real and measurable, GEMM time rose from 6.6 s to 7.0 s, but that is a tenth of the 4.1 s the step lost.
+  - text: Sequence parallelism fell out of the config, so norms and dropout run redundantly on all 16 TP ranks
+    correct: false
+    why: It is a real defect and explains the rise in peak memory, but the redundant elementwise work is small and an all-reduce moves the same bytes as the reduce-scatter and all-gather it replaces.
+  - text: Each rank now holds twice the parameters, so the data-parallel gradient all-reduce doubled in size
+    correct: false
+    why: Tensor times pipeline degree is 64 before and after, so each rank holds the same share of the parameters and the data-parallel all-reduce is unchanged.
+  - text: Each TP group now spans two nodes, so every layer's all-reduces wait on InfiniBand rather than NVLink
+    correct: true
+    why: Communication time rose by 3.9 s while GEMM time rose by 0.4 s, and with tensor-parallel ranks innermost a group of 16 on 8-GPU nodes cannot avoid an inter-node hop on every layer, forward and backward.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"We changed the parallel layout on our dense run to shrink the pipeline bubble, and MFU fell from 41% to 29% on the same cluster. Here is the change and the only profile we kept. What happened, and what do you ship tomorrow?"
+</Callout>
+
+The run trains a dense model with 80 layers at hidden size 8,192 on 64 nodes of 8 H100s, NVLink inside each node and one 50 GB/s InfiniBand link per GPU. The pull request description says: "Halve PP to cut the bubble from 7/32 to 3/32; TP 16 keeps the per-GPU parameter count unchanged."
+
+```diff
+ model: dense-80l-h8192
+ nodes: 64
+ gpus_per_node: 8
+-tensor_parallel: 8
+-pipeline_parallel: 8
++tensor_parallel: 16
++pipeline_parallel: 4
+ data_parallel: 8
+ zero_stage: 1
+ micro_batches: 32
+ micro_batch_size: 1
+ seq_len: 4096
+-sequence_parallel: true
+ recompute: selective
+ tp_comm_overlap: true
+ rank_order: [tp, pp, dp]
+```
+
+Rank 0, one steady-state step from each run. Kernel times overlap across streams, so the columns do not add up to the step time.
+
+| | before | after |
+|---|---|---|
+| step time | 10.0 s | 14.1 s |
+| MFU | 41% | 29% |
+| GEMM kernel time | 6.6 s | 7.0 s |
+| NCCL kernel time, all communicators | 2.4 s | 6.3 s |
+| peak memory | 61 GB | 74 GB |
+
+<p class="tiny">The run, the config and the numbers are synthetic, built so the ratios match the mechanisms in the sources.</p>
+
+You do not have a per-communicator breakdown of the NCCL time, profiles from any other rank, or bandwidth tests for a 16-GPU group. Pick the cause of the drop, then rank the other candidates by how much each matters once the cause is fixed, and say what you would collect and what you would ship without it.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the list of global ranks in rank 0's tensor-parallel group and the hostnames they map to.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the NCCL kernel time split by communicator: tensor, pipeline and data parallel.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask for an all-reduce bandwidth test at the per-layer message size, on 8 GPUs in one node and on 16 across two.</p></details>
+
+## Answer
+
+The cause is placement. With `rank_order: [tp, pp, dp]`, tensor-parallel ranks are innermost and contiguous, so rank 0's group is ranks 0 to 15, which are nodes 0 and 1. No ordering can fit a group of 16 into an 8-GPU node. Tensor parallelism puts two all-reduces in each layer's forward pass and two in its backward, each over a full micro-batch of activations, and every one now crosses InfiniBand. The scaling book gives 450 GB/s per direction on NVLink against 50 GB/s on InfiniBand, a factor of 9, and a ring is as fast as its slowest hop.
+
+The size of the traffic makes it the only candidate that fits the profile. One all-reduce carries s x h x 2 bytes = 4,096 x 8,192 x 2 = 67 MB. Each GPU now runs 20 layers instead of 10, at 4 all-reduces per layer for each of 32 micro-batches, and a ring all-reduce at 16 sends 2 x 15/16 of the buffer per GPU: 20 x 4 x 32 x 126 MB = 322 GB per GPU per step, against 10 x 4 x 32 x 117 MB = 150 GB before. Before, that traffic ran on NVLink in about 0.4 s. After, more than twice the bytes go through a ring with an InfiniBand hop on it. The 3.9 s rise in NCCL time is the right size for it, and `tp_comm_overlap` cannot hide communication that is longer than the matmul it overlaps with. The playbook measured the same shape: significant drops from TP 8 to TP 16, against a much smaller loss when pipeline stages crossed nodes.
+
+The pull request made the change look safe: the parameters per GPU really are unchanged, and the bubble really does shrink from 7/32 to 3/32 of the useful time. Neither statement is about where the collectives run.
+
+**Ranking the rest after the fix.**
+
+1. *Sequence parallelism removed.* Real and second, and it should be restored with the revert. Its compute cost is small, but without it each GPU holds full-size activations in the norm and dropout regions: Korthikanti et al.'s per-layer bytes go from 34sbh/t to sbh(10 + 24/t), which is why peak memory rose to 74 GB despite twice the tensor sharding. On a longer sequence that becomes an OOM.
+2. *Narrower GEMMs.* Real and third. GEMM time rose 6% with half-width shards; at TP 8 it returns.
+3. *Data-parallel all-reduce.* Not a defect: tensor times pipeline degree is 64 in both layouts, so each rank holds the same parameters and the gradient all-reduce did not change.
+
+**What to collect.** The rank-to-host map for one tensor group, which confirms the cause in a minute; the per-communicator NCCL breakdown; and the bandwidth test from hint 3. **What to ship without it.** Revert to `tensor_parallel: 8` with sequence parallelism restored. That layout ran at 41%, and nothing in the evidence argues against it.
+
+**The bubble, which was the goal.** Two defensible ways to get it back without crossing nodes. Keep TP 8 and PP 8 and interleave two stages per device: the bubble falls from 7/32 to 7/64, at twice the point-to-point traffic between stages and an engine change. Or move to TP 8, PP 4, DP 16 with 16 micro-batches to keep the global batch: the bubble is 3/16, each GPU holds twice the parameters (fine under ZeRO-1 at this size: about 10 to 12 GB of model state per GPU, depending on the MLP width), and the data-parallel all-reduce runs over twice as many ranks. The first gives the smaller bubble at engineering cost; the second is a config change with a larger bubble than the first. Measure both for a few hundred steps.
+
+**How the fix fails.** Reverting restores 41% only if nothing else changed between the runs. If the cluster's fabric or NCCL version moved too, the revert will land below 41%, and the team will be tempted to blame the revert; record the NCCL version and the bandwidth test result with the rerun.
+
+## Follow-ups
+
+- *The research lead wants TP 16 anyway, because the next model's layers will not fit at TP 8 with PP 4. What do you propose instead, and what do you write down about the cost of each option?*
+- *After the revert, MFU is 38%, not 41%. What do you check, in what order, and when do you stop looking?*
+- *How would you make a tensor-parallel group that crosses a node boundary fail the config review instead of costing a day of cluster time?*
+
+## Common mistakes
+
+- Picking narrower GEMMs because the arithmetic is familiar, without comparing the 0.4 s rise in GEMM time with the 4.1 s rise in step time.
+- Reading the unchanged parameter count per GPU as proof that communication is unchanged.
+- Treating the shrinking bubble as a sign the change was good; the bubble improved and the step got slower.
+- Restoring TP 8 and forgetting the removed `sequence_parallel` line, which comes back as an OOM at a longer sequence.

@@ -1,0 +1,188 @@
+---
+title: The request bill of materials and cache break-even
+track: system-design
+module: capacity
+order: 1
+kind: lesson
+level: senior
+minutes: 14
+summary: A cost line is tokens per term times price times traffic, and the prompt-cache break-even hit rate follows from two multipliers on the price page.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Anthropic, pricing
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: Claude Sonnet 5 at $2 input, $2.50 5-minute cache write, $4 1-hour write, $0.20 cache read, $10 output per million tokens, with the $2/$10 launch price made standard (the planned rise to $3/$15 on 2026-09-01 will not occur); Opus 5.5 and Sonnet 5.5 cache reads at 0.05x; Haiku 5.5 at $0.10 input and $0.50 output for prompts up to 100,000 tokens; Batch API 50% off input and output; Claude 4.7 and later produce about 30% more tokens for the same text; 286-token tool-use system prompt on Opus 5.5, Sonnet 5.5 and Haiku 5.5; full 1M context at standard rates on Claude 4.6 and later except Haiku 5.5; US-only inference at 1.1x; regional endpoints 10% over global on Bedrock and Google Cloud; fast mode on Opus 5.5 at $8 in and $40 out; checked 2026-10-28
+  - title: OpenAI API pricing
+    url: https://developers.openai.com/api/docs/pricing
+    note: gpt-6.1-sol at $2.00 input, $0.10 cached input, $10.00 output, $2.50 30-minute and $5.00 12-hour cache writes per million tokens; above 272K input tokens input is 2x and output 1.5x; Fast tier 2x Standard; Batch and Flex 50% of Standard; checked 2026-10-28
+  - title: Anthropic docs, prompt caching
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: 5-minute default lifetime refreshed on each use and measured from the start of the request; write multipliers 1.25x (5 min) and 2x (1 h), read 0.1x; minimum cacheable prompt 512 tokens on the 5.x models and 1,024 on Sonnet 5; prefix order tools, system, messages; caches isolated between organizations and, on the Claude API, between workspaces; checked 2026-10-28
+  - title: Anthropic docs, rate limits
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: token bucket enforcement, 60 RPM may be enforced as 1 request per second; input_tokens and cache_creation_input_tokens count toward ITPM, cache_read_input_tokens do not on most models; worked example of 10,000,000 input tokens a minute under a 2,000,000 ITPM limit at an 80% hit rate; Scale tier for Claude Sonnet 5 at 10,000 RPM, 10,000,000 ITPM and 2,000,000 OTPM; checked 2026-10-28
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import SystemDesignCostCalc from '../../../../components/widgets/SystemDesignCostCalc.astro';
+
+The cost line in a design is one sum: tokens per request in each billing term, times the price of that term, times requests per day. The terms are uncached input, cache writes, cache reads and output on the model call, plus anything the request triggers that has its own bill: tool-use overhead, retrieval, and the attempts you retried. Whether prompt caching lowers that sum is decided by one inequality on two multipliers from the price page and by the request rate each cached prefix sees.
+
+## The terms and where each one comes from
+
+**Uncached input** is the tail after the last cache breakpoint plus every prefix that missed. On Anthropic's usage object it is `input_tokens` plus `cache_creation_input_tokens`; `input_tokens` alone counts only the tail, so a dashboard built on it hides a cache that has stopped working.
+
+**Cache writes and reads** are priced as multiples of the input price. On Anthropic's list (checked 28 Oct 2026) a 5-minute write is 1.25 times input, a 1-hour write 2 times, and a read 0.1 times, except on Opus 5.5 and Sonnet 5.5, where a read is 0.05 times. OpenAI's gpt-6.1-sol lists $2.00 input, $0.10 cached input, and writes at $2.50 for 30 minutes or $5.00 for 12 hours, which are 1.25 and 2.5 times input.
+
+**Output** is five times input on both lists for the mid-tier models: $10 against $2 per million on Claude Sonnet 5 and on gpt-6.1-sol.
+
+**Tool overhead** is input you did not write. Declaring tools on Opus 5.5, Sonnet 5.5 or Haiku 5.5 adds a 286-token tool-use system prompt before your own tool definitions, and every tool result becomes input on the next call.
+
+**Retrieval** has its own vendors: the embedding call for the query and the vector store. Carry them as their own row at your contract price; they rarely dominate, and they are the row a reviewer asks about.
+
+**Retries** multiply whatever the failed attempt consumed. Count them from the usage records of failed attempts, not from the retry rate, because a request rejected at admission and a stream that died after 280 output tokens cost different amounts.
+
+## Three workloads, three dominant terms
+
+The same price list gives three different answers about where the money goes. The code uses Claude Sonnet 5 list prices; the token counts are scenario inputs.
+
+```python
+# Sonnet 5 list prices, USD per million tokens (checked 2026-10-28).
+PRICE = {"input": 2.00, "write_5m": 2.50, "read": 0.20, "output": 10.00}
+
+def bill(tokens):
+    """tokens: dict mapping each term to tokens per request (or per task)."""
+    lines = {t: n * PRICE[t] / 1e6 for t, n in tokens.items()}
+    total = sum(lines.values())
+    return total, {t: round(100 * c / total) for t, c in lines.items()}
+
+def agent_task(start=12_000, steps=20, tool_result=1_500, out=400):
+    # Each step re-sends the whole context. With caching at the end of the
+    # conversation, step k reads the prefix step k-1 wrote and writes only
+    # the new tail (the previous output plus the new tool result).
+    ctx = [start + k * (tool_result + out) for k in range(steps)]
+    return {"read": sum(ctx[:-1]),
+            "write_5m": ctx[-1] - ctx[0] + start,
+            "output": steps * out}
+
+workloads = {
+    # 2,000-token prefix at a 90% hit rate; misses write the 5-minute cache.
+    "RAG answer": {"read": 0.9 * 2_000, "write_5m": 0.1 * 2_000,
+                   "input": 1_500, "output": 300},
+    "agent task, 20 steps": agent_task(),
+    # 700 tokens is below Sonnet 5's 1,024-token minimum, so nothing caches.
+    "extraction": {"input": 700, "output": 20},
+}
+for name, tokens in workloads.items():
+    total, share = bill(tokens)
+    print(f"{name:22} ${total:.4f}  {share}")
+```
+
+```text
+RAG answer             $0.0069  {'read': 5, 'write_5m': 7, 'input': 44, 'output': 44}
+agent task, 20 steps   $0.3108  {'read': 36, 'write_5m': 39, 'output': 26}
+extraction             $0.0016  {'input': 87, 'output': 12}
+```
+
+For the RAG answer the cache has done its work: retrieved context and output are 88 percent of the bill, so the next saving is fewer chunks, shorter answers or a cheaper model. For the agent, the largest term is cache writes, because every step writes its new tail at 1.25 times input, and reads come second; without caching the same task costs $1.28, of which input is 94 percent. For extraction the prompt is below the minimum cacheable length, input is the bill, and the lever is the Batch API, which takes 50 percent off input and output if the work can wait.
+
+## The break-even hit rate
+
+A miss pays the write multiplier w on the prefix, a hit pays the read multiplier r, and no cache pays 1. With hit rate h, caching wins when h × r + (1 − h) × w is below 1, which rearranges to h above (w − 1) / (w − r).
+
+| Tier | w | r | Break-even hit rate |
+|---|---|---|---|
+| Anthropic 5-minute | 1.25 | 0.1 | 0.25 / 1.15 = 21.7% |
+| Anthropic 5-minute, Opus 5.5 or Sonnet 5.5 | 1.25 | 0.05 | 0.25 / 1.20 = 20.8% |
+| Anthropic 1-hour | 2 | 0.1 | derive it below |
+| OpenAI gpt-6.1-sol, 12-hour | 2.5 | 0.05 | 1.5 / 2.45 = 61.2% |
+
+<Predict id="sys-capacity-breakeven-1h" question="What hit rate does Anthropic's 1-hour cache need to break even (write 2x, read 0.1x)? Answer in percent." answer={52.6} tolerance={1} unit="%">
+<p><b>52.6 percent</b>: (2 − 1) / (2 − 0.1) = 1 / 1.9. The longer lifetime raises the break-even, and it pays only when it turns misses into hits, which depends on how often each prefix is requested.</p>
+</Predict>
+
+<Predict id="sys-capacity-cache-20" question="RAG answer above at 1,000,000 requests a day: no cache costs $10,000 a day. What does it cost at a 20% hit rate on the 5-minute cache?" answer={10080} tolerance={150} unit="USD/day">
+<p><b>$10,080 a day</b>, more than with caching off. The prefix costs 2,000 × $2 × (0.2 × 0.1 + 0.8 × 1.25) / 1,000,000 = $0.00408 per request instead of $0.004. At 90 percent hits the same line is $0.00086, and the day is $6,860.</p>
+</Predict>
+
+## Hit rate is a property of traffic per prefix
+
+A provider cache entry is keyed by the exact prefix, refreshed on every read, and expires one lifetime after the start of the last request that touched it. A request hits when the gap since the previous request with the same prefix is shorter than the lifetime. If requests for one prefix arrive as a Poisson process with mean gap g, the hit rate is 1 − e^(−T/g) for lifetime T, and the prefix multiplier follows from it.
+
+| Mean gap per prefix | 5-min hit rate | 5-min multiplier | 1-hour hit rate | 1-hour multiplier |
+|---|---|---|---|---|
+| 1 minute | 99.3% | 0.108 | 100% | 0.100 |
+| 5 minutes | 63.2% | 0.523 | 100% | 0.100 |
+| 10 minutes | 39.3% | 0.798 | 99.8% | 0.105 |
+| 20 minutes | 22.1% | 0.996 | 95.0% | 0.195 |
+| 60 minutes | 8.0% | 1.158 | 63.2% | 0.799 |
+
+Setting 1 − e^(−300/g) equal to 21.7 percent puts the 5-minute break-even at a mean gap of 20.4 minutes per prefix; the 1-hour tier breaks even at about 80 minutes. The steady-state table leaves out the first write of each day, which the 1-hour tier pays at 2 times instead of 1.25, so for prefixes requested every few seconds the tiers cost the same and the 5-minute tier is the default.
+
+Three things in a design change g without changing traffic. Isolation: caches are never shared across organizations, and on the Claude API they are isolated per workspace, so putting each enterprise tenant in its own workspace divides the request rate per cache by the number of tenants. Prefix variety: a tenant name, a feature flag or a timestamp inside the prefix splits one cache into many. Minimum length: a prefix under 1,024 tokens on Sonnet 5, or under 512 on the 5.x models, is processed without caching and without an error.
+
+<SystemDesignCostCalc note="defaults are the RAG answer above; Sonnet 5 prices checked 28 Oct 2026" defaults={{ conc: 162 }} />
+
+Set the hit rate to 20 and the cached cost crosses the uncached one. Set it back to 90 and read the share line: once the cache works the prefix is a small slice, and the next dollar comes from per-request input and output.
+
+## Rate limits are capacity
+
+On a hosted model the provider's limits are the fleet. Anthropic enforces requests, input tokens and output tokens per minute separately with a token bucket, so a limit of 60 a minute can behave as one a second and a burst inside the minute can be rejected. Only `input_tokens` and `cache_creation_input_tokens` count toward the input-token limit on most models; reads do not. The docs' own example processes 10,000,000 input tokens a minute under a 2,000,000 limit at an 80 percent hit rate.
+
+For the RAG answer at a million requests a day with a peak three times the average (a scenario ratio), peak traffic is 1,000,000 / 1,440 × 3 = 2,083 requests a minute. Against Sonnet 5's Scale tier of 10,000 RPM, 10,000,000 ITPM and 2,000,000 OTPM:
+
+| Limit | Peak use, cache at 90% | Share | Without caching | Share |
+|---|---|---|---|---|
+| Requests | 2,083 | 21% | 2,083 | 21% |
+| Input tokens | 2,083 × (1,500 + 0.1 × 2,000) = 3.54M | 35% | 2,083 × 3,500 = 7.29M | 73% |
+| Output tokens | 2,083 × 300 = 625K | 31% | 625K | 31% |
+
+The cache roughly halves input-limit use, so a prompt change that breaks the cache shows up as 429s at unchanged traffic as well as on the invoice. Little's law gives the client side: at 34.7 requests a second and 12.5 seconds per streamed answer (0.5 s to first token plus 300 tokens at 40 ms), 434 requests are open at peak, which sizes the connection pool and the concurrency limit in your gateway.
+
+## Inputs that move between quarters
+
+These change the arithmetic and carry a date.
+
+- Tokenizer: Claude 4.7 and later produce about 30 percent more tokens for the same text than Sonnet 4.6 and earlier, so counts measured on an older model under-count.
+- List price: Sonnet 5 launched at $2/$10 as an introductory price; Anthropic made it standard and cancelled the move to $3/$15 planned for 1 September 2026.
+- Long context: Claude 4.6 and later, except Haiku 5.5, bill the full 1M window at standard rates; OpenAI's flagships charge 2 times input and 1.5 times output above 272K input tokens.
+- Placement: US-only inference on Claude 4.6 and later is 1.1 times every token price.
+- Speed: fast mode on Opus 5.5 is $8 in and $40 out against $4 and $20; OpenAI's Fast tier is 2 times Standard.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+"The assistant costs $6,860 a day at a million requests on Sonnet 5 with a 90 percent cache hit rate. Finance caps it at $5,000 a day from the first of next month, and product will not accept shorter answers. What do you change, and what do you put in writing?"
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Output and retrieved context are 88 percent of the bill and output is off the table, so the levers are retrieved tokens and the model. Halving retrieved context to 750 tokens lands at $5,360, still over. Routing half the traffic to Haiku 5.5 lands near $3,600 but needs an eval showing the routed half does not regress, which a month may not allow. I would ship the retrieval cut now with a recall check, route only the query classes the eval clears, and write the remaining gap down as a risk against the cap.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Moving to Sonnet 5.5 at the same $2/$10 list price with 0.05x reads changes only the prefix: $6,680 a day. The prefix is already a small share, so cache work cannot close a $1,860 gap.</p>
+<p>Retrieved context: 1,500 tokens to 750 saves 750 × $2 / 1M per request, $1,500 a day, to $5,360. The cost is recall on questions whose evidence sat in the dropped chunks; measure it on the existing eval set before shipping, and rerank so the cut drops the lowest-scored chunks.</p>
+<p>Routing: Haiku 5.5 lists at $0.10 input and $0.50 output for prompts up to 100,000 tokens, so the RAG answer costs $0.000343 on it at the same hit rate. Half the traffic on Haiku and half on Sonnet 5 is $172 + $3,430 = $3,602 a day. It costs a classifier, a per-class eval, and a quality regression on any class the router gets wrong.</p>
+<p>The written artefact is a decision memo: the retrieval cut with its measured recall change, the routed classes with their eval results, the projected daily cost, and a rollback trigger on answer acceptance rate per class. If the eval cannot finish before the first of the month, the memo states that the cap is missed by about $360 a day for those weeks and names who accepted it.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The routing eval takes two engineer-weeks you do not have before the cap. Which half do you ship, and what risk do you sign?</em></li>
+<li><em>What would you need to see in production to undo the routing?</em> A per-class drop in acceptance or a rise in escalations beyond the band agreed in the memo, read weekly, not an aggregate that the large Sonnet half can hide.</li>
+<li><em>Finance asks why the bill moved 15 percent in a week with flat traffic. What do you pull first?</em> Cache read and write tokens per request and the model id per request, before any retrieval change.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The bill of materials assumes each request is billed on its own at list price. Committed-use contracts, batch windows, regional endpoints and long-context surcharges change the price column; the formula stays and the inputs need checking against the current page.
+
+The Poisson hit-rate model assumes arrivals per prefix are independent. Real traffic is bursty: a tenant that sends 100 requests in a morning burst gets a better hit rate than the same 100 spread over the day, and a nightly job that spaces requests past the lifetime gets none. Measure hit rate per prefix from the usage fields rather than trusting the model.
+
+On a self-hosted engine the provider multipliers do not apply. The prefix cache there saves GPU time, the money is the fleet, and the traffic-to-fleet lesson sizes it.
+
+<SelfRate id="lesson:system-design/capacity/cost-model" />

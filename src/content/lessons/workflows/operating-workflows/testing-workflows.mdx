@@ -1,0 +1,201 @@
+---
+title: "Testing workflows: replay, golden traces and crash injection"
+track: workflows
+module: operating-workflows
+order: 2
+kind: lesson
+level: senior
+minutes: 13
+summary: Workflow tests come in four layers (steps against recorded model responses, replay of recent histories against new code, time skipping, and crash injection at every boundary), and the word replay means three different things depending on the engine.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Temporal docs, Python testing suite
+    url: https://docs.temporal.io/develop/python/testing-suite
+    note: start_time_skipping fast-forwards timers except while activities run; env.sleep advances time manually; time is global to one WorkflowEnvironment; mocked activities need the same name and signature; Replayer replays JSON or production histories and fails on non-determinism; fail_fast=False; four-step CI recipe for replay
+  - title: LangGraph docs, time travel
+    url: https://docs.langchain.com/oss/python/langgraph/use-time-travel
+    note: nodes before the checkpoint are not re-executed; nodes after it re-execute, including LLM calls, API requests and interrupts, and may produce different results; update_state forks rather than rolling back
+  - title: Inngest docs, Replay
+    url: https://www.inngest.com/docs/platform/replay
+    note: bulk recovery of runs after an incident, selected by time range and status; replay creates new executions, so charges, messages or records could repeat; availability follows the plan's event retention
+  - title: Duolingo, Making production-ready agents the default (4 August 2026)
+    url: https://blog.duolingo.com/production-ready-ai-agent-platform/
+    note: eval suite is a Temporal workflow with a child workflow per case and repetition; deterministic graders structured_output, diff_assertions and no_op_consistency, with an optional LLM judge
+  - title: OpenAI Agents SDK docs, human in the loop
+    url: https://openai.github.io/openai-agents-python/human_in_the_loop/
+    note: approval permits a tool call to execute and does not guarantee exactly-once execution; resuming an older snapshot can run a tool again, so each logical action needs a stable idempotency key
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Four layers, each catching a different bug
+
+A workflow with model steps has four kinds of defect that service tests miss: a step that mishandles a model response, a code change that no longer matches the history of runs in flight, a branch that only executes after a long timer, and a side effect that happens twice when a worker dies at the wrong moment. Each needs its own layer.
+
+| Layer | Catches | Runs against | Cost per CI run |
+|---|---|---|---|
+| Step tests with recorded model responses | parsing, validation, routing on a known output | fixtures | no model calls |
+| Replay of recent histories | non-deterministic changes to workflow code | exported production histories | no model calls, no activities |
+| Time skipping | timeout and escalation branches | a test server with a virtual clock | no real waiting |
+| Crash injection | duplicate or missing side effects | a fake provider that counts effects | one run per crash point |
+
+Model quality is a fifth concern and belongs to evals; this lesson ends where the evals track starts, with one exception covered below: running evals as workflows.
+
+## Layer 1: steps against recorded responses
+
+A model step is an activity (or node, or step function) that calls a model and returns a validated value. Test it with the model call replaced by a recorded response; Temporal's docs require a mocked activity to keep the real activity's name and input and output signature.
+
+Fixtures are real responses from production or staging, stored with the model id, prompt version and date. Include the ugly ones: a response that fails schema validation, a refusal, a truncated output with a length finish reason, an answer in the wrong language. Most workflow bugs are in what the step does with those, not in the happy path.
+
+Recorded responses go stale on a model upgrade: re-record a sample as part of the upgrade change and diff the new responses against the old before regenerating the rest.
+
+## Layer 2: replay, and its three meanings
+
+Three engines use the word replay for three different operations.
+
+| Engine | What "replay" does | Re-executes side effects? |
+|---|---|---|
+| Temporal `Replayer` | re-runs workflow code against a recorded event history to check the code still produces the same commands | no: activity results come from the history |
+| LangGraph time travel | resumes from a saved checkpoint and runs every node after it | yes: nodes after the checkpoint re-execute, including LLM calls, API requests and interrupts |
+| Inngest Replay | starts new executions of failed runs in bulk after a fix | yes: the docs warn that charges, messages or records could repeat |
+
+Only the first is a test. Temporal's version succeeds only if the new workflow definition is deterministically compatible with the history, and raises an error otherwise. It is the CI check for "this change is safe for runs already in flight". The documented recipe has four steps: find the workflow types or task queues the changed worker code targets, download histories of representative recent open and closed runs for each, replay them, and fail CI on any error. Passing `fail_fast=False` to `replay_workflows` reports every failing history instead of the first. Replaying production histories needs Advanced Visibility to list them (server 1.18 or later).
+
+LangGraph's time travel is a debugging and recovery tool: nodes after the checkpoint re-execute and may return different results, and `update_state` forks from a checkpoint rather than rolling the thread back. As a regression test it spends tokens, calls tools for real and is non-deterministic. If your graph needs a determinism test, the equivalent is a test that loads saved checkpoints into the new graph and asserts that the next node and the state schema still line up, with every node after it mocked.
+
+Inngest's Replay is an operation, not a test: the docs present it as recovering many affected runs after an incident without restarting them one by one, and tell you to check idempotency before running it, because each replay is a new execution. That makes the crash-injection layer below a precondition for using it safely.
+
+## Layer 3: time skipping
+
+A refund workflow that waits three days for an approval and then escalates has a branch nobody will exercise by waiting. Three days is 3 times 86,400, or 259,200 seconds of wall-clock time per test.
+
+Temporal's `WorkflowEnvironment.start_time_skipping()` starts a test server that fast-forwards timers, including sleeps and condition timeouts, except while activities are running. `env.sleep(seconds)` advances the clock by a chosen amount when the test needs to land between two timers, for example to send the approval signal one hour before the deadline and assert that escalation never fires. `start_local()` runs a full local server with real time, for tests where the timer is not the point.
+
+Time is global to one environment. Tests that skip time automatically can run in parallel against one server; tests that advance time manually must run in series or each get their own server. Mixing them in one parallel suite produces failures that depend on test order.
+
+## Layer 4: crash injection
+
+Durable execution is at-least-once per step. An engine that records "activity completed" after the activity returns will re-run the activity if the worker dies between the side effect and the record. Exactly-once outcomes come from an idempotency key the provider deduplicates on, never from the engine or from a human approval in front of the step.
+
+Crash injection makes that testable. For each step, kill the run at three boundaries: before the step starts, after its external effect but before the engine records the result, and after the record. Then resume and assert two invariants: every step completed, and every external effect happened exactly once at the provider.
+
+<Predict id="wfl-crash-matrix" question="The refund workflow has 5 steps and you inject a crash at 3 boundaries per step. Testing every single crash point plus every pair of two different crash points in one run, how many runs does the matrix need?" answer={120} tolerance={0} unit="runs">
+<p>Single crashes: 5 times 3 is 15 runs. Pairs of distinct crash points: 15 choose 2 is 15 times 14 over 2, or 105. Total 120. The pairs matter because a crash during recovery from a crash exercises the resume path twice. Under time skipping each run takes about as long as the code takes to execute, so 120 runs fit in an ordinary CI job; against a real server with real timers they would not.</p>
+</Predict>
+
+The harness fits in the standard library. The journal stands in for the engine's history and survives the crash; the fake provider deduplicates on the idempotency key, as a payment API with idempotent requests does.
+
+```python
+import itertools
+
+class Crash(Exception):
+    pass
+
+class FakePayments:
+    def __init__(self):
+        self.refunds = {}     # idempotency key -> amount, as the provider stores it
+        self.calls = 0        # every request that reached the provider
+    def refund(self, key, amount):
+        self.calls += 1
+        self.refunds.setdefault(key, amount)
+        return {"refund_id": "r-" + key}
+
+STEPS = ["load_order", "classify", "await_approval", "issue_refund", "notify"]
+BOUNDARIES = ["before", "after_effect", "after_record"]
+
+def run(run_id, journal, payments, crash_at=None):
+    for step in STEPS:
+        if step in journal:                       # resumed: result already recorded
+            continue
+        if crash_at == (step, "before"):
+            raise Crash
+        if step == "issue_refund":
+            result = payments.refund(key=f"{run_id}:{step}", amount=4200)
+        else:
+            result = {"ok": True}
+        if crash_at == (step, "after_effect"):
+            raise Crash
+        journal[step] = result
+        if crash_at == (step, "after_record"):
+            raise Crash
+
+for point in itertools.product(STEPS, BOUNDARIES):
+    journal, payments = {}, FakePayments()
+    try:
+        run("run-1", journal, payments, crash_at=point)
+    except Crash:
+        pass
+    run("run-1", journal, payments)               # the worker restarts and resumes
+    assert set(journal) == set(STEPS), point
+    assert len(payments.refunds) == 1, point
+    if point == ("issue_refund", "after_effect"):
+        assert payments.calls == 2                # at-least-once reached the provider twice
+print("15 crash points: every run completes with one refund")
+```
+
+Change the key to something generated per attempt (a fresh UUID inside the step) and the `after_effect` case fails with two refunds. That assertion is the reason the layer exists; `notify` needs the same treatment against the email provider. The [workflow engine lab](/labs/workflow-engine) builds this journal into an engine step by step and ends with the same crash sweep.
+
+## Golden traces
+
+A golden trace is a recorded run whose structure is the assertion: which steps ran, in what order, which tools were called with which argument shapes, how many model calls each step needed and which branch the router took. It is stored as data (from the engine's history or from spans) and compared structurally, never on generated text.
+
+Golden traces catch regressions that pass every step test: a prompt change that makes the classifier escalate a category it used to handle, a tool dropped from the list in a refactor, a step that now needs three attempts. Keep a small set per workflow covering each branch, and refresh them in reviewed changes, never automatically.
+
+## Evals as workflows
+
+Duolingo runs its agent evals as a Temporal workflow: the suite starts a child workflow per case and per repetition, runs repetitions in parallel, aggregates results and renders a report. Its graders are deterministic first: `structured_output` checks fields in the agent's structured response, `diff_assertions` checks the repository diff for required or forbidden changes, file counts or paths, and `no_op_consistency` fails a run whose output says nothing changed while files did, or claims a fix with an empty diff. An LLM judge is optional, for cases where exact diff assertions are too brittle; the post says the team does not want its only signal to be one model judging another model's work.
+
+Running evals on the production engine gives them the same retries, timeouts and visibility, and lets CI, a schedule or a release workflow start the same suite.
+
+## The CI gate for the refund workflow
+
+| Trigger | Runs | Blocks merge when |
+|---|---|---|
+| Every change | step tests on fixtures; crash matrix under time skipping; timer branches under time skipping | any assertion fails |
+| Change to workflow code | replay of recent open and closed histories for the changed task queue | any history fails to replay |
+| Change to a prompt, model or tool list | golden-trace structure diff; eval suite on recorded inputs with deterministic graders | structure diff is not approved; a grader regresses beyond the agreed margin |
+| Release | eval suite with repetitions on live model calls | owner sign-off on the report |
+
+The first two rows make no model calls; the live eval runs once per release, which keeps the CI bill flat.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You own a five-step refund workflow on Temporal. CI must finish in ten minutes, the finance team will not accept a duplicate refund, and a model upgrade is due in two weeks. Design the test plan and the merge gate."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Four layers. Step tests on recorded model responses, including invalid and truncated ones. Replay of recent open and closed histories on every workflow-code change, failing CI on any non-determinism. Time skipping for the approval timeout and escalation branches. A crash matrix at three boundaries per step, asserting one refund at a deduplicating fake provider. All four run without model calls, so they fit in ten minutes. For the upgrade: re-record a fixture sample on the new model, run golden-trace structure diffs and a deterministic-first eval suite, and gate the release on owner sign-off.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The duplicate-refund requirement decides the most important test. The engine guarantees at-least-once per step, so the crash after the provider accepted the refund but before the engine recorded it will re-run the call. The test injects exactly that crash and asserts the provider holds one refund, which only passes if the idempotency key is derived from the run and step, not generated per attempt.</p>
+<p>The ten-minute budget decides what runs where. Replay, time-skipping and crash tests make no model calls and no real waits; the full single-and-pair crash matrix for five steps is 120 runs. Live-model evals go on the release path, not on every commit.</p>
+<p>The model upgrade decides the fixture policy. Recorded responses from the old model cannot validate the new one, so the upgrade change re-records a sample, diffs it against the old fixtures and runs the golden traces. If the classifier's branch mix shifts, that is a reviewed decision, not a fixture refresh.</p>
+<p>What I give up: replay only covers the histories I sampled, so a rare branch that no recent run took is not checked for determinism; I cover it with a golden trace that forces that branch.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The crash matrix and replay suite take twenty minutes, twice the budget. Which half do you cut, and what risk do you accept in writing?</em> Pairs of crash points run nightly instead of per commit; single crash points stay on every commit because they cover the duplicate-refund case. The accepted risk is a bug in the double-recovery path merging and being caught the next morning.</li>
+<li><em>Replay passes, but the change renames an activity. What happens to runs in flight, and what would you add?</em> Replay against histories that already scheduled the old name fails, which is the point; if it passed, the sampled histories missed those runs, so add open histories filtered by the old activity type.</li>
+<li><em>Two senior engineers disagree: one wants the live-model eval on every commit, the other only on release. How do you decide without deciding by rank?</em> Compare the cost of the eval per run with the rate at which non-prompt commits have changed eval results historically; if they never have, release-only is justified by data.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Replay checks determinism against the histories you fed it and nothing else. It says nothing about whether the new code is correct, and a history that predates a versioned branch only tests the old path. A replay suite built only from closed runs misses the case that matters most, open runs with timers pending.
+
+Recorded responses make step tests fast and cheap and also make them blind to the model. A suite that never calls a model passes the day the provider changes behaviour. The eval suite on release is the only layer that sees it.
+
+The crash harness here simulates a crash as an exception in one process. Real failures also include a provider that accepted the request while the client timed out, a network partition between worker and provider, and a deploy that kills every worker at once. Those need the same invariant tested against a fake provider over a real network boundary, or fault injection in a staging environment.
+
+Time skipping does not skip time inside activities. An activity that sleeps or polls with real timeouts still takes real time, and a test that mocks it away no longer tests its timeout handling.
+
+For durable-execution internals, determinism rules and versioning, see the [durable execution module](/learn/workflows/durable-execution).
+
+<SelfRate id="lesson:workflows/operating-workflows/testing-workflows" />

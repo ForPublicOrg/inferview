@@ -1,0 +1,93 @@
+---
+id: trn-040
+title: Make a hard top-k router trainable
+subtitle: straight-through, Gumbel-softmax, relaxation or REINFORCE, and the defaults you would ship
+track: training
+module: moe
+type: concept
+difficulty: hard
+seniority: [staff]
+minutes: 30
+core: false
+tags: [mixture-of-experts, routing, gradient-estimators, load-balancing]
+companies:
+  - name: Citadel
+    url: https://prachub.com/interview-questions/make-a-hard-moe-router-differentiable
+updated: 2026-10-28
+sources:
+  - title: PracHub, Make a hard MoE router differentiable (posted 2025-07-15)
+    url: https://prachub.com/interview-questions/make-a-hard-moe-router-differentiable
+    note: "candidate report, unverified: names Citadel, machine learning engineer technical screen; asks for modifications so the routing parameter is learnable by gradient descent, comparing at least two of straight-through, Gumbel-softmax, steep softmax relaxations and REINFORCE, with auxiliary losses, temperature schedules and regularisation against expert collapse. The worked answer here is original. Checked 2026-10-28."
+  - title: Fedus, Zoph and Shazeer, Switch Transformers (arXiv 2101.03961)
+    url: https://arxiv.org/abs/2101.03961
+    note: "top-1 routing with the expert output scaled by the router probability; balance loss with alpha 10^-2 where only the probability term is differentiable; float32 router; initialisation scale reduced by 10. Checked 2026-10-28."
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: "selection bias outside the loss, gamma 0.001, sequence-wise balance loss alpha 0.0001, gates from the unbiased sigmoid affinities. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="As a candidate report on PracHub describes the screen">
+An MoE layer routes each token to its top-k experts with a hard argmax over router scores, and the router's parameters are not learning. Propose changes so they become learnable by gradient descent. Compare at least two approaches on output fidelity, training stability, compute cost and implementation, and give the auxiliary losses, temperature schedule and collapse regularisation you would ship.
+</Callout>
+
+Assume a 64-expert, top-2 layer inside a model that will be trained once at a scale where you cannot afford to rerun. Inference will use hard top-2.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask to see the layer's forward function, from the router's output to the sum over experts.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what fraction of extra expert compute the training budget allows during warm-up.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask whether inference must match training routing exactly, or whether some train-inference mismatch is acceptable.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>First check whether the gate is in the forward pass: if the layer uses only the argmax index, the router has no gradient at all, and multiplying each selected expert's output by its normalised score fixes it. That gives gradient to the selected logits only. Add a balance mechanism to keep exploring, a Switch-style loss at alpha around 10^-2 or a DeepSeek-style selection bias. If unselected experts need signal, use straight-through top-k in the backward pass. I would not train a model I cannot rerun with Gumbel or REINFORCE as the primary path.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>The likely bug.</b> A router that emits only indices is a non-differentiable lookup. The standard fix is to scale each selected expert's output by its gate, y = sum over chosen i of g_i(x) E_i(x). Then dy/dg_i = E_i(x), and the gradient reaches the router through the softmax or sigmoid. Unselected experts still get nothing from the main loss.</p>
+<p><b>Straight-through top-k.</b> Forward: hard mask times gates. Backward: treat the mask as if it were the dense softmax, so every logit gets gradient. Fidelity: exact, since training and inference use the same hard routing. Stability: the gradient is biased, and the bias grows when scores are close. Cost: no extra expert compute, a dense softmax backward. Implementation: a few lines.</p>
+<p><b>Gumbel-softmax.</b> Add Gumbel noise to logits and take a softmax at temperature tau, annealed toward a hard choice. Fidelity: training uses soft mixtures until tau is small, so there is a train-inference gap. Stability: exploration from the noise helps cold experts; low tau makes gradient variance large. Cost: a soft mixture needs every expert computed for every token, 32 times the expert compute at top-2 of 64, unless you sample hard and use straight-through, which brings back the bias.</p>
+<p><b>Steep softmax relaxation.</b> Dense softmax with a temperature driven toward zero. Same fidelity and cost problems as soft Gumbel, without the exploration.</p>
+<p><b>REINFORCE.</b> Treat routing as a policy and the negative loss as reward. Unbiased, high variance, needs a baseline per token, and couples router learning to a noisy scalar; slow at scale.</p>
+<p><b>What I ship.</b> Gate-weighted hard top-2, float32 router, initialisation scaled down by 10, and a balancer. With alpha around 10^-2, as Switch used after a sweep from 10^-1 to 10^-5, the balance loss adds gradient to every logit through its probability term. If quality suffers from that coupling, move balance into a selection bias outside the loss, with gamma near DeepSeek-V3's 0.001 and a small sequence-wise loss, alpha near 0.0001. Straight-through is an optional addition if cold experts stay cold.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>You shipped gate-weighted top-2 with a balance loss, and after 20% of training four experts receive almost nothing. Do you switch to straight-through mid-run, raise alpha, or reset those experts, and what does each risk?</li>
+<li>A researcher wants Gumbel-softmax during the first 5% of training for exploration. The extra compute is 32 times the expert FLOPs for that period. What would you need to see to approve it?</li>
+<li>Two senior engineers disagree: one says the balance loss already provides the exploration gradient, the other says it only pushes toward uniformity, not toward fit. How do you settle it with an experiment that costs under a day?</li>
+</ul>
+</Fragment>
+</Depth>
+
+**The decision with two defensible answers.**
+
+*Keep hard routing, add estimators sparingly.* Gate-weighted top-k plus a balancer is the configuration that the large published MoE runs discussed in this module use, which is evidence it trains at scale. It costs nothing extra in compute and keeps training and inference identical. Its weakness is that unselected experts learn about tokens only through the balance mechanism, which pushes toward even counts, not toward fit.
+
+*Relax during warm-up, harden later.* Gumbel-softmax or a soft relaxation for an early phase gives every expert gradient from the main loss on every token, which can produce better specialisation from the start. It costs dense expert compute for that phase and a schedule to tune, and it introduces a phase where the router learns a soft mixture that hard top-2 will then break.
+
+For a model that cannot be rerun, the first is the lower-risk default; the second is justified when a small-scale ablation shows the specialisation gain survives the switch to hard routing.
+
+**The quantities you choose.** Alpha for an auxiliary loss, or gamma for a bias controller. Both have published reference points (10^-2 in Switch; 0.001 and 0.0001 in DeepSeek-V3), but they were tuned for those models, so treat them as starting points and verify with per-layer load.
+
+**The constraint conflict.** Stability against specialisation: a strong balance term prevents collapse and also flattens routing toward uniform, which is the opposite of what experts are for. Compute against gradient quality: every estimator that gives unselected experts an unbiased signal needs their outputs, which is the compute MoE exists to avoid.
+
+**How the recommended answer fails.** Gate-weighted top-k has a self-reinforcing loop: the expert that wins more gets better and wins more. If the balancer is too weak, or silently broken (a balance loss whose probability term is computed without gradient still logs a value), the router collapses onto a few experts within thousands of steps. Log max-over-mean load per layer and assert that the auxiliary term has a gradient.
+
+## Follow-ups
+
+- *Your straight-through backward doubles router backward memory at 64 experts. Which half of the safety net do you cut, the estimator or the balance loss, and what do you accept in writing?*
+- *What would you need to see in the first 10,000 steps to abandon hard routing for a relaxation?*
+- *Inference will use hard top-2, but a relaxed phase trained soft mixtures. How do you measure the train-inference mismatch before deciding when to harden?*
+
+## Common mistakes
+
+- Proposing Gumbel-softmax without pricing the dense expert compute a soft mixture needs.
+- Treating the balance loss as a fix for differentiability; it adds gradient through probabilities, not through the selection.
+- Annealing temperature on a fixed schedule without measuring when routing has actually hardened.
+- Omitting the float32 router and the reduced initialisation, which Switch reports as stability measures, not as tuning.

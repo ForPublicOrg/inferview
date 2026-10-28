@@ -4,7 +4,7 @@ Scope: the prototypes in `prototypes/`. The anti-slop rules (R-31, R-37) ask for
 
 ## The learning pattern
 
-Nine tracks in one order, each a set of modules with lessons, widgets and interview questions. The landing page shows the daily problem, the track list with progress, and one live widget. Lessons follow a fixed skeleton (hook, toy numbers, one widget, real numbers, code, three-depth answer, self-rating) and every question becomes a review card. Two graph-style home pages were tried and rejected as too much to read; the graph data is kept in research notes.
+Fifteen tracks in one order (nine before curriculum v2), each a set of modules with lessons, widgets and interview questions. The landing page shows the daily problem, the track list with progress, and one live widget. Lessons follow a fixed skeleton (hook, toy numbers, one widget, real numbers, code, three-depth answer, self-rating) and every question becomes a review card. Two graph-style home pages were tried and rejected as too much to read; the graph data is kept in research notes.
 
 ## Character
 

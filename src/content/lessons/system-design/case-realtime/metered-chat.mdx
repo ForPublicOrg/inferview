@@ -1,0 +1,154 @@
+---
+title: Multi-tenant chat with conversation state and metered billing
+track: system-design
+module: case-realtime
+order: 2
+kind: lesson
+level: staff
+minutes: 16
+summary: A multi-tenant chat backend keeps three records of the same usage (the provider's, its own ledger and the billing system's meter), and the design is the path between them, the price category of every token, and the correction window that decides when a number can still be fixed.
+prerequisites: [system-design/capacity/cost-model]
+updated: 2026-10-28
+sources:
+  - title: Claude API docs, Rate limits (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: "token bucket; 60 RPM may be enforced as 1 request per second; total_input_tokens = cache_read_input_tokens + cache_creation_input_tokens + input_tokens; input_tokens counts tokens after the last cache breakpoint; for most models only input_tokens and cache_creation_input_tokens count toward ITPM; max_tokens does not count toward OTPM; Build tier Claude Sonnet 5: 5,000 RPM, 5,000,000 ITPM, 1,000,000 OTPM; workspace limits sit under organization limits; spend-cap 429 has no retry-after and error_code enforced_spend_limit_reached"
+  - title: Claude API docs, Pricing (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: Claude Sonnet 5 per million tokens, input $2, 5-minute cache write $2.50, 1-hour cache write $4, cache read $0.20, output $10; the $2/$10 launch price became the standard price; cache reads on Claude Opus 5.5 and Sonnet 5.5 are 0.05x base input instead of 0.1x
+  - title: Claude API docs, Model deprecations (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/about-claude/model-deprecations
+    note: the Console usage export breaks usage down by API key and model
+  - title: OpenAI API docs, Conversation state (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/guides/conversation-state
+    note: with previous_response_id, "all previous input tokens for responses in the chain are billed as input tokens"; responses stored 30 days by default, store false turns it off; Conversations API objects are not subject to the 30-day TTL
+  - title: Stripe docs, Record usage for billing (checked 2026-10-28)
+    url: https://docs.stripe.com/billing/subscriptions/usage-based/recording-usage
+    note: meter events are processed asynchronously; Stripe recommends Metronome for new usage-based integrations and Billing Meters only for teams already using them
+  - title: Stripe docs, Record usage for billing with the API (checked 2026-10-28)
+    url: https://docs.stripe.com/billing/subscriptions/usage-based/recording-usage-api
+    note: identifier per meter event for deduplication; timestamps within the past 35 calendar days and at most 5 minutes in the future; events accepted after invoice finalisation do not update that invoice; 1,000 meter event calls per second per account in live mode and one concurrent call per customer per meter; up to 10,000 events per second with v2 meter event streams; at most 10,000 dimension combinations per meter per hour and 100 per customer; errors reported asynchronously as events
+  - title: Stripe docs, Create and configure a meter (checked 2026-10-28)
+    url: https://docs.stripe.com/billing/subscriptions/usage-based/meters/configure
+    note: aggregation by sum, count or last; meter event adjustments cancel only events sent within the last 24 hours; cancelled usage on a finalised invoice is not corrected; negative quantities are accepted and a negative cycle total bills as 0
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Three records of the same tokens
+
+Every model call in a metered chat product is counted three times: by the provider, in the usage object it returns and in its own console; by your ledger, which turns usage into a charge for a tenant; and by the billing system, which aggregates what you send it into an invoice. The three are written at different times by different systems, and each accepts corrections under different rules. The provider's count is final. Your ledger can be corrected at any time. The billing system accepts a correction only within a window, and after the invoice is finalised it accepts none.
+
+The design question is the path between the three and where each number is checked. Conversation state and rate limits belong to the same design because both decide which tokens are billed at which price.
+
+## Where conversation state lives
+
+Two defensible answers, with different costs.
+
+**Your own store as the record.** Messages keyed by tenant and conversation, each with model ID, prompt version and the request ID that produced it. Every request is rebuilt from the store with a stable prefix, so the provider's prompt cache does the work that server-side state would. This is the only option for a tenant under a zero-retention agreement, and the only one that survives a provider change. It costs storage, a summarisation job for long conversations, and the engineering to keep the prefix byte-stable so the cache hits.
+
+**Provider-held state.** OpenAI's Responses API chains turns with `previous_response_id` or stores them in a Conversations object. It saves payload and code, but not money: OpenAI's guide says all previous input tokens in a chain are billed as input tokens. Responses are kept 30 days by default (`store: false` turns that off), while Conversation objects are not subject to the 30-day limit. A chain is therefore not a record you can rebuild an invoice from after a month, and it ties the conversation to one provider.
+
+For a multi-tenant product that bills per token, the own-store answer wins on auditability: an invoice dispute is settled by replaying ledger rows tied to stored messages. The provider-held answer is reasonable for a single-tenant internal tool where nobody disputes a bill.
+
+## Usage fields, price categories and the two classic bugs
+
+On the Claude API, the input side of a response has three fields, each at its own price. `input_tokens` is only the tokens after the last cache breakpoint; the documented total is `cache_read_input_tokens + cache_creation_input_tokens + input_tokens`. On Claude Sonnet 5 the prices per million tokens are $2 input, $2.50 for a five-minute cache write, $0.20 for a cache read and $10 output, checked on 28 October 2026. Newer models change the read multiplier (0.05x base input on Claude Opus 5.5 and Sonnet 5.5, instead of 0.1x), so the price table is keyed by model and dated.
+
+```python
+# Price one Messages API response from its usage object. Claude Sonnet 5 list prices in USD per
+# million tokens, checked 2026-10-28: input 2.00, 5-minute cache write 2.50, cache read 0.20, output 10.00.
+PRICE = {"input_tokens": 2.00, "cache_creation_input_tokens": 2.50,
+         "cache_read_input_tokens": 0.20, "output_tokens": 10.00}
+
+def cost(usage):
+    return sum(usage.get(k, 0) * p for k, p in PRICE.items()) / 1e6
+
+usage = {"cache_read_input_tokens": 40_000, "cache_creation_input_tokens": 2_000,
+         "input_tokens": 300, "output_tokens": 500}
+total_in = sum(usage[k] for k in ("cache_read_input_tokens", "cache_creation_input_tokens", "input_tokens"))
+
+print(f"correct:                    ${cost(usage):.4f}")
+print(f"input_tokens only:          ${cost({'input_tokens': 300, 'output_tokens': 500}):.4f}")
+print(f"all input at the base rate: ${cost({'input_tokens': total_in, 'output_tokens': 500}):.4f}")
+
+# The ledger: one row per provider call, keyed by our request ID, so a retried write is a no-op.
+ledger = {}
+def record(request_id, tenant, usage, price_version="sonnet-5/list-2026-10-28"):
+    ledger.setdefault(request_id, (tenant, price_version, dict(usage)))
+
+for rid in ("req-1", "req-1", "req-2"):          # req-1 is written twice after a retry
+    record(rid, "acme", usage)
+print("rows:", len(ledger), " acme total:", f"${sum(cost(u) for t, _, u in ledger.values() if t == 'acme'):.4f}")
+```
+
+```text
+correct:                    $0.0186
+input_tokens only:          $0.0056
+all input at the base rate: $0.0896
+rows: 2  acme total: $0.0372
+```
+
+A turn deep into a cached conversation costs $0.0186. Reading only `input_tokens` bills 30 percent of that, and the loss grows with the cache hit rate, so the best-cached tenants are the most under-billed. Charging every input token at the base rate bills 4.8 times the cost, which a tenant with their own usage logs will find. Both bugs pass a unit test that uses an uncached request.
+
+## Rate limits are capacity, and the cache is part of it
+
+The provider's limits are the product's capacity ceiling, shared by every tenant. On the Claude API they are enforced as token buckets per organization, and the docs warn that 60 requests per minute may be enforced as one per second, so a per-minute average says little about a burst. For most current models only `input_tokens` and `cache_creation_input_tokens` count toward input tokens per minute; cache reads do not, and `max_tokens` does not count toward output tokens per minute.
+
+<Predict id="sys-metered-chat-capacity" question="Build tier, Claude Sonnet 5: 5,000 requests, 5,000,000 input tokens and 1,000,000 output tokens per minute. Every chat turn looks like the usage object above (40,000 cache read, 2,000 cache write, 300 uncached input, 500 output). How many turns per minute before the first limit is hit?" answer={2000} tolerance={20} unit="turns per minute">
+<p><b>2,000 turns a minute, bound by output tokens.</b> Input counts 2,000 + 300 = 2,300 tokens per turn toward the input limit, which allows about 2,174 turns; output allows 1,000,000 / 500 = 2,000; requests allow 5,000. If the same turns missed the cache, all 42,300 input tokens would count, and the input limit would allow about 118 turns a minute. The cache hit rate is a capacity number, not only a cost number, and a deploy that changes a byte in the shared prefix cuts capacity by a factor of about 17 for as long as the cache is cold.</p>
+</Predict>
+
+Per-tenant limits are carved from that ceiling in your own gateway, not by the provider: a token bucket per tenant on estimated uncached input and on output, sized so the sum of tenant guarantees stays under the organization's limit with headroom for bursts. Claude API workspaces can set lower limits per workspace, and organization limits still apply even when workspace limits add up to more, so a workspace per large tenant isolates spend but does not create capacity.
+
+One 429 is not like the others. When the organization reaches its tier's monthly spend cap the API returns 429 with no `retry-after` header and `error.details.error_code` set to `enforced_spend_limit_reached`, and every retry fails until the month turns. A gateway that retries all 429s turns that event into a retry storm across every tenant. It is a page to a person, and the per-tenant spend caps in your own ledger exist so that one tenant cannot consume the organization's cap for everyone.
+
+## The metering path
+
+The billing system is downstream and asynchronous. Stripe processes meter events asynchronously and reports invalid events later as events of their own, so the request path never waits on it. The path that holds up under retries and disputes has four steps.
+
+**Write the ledger row with the message.** One row per provider call, keyed by your request ID, written in the same transaction as the assistant message, holding every usage field, the model, and the price version. A retried write is a no-op. A stream that fails halfway still writes a row if the provider reported usage; whether the tenant is charged for it is a product policy applied in the ledger, not an accident of where the exception was caught.
+
+**Aggregate before sending.** Stripe's meter event endpoint allows 1,000 calls per second per account in live mode and one concurrent call per customer per meter, and caps dimension combinations at 10,000 per meter per hour and 100 per customer. A chat product that sends one event per model call hits the per-customer concurrency limit on its busiest tenant first. Send one event per tenant, price category and hour, with an identifier derived from those three, so a resend of the same hour deduplicates.
+
+**Reconcile before the window closes.** Meter event adjustments can cancel only events sent within the last 24 hours, and cancelled usage on a finalised invoice is not corrected. Negative quantities are accepted afterwards, but only until the invoice finalises. So the aggregator waits for a reconciliation step before it sends an hour: ledger totals per model against the provider's usage, which the Claude Console exports by API key and model. The wait trades freshness for correctness. A tenant watching a usage dashboard sees numbers that lag by the reconciliation delay, and threshold invoices include only usage received before they are created.
+
+**Correct in the ledger, then forward.** A correction found after the window is a ledger row with a negative amount and a reason, forwarded as a negative quantity if the invoice is still open and as a credit note if it is not. The ledger is the only place every correction is visible.
+
+Stripe's own docs now recommend Metronome for new usage-based integrations, and Billing Meters only for teams already using them. The ledger design does not change with that choice; the correction rules do, so they are read again before the integration is built.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+You run a chat backend for 300 business tenants on Claude Sonnet 5. Finance found that cached traffic has been billed from <code>input_tokens</code> for four months, and the top ten tenants were under-billed. The CFO wants back-billing on this month's invoices, which finalise in six days; the head of sales says the top tenants will leave if surprised. Redesign the metering path and decide what happens to the four months.
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Fix the path first: ledger rows with every usage field and a dated price version, hourly aggregates per tenant and price category with deterministic identifiers, and reconciliation against the provider's export before each hour is sent. For the past four months, the ledger can recompute what each tenant should have paid, but finalised invoices cannot be corrected through the meter, so back-billing would be new line items or invoices that I would not send without a contract review. My recommendation is to bill correctly from the next unfinalised period, and to put the back-billing decision to finance and sales with the per-tenant amounts in front of them. What I give up is four months of revenue, unless the contracts support collecting it.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The recomputation is mechanical if the old rows kept the cache fields; if they kept only <code>input_tokens</code>, the provider's export by API key and model gives totals but not per-tenant splits unless each tenant had its own key, and that is the first thing I would check.</p>
+<p>The six-day deadline conflicts with correctness: changing the formula for the current period mid-cycle means part of the month at the old rate and part at the new one. I would apply the corrected formula from the ledger for the whole open period and send the difference as one dated adjustment per tenant before finalisation, with notice to the ten affected tenants first, since a surprise invoice is the outcome sales is right to fear.</p>
+<p>Failure mode of this design: the reconciliation step depends on the provider export arriving on time, and when it is late the aggregator either sends unreconciled hours or holds them. I would hold them up to a stated limit, then send and mark them, with corrections as negative quantities while the invoice is open.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Holding hours for reconciliation makes the tenant usage dashboard lag by a day, and the largest tenant complains. Which do you give up, freshness or the reconciliation, and what do you write down?</em></li>
+<li><em>What would you need to see to move conversation state to the provider's server-side storage?</em></li>
+<li><em>The provider ships a model whose cache reads cost half of the old multiplier. Your contracts price per token with a fixed margin. Do you pass the saving on, and who decides?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The prices, limits and windows here are one provider's and one billing system's, checked on 28 October 2026. Other providers count cached input differently and may count cache reads toward their rate limits; Claude Haiku 3.5 did. Read every field in the usage object of the provider you use before writing the price table.
+
+The capacity arithmetic assumes the cache hits. A cache entry expires, a deploy changes the prefix, and a new tenant's first turn always writes; the steady-state figure is an upper bound and the first minutes after a deploy are the lower one. Size the per-tenant buckets for the cold case or accept that a deploy at peak sheds load.
+
+If tenants bring their own provider keys, the provider bills them directly and most of this path collapses to a platform fee. The ledger still records usage, because quotas, abuse detection and support need it.
+
+<SelfRate id="lesson:system-design/case-realtime/metered-chat" />

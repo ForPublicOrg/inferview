@@ -1,0 +1,127 @@
+---
+id: rag-033
+title: Fifty neighbours unfiltered, eleven with three filters
+subtitle: a catalogue search on pgvector 0.8.7
+track: rag
+module: vector-systems
+type: debug
+difficulty: hard
+seniority: [staff]
+minutes: 30
+core: true
+tags: [hnsw, filtered-search, pgvector, multi-tenant, recall, latency]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: PracHub, Vector Database Interview Questions, HNSW, IVF, Filtering, and Recall vs Latency (2026-08-13)
+    url: https://prachub.com/resources/vector-database-interview-questions-hnsw-ivf-filtering-and-recall-vs-latency
+    note: "third-party interview guide; the worked example: unfiltered HNSW returns 50 neighbours in 18 ms at 96% recall, and with tenant, category and inventory filters the same query returns 11 results in 140 ms; authorization filters are never relaxed to fill top-k. A guide, not a candidate report, so no company tag. Checked 2026-10-28."
+  - title: pgvector README (v0.8.7 in the install instructions)
+    url: https://github.com/pgvector/pgvector
+    note: "filtering is applied after an approximate index scan; iterative scans with strict_order or relaxed_order; hnsw.max_scan_tuples defaults to 20,000; relaxed results re-sorted with a materialized CTE and ORDER BY distance + 0; an index on the filter column for exact search, partial indexes for few values, partitioning for many; vacuuming HNSW can be slow and REINDEX INDEX CONCURRENTLY first speeds it up; vector columns index up to 2,000 dimensions, halfvec up to 4,000. Checked 2026-10-28."
+  - title: Qdrant documentation, indexing
+    url: https://qdrant.tech/documentation/concepts/indexing/
+    note: "filterable HNSW adds edges for indexed payload values, so payload indexes must exist before the graph is built; below full_scan_threshold (default 10,000 KB, where 1 KB is one 256-dimension vector) the planner uses the payload index and a full rescore; mid-range filters are described as a weak spot. Checked 2026-10-28."
+  - title: "ACORN: Performant and Predicate-Agnostic Search Over Vector Embeddings and Structured Data (Patel et al., 2024)"
+    url: https://arxiv.org/abs/2403.04871
+    note: "predicate subgraph traversal over an HNSW-based index; the paper reports 2 to 1,000 times higher throughput at a fixed recall than prior methods. Checked 2026-10-28."
+choices:
+  - text: Each in_stock update adds the row to the HNSW graph again, and the dead versions take scan slots that live matching rows would fill
+    correct: false
+    why: "Real, and worth fixing, but 1.9 million dead versions in about 31.9 million graph entries cost about 6% of the scan, roughly one row of the eleven."
+  - text: At 16,500 matching rows in 30 million, the iterative scan reaches hnsw.max_scan_tuples and returns whatever it has found by then
+    correct: true
+    why: "20,000 x 16,500 / 30,000,000 = 11.0 expected rows, and reading 20,000 tuples where an unfiltered query stops after 50 matches is where the 140 ms goes."
+  - text: hnsw.ef_search caps the candidate list at 100, and the three filters remove nearly all of those candidates before LIMIT 50 applies
+    correct: false
+    why: "With iterative scans on, the scan keeps going past the first candidate list; a hard cap at 100 would leave 100 x 0.00055, about 0.06 rows, not 11."
+  - text: The planner multiplies the three filter selectivities as if independent and picks the HNSW scan where the B-tree plan would be exact
+    correct: false
+    why: "Plan choice decides which path runs, not where a running scan stops; and here the shares multiply out to the measured 16,500 rows, so the estimate is not the problem."
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"Unfiltered, our HNSW search returns 50 neighbours in 18 ms at 96% recall. Add the tenant, category and in-stock filters and the same query returns 11 results in 140 ms. Which explanation fits, what else is wrong, and how do you fix filtered recall without destroying latency?"
+</Callout>
+
+The two measurements are the worked example in a public interview guide (PracHub, 2026-08-13). The system around them is a scenario.
+
+One Postgres 17 table, `products`, holds 30 million rows for every tenant, with `embedding vector(1024)`. pgvector is 0.8.7. The indexes:
+
+```sql
+CREATE INDEX products_embedding_hnsw ON products USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX products_filter ON products (tenant_id, category_id, in_stock);
+```
+
+The application role was configured last quarter, and `SHOW` from a pooled application connection returns both values:
+
+```sql
+ALTER ROLE api SET hnsw.iterative_scan = relaxed_order;
+ALTER ROLE api SET hnsw.ef_search = 100;
+```
+
+The search query:
+
+```sql
+WITH hits AS MATERIALIZED (
+  SELECT id, embedding <=> $1 AS distance
+  FROM products
+  WHERE tenant_id = $2 AND category_id = $3 AND in_stock
+  ORDER BY embedding <=> $1
+  LIMIT 50
+)
+SELECT id, distance FROM hits ORDER BY distance + 0;
+```
+
+What else you have:
+
+- The slow request was tenant 4417, category 12. Tenant 4417 owns 330,000 rows; 33,000 of those are in category 12, and 16,500 of those are in stock.
+- An inventory sync updates `in_stock` on about 2 million rows a day. `pg_stat_user_tables` shows 1.9 million dead tuples on `products`, almost no HOT updates, and an autovacuum that last finished three days ago.
+- The 96% was measured against exact search on 500 logged unfiltered queries. Nobody has measured filtered recall.
+- The search API's p95 budget is 100 ms (scenario).
+- No one has run `EXPLAIN (ANALYZE, BUFFERS)` on the slow query.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how many rows pass all three filters for the slow request, and what fraction of the table that is.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request every `hnsw.` setting the application session sees, including the ones nobody changed.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask which columns of `products` are in an index, and how often each one changes.</p></details>
+
+## Answer
+
+**The cause.** Iterative scans are on, so the scan does not stop at the first `ef_search` candidates; it keeps reading the graph until it has 50 rows that pass the filter or until it has read `hnsw.max_scan_tuples` tuples, 20,000 by default. Only 16,500 of 30 million rows pass, one in about 1,800. Reading 20,000 tuples at that rate yields 20,000 x 16,500 / 30,000,000 = 11.0 rows, the count observed. The same arithmetic explains the latency: in the unfiltered query every tuple matches, so the scan can stop after the first 50; the filtered one reads 20,000 and checks each against the heap.
+
+**Why the other options are tempting.** The in-stock updates are a real defect. `in_stock` is in a B-tree, so no update to it can be HOT; each one inserts a new entry into every index on the table, the HNSW graph included, which re-links a 4 KB vector to flip a boolean. Until vacuum runs, the dead versions sit in the graph and use up scan slots: 1.9 million of about 31.9 million entries, about 6%, roughly one row of the eleven. It does explain why vacuum is slow, and the README's advice to `REINDEX INDEX CONCURRENTLY` before vacuuming applies. The `ef_search` option is the belief that the candidate list is the result limit, true with iterative scans off, which is the shape of a different incident. The planner option is a real risk for correlated filters, but plan choice decides which path runs, not where a running scan stops.
+
+**The evidence that is missing, and what to do without it.** Run `EXPLAIN (ANALYZE, BUFFERS)` through the application role and read the tuples scanned and the buffers touched; if the scan stops at 20,000, the cause is confirmed. Measure filtered recall: take the 500-query sample, attach the filters real users send, and compare against exact search over the filtered rows. Pull the distribution of filtered set sizes across a day of queries, because the fix depends on how many requests look like this one. Without any of that, the arithmetic is strong enough to act on, and the first change below is reversible per request.
+
+**The decision.** Raising the cap is the obvious lever and the wrong one: 50 rows at one in 1,800 needs about 50 x 1,818 = 91,000 tuples, 4.5 times the 20,000 that took 140 ms, so on the order of 600 ms if time scales with tuples read, an assumption to check in the `EXPLAIN` output. Two answers are defensible.
+
+- *An exact path for small filtered sets.* When the filtered set is under a threshold, skip the HNSW index: fetch the rows through the B-tree and compute exact distances. Recall is 100% by construction. Cost: the work is I/O on the vector column, not arithmetic. At 1,024 float32 dimensions a vector is 4,096 bytes, so this request reads 16,500 x 4,096 = 67.6 MB. Two query shapes to maintain, and the router needs a count it can trust, which means a counts table per tenant and category kept by the application, not the planner's estimate.
+- *Hash partitions by tenant, with an HNSW index per partition.* The tenant filter becomes structural. With 64 partitions a partition holds about 30,000,000 / 64 = 469,000 rows, of which tenant 4417 is 330,000, about 70%. The remaining filters pass 10% x 50% of those, so the share is about 3.5% and 50 rows need about 50 / 0.035 = 1,430 tuples, well under the cap. Cost: a table rewrite, 64 graphs to build and vacuum, and small tenants that share a partition with a large one are still in the one-in-thousands regime.
+
+I would ship the exact path first, because it is a routing change that can be turned off per request, and move `in_stock` out of the B-tree (or into a narrow side table joined after the search) so inventory churn stops rewriting the graph. Partitioning waits for the measured distribution: if more than a small share of queries take the exact path, or the exact path's p95 breaks the budget, partition.
+
+**The threshold is yours to choose.** Measure the exact path's p95 at 5,000, 20,000 and 100,000 rows on production hardware under production concurrency, and set the threshold at the largest size inside 100 ms. Anything from a few thousand to a few tens of thousands of rows can be right; a threshold chosen without that measurement is not.
+
+**The constraint conflict** is recall against latency and against the buffer cache. Every route that returns 50 correct rows reads more data than the unfiltered query, and the cheapest-looking one, a larger cap, spends that budget on every filtered request.
+
+**The failure mode of the recommended fix.** At 67.6 MB per request, a burst of small-tenant queries pulls vector pages through shared buffers and evicts the HNSW graph, so unfiltered latency rises for everyone at the moment the filtered queries look fixed. Bound it: store a `halfvec` copy for the exact path (2,048 bytes per vector halves the read), cap concurrent exact-path requests, and alert on two ratios per tenant, rows returned over `LIMIT` and exact-path share of queries. The counts table can also go stale after a bulk import and route a 400,000-row set to the exact path; refresh it in the import job, not on a timer.
+
+## Follow-ups
+
+- *The DBA says the exact path will evict the graph from shared buffers at peak. Do you drop the exact path, relax the 100 ms budget for small tenants, or pay for memory for a `halfvec` copy, and who signs the risk?*
+- *What would you need to see in production to move from the exact path to tenant partitions, and what would make you skip partitions and change engines?* A filter-aware graph is the alternative: Qdrant adds edges for payload values only if the payload index exists before the graph is built, and the ACORN paper reports 2 to 1,000 times higher throughput at fixed recall than earlier filtered methods.
+- *Two staff engineers disagree: one wants `strict_order` so citations never arrive out of order, the other keeps `relaxed_order` with the re-sort. How do you decide without deciding by rank?* Replay a day of filtered queries under both and compare rows returned and p95 per tenant size band.
+- *Tenant 4417 is a reseller that may only see in-stock items. A product manager asks to drop the in-stock filter when results are short. What do you say, and where does that rule live in code?*
+
+## Common mistakes
+
+- Raising `hnsw.ef_search` or `LIMIT`, neither of which moves the point where the scan stops.
+- Raising `hnsw.max_scan_tuples` without computing how many tuples 50 rows need at this selectivity.
+- Routing on the planner's row estimate when filter columns are correlated across tenants.
+- Leaving a high-churn column in an index on the table that holds the vectors.
+- Relaxing a tenant or entitlement filter to fill the result count.

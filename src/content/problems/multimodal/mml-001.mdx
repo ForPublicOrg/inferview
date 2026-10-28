@@ -1,0 +1,138 @@
+---
+id: mml-001
+title: The 128K launch made short answers worse
+subtitle: rank the causes from a deploy diff and an eval table, then decide how to serve both lengths
+track: multimodal
+module: long-context
+type: debug
+difficulty: hard
+seniority: [staff]
+minutes: 35
+core: true
+tags: [long-context, yarn, rope-scaling, serving, evals]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Qwen/Qwen3-8B model card, Processing Long Texts (Hugging Face)
+    url: https://huggingface.co/Qwen/Qwen3-8B
+    note: native context 32,768 tokens; YaRN block with factor 4.0 and original_max_position_embeddings 32768; notable open-source frameworks implement static YaRN, whose factor stays constant regardless of input length, which may impact performance on shorter texts; add rope_scaling only when long contexts are required; factor 2.0 if typical length is 65,536; the Alibaba Model Studio endpoint supports dynamic YaRN by default; checked 2026-10-28
+  - title: Hugging Face transformers, modeling_rope_utils.py (main branch)
+    url: https://raw.githubusercontent.com/huggingface/transformers/main/src/transformers/modeling_rope_utils.py
+    note: for rope_type yarn, attention_factor defaults to get_mscale(factor) = 0.1 ln(factor) + 1 when the block does not set it; beta_fast 32 and beta_slow 1 by default; checked 2026-10-28
+  - title: Peng et al., YaRN (arXiv 2309.00071)
+    url: https://arxiv.org/html/2309.00071
+    note: Dynamic scaling recomputes the factor as max(1, current length / trained length) on each forward pass; checked 2026-10-28
+  - title: Yen et al., HELMET (arXiv 2410.02694)
+    url: https://arxiv.org/abs/2410.02694
+    note: synthetic tasks like needle-in-a-haystack do not reliably predict downstream performance; checked 2026-10-28
+choices:
+  - text: The rope_scaling block applies factor 4 to every request, so prompts far below 32K run on stretched frequencies
+    correct: true
+    why: The engine applies the block at load time for all inputs, the model card warns that static YaRN can hurt shorter texts, and the one replica without FP8 but with the block shows the same short-prompt complaints.
+  - text: The FP8 key-value cache rounds every cached key and value, and that rounding costs accuracy at every prompt length
+    correct: false
+    why: It is a real change that can cost accuracy and it needs its own ablation, but the replica that ran without it still showed the regression on short prompts.
+  - text: The YaRN block sets no attention temperature, so attention logits are too flat for long and short prompts alike
+    correct: false
+    why: When the block omits it, the engine derives the attention factor from the scaling factor (0.1 ln 4 + 1, as transformers does), so the temperature is present; the defect is that it and the stretch apply to every request.
+  - text: Raising max_model_len to 131,072 shrank batches per GPU, and the preemptions that followed altered short answers
+    correct: false
+    why: A smaller batch and more preemption raise latency; preemption delays a request without changing which tokens the model computes, apart from batch-dependent numerics.
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Short prompts got worse after the 128K launch. Find out why, and tell me how we serve both."
+</Callout>
+
+All numbers in this question are scenario. A team self-hosts Qwen3-8B, whose model card gives a native context of 32,768 tokens. A contract-review customer needs documents of 40K to 120K tokens, so last Tuesday's deploy changed two files:
+
+```diff
+ # config.json
+   "model_type": "qwen3",
++  "rope_scaling": {
++    "rope_type": "yarn",
++    "factor": 4.0,
++    "original_max_position_embeddings": 32768
++  },
+   "torch_dtype": "bfloat16",
+
+ # serve.yaml
+-  max_model_len: 32768
++  max_model_len: 131072
+-  kv_cache_dtype: auto
++  kv_cache_dtype: fp8      # fits 128K on the same GPUs
+```
+
+The offline evals, run before and after on the same items with greedy decoding:
+
+| Set | Prompt length | Items | Before | After |
+| --- | --- | --- | --- | --- |
+| Support answers | under 2K | 400 | 81.0% | 76.5% |
+| Policy extraction | 6K to 12K | 250 | 77.2% | 74.8% |
+| Contract review | 40K to 120K | 120 | not served | 58.3% |
+| Needle sweep | 4K to 128K | 99 cells | not run | 99 of 99 |
+
+Since Tuesday, thumbs-down on support answers rose from 4.1% to 5.6% of rated answers. One replica, restarted by mistake with the new `config.json` and the old `serve.yaml`, took about 5% of traffic for a day; its thumbs-down rate on support answers was 5.4%, on far fewer ratings. 94% of production requests are under 8K tokens. You do not have per-item results, an ablation of each change, or the engine's documentation on how it applies `rope_scaling`.
+
+Pick the change that best explains the short-prompt regression, rank the others, say what you would collect and what you would ship before you have it, and decide how this deployment should serve 2K and 120K prompts. The contract customer goes live in ten days.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask whether the engine computes the rotation frequencies once at load time or per request.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the per-item pass and fail of the 400 support items before and after, so the comparison can be paired.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask for the prompt-plus-output length distribution of the contract customer's requests, not only the prompt length.</p></details>
+
+## Answer
+
+The `rope_scaling` block is the best explanation. Every notable open-source framework implements static YaRN, according to the Qwen3 model card, so the factor stays 4 whatever the input length, and the card warns that this may hurt shorter texts and advises adding the block only when long contexts are needed. A 1,500-token support prompt now runs on frequencies stretched for 131,072 positions, plus the attention temperature that goes with them. The accidental replica is the closest thing to an ablation in the evidence: it had the block and not the FP8 cache, and its thumbs-down rate moved with the fleet.
+
+**Ranking the others.**
+
+1. *The FP8 cache* is real and secondary. It changes every cached key and value at every length and may cost accuracy on its own, which nothing here measures. It ranks second because the replica without it still regressed, and first among the things to ablate, because it was added only to make 128K fit and the routing decision below may remove the need for it on short traffic.
+2. *The batch-size change* is a latency and throughput problem. Preemption delays a request; it does not change which tokens the model computes beyond batch-dependent numerics.
+3. *The missing temperature* is not a defect. When the block does not set `attention_factor`, transformers computes it from the factor as 0.1 ln 4 + 1 ≈ 1.139, which multiplies the logits by about 1.296 through the scaled cos and sin. Check that the engine does the same, and the problem disappears.
+
+**How strong is the evidence?** The 4.5-point drop on 400 items is smaller than it looks if it is read as unpaired: the standard error of the difference is √(0.81 × 0.19 / 400 + 0.765 × 0.235 / 400) ≈ 2.9 points, so the drop is about 1.6 standard errors. The per-item results allow a paired count of items that flipped each way, which is the test to run. The replica's rate rests on about a day of 5% of ratings. The needle sweep says nothing about contract review: HELMET reports that needle results do not reliably predict downstream performance, and 99 of 99 is the expected result for a model that can match a literal string.
+
+**What to collect.** The paired flips on the 400 support items for three configurations: block off and FP8 off, block on and FP8 off, block off and FP8 on. That is three runs of an eval that already exists. Also the engine's handling of `rope_scaling`, and the contract customer's prompt-plus-output lengths.
+
+**What to ship before you have it.** Move short traffic back to the old configuration today: a second deployment with no `rope_scaling` block and the default cache dtype, taking every request whose prompt plus maximum output fits in 32,768 tokens. Nothing about the contract launch depends on short traffic sharing its replicas.
+
+<Depth>
+<Fragment slot="short">
+<p>The static YaRN block applies to every request, and Qwen's own card warns that it can hurt short inputs; the one replica without FP8 still regressed. FP8 is a real secondary change to ablate. Serve two deployments routed by prompt plus maximum output length: native for anything that fits in 32,768 tokens, YaRN factor 4 for the rest. The router is the new failure point.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>Option A, two deployments routed by length.</b> Short traffic gets the model it was evaluated on; long traffic gets YaRN. Cost: two fleets to size, deploy and monitor, a long pool that serves a small share of requests and idles between them, and a prefix cache that is not shared between pools. A conversation that grows past the threshold moves pools and pays its prefill again.</p>
+<p><b>Option B, one deployment with YaRN on everywhere.</b> One fleet, one cache. Cost: whatever the paired ablation shows on 94% of traffic, accepted in writing. If the paired result is within noise, this is the cheaper answer and two pools are overhead.</p>
+<p><b>Option C, factor 2 everywhere</b>, which the Qwen card suggests when typical length is 65,536. Cost: contracts above 64K need chunking or retrieval, which the ten-day deadline does not allow.</p>
+<p><b>Option D, a hosted endpoint with dynamic YaRN</b>, which the card says Alibaba Model Studio supports by default. Cost: contract documents leave your infrastructure, which the customer's agreement may not permit.</p>
+<p>Recommended: A now, B later if the ablation shows no paired regression. The quantity to choose is the routing threshold: route on prompt tokens plus the request's maximum output tokens, not on prompt tokens, and set it at 32,768 less a margin for the chat template.</p>
+<p><b>How A fails.</b> A router that counts only the prompt sends a 31K prompt with a 4K output budget to the native pool, which then generates past its trained length with no scaling at all. The symptom is degraded endings on long answers in the short pool, which no short-prompt eval covers. Count with the serving tokenizer, include the template, and reject or reroute at the router, never in the engine.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Finance asks for one pool because the long pool idles. Your ablation shows a paired regression of 2 points on support answers with YaRN on. Which do you ship, and what do you write down about the 2 points?</li>
+<li>What would you need to see in the paired ablation to reverse the two-pool decision?</li>
+<li>The contract customer goes live in ten days and the 58.3% on contract review has no baseline. What do you tell them the number means, and what eval do you build before the second customer signs?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- Your platform team wants to keep FP8 on the short pool too, because it doubles batch size there. What result from which run would you accept as the reason to say yes?
+- Two senior engineers disagree: one wants dynamic YaRN patched into the engine, the other wants two pools. How do you decide without deciding by rank, given ten days?
+- A month later, conversations in the support product start reaching 40K tokens because of pasted logs. What changes in the router, and who owns that change?
+
+## Common mistakes
+
+- Taking 99 of 99 on the needle sweep as evidence that contract review works.
+- Reading a 4.5-point drop on 400 items as significant without pairing the items.
+- Reverting both changes, which ships no contract support ten days before the launch.
+- Blaming FP8 because it is the change with a comment and an obvious precision story.
+- Routing on prompt length alone, so long outputs from short-pool requests run past the native window.

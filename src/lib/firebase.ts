@@ -11,6 +11,8 @@ const config = {
 };
 
 export const firebaseConfigured = Boolean(config.apiKey && config.authDomain && config.projectId && config.appId);
+/** Firestore location shown on the privacy page; optional. */
+export const firebaseRegion = (import.meta.env.PUBLIC_FIREBASE_REGION ?? '').trim();
 
 export type SessionUser = { uid: string; email: string | null; name: string | null };
 
@@ -25,7 +27,7 @@ type Ctx = {
 let ctxPromise: Promise<Ctx> | null = null;
 
 function load(): Promise<Ctx> {
-  if (!firebaseConfigured) return Promise.reject(new Error('Sign-in is not configured on this deployment.'));
+  if (!firebaseConfigured) return Promise.reject(new Error('This build has no Firebase settings, so sign-in is off.'));
   // A failed load is not cached, so the next call retries the imports.
   ctxPromise ??= (async () => {
     const [appMod, authMod, fsMod] = await Promise.all([

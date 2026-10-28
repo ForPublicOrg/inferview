@@ -1,37 +1,40 @@
 ---
 id: sfe-012
 title: One tenant's documents surface in another's answers
-subtitle: find the bug
+subtitle: rank the defects
 track: safety
 module: guardrails
 type: debug
 difficulty: medium
-seniority: [mid, senior, staff]
-minutes: 20
-core: true
-tags: [multi-tenant, rbac, retrieval, access-control]
+seniority: [senior, staff]
+minutes: 25
+core: false
+tags: [multi-tenant, retrieval, caching, tenant-isolation, vector-database]
 companies: []
 updated: 2026-10-28
 sources:
-  - title: amitshekhariitbhu, AI engineering interview questions
-    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
-    note: source of the question, per-user access control on internal documents in RAG
-  - title: OWASP Top 10 for LLM Applications, 2025 list
-    url: https://genai.owasp.org/llm-top-10/
-    note: LLM02 Sensitive Information Disclosure, LLM08 Vector and Embedding Weaknesses
+  - title: Pinecone docs, Implement multitenancy
+    url: https://docs.pinecone.io/guides/index-data/implement-multitenancy
+    note: "one namespace per tenant for isolation; reads and writes always target a single namespace; metadata filtering for when isolation is not a strict requirement; with filtering, queries scan the entire namespace and cost is 1 RU per GB of namespace (100 tenants of 1 GB: 1 RU per query with namespaces, 100 RUs with one filtered namespace); offboarding deletes the tenant's namespace. Checked 2026-10-28."
+  - title: Microsoft Learn, Data, Privacy, and Security for Microsoft Copilot (updated 2026-10-26)
+    url: https://learn.microsoft.com/en-us/copilot/microsoft-365/microsoft-365-copilot-privacy
+    note: "Copilot only surfaces organizational data to which individual users have at least view permissions; the semantic index honours the user identity-based access boundary. Checked 2026-10-28."
+  - title: Gu, Li, Kuditipudi, Liang and Hashimoto, Auditing Prompt Caching in Language Model APIs (arXiv 2502.07776, revised July 2025)
+    url: https://arxiv.org/abs/2502.07776
+    note: "statistical audits detect global cache sharing across users in seven API providers; the risk described is a timing side channel on other users' prompts. Checked 2026-10-28."
 choices:
-  - text: The tenant is filtered after the top-k search runs, and the tenant id is read from the request body, so a cross-tenant match fills the page and a forged body reads another tenant
+  - text: The answer cache is keyed on the normalised question alone, so Globex was served a reply generated earlier from Initech chunks
     correct: true
-    why: Ranking across all tenants then filtering returns fewer or wrong results, and the moment the post-filter is weakened or the body is trusted, another tenant's chunks leak. Identity must come from the verified token and the filter must be inside the query.
-  - text: The embedding model is too small, so vectors from different tenants collide in the space
+    why: A cache hit returns before retrieval runs, which is why Globex's request has no retrieval log line, and the key carries no tenant, so any tenant asking the same question within the hour gets the first tenant's grounded answer.
+  - text: The tenant check runs after a top-20 search across every tenant, so Initech chunks reach the prompt when Globex has few close matches
     correct: false
-    why: Embedding quality affects relevance, not access control. Even perfect vectors leak if the query is allowed to return other tenants' rows.
-  - text: The top-k value is too high, so irrelevant documents are returned
+    why: The list comprehension drops every hit from another tenant before the prompt is built, so a sparse tenant gets fewer chunks, not foreign ones. It explains Globex's second complaint and leaves one line between tenants, but it did not produce this answer.
+  - text: Chunk ids are built from file names, so an Initech upload with the same file name replaced Globex vectors with Initech text
     correct: false
-    why: A large k returns more low-relevance results; it does not by itself cross a tenant boundary. The boundary is crossed because the query is not scoped by a trusted identity.
-  - text: The results are not re-ranked, so the best document is not first
+    why: The overwrite is real, but upsert replaces the whole record, metadata included, so the replaced chunks now say tenant initech and Globex's filter removes them. Globex loses documents; it does not see Initech's.
+  - text: The model provider shares its prompt cache across organisations, so a cached Initech prefix was replayed into a Globex completion
     correct: false
-    why: Re-ranking changes ordering, not which tenants' documents are eligible. It cannot fix a missing access filter.
+    why: Shared provider caches are documented, but what they leak is timing; a cache hit speeds up a matching prefix and never returns another customer's tokens. And a request served from the answer cache never reaches the provider at all.
 ---
 import Callout from '../../../components/Callout.astro';
 import Depth from '../../../components/Depth.astro';
@@ -39,62 +42,92 @@ import Depth from '../../../components/Depth.astro';
 ## Question
 
 <Callout kind="interview" label="Debug round">
-A multi-tenant RAG service sometimes shows one customer content from another customer's documents, and small tenants often get thin or empty results. Find the bug and the fix.
+"A customer says our assistant quoted another customer's refund policy to them. Here is the service, the last deploy and what we have. Which defect explains it, what else is wrong, and what do you do in the next hour?"
 </Callout>
 
+A multi-tenant document assistant. Every tenant's chunks live in one vector index.
+
 ```python
-def search(query, request):
-    tenant = request.body.get("tenant")           # from the client
-    hits = vector_index.search(embed(query), k=5)  # across the whole index
-    allowed = [h for h in hits if h.tenant == tenant]
-    return allowed
+ANSWERS = TTLCache(maxsize=50_000, ttl=3600)
+
+def handle(request):
+    user = auth.verify(request.headers["Authorization"])   # signed session token
+    question = request.json["question"]
+    key = "ans:" + sha256(normalise(question).encode()).hexdigest()
+    if key in ANSWERS:
+        return ANSWERS[key]
+    chunks = retrieve(question, tenant=user.tenant_id)
+    log.info("retrieval", tenant=user.tenant_id, ids=[c.id for c in chunks])
+    reply = llm.generate(build_prompt(question, chunks))
+    ANSWERS[key] = reply
+    return reply
+
+def retrieve(question, tenant):
+    hits = index.query(vector=embed(question), top_k=20,
+                       namespace="prod", include_metadata=True)
+    mine = [h for h in hits.matches if h.metadata["tenant"] == tenant]
+    return rerank(question, mine)[:5]
+
+def ingest(tenant, filename, text):
+    for n, chunk in enumerate(split(text)):
+        index.upsert(namespace="prod", vectors=[{
+            "id": f"{filename}#{n}",
+            "values": embed(chunk),
+            "metadata": {"tenant": tenant, "text": chunk},
+        }])
 ```
 
-`request.body` is client-controlled. The signed-in user's tenant is available as `request.auth.tenant`, verified from their session token.
+Last Tuesday's deploy made three changes: `top_k` went from 10 to 20, `normalise()` now lowercases and strips punctuation, and the `ANSWERS` cache was added to cut model spend.
+
+What you have:
+
+- Globex's ticket: at 14:02 UTC the assistant answered "What's the refund window for annual plans?" with a 45-day window and the phrase "Initech annual subscriptions". Globex has no such document.
+- Globex has retrieval log lines all day, but none between 13:55 and 14:10.
+- The on-call engineer checked the index: every chunk whose text mentions Initech carries `tenant: initech`.
+- Separately, since Tuesday Globex says questions about its employee handbook often come back with "I could not find that in your documents".
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>In what order does this code rank and filter? What happens to a small tenant whose documents never make the global top 5?</p></details>
-<details class="hint"><summary>Hint 2</summary><p>Where does `tenant` come from, and who can set it?</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask which code paths return a reply without writing a retrieval log line.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the model provider's request log for Globex's API key at 14:02.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask which other tenants uploaded a file named like Globex's handbook since Tuesday.</p></details>
 
 ## Answer
 
 <Depth>
 <Fragment slot="short">
-<p>Two bugs, one shape. The search ranks across every tenant and filters afterwards, so a small tenant's documents get crowded out of the global top 5 (thin results) and any slip in the post-filter leaks another tenant's chunks. And the tenant comes from the request body, which the client controls, so a forged body reads a chosen tenant. Fix both: take the tenant from the verified session token, and push it into the query as a filter so the index only ever returns that tenant's rows.</p>
+<p>The answer cache. Its key is the normalised question with no tenant in it, so the first tenant to ask a common question writes an answer grounded in its own documents, and every other tenant asking within the hour reads it back. A hit returns before retrieval, which is why Globex has no retrieval log line at 14:02. Two more defects are real but did not cause this leak: the tenant filter runs after a global top-20 search, which starves small tenants and leaves one line of Python as the boundary, and chunk ids built from file names let one tenant's upload overwrite another's chunks, which is the likeliest cause of Globex's missing handbook answers.</p>
 </Fragment>
 <Fragment slot="long">
-<p>Ordering. <code>vector_index.search(..., k=5)</code> returns the five nearest vectors in the whole index, then Python drops the ones from other tenants. For a tenant with few documents, the global top 5 may contain none of theirs, so they get an empty page. Worse, the only thing standing between a user and other tenants' content is that post-filter line; delete it in a refactor, or get the tenant wrong, and everything leaks.</p>
-<p>Identity. <code>request.body.get("tenant")</code> trusts the client. Anyone who can call the endpoint can set <code>tenant</code> to a competitor and, combined with the weak filtering, read their data.</p>
-<p>Fix: take the tenant from the verified token and pass it as a filter into the search, so the index only ever returns that tenant's rows.</p>
-
-```python
-def search(query, request):
-    tenant = request.auth.tenant            # from the verified token
-    return vector_index.search(
-        embed(query), k=5,
-        filter={"tenant": tenant},          # applied inside the query
-    )
-```
-
-<p>The filter inside the query means the index considers only that tenant's vectors, so the top 5 are the best 5 for that tenant and no other tenant's row is eligible. The identity comes from the token, so it cannot be forged in the body or in the prompt. For mixed permissions within a tenant, store each chunk's access list at ingestion and add the user's groups to the filter. Keep separate indexes or namespaces per tenant when a contract or regulator requires hard isolation.</p>
+<p><b>The leak.</b> The cache was keyed for the single-tenant case: same question, same answer. In a multi-tenant system the answer is a function of the question and the documents the asker may read, so the key must carry both, or grounded answers must not be cached at all. Tuesday's <code>normalise()</code> change did not cause the leak but widened it: more questions now collide on the same key. The evidence is consistent but not proof. To confirm it, check that the provider has no request for Globex at 14:02, and find an Initech request in the hour before with the same normalised question. Then add the writer's tenant to each cache value and count reads where the reader's tenant differs; that count is also the size of the incident.</p>
+<p><b>The next hour, without waiting for proof.</b> Turn the answer cache off and purge it. The cost is the model spend and latency the cache was added to save, and it is the only change that stops the leak whatever the remaining evidence shows. Notify affected tenants once the cross-tenant read count exists, not before.</p>
+<p><b>The fix.</b> Key on tenant, the user's permission scope, the corpus version and the normalised question, or cache retrieval results per tenant instead of answers. Tenant alone is not enough when documents inside a tenant have different readers: Microsoft's Copilot documentation states the rule, only data the individual user can at least view, and a tenant-wide key would serve HR's answer to an intern.</p>
+<p><b>Second, the shared namespace with a post-filter.</b> With every tenant in <code>prod</code>, a top-20 search returns the 20 nearest chunks across all tenants; when a large tenant's chunks fill them, the filter leaves Globex with few or none, and Tuesday's increase from 10 to 20 only softened that. It also means the only thing between tenants is the list comprehension. Pinecone's guidance is one namespace per tenant, with reads and writes that always target a single namespace; with a filter instead, every query scans the whole namespace, 1 RU per GB, so the shared layout is also the expensive one.</p>
+<p><b>Third, file-name ids.</b> An id made of the file name and the chunk number is global, so any tenant uploading <code>handbook.pdf</code> replaces chunk records of every other tenant's <code>handbook.pdf</code>, metadata included. That is a cross-tenant write: Initech can delete Globex's knowledge without either noticing. Ids must include the tenant and a document id the server assigns, and per-tenant namespaces make the collision impossible.</p>
+<p><b>The failure mode of the fix.</b> Keying the cache on tenant and permission scope cuts its hit rate, possibly to the point where it no longer pays for itself, and a scope that is computed wrong (stale group membership) recreates the leak inside a tenant. Measure the hit rate per tenant after the change before deciding the cache is worth keeping.</p>
 </Fragment>
 <Fragment slot="followups">
 <ul>
-<li><em>Why not filter after search but fetch a larger k?</em> You would need an unbounded k to be safe for a small tenant, and it still leaves the boundary in application code where one edit removes it.</li>
-<li><em>Where else does the tenant id get trusted by mistake?</em> Tool arguments the model fills, cache keys, and log queries. Take it from the token everywhere.</li>
-<li><em>How do you test this?</em> A test that seeds two tenants, searches as one for the other's content, and asserts an empty result even if the post-filter is removed.</li>
+<li><em>Product wants the cache back this week because the model bill rose. What do you let them cache, and what do you require before it ships?</em></li>
+<li><em>Moving every tenant to its own namespace is a migration. What do you do first, and what do you accept in the meantime?</em></li>
+<li><em>How would a test have caught this before Tuesday?</em> Two seeded tenants with different answers to the same question, asked in sequence, asserting each sees only its own.</li>
 </ul>
 </Fragment>
 </Depth>
 
+**Why the correct choice is correct.** It is the only defect on the path that served Globex's request: a cache hit, no retrieval, no model call, an answer generated from another tenant's documents.
+
+**Why the others are tempting.** The post-filter looks like the classic multi-tenant bug and is the reason for Globex's thin results, but it filters correctly. The file-name ids are a genuine cross-tenant bug and change what Globex can find, but in the wrong direction for this symptom. The provider cache is a real, published concern, and an engineer who has read about it reaches for it first; it leaks timing, not text, and this request never reached the provider.
+
 ## Follow-ups
 
-- *The vector store does not support metadata filters. Now what?* Use per-tenant collections or namespaces so the query targets only that tenant's data.
-- *Does encryption help here?* Not with this bug; the query returns rows the user can read. Access scoping, not encryption, is the control.
+- *Your fix keys the cache on permission scope. Group membership changes; how long can a cached answer outlive a revoked permission, and who signs off on that window?*
+- *A tenant asks for proof that no other tenant saw its data during the incident. What can you prove from the logs you have, and what can you not?*
+- *Where else in this service does an identifier cross tenants?* Log fields, trace attributes, evaluation sets built from traffic, and any tool whose arguments the model fills.
 
 ## Common mistakes
 
-- Filtering by tenant after a global search instead of inside the query.
-- Reading the tenant or user id from the request body or the model's arguments.
-- Assuming a better embedding or re-ranker fixes an access-control bug.
+- Fixing the post-filter and declaring the leak closed, because it is the bug everyone expects in multi-tenant retrieval.
+- Adding the tenant to the cache key and forgetting per-user permissions inside the tenant.
+- Waiting for proof before turning the cache off, while the leak keeps serving answers.
+- Treating the file-name collision as a data-quality issue rather than one tenant writing into another's data.

@@ -1,0 +1,131 @@
+---
+id: wfl-021
+title: Per-step timeouts and what one retry does to the p99
+subtitle: three model steps, a 60-second gateway and a false-timeout rate you choose
+track: workflows
+module: retries-flow-control
+type: estimate
+difficulty: hard
+seniority: [senior, staff]
+minutes: 25
+core: false
+tags: [timeouts, latency, percentiles, retries, step-budgets, estimation]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: AWS Builder Center, Timeouts, retries and backoff with jitter (published 2019-12-05)
+    url: https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter
+    note: choose an acceptable false-timeout rate such as 0.1% and read the matching latency percentile (p99.9); add padding when p99.9 is close to p50; timeouts set too low cause retry storms
+  - title: Temporal docs, detecting activity failures (checked 2026-10-28)
+    url: https://docs.temporal.io/encyclopedia/detecting-activity-failures
+    note: Start-To-Close bounds one attempt; on expiry the attempt is retried under the retry policy and the timer resets; Schedule-To-Close bounds all attempts
+  - title: Claude API docs, errors (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/errors
+    note: 504 timeout_error; streaming recommended for long requests; the SDK guards non-streaming requests expected to exceed 10 minutes
+range: { low: 22, high: 32, unit: seconds (end-to-end p99) }
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Set per-step timeouts for a three-step extraction from its latency percentiles, at a false-timeout rate you choose, and show what the retries do to the end-to-end p99."
+</Callout>
+
+The workflow and its latencies are a scenario. A document-extraction workflow runs three model steps in sequence: classify (Claude Haiku 5.5), extract (Claude Sonnet 5.5) and verify (Claude Haiku 5.5). Thirty days of production traces give these latencies per call, in seconds:
+
+```text
+step       p50    p90    p99    p99.9
+classify   1.0    1.8    3.0     6.0
+extract    8.0   13.0   20.0    45.0
+verify     1.5    2.5    4.0     9.0
+```
+
+The upload API answers synchronously, and the gateway in front of it, owned by another team, cuts every request at 60 seconds. The workflow retries a step once when it times out, after a 1-second wait. Treat step latencies as independent of each other and of the retry.
+
+**Choose a false-timeout rate, set the three timeouts, and estimate the end-to-end p99 of the workflow in seconds**, including the retries your timeouts cause. Then check the worst case against the gateway.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>With your timeouts, what share of runs retries at least one step, and is that share above or below 1%?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Which step's tail is wide enough that the other two barely move the end-to-end number?</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the extract step's latency split by document length or output tokens. Is a slow call slow by chance, or because of what it was asked to do?</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>At a 0.1% false-timeout rate the timeouts are each step's p99.9 (6, 45 and 9 seconds), only about 0.3% of runs retry, and the end-to-end p99 is set by extract's own tail: about 20 + 1.0 + 1.5 = 22.5 seconds on the napkin, about 25 with the other steps' tails. At 1% the timeouts are the p99s (3, 20 and 4), about 3% of runs retry, and the 1% of runs whose extract times out become the slowest 1%, which puts the p99 in the mid-20s to low 30s. The p99 barely differs; the worst case does. With p99 timeouts and one retry it is 57 seconds, under the gateway; with p99.9 timeouts it is 123, so the retry must be skipped when the deadline cannot fit it.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>Retry share.</b> At p99.9 timeouts each step times out on 0.1% of calls, so 1 − 0.999³ ≈ 0.3% of runs retry something, fewer than 1%: retries do not reach the p99. At p99 timeouts, 1 − 0.99³ ≈ 3% of runs retry, more than 1%, so the slowest 1% of runs is now made of retried runs.</p>
+<p><b>p99 at 0.1%.</b> Extract dominates: its p99 of 20 seconds is more than the other two steps' p99.9 combined. The napkin p99 is extract's p99 plus the others' medians, 20 + 1.0 + 1.5 = 22.5 seconds. That underestimates a little, because the slowest runs also tend to draw above-median classify and verify times.</p>
+<p><b>p99 at 1%.</b> One percent of runs time out on extract and pay 20 + 1 + a second extract (median 8) + 2.5 for the other steps, typically about 31.5 seconds and at least 20 + 1 + 3 + 1.0 = 25. Classify and verify timeouts add only a few seconds to a run and stay below that. So the slowest 1% are the extract retries, and the p99 sits at the low edge of that group, in the mid-20s.</p>
+<p><b>A check by simulation.</b> Drawing each step from the table, interpolating linearly between percentiles, with independent retries:</p>
+
+```python
+import random
+
+STEPS = [  # (percentile, seconds) per step, with assumed minimum and maximum
+    [(0, 0.4), (0.5, 1.0), (0.9, 1.8), (0.99, 3.0), (0.999, 6.0), (1, 12.0)],
+    [(0, 3.0), (0.5, 8.0), (0.9, 13.0), (0.99, 20.0), (0.999, 45.0), (1, 90.0)],
+    [(0, 0.6), (0.5, 1.5), (0.9, 2.5), (0.99, 4.0), (0.999, 9.0), (1, 18.0)],
+]
+
+def at(points, u):
+    for (p0, x0), (p1, x1) in zip(points, points[1:]):
+        if u <= p1:
+            return x0 + (x1 - x0) * (u - p0) / (p1 - p0)
+
+def run_once(timeouts, retries=1, backoff=1.0):
+    total = 0.0
+    for points, limit in zip(STEPS, timeouts):
+        for attempt in range(retries + 1):
+            d = at(points, random.random())
+            if d <= limit:
+                total += d
+                break
+            total += limit + (backoff if attempt < retries else 0)
+        else:
+            return None  # every attempt timed out
+    return total
+
+def p99(level, n=200_000):
+    random.seed(1)
+    timeouts = [at(s, level) for s in STEPS]
+    runs = [run_once(timeouts) for _ in range(n)]
+    done = sorted(r for r in runs if r is not None)
+    return round(done[int(0.99 * len(done))], 1)
+
+print(p99(0.999), p99(0.99))  # 24.8 26.0
+```
+
+<p>It gives 24.8 seconds at p99.9 timeouts and 26.0 at p99 timeouts. The band of 22 to 32 seconds admits the napkin and the simulation for either choice. An answer near 60 adds the three p99.9 timeouts as if every run hit them, 57 is the worst case with p99 timeouts and one retry rather than a percentile, and an answer near 11 is the sum of medians.</p>
+<p><b>The worst case against the gateway.</b> With p99 timeouts and one retry everywhere, the longest a run can take is 2 × (3 + 20 + 4) + 3 × 1 = 57 seconds, under 60. With p99.9 timeouts and no retry it is 6 + 45 + 9 = 60, exactly the gateway's cut, with nothing left for the API's own work. With p99.9 timeouts and one retry it is 2 × 60 + 3 = 123 seconds, so the retry is only safe when it is deadline-aware: before retrying, check that the time left before 60 seconds covers the step's timeout, and fail the run if it does not.</p>
+<p><b>The decision.</b> Both rates are defensible. A 0.1% rate keeps retries rare, so extract is almost never paid twice, at the cost of a long fixed wait (45 seconds) on the rare stuck call and a deadline check the code must get right. A 1% rate fits the gateway without a deadline check and fails fast on stuck calls, at the cost of retrying about 3% of runs, each retry repeating work the provider may already have done. For a synchronous API with a hard 60-second cut, take p99.9 for classify and verify and a deadline-aware retry for extract.</p>
+<p><b>The assumption that flips it.</b> Independence. Extract's latency is mostly a function of how much it writes, and that depends on the document. If the slowest 1% are long invoices, a retry of the same invoice is just as slow: at p99 timeouts those runs time out twice and fail after 20 + 1 + 20 = 41 seconds, so about 1% of uploads fail outright and the retry only added cost. That is also the failure mode of the recommendation: a deadline-aware retry on a document-driven tail buys nothing. If the traces show latency tracking output length, set extract's timeout from the document (expected output tokens or max_tokens times the measured per-token time) and send long documents to an asynchronous path instead of retrying them.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The provider has a bad hour and extract's p50 doubles. What happens to your timeouts, your retry share and your bill?</em></li>
+<li><em>Why read the timeout from p99.9 and not from p99 plus a margin?</em></li>
+<li><em>Where do these timeouts live in a Temporal workflow, and which one bounds the whole run?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+The dominant term is extract's tail: whatever the choice, the end-to-end p99 is extract's p99 or its timeout-plus-retry, with classify and verify adding a few seconds. Two shortcuts give wrong numbers: adding or averaging the three p99s, which assumes every step is slow in the same run, and choosing a rate without computing the share of runs it retries, which hides whether retries reach the p99 at all.
+
+## Follow-ups
+
+- *Pushback: product wants a 15-second p99 on the synchronous API. Which step do you change, and what do you accept in writing?* No timeout setting reaches it, because extract's own p99 is 20 seconds. The options are a faster model for extract on short documents, streaming partial results, or an asynchronous API for long documents; each trades accuracy, client complexity or product scope, and the note names which.
+- *Reversal: what would you need to see in the traces to switch from p99.9 to p99 timeouts for extract?* Evidence that slow extract calls are slow by chance, not by document: retries of timed-out calls finishing near the median, and no correlation between latency and output length.
+- *Operating: the provider ships a new model version and extract's p99 moves from 20 to 28 seconds with no other change. Who notices, and when?* Only someone alerting on the timeout rate per step; at p99 timeouts the retry share jumps from 1% to well above it the same day. Timeouts read from a percentile need re-reading when the model changes.
+
+## Common mistakes
+
+- Setting every timeout at the same round number instead of reading it from each step's distribution.
+- Adding the timeouts and calling the sum the p99.
+- Assuming a retry is an independent draw when latency depends on the input.
+- Retrying without checking the time left before an outer deadline.

@@ -1,0 +1,495 @@
+---
+id: sec-008
+title: Extend a file permission gate past path tricks
+subtitle: protected paths, symlinks and an audit record per decision
+track: security
+module: permissions-identity
+type: code
+difficulty: hard
+seniority: [senior, staff]
+minutes: 50
+core: false
+tags: [permissions, symlinks, path-normalisation, audit, coding-agents, protected-paths]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Claude Code docs, Configure permissions (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/permissions
+    note: "rules evaluated deny, then ask, then allow, and specificity does not change the order; through a symlink, allow rules apply only when both the requested path and the file it resolves to match, deny rules when either matches; a path whose symlinks do not resolve is refused; a deny or ask rule written through a symlinked directory also applies at its real location; Read and Edit rules do not reach a script that opens files itself"
+  - title: Claude Code docs, Permission modes, Protected paths (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/permission-modes
+    note: "writes to .git, .vscode, .idea, .husky, .devcontainer, .claude and files such as .mcp.json, .gitconfig, .bashrc, .envrc and .npmrc are never auto-approved except in bypassPermissions and some plan-mode sessions; they prompt in default and acceptEdits and are denied in dontAsk; allow rules in settings files do not pre-approve them"
+  - title: Cymulate, InversePrompt (CVE-2025-54794 and CVE-2025-54795)
+    url: https://www.cymulate.com/blog/cve-2025-547954-54795-claude-inverseprompt/
+    note: "researcher's write-up: Claude Code's working-directory check was path.resolve(file).startsWith(path.resolve(cwd)), so /Users/eladbeber/Documents/claude_code_evil passed for claude_code; fixed in 0.2.111. Checked 2026-10-28."
+  - title: CVE-2025-54135 (CVE record, published 2025-08-05)
+    url: https://cveawg.mitre.org/api/cve/CVE-2025-54135
+    note: "Cursor below 1.3.9 asked before editing an existing dotfile but not before creating one, so an injected agent could create .cursor/mcp.json. Checked 2026-10-28."
+  - title: Codex docs, Agent approvals and security (checked 2026-10-28)
+    url: https://learn.chatgpt.com/docs/agent-approvals-security
+    note: "in workspace-write mode .git under a writable root is read-only, recursively, whether it is a directory or a pointer file, and the git directory a pointer file names is protected too; .agents, .codex and .aws are protected only when they exist as directories"
+code:
+  starter: |
+    PROTECTED = frozenset({
+        ".git", ".claude", ".cursor", ".codex", ".vscode", ".idea", ".husky", ".devcontainer",
+        ".mcp.json", ".gitconfig", ".gitmodules", ".bashrc", ".zshrc", ".profile", ".envrc", ".npmrc",
+    })
+
+
+    class PathGate:
+        """The file gate in front of the agent's read and edit tools. Today it matches rules against the joined path.
+
+        root:  the workspace, an absolute path such as "/work/app". It may itself sit behind a symlink.
+        fs:    the filesystem, {absolute path: "dir" | "file" | ("link", target)}. A link target is absolute, or
+               relative to the directory that holds the link. A path that is not a key does not exist yet.
+        rules: {"deny": [...], "ask": [...], "allow": [...]}, each rule a (tool, path) pair with tool "read" or "edit".
+               A rule covers its path and everything below it. Deployments generate tens of thousands of rules.
+
+        Extend decide(tool, path) so that it returns an audit record, a dict with at least
+            seq        1 for the first decision this gate makes, then 2, 3, ...
+            tool       as given
+            requested  the path exactly as the tool call gave it (relative paths are relative to root)
+            resolved   where the path leads, read component by component as the kernel does (a ".." after a symlink
+                       leaves the link's target), or None if it never settles
+            decision   "deny", "ask" or "allow"
+            reason     a non-empty sentence a reviewer can read
+            rule       the (tool, path) rule that decided, or None
+        and appends the same record to self.log. Callers must not be able to change the log through what you return.
+
+        The policy, where "the requested path" means the path joined to root with ".", ".." and repeated slashes
+        removed, without following any symlink:
+          - Deny beats ask beats allow, whatever the specificity. A path that never resolves is denied.
+          - Deny and ask rules match if they cover the requested path or the resolved one.
+          - An allow needs allow rules covering both the requested and the resolved path.
+          - An edit is never allowed if either path passes through a name in PROTECTED (this includes files that do
+            not exist yet), if it resolves outside the workspace, or if the requested path is itself a symlink.
+            Whether such an edit is asked or denied is your call.
+          - With no matching rule, a read that stays inside the workspace is allowed; everything else is asked.
+        """
+
+        def __init__(self, root, fs, rules, protected=PROTECTED):
+            self.root = root
+            self.fs = fs
+            self.rules = rules
+            self.protected = protected
+            self.log = []
+
+        def _match(self, kind, tool, path):
+            for rule_tool, rule_path in self.rules.get(kind, ()):
+                if rule_tool == tool and path.startswith(rule_path):
+                    return (rule_tool, rule_path)
+            return None
+
+        def decide(self, tool, path):
+            full = path if path.startswith("/") else self.root + "/" + path
+            for kind in ("deny", "ask", "allow"):
+                if self._match(kind, tool, full):
+                    return kind
+            return "allow" if tool == "read" and full.startswith(self.root) else "ask"
+  tests: |
+    FS = {
+        "/work": "dir", "/work/app": "dir", "/work/app/src": "dir", "/work/app/src/main.py": "file",
+        "/work/app/docs": "dir", "/work/app/.git": "dir", "/work/app/.git/config": "file",
+        "/work/app/keys": ("link", "/home/dev/.ssh"),
+        "/home": "dir", "/home/dev": "dir", "/home/dev/.ssh": "dir", "/home/dev/.ssh/id_ed25519": "file",
+    }
+    RULES = {
+        "deny": [("read", "/home/dev/.ssh")],
+        "ask": [],
+        "allow": [("edit", "/work/app/src"), ("edit", "/work/app/docs")],
+    }
+    gate = PathGate("/work/app", FS, RULES)
+
+    assert gate.decide("edit", "src/main.py")["decision"] == "allow"
+    assert gate.decide("edit", "src/new_module.py")["decision"] == "allow", "a new file under an allowed directory"
+    assert gate.decide("read", "keys/id_ed25519")["decision"] == "deny", "a deny rule matches where the symlink leads"
+    assert gate.decide("edit", ".git/config")["decision"] != "allow", "no rule approves an edit to a protected path"
+    assert gate.decide("edit", "docs/../.git/hooks/pre-commit")["decision"] != "allow", "normalise before matching"
+    record = gate.decide("read", "src/main.py")
+    assert record["decision"] == "allow" and record["resolved"] == "/work/app/src/main.py" and record["requested"] == "src/main.py"
+    assert [r["seq"] for r in gate.log] == [1, 2, 3, 4, 5, 6], "one audit record per decision, numbered from 1"
+  hidden: |
+    _FS = {
+        "/": "dir", "/work": "dir", "/work/app": "dir", "/work/app_evil": "dir", "/work/app_evil/x.py": "file",
+        "/work/app/src": "dir", "/work/app/src/main.py": "file", "/work/app/src/util": "dir",
+        "/work/app/docs": "dir", "/work/app/.git": "dir", "/work/app/.git/hooks": "dir",
+        "/work/app/notes": ("link", ".git/hooks"),
+        "/work/app/up": ("link", "../.."),
+        "/work/app/src/cfg": ("link", "../../app/.cursor"),
+        "/work/app/src/loop_a": ("link", "loop_b"), "/work/app/src/loop_b": ("link", "loop_a"),
+        "/work/app/src/self": ("link", "self"),
+        "/work/app/src/chain1": ("link", "chain2"), "/work/app/src/chain2": ("link", "chain3"),
+        "/work/app/src/chain3": ("link", "/etc"),
+        "/work/app/src/alias.py": ("link", "main.py"),
+        "/work/app/vendor": ("link", "/opt/vendor"),
+        "/opt": "dir", "/opt/vendor": "dir", "/opt/vendor/lib.py": "file",
+        "/etc": "dir", "/etc/passwd": "file",
+        "/home": "dir", "/home/dev": "dir", "/home/dev/.bashrc": "file", "/home/dev/.ssh": "dir",
+        "/work/app/home": ("link", "/home/dev"),
+    }
+    _RULES = {
+        "deny": [("read", "/home/dev/.ssh"), ("edit", "/etc"), ("read", "/etc/passwd")],
+        "ask": [("edit", "/work/app/src/util")],
+        "allow": [("edit", "/work/app"), ("read", "/opt/vendor"), ("edit", "/opt/vendor")],
+    }
+
+
+    def _d(g, tool, path):
+        return g.decide(tool, path)["decision"]
+
+
+    _g = PathGate("/work/app", _FS, _RULES)
+
+    _NEVER_ALLOW_EDIT = [
+        ".git/config", ".git/hooks/pre-commit", "./.git/hooks/post-checkout", "src/../.git/config",
+        "//work/app/.git/config", "/work/app//.git/config", "/../../work/app/.git/config", ".git/",
+        "notes/pre-commit", "notes/../config",
+        ".cursor/mcp.json", "src/cfg/mcp.json", ".mcp.json", ".vscode/settings.json", ".claude/settings.json",
+        "docs/../.claude/hooks/start.sh", "home/.bashrc",
+        "../app_evil/x.py", "/work/app_evil/x.py", "/work/app/../app_evil/x.py",
+        "up/etc/cron.d/job", "/tmp/out.txt", "src/chain1/hosts",
+        "src/loop_a", "src/loop_a/x", "src/self", "src/alias.py",
+        "src/util/helpers.py",
+    ]
+    assert [p for p in _NEVER_ALLOW_EDIT if _d(_g, "edit", p) == "allow"] == []
+
+    assert _d(_g, "edit", "src/chain1/hosts") == "deny", "a deny rule matches the end of a symlink chain"
+    assert _d(_g, "edit", "/etc/../etc/hosts") == "deny"
+    assert _d(_g, "edit", "//etc/hosts") == "deny", "a leading // is still the root"
+    assert _d(_g, "read", "home/.ssh/id_rsa") == "deny"
+    assert _d(_g, "read", "src/loop_a") == "deny" and _g.log[-1]["resolved"] is None, "a loop does not resolve"
+    assert _d(_g, "edit", "src/util/helpers.py") == "ask", "ask beats a broader allow"
+    assert _d(_g, "read", "src/../../app_evil/x.py") == "ask", "a sibling whose name starts with the root's name is outside"
+    assert _d(_g, "read", "up/etc/hosts") != "allow"
+    assert _d(_g, "read", "vendor/lib.py") != "allow", "an allow rule that covers only the target is not enough"
+    assert _d(_g, "edit", "vendor/lib.py") != "allow", "an edit through a symlink out of the workspace"
+
+    _ALLOWED = [("edit", "src/main.py"), ("edit", "src/new.py"), ("edit", "docs/a/b/c.md"), ("edit", "./src//main.py"),
+                ("edit", "/work/app/src/main.py"), ("read", ".git/config"), ("read", "notes/pre-commit"),
+                ("read", "src/alias.py"), ("edit", "src/../docs/x.md"), ("read", "src")]
+    assert [x for x in _ALLOWED if _d(_g, *x) != "allow"] == []
+
+    _n = len(_g.log)
+    _r = _g.decide("edit", "src/main.py")
+    assert len(_g.log) == _n + 1 and _g.log[-1]["seq"] == _n + 1
+    assert [r["seq"] for r in _g.log] == list(range(1, len(_g.log) + 1))
+    _r["decision"] = "deny"
+    assert _g.log[-1]["decision"] == "allow", "the caller cannot rewrite the audit log through the returned record"
+
+    _ASKED = set(_NEVER_ALLOW_EDIT) | {x[1] for x in _ALLOWED} | {
+        "src/chain1/hosts", "/etc/../etc/hosts", "//etc/hosts", "home/.ssh/id_rsa", "src/loop_a",
+        "src/util/helpers.py", "src/../../app_evil/x.py", "up/etc/hosts", "vendor/lib.py", "src/main.py"}
+    assert all(r["requested"] in _ASKED for r in _g.log), "requested is the path exactly as the tool call gave it"
+
+
+    def _rules_of(rules, kind):
+        return [tuple(r) for r in rules[kind]]
+
+
+    def _records_consistent(g, rules):
+        for rec in g.log:
+            if not all(k in rec for k in ("seq", "tool", "requested", "resolved", "decision", "reason", "rule")):
+                return False
+            if not isinstance(rec["reason"], str) or not rec["reason"].strip():
+                return False
+            if rec["decision"] not in ("allow", "ask", "deny"):
+                return False
+            if rec["rule"] is not None and tuple(rec["rule"]) not in _rules_of(rules, rec["decision"]):
+                return False
+        return True
+
+
+    assert _records_consistent(_g, _RULES)
+
+    _FS2 = {"/": "dir", "/private": "dir", "/private/tmp": "dir", "/private/tmp/ws": "dir", "/private/tmp/ws/a.txt": "file",
+            "/private/tmp/ws/.git": "dir", "/tmp": ("link", "/private/tmp")}
+    _g2 = PathGate("/tmp/ws", _FS2, {"deny": [], "ask": [], "allow": [("edit", "/tmp/ws")]})
+    assert _d(_g2, "edit", "a.txt") == "allow", "the workspace root may sit behind a symlink"
+    assert _d(_g2, "read", "/private/tmp/ws/a.txt") == "allow"
+    assert _d(_g2, "edit", ".git/index") != "allow"
+
+
+    def _random_paths(seed, n):
+        import random
+        rng = random.Random(seed)
+        parts = ["src", "docs", ".git", "hooks", "..", ".", "", "notes", "up", "vendor", "home", "cfg", "loop_a",
+                 "chain1", "x.py", "app_evil", "app", "work", ".cursor", "mcp.json", "util", "alias.py", "etc", ".ssh"]
+        for _ in range(n):
+            p = "/".join(rng.choice(parts) for _ in range(rng.randint(1, 7)))
+            yield ("/" + p) if rng.random() < 0.3 else p
+
+
+    _PATHS = list(_random_paths(7, 1500))
+
+
+    def _lex(p):
+        out = []
+        for c in ("/work/app/" + p if not p.startswith("/") else p).split("/"):
+            if c == "..":
+                out = out[:-1]
+            elif c not in ("", "."):
+                out.append(c)
+        return "/" + "/".join(out)
+
+
+    def _covers(root, p):
+        return p is not None and (p == root or p.startswith(root + "/"))
+
+
+    def _edit_allows_are_safe():
+        g = PathGate("/work/app", _FS, _RULES)
+        for p in _PATHS:
+            for tool in ("read", "edit"):
+                rec = g.decide(tool, p)
+                if rec["decision"] != "allow":
+                    continue
+                if rec["resolved"] is None:
+                    return False
+                if tool == "edit":
+                    if any(c in PROTECTED for c in rec["resolved"].split("/") + _lex(p).split("/")):
+                        return False
+                    if not _covers("/work/app", rec["resolved"]):
+                        return False
+        return _records_consistent(g, _RULES)
+
+
+    assert _edit_allows_are_safe()
+
+
+    def _monotonic():
+        order = {"allow": 0, "ask": 1, "deny": 2}
+        base = PathGate("/work/app", _FS, _RULES)
+        tighter = PathGate("/work/app", _FS, dict(_RULES, deny=_RULES["deny"] + [("edit", "/work/app/docs"), ("read", "/opt")]))
+        looser = PathGate("/work/app", _FS, dict(_RULES, allow=_RULES["allow"] + [("read", "/etc"), ("edit", "/home/dev")]))
+        for p in _PATHS:
+            for tool in ("read", "edit"):
+                b = order[_d(base, tool, p)]
+                if order[_d(tighter, tool, p)] < b or order[_d(looser, tool, p)] > b:
+                    return False
+        return True
+
+
+    assert _monotonic()
+
+
+    def _perf():
+        import time
+        fs = {"/": "dir", "/repo": "dir"}
+        allow, deny = [], []
+        for i in range(400):
+            fs["/repo/pkg%d" % i] = "dir"
+            for j in range(100):
+                fs["/repo/pkg%d/m%d" % (i, j)] = "dir"
+                allow.append(("edit", "/repo/pkg%d/m%d" % (i, j)))
+        for i in range(10000):
+            deny.append(("read", "/secrets/s%d" % i))
+        fs["/repo/pkg7/m3/link"] = ("link", "/repo/pkg9/m4")
+        rules = {"deny": deny, "ask": [("edit", "/repo/pkg5")], "allow": allow}
+        calls = [("edit", "pkg%d/m%d/a/b/c/f%d.py" % (k % 400, k % 100, k)) for k in range(20000)]
+        calls.append(("edit", "pkg7/m3/link/x.py"))
+        t = time.perf_counter()
+        g = PathGate("/repo", fs, rules)
+        out = []
+        for k, (tool, p) in enumerate(calls):
+            out.append(g.decide(tool, p)["decision"])
+            if k % 500 == 0 and time.perf_counter() - t > 3.0:
+                return False
+        took = time.perf_counter() - t
+        return took < 3.0 and out[-1] == "allow" and out.count("ask") == 50 and len(g.log) == 20001
+
+
+    assert _perf()
+  solution: |
+    PROTECTED = frozenset({
+        ".git", ".claude", ".cursor", ".codex", ".vscode", ".idea", ".husky", ".devcontainer",
+        ".mcp.json", ".gitconfig", ".gitmodules", ".bashrc", ".zshrc", ".profile", ".envrc", ".npmrc",
+    })
+    MAX_HOPS = 40
+
+
+    def _norm(path):
+        # Lexical only. posixpath.normpath would keep a leading "//", which then matches no rule.
+        out = []
+        for c in path.split("/"):
+            if c in ("", "."):
+                continue
+            if c == "..":
+                if out:
+                    out.pop()
+            else:
+                out.append(c)
+        return "/" + "/".join(out)
+
+
+    def _ancestors(path):
+        yield path
+        while path != "/":
+            path = path.rsplit("/", 1)[0] or "/"
+            yield path
+
+
+    def _inside(path, root):
+        # Whole components: /work/app_evil is not inside /work/app.
+        return path is not None and (root == "/" or path == root or path.startswith(root + "/"))
+
+
+    class PathGate:
+        def __init__(self, root, fs, rules, protected=PROTECTED):
+            self.fs = fs
+            self.root = _norm(root)
+            self.real_root = self._resolve(self.root) or self.root
+            self.protected = frozenset(protected)
+            self.log = []
+            # One dict per (kind, tool), keyed by the rule's path as written and by where it resolves.
+            # A lookup probes the ancestors of one path, so its cost does not grow with the number of rules.
+            self.index = {}
+            for kind in ("deny", "ask", "allow"):
+                for rule in rules.get(kind, ()):
+                    tool, p = rule
+                    table = self.index.setdefault((kind, tool), {})
+                    for q in {_norm(p), self._resolve(_norm(p))}:
+                        if q is not None:
+                            table.setdefault(q, tuple(rule))
+
+        def _rule(self, kind, tool, path):
+            table = self.index.get((kind, tool))
+            if table and path is not None:
+                for a in _ancestors(path):
+                    if a in table:
+                        return table[a]
+            return None
+
+        def _resolve(self, path):
+            """Follow every symlink, as realpath does; missing components stay lexical. None on a loop."""
+            todo = [c for c in reversed(path.split("/")) if c not in ("", ".")]
+            cur, hops = "/", 0
+            while todo:
+                c = todo.pop()
+                if c == "..":
+                    cur = cur.rsplit("/", 1)[0] or "/"
+                    continue
+                nxt = cur.rstrip("/") + "/" + c
+                entry = self.fs.get(nxt)
+                if isinstance(entry, tuple):
+                    hops += 1
+                    if hops > MAX_HOPS:
+                        return None
+                    if entry[1].startswith("/"):
+                        cur = "/"
+                    todo.extend(x for x in reversed(entry[1].split("/")) if x not in ("", "."))
+                    continue
+                cur = nxt
+            return cur
+
+        def _in_ws(self, path):
+            return _inside(path, self.root) or _inside(path, self.real_root)
+
+        def _protected(self, path):
+            return any(c in self.protected for c in path.split("/"))
+
+        def _decide(self, tool, path, resolved):
+            if resolved is None:
+                return "deny", "the path does not resolve: a symlink loop or too many hops", None
+            for p in (path, resolved):
+                r = self._rule("deny", tool, p)
+                if r:
+                    return "deny", "deny rule covers " + p, r
+            if tool == "edit":
+                if self._protected(path) or self._protected(resolved):
+                    return "ask", "protected path: no rule approves an edit here", None
+                if not self._in_ws(resolved):
+                    return "ask", "the edit resolves outside the workspace", None
+                if isinstance(self.fs.get(path), tuple):
+                    return "ask", "the requested path is itself a symlink", None
+            for p in (path, resolved):
+                r = self._rule("ask", tool, p)
+                if r:
+                    return "ask", "ask rule covers " + p, r
+            if self._rule("allow", tool, path) and self._rule("allow", tool, resolved):
+                return "allow", "allow rules cover the requested and the resolved path", self._rule("allow", tool, resolved)
+            if tool == "read" and self._in_ws(path) and self._in_ws(resolved):
+                return "allow", "a read inside the workspace", None
+            return "ask", "no rule allows this", None
+
+        def decide(self, tool, path):
+            raw = path if path.startswith("/") else self.root + "/" + path
+            full = _norm(raw)
+            resolved = self._resolve(raw)  # not _resolve(full): "link/.." leaves where the link points, not where it sits
+            decision, reason, rule = self._decide(tool, full, resolved)
+            record = {"seq": len(self.log) + 1, "tool": tool, "requested": path, "path": full,
+                      "resolved": resolved, "decision": decision, "reason": reason, "rule": rule}
+            self.log.append(record)
+            return dict(record)
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Coding, 50 minutes">
+Your agent's read and edit tools go through a file gate. Today it joins the path to the workspace and prefix-matches it against deny, ask and allow rules. Extend it: protected paths that no rule can approve, symlinks resolved the way the kernel resolves them, and an audit record for every decision. The contract is in the starter's docstring.
+</Callout>
+
+The policy follows Claude Code's documented behaviour for file rules as of 2026-10-28: allow rules must cover both the requested path and the file it resolves to, deny rules apply if either matches, and a path whose symlinks do not settle is refused. Three published bugs shaped the hidden tests. Claude Code's working-directory check once compared strings, so a sibling directory whose name began with the workspace's name counted as inside it (CVE-2025-54794). Cursor asked before editing an existing dotfile but not before creating one, so an injected agent created `.cursor/mcp.json` (CVE-2025-54135). And `..` after a symlink leaves the link's target, not the directory the link sits in.
+
+Two things are yours to decide. Whether an edit that can never be allowed (protected, outside the workspace, or aimed at a symlink) is asked or denied: asking keeps a person in the loop, denying is what an unattended run needs. And what goes into `reason`, which is the line a reviewer reads during an incident.
+
+One constraint is not in the visible tests. The rules are generated from a monorepo's package layout, tens of thousands of them, and the gate runs on every file call of every session. A batch of 20,000 decisions against 50,000 rules has to finish in a few seconds.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which filesystem the gate will run on, and whether the workspace root itself can be a symlink.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask the person who will read the audit log during an incident which fields they need to rebuild what the agent asked for and what the gate understood.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the size of the largest generated rule file and the number of file calls in a long session, then work out what one decision costs if it walks every rule.</p></details>
+
+## Answer
+
+The reference solution has four parts: two views of every path, rule lookup by ancestor, the protection checks in a fixed order, and a record built once and copied out.
+
+**Two views of the path.** The lexical path joins the request to the root and removes `.`, `..` and repeated slashes without touching the filesystem. It is written by hand because `posixpath.normpath("//etc/hosts")` returns `//etc/hosts`: POSIX lets two leading slashes mean something else, so the standard function keeps them, and a deny rule on `/etc` would never match. The resolved path walks the raw request one component at a time, follows each symlink by pushing its target's components back onto the work list, and only then applies `..`. Resolving the lexical path instead is the bug the hidden tests look for: `notes/../config`, with `notes` pointing at `.git/hooks`, is `/work/app/config` lexically and `/work/app/.git/config` on disk. A hop counter turns a loop into `None`; the reference gives up after 40 hops.
+
+**Rules by ancestor.** Each rule goes into a dictionary keyed by its normalised path, and by where that path resolves, so a deny on `/tmp/ws` also holds at `/private/tmp/ws`. A lookup walks the path's ancestors, a handful of dictionary probes, instead of the rule list:
+
+```python
+def _rule(self, kind, tool, path):
+    table = self.index.get((kind, tool))
+    if table and path is not None:
+        for a in _ancestors(path):          # /work/app/src/x.py, /work/app/src, /work/app, /work, /
+            if a in table:
+                return table[a]
+    return None
+```
+
+Matching by whole components also fixes the prefix bug for free: `/work/app_evil` has no ancestor equal to `/work/app`. The same rule applies to the workspace check, which compares against both the root and the root's resolved form.
+
+**The order of checks.** A path that does not resolve is denied. A deny rule on either view denies. For edits, a protected name in either view, a resolved path outside the workspace, or a requested path that is itself a symlink returns `ask` before any allow rule is consulted, which is what "no rule can approve it" means in code. Then ask rules on either view, then allow rules that cover both views, then the default. Protection is a property of the name, so a file that does not exist yet is covered, which closes the CVE-2025-54135 pattern.
+
+**The audit record.** Built once per call, appended, and returned as a copy, so a caller that edits the returned dict cannot rewrite history. It keeps the request exactly as the tool call gave it, the lexical and resolved paths, the decision, the reason and the rule. Without the raw request, an investigator cannot tell `src/../.git/config` from `.git/config`, and the difference is the whole incident.
+
+**Performance.** Walking every rule costs (rules × calls) comparisons: 50,000 × 20,000 is 10<sup>9</sup> at the hidden test's size. Measured in CPython 3.12 on one laptop, a linear-scan version of the reference took about 18 seconds for the first 2,000 decisions, which puts the full batch near three minutes; the reference took about half a second for all 20,000. The reference still resolves every path from scratch; a real gate would cache resolutions per call, never across calls, because the filesystem changes between them.
+
+### The decision with two defensible answers: ask or deny
+
+- **Ask** for protected, outside and symlink-target edits. A person sees the path and decides, and legitimate work (editing a git hook on purpose) is possible. Cost: in an unattended run, ask is a hang or an auto-approval, and in an attended one it is another prompt to click through.
+- **Deny** them. Nothing the agent writes reaches config or leaves the workspace through the file tools. Cost: the agent cannot help with hooks or editor settings at all, and people will run it in a mode that skips the gate to get that work done.
+
+Claude Code splits it by mode: protected-path writes prompt in the default modes and are denied in `dontAsk`. The reference asks, and a gate for CI should deny; the conflict is autonomy against safety, and the deciding fact is whether a person is there to answer.
+
+### Where this fails
+
+The gate decides on paths at the moment of the check. Between the check and the write, the agent can swap a directory for a symlink, and the write lands somewhere the gate never approved. Claude Code's docs say its tools confirm, when they open the approved file, that the path still resolves to where the check said; the reference does not, because it never opens anything. The gate also only sees the read and edit tools. A Python script the agent runs opens whatever it likes, which is why Claude Code's own docs point at the OS sandbox for enforcement that does not depend on the tool. And the name list is never finished: every tool that reads config from the workspace is a name someone has to remember to add.
+
+## Follow-ups
+
+- *What changes to run this in a real harness?* Resolve against the real filesystem with `os.path.realpath`, then open with `O_NOFOLLOW` on the final component and compare the opened file's device and inode with the checked path, so a swap between check and write fails. On macOS and Windows, compare names case-insensitively: `.GIT/config` is `.git/config` on the default filesystem there.
+- *Your protected list makes the agent ask about every `.vscode` edit, and the frontend team uses those settings daily. What do you remove, and what do you accept in writing?*
+- *What would you need to see in a month of audit records to change the default for outside-the-workspace edits from ask to deny?*
+- *Two senior engineers disagree: one wants the gate to resolve symlinks, the other wants the sandbox to refuse to create them. How do you decide without deciding by rank?*
+
+## Common mistakes
+
+- Comparing paths with `startswith` on strings, which puts `/work/app_evil` inside `/work/app`.
+- Normalising `..` before resolving symlinks, which judges a path the kernel will never open.
+- Protecting files that exist and forgetting the ones the agent is about to create.
+- Using `posixpath.normpath` and trusting it to collapse a leading `//`.
+- Returning the record that is in the log, so the caller can change the log.
+- Scanning every rule on every call; the visible tests pass and a generated rule file stalls the gate.

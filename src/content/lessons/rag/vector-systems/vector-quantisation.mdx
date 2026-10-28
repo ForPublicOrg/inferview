@@ -1,0 +1,160 @@
+---
+title: Vector quantisation with a verification pass
+track: rag
+module: vector-systems
+order: 3
+kind: lesson
+level: senior
+minutes: 11
+summary: Scalar int8, binary codes, product quantisation and RaBitQ all shrink the vectors the search touches and then verify a shortlist against better vectors, so the choice is a code size that fits the RAM budget plus a verification pass sized to the recall target.
+prerequisites: [rag/vector-systems/hnsw-by-hand]
+updated: 2026-10-28
+sources:
+  - title: "Shakir, Aarsen and Lee, Binary and Scalar Embedding Quantization for Significantly Faster and Cheaper Retrieval (Hugging Face, 2024-03-22)"
+    url: https://huggingface.co/blog/embedding-quantization
+    note: "binary: threshold normalised embeddings at 0, 32x smaller, Hamming distance, 1,024 dims pack into 128 bytes; int8: per-dimension min and max from a calibration set, 256 levels, 4x smaller; rescoring retrieves rescore_multiplier x top_k with binary codes, then rescores with the float32 query against the binary document embeddings; mxbai-embed-large-v1 on MTEB retrieval: binary keeps about 92.53% of float32 NDCG@10 without rescoring and 96.45% with, multipliers 1 to 10 gave no further gain; int8 about 97% without and about 99.3% with a multiplier of 4 to 5; 250M x 1,024 dims: 953.67 GB float32, 238.41 GB int8, 29.80 GB binary; exact CPU search speedup over float32: int8 3.66x mean, binary 24.76x mean; 41M Wikipedia pipeline: binary index 5.2 GB in memory, top 40 rescored from an int8 index on disk (47.5 GB, 0 bytes of memory), against roughly 200 GB of memory for float32"
+  - title: pgvector README (checked 2026-10-28)
+    url: https://github.com/pgvector/pgvector
+    note: "binary quantization: HNSW expression index on binary_quantize(embedding)::bit(n) with bit_hamming_ops; re-rank by ordering a LIMIT 20 Hamming subquery by full-vector distance and taking LIMIT 5; half-precision expression index on embedding::halfvec(n); bit type stores dimensions/8 + 8 bytes, HNSW indexes up to 64,000 bit dimensions; halfvec up to 4,000"
+  - title: pgvector CHANGELOG (checked 2026-10-28)
+    url: https://github.com/pgvector/pgvector/blob/master/CHANGELOG.md
+    note: "0.7.0 (2024-04-29) added halfvec and binary_quantize; 0.8.1 improved binary_quantize performance"
+  - title: "Jégou, Douze and Schmid, Product Quantization for Nearest Neighbor Search (IEEE TPAMI 33(1), 2011)"
+    url: https://hal.univ-grenoble-alpes.fr/inria-00514462v1
+    note: "split a vector into m sub-vectors and quantise each with k* centroids; code length m log2 k*; k* = 256 and m = 8 (64-bit codes) often a reasonable choice; ADC compares the unencoded query with database codes using squared distances from each query sub-vector to every centroid, computed before the search; SDC's only advantage is query memory and ADC has lower distortion at similar cost; validated on two billion vectors (text read from the paper's postprint)"
+  - title: "Gao and Long, RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor Search (arXiv 2405.12497, SIGMOD 2024)"
+    url: https://arxiv.org/abs/2405.12497
+    note: "D-dimensional vectors become D-bit strings after normalising against a centroid and a random orthogonal rotation; unbiased inner-product estimator with error O(1/sqrt(D)) with high probability; query quantised to B_q = 4 bits makes query-side error negligible; distances by AND and popcount; re-ranking drops a candidate whose distance lower bound exceeds the current nearest exact distance instead of using a tuned count; PQ's default code is 2D bits; on MSong PQ has over 50% average relative error and at most 60% recall even with re-ranking; IVF-RaBitQ normalises against the IVF cluster centroid"
+  - title: "Douze et al., The Faiss Library (arXiv 2401.08281 v4, 2025-10-23)"
+    url: https://arxiv.org/abs/2401.08281
+    note: "PQ code size M x nbits; ADC compares the uncompressed query with codes and most Faiss indexes use it; refinement: a fast index returns a shortlist and a more accurate index re-scores it, which needs random access to the stored vectors; the first-level metric is recall at the shortlist size; binary codes with Hamming distance are crude but fast"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The mechanism
+
+Every vector quantisation scheme in production is a lossy index followed by a recheck, the same shape as a Postgres GiST index on bounding boxes that returns candidates and lets the executor recheck the real geometry. The compressed codes decide which candidates are worth looking at; a second pass over better vectors decides the order. The difference from the GiST case is that the recheck is optional and approximate in both stages, so recall depends on two numbers you choose: the code size, which sets how good the shortlist is, and the shortlist length, which sets how much of the first stage's error the second can repair.
+
+The Faiss paper states the rule for the second stage plainly: the first-level index should be judged by recall at the shortlist size, not at k. A binary index whose recall@10 is poor can still have excellent recall@100, and then a verification pass over 100 full vectors returns a correct top 10.
+
+## Four codes
+
+**Scalar int8.** Each dimension is mapped to 256 levels using a per-dimension minimum and maximum taken from a calibration set, one byte per dimension, four times smaller than float32. In Hugging Face's measurement with mixedbread's 1,024-dimension model on MTEB retrieval, int8 kept about 97% of float32 NDCG@10 without rescoring and about 99.3% with a rescore multiplier of 4 to 5. The calibration set is the failure point: a shift in the embedding distribution after calibration clips values silently.
+
+**Binary.** Each dimension becomes one bit, its sign after normalisation, 32 times smaller; 1,024 dimensions pack into 128 bytes, and distance is Hamming, an XOR and a popcount. The same measurement kept about 92.53% of NDCG@10 without rescoring and 96.45% with it, and the authors report that multipliers from 1 to 10 gave no further gain for that model. Their rescoring step scores the shortlist with the float32 query against the binary document codes, an asymmetric pass that needs no full document vectors at all. In exact CPU search they measured binary at 24.76 times float32's speed on average and int8 at 3.66 times. Hugging Face sized 250M such embeddings at 953.67 GB as float32, 238.41 GB as int8 and 29.80 GB as binary (the figures are GiB).
+
+**Product quantisation.** Split each vector into m sub-vectors and replace each with the id of the nearest of k* centroids learned for that slice; the code is m x log2(k*) bits. The PQ paper calls k* = 256 with m = 8 (64-bit codes) often a reasonable choice. Search uses asymmetric distance computation: before scanning, compute the squared distance from each of the query's m sub-vectors to each of the k* centroids of its slice, a table of m x k* numbers; the distance to any database code is then m table lookups and adds. The paper's verdict on the symmetric variant, which also encodes the query, is that its only advantage is saving query memory, and that the asymmetric version has lower distortion at similar cost. Faiss uses asymmetric distances in most of its indexes.
+
+**RaBitQ.** A 2024 SIGMOD paper that keeps the bit budget of binary codes and adds a guarantee. Each vector is normalised against a centroid (in IVF-RaBitQ, its cluster's centroid), rotated by a random orthogonal matrix, and stored as D bits for D dimensions. The paper proves an unbiased estimator of the inner product whose error is O(1/sqrt(D)) with high probability, quantises the query to 4 bits so its error is negligible, and computes distances with AND and popcount. The bound changes the verification pass: instead of a tuned shortlist length, a candidate is dropped when its distance lower bound already exceeds the exact distance of the best result so far, and every other candidate is checked. The authors' case against PQ is that it has no such bound and fails badly on some data: on the MSong dataset they report PQ with over 50% average relative distance error and no more than 60% recall even with re-ranking.
+
+## In Postgres
+
+pgvector exposes two of these as expression indexes on an ordinary `vector` column, since 0.7.0 (April 2024). The binary form indexes `binary_quantize(embedding)::bit(n)` with `bit_hamming_ops` and verifies with a subquery that takes a Hamming shortlist and re-orders it by full-vector distance; the README's example takes 20 by Hamming and returns 5:
+
+```sql
+CREATE INDEX ON items USING hnsw ((binary_quantize(embedding)::bit(1024)) bit_hamming_ops);
+
+SELECT * FROM (
+    SELECT * FROM items
+    ORDER BY binary_quantize(embedding)::bit(1024) <~> binary_quantize($1)
+    LIMIT 40
+) ORDER BY embedding <=> $1 LIMIT 10;
+```
+
+The full vectors stay in the table, so the verification pass is 40 heap fetches, each carrying a 4,104-byte value (4 x 1,024 + 8) for a 1,024-dimension `vector`. That is the cost the RAM budget moved: off the index, onto random reads of the table. The half-precision form indexes `embedding::halfvec(n)`, which halves the index and needs no recheck beyond what HNSW already does.
+
+## Choosing a format
+
+<Predict id="rag-vs-quant-budget" question="Largest code size per vector the RAM budget allows, in bytes?" answer={640} tolerance={5} unit="bytes">
+<Fragment slot="prompt">
+<p>100M vectors of 1,024 dimensions. The codes the search touches must fit in 64 GB of RAM (decimal), ignoring graph links and engine overhead. Full float32 vectors may live on SSD.</p>
+</Fragment>
+<p><b>640 bytes.</b> 64 x 10<sup>9</sup> / 10<sup>8</sup> = 640. int8 needs 1,024 bytes and does not fit; halfvec needs 2,048. Binary at 128 bytes fits five times over, PQ at 64 sub-vectors of one byte is 64 bytes, and RaBitQ at one bit per dimension is 128 bytes plus a few per-vector factors. Of 640 bytes, HNSW links at M = 16 take about 151, which leaves 489: binary or RaBitQ in a graph, or PQ in an IVF index, and the full vectors read from SSD only for the shortlist.</p>
+</Predict>
+
+The decision procedure, in order:
+
+1. **Budget.** RAM per vector, as in the prediction. It rules formats out before recall is measured.
+2. **Recall target and where the verification vectors live.** If full or int8 vectors fit in RAM, the verification pass is cheap and a long shortlist costs little. If they live on SSD, each shortlist entry is a random read, and the shortlist length times queries per second is an IOPS budget. Hugging Face's 41M-document pipeline is the worked example: a 5.2 GB binary index in memory, the top 40 rescored from a 47.5 GB int8 index on disk with no memory reserved for it, against roughly 200 GB of memory for float32.
+3. **The model.** Retention figures are per model. Measure recall@10 against float32 exact search on your labelled queries for each candidate format, at shortlist lengths of 2, 4 and 10 times k, and choose the smallest code and shortest shortlist that meet the target.
+4. **Guarantee.** If the data includes outlier distributions where a codebook can be badly wrong (the MSong case), prefer a scheme with an error bound, or a longer verification pass.
+
+The toy below shows why step 3 is a measurement. It is 2,000 normalised 256-dimension vectors in 20 tight clusters, sign-quantised, with and without a verification pass.
+
+```python
+import math
+import random
+
+random.seed(3)
+D, N, K = 256, 2000, 10
+
+
+def unit(v):
+    n = math.sqrt(sum(x * x for x in v))
+    return [x / n for x in v]
+
+
+centres = [[random.gauss(0, 1) for _ in range(D)] for _ in range(20)]
+docs = [unit([c + random.gauss(0, 0.6) for c in random.choice(centres)]) for _ in range(N)]
+queries = [unit([c + random.gauss(0, 0.6) for c in random.choice(centres)]) for _ in range(20)]
+codes = [sum(1 << i for i, x in enumerate(d) if x > 0) for d in docs]  # D floats become D bits
+
+
+def dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+
+def search(q, multiplier):
+    qb = sum(1 << i for i, x in enumerate(q) if x > 0)
+    shortlist = sorted(range(N), key=lambda i: (qb ^ codes[i]).bit_count())[: K * multiplier]
+    if multiplier == 1:
+        return shortlist
+    return sorted(shortlist, key=lambda i: -dot(q, docs[i]))[:K]  # verification on full vectors
+
+
+exact = [set(sorted(range(N), key=lambda i: -dot(q, docs[i]))[:K]) for q in queries]
+for multiplier in (1, 4, 10):
+    hits = sum(len(e & set(search(q, multiplier))) for q, e in zip(queries, exact))
+    read = 0 if multiplier == 1 else K * multiplier
+    print(f"multiplier {multiplier:>2}: recall@10 {hits / (K * len(queries)):.2f}, full vectors read {read}")
+# multiplier  1: recall@10 0.32, full vectors read 0
+# multiplier  4: recall@10 0.72, full vectors read 40
+# multiplier 10: recall@10 1.00, full vectors read 100
+```
+
+On this data the multiplier is everything: 0.32 without verification, 0.72 at 4 and 1.00 at 10. Hugging Face found no gain beyond a multiplier of 1 for their model. Both are true for their data; the clusters here are tight enough that sign bits cannot order points inside a cluster, and a real model's embeddings may or may not look like that. The only way to know is the sweep in step 3.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You serve 100M 1,024-dimension embeddings. Recall@10 must stay within 0.95 of float32 exact search, p95 under 50 ms at 300 queries per second, and each serving node has 64 GB of RAM and a local NVMe drive. Finance will not add nodes this year. Which format do you pick, how long is the verification shortlist, and what do you measure before cutting over?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Binary or RaBitQ codes in a RAM-resident graph, because 640 bytes per vector rules out int8 and float16, with full or int8 vectors on NVMe for the verification pass. The shortlist starts at four times k and is set by a sweep on labelled queries; at 300 QPS, 40 reads per query is 12,000 random reads a second, which I check against the drive before agreeing to it.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Budget. 64 GB over 100M vectors is 640 bytes each. int8 (1,024) and halfvec (2,048) are out. Binary or RaBitQ codes are 128 bytes, plus about 151 bytes of HNSW links at M = 16, about 28 GB in all, leaving room for the engine and the page cache.</p>
+<p>Verification. The float32 vectors are 409.6 GB, which must live on NVMe; an int8 copy is 102.4 GB and halves the bytes per read. The shortlist length decides both recall and I/O: at 300 QPS, a 40-entry shortlist is 12,000 random reads a second and a 100-entry one is 30,000. I would measure the drive's random-read latency at those rates, because p95 is set by the slowest of the shortlist's reads, not the mean.</p>
+<p>Format. Binary is in every engine; RaBitQ's bound lets the verification pass stop early instead of reading a fixed count, which matters when reads are the cost. I would run both on our labelled queries at multipliers 2, 4 and 10 and pick the smallest that meets 0.95. What I give up: NVMe read headroom, and a recall that depends on a model-specific property I have to re-measure when the embedding model changes. Written down: the multiplier, the measured recall per format, and the trigger to re-run the sweep (any model or data change).</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The sweep says binary needs a multiplier of 10 and the drive cannot sustain 30,000 reads a second at your latency. Which constraint gives?</em> Move the verification vectors to int8 in RAM on fewer, larger shards if finance allows a reshape, or accept a lower recall floor in writing; a scheme with an error bound may also cut the reads.</li>
+<li><em>What would make you go back to float32 in RAM?</em> Measured recall below target at every multiplier the drive can serve, on the queries that matter commercially.</li>
+<li><em>The embedding model is replaced next quarter. What breaks?</em> int8 calibration ranges, PQ codebooks and the measured multiplier are all properties of the old model's distribution; each is re-learned and re-measured before cut-over.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Recall against float32 exact search is the metric here, and it is not relevance. A quantised index can lose 3% of NDCG on a benchmark and nothing a user notices, or the reverse on a corpus of near-duplicates where the top 10 are separated by tiny distances.
+
+The retention figures are Hugging Face's, for one model on public retrieval tasks, and their rescoring used binary document codes rather than full vectors, so it is not the same pass as pgvector's re-rank. RaBitQ's bound is on the distance estimate, not on recall; recall still depends on the index structure the codes sit in. PQ codebooks and int8 ranges are trained on data, so they degrade when the data drifts, while sign bits do not need training but lose information when the embeddings are not centred on the origin; RaBitQ normalises against a centroid before taking bits. The decision also moves with hardware: when vectors are on SSD, the verification pass is an I/O budget, and the disk-resident designs in the next lesson and the teardown are built around keeping it to a few reads.
+
+<SelfRate id="lesson:rag/vector-systems/vector-quantisation" />

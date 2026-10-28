@@ -1,0 +1,170 @@
+---
+title: "Prompt caching: prefix rules, breakpoints and what invalidates them"
+track: apis
+module: context-engineering
+order: 1
+kind: lesson
+level: senior
+minutes: 14
+summary: Provider prompt caches match exact prefixes in a fixed order, so the layout of a prompt decides the hit rate, and the usage fields are the only way to see it.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Claude docs, prompt caching
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: prefix order tools, system, messages; up to 4 breakpoints; lookback of at most 20 positions per breakpoint, writes only at breakpoints; consecutive tool_use or tool_result blocks count as one position; 5-minute lifetime refreshed at no cost on use, measured from the start of the request; 1-hour option; longer TTLs must come before shorter ones; minimum cacheable lengths (512 tokens on Opus 5.5, Sonnet 5.5 and Haiku 5.5; 1,024 on Opus 4.8 and Sonnet 5; 4,096 on Opus 4.6, Opus 4.5 and Haiku 4.5); invalidation table; usage fields and total input formula; isolation by organization and by workspace; cache hits not deducted against rate limits; checked 2026-10-28
+  - title: Claude docs, pricing
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: per million tokens, base input, 5-minute write, 1-hour write, cache hit, output; Opus 5.5 $4, $5, $8, $0.20, $20; Sonnet 5.5 $2, $2.50, $4, $0.10, $10; Haiku 5.5 up to 100,000-token prompts $0.10, $0.125, $0.20, $0.01, $0.50; Opus 4.8 $5, $6.25, $10, $0.50, $25; multipliers 1.25x, 2x, reads 0.1x except 0.05x on Opus 5.5 and Sonnet 5.5 and 0.025x on Fable 5.1 and Mythos 5.1; multipliers stack with batch and data residency; checked 2026-10-28
+  - title: OpenAI API docs, prompt caching
+    url: https://developers.openai.com/api/docs/guides/prompt-caching
+    note: 1,024 visible input tokens minimum on GPT-5.6 and later; reads 0.1x input (0.05x on GPT-6.1 Sol and Terra); writes 1.25x for 30 minutes, 2.5x for 12 hours on GPT-5.6 and later; no write charge on GPT-5.5 and earlier; entries live on machines, overflow routing above 15 requests per minute; prompt_cache_key steers routing before GPT-5.6 and separates accounting after; cached tokens count toward TPM; checked 2026-10-28
+  - title: Gemini API docs, context caching
+    url: https://ai.google.dev/gemini-api/docs/caching
+    note: implicit caching on by default for Gemini 2.5 and newer; minimum 4,096 tokens on Gemini 4 Argon, 3.8 Flash, 3.6 Flash and 3.1 Pro Preview, 2,048 on 2.5 Flash and Pro; on Gemini 4 Argon and newer a new turn must add at least 2,050 tokens for the full previous request to be cached; no discount rate stated on the caching page; checked 2026-10-28
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import ApisCachePrefix from '../../../../components/widgets/ApisCachePrefix.astro';
+
+## The cache key is the whole prefix
+
+A provider prompt cache stores the attention state computed for a prefix of the request and reuses it when a later request starts with the same bytes. The key is every token from the first one up to a cache point, in the order the provider serialises them. That makes it a memo table with one unusual property: a difference at token 40 makes every later token a miss, however much of the rest is identical.
+
+On the Claude API the serialisation order is fixed: `tools`, then `system`, then `messages`. A change in the tool list invalidates all three levels; a change in the system prompt invalidates the system and message levels; a change in the messages invalidates only what follows it. OpenAI routes on a hash of the initial tokens after its hidden system content, tool definitions included, and Gemini's guidance for implicit caching states the same rule as advice: put large common content first and send requests with a similar prefix close together.
+
+The design rule is to sort the prompt by volatility. Content identical across users and days goes first, then content stable for a tenant, then the conversation, then anything that changes per request. Every per-request value placed above stable content (a timestamp, a request id, a user name in the system prompt, a retrieval result) caps the cacheable prefix at its position.
+
+<ApisCachePrefix />
+
+## Where entries are written, and where lookups stop
+
+Claude's cache does not look up every prefix length. Entries are written only at breakpoints, and a request may carry up to four. With automatic caching, a single top-level `cache_control` puts the breakpoint on the last cacheable block and moves it forward as the conversation grows; it occupies one of the four slots.
+
+A lookup starts at each breakpoint and walks backwards one block at a time, checking at most 20 positions, the breakpoint included, for a prefix hash that an earlier request wrote. If nothing matches in that window, the search for that breakpoint stops. Consecutive `tool_use` blocks count as one position, and so do consecutive `tool_result` blocks.
+
+The window explains a miss that looks impossible from the outside. A conversation with automatic caching writes an entry at the end of request *n*. Request *n* + 1 appends a turn and moves the breakpoint forward. If that turn added more than 19 positions (a user message carrying 25 separate document blocks, say), the walk back from the new breakpoint never reaches the old entry, and the request reads nothing although almost all of it is unchanged. The fix is a second, explicit breakpoint before the volatile tail, at the end of the system prompt or of the reference documents, so an entry is always within reach.
+
+Three more rules from the same page decide whether a layout can hit at all:
+
+| Rule | Claude API, checked 28 October 2026 |
+|---|---|
+| Minimum cacheable length | 512 tokens on Opus 5.5, Sonnet 5.5 and Haiku 5.5; 1,024 on Opus 4.8 and Sonnet 5; 4,096 on Opus 4.6, Opus 4.5 and Haiku 4.5. Shorter prompts are processed without caching and no error is returned. |
+| Lifetime | 5 minutes by default, measured from the start of the request that wrote or read the entry, and refreshed at no cost on every hit. A 1-hour lifetime is available at a higher write price. |
+| Mixing lifetimes | 1-hour entries must appear before 5-minute entries in the prompt. |
+
+Refresh on hit means the lifetime that matters is the gap between consecutive requests sharing a prefix, not the age of the entry. A tenant sending one request a minute keeps a 5-minute entry alive all day for one write; a tenant sending one every ten minutes pays a write on every request.
+
+## What invalidates a level
+
+Claude's documentation lists the changes and the level each invalidates. These are the ones that ship by accident:
+
+| Change | Tools | System | Messages |
+|---|---|---|---|
+| Tool definitions (names, descriptions, parameters) | invalidated | invalidated | invalidated |
+| Web search or citations toggled, speed setting changed | kept | invalidated | invalidated |
+| `tool_choice` changed, an image added or removed anywhere | kept | kept | invalidated |
+| Thinking parameters or the effort setting changed | model-specific | model-specific | invalidated |
+
+A tool list built by iterating a set, or a dict filled in plugin registration order, is the usual source of a silent miss, because two server processes can serialise the same tools differently and the prefix is compared byte for byte. Routing logic that flips `tool_choice` between `auto` and a forced tool invalidates the message level on every flip. On models that strip earlier thinking blocks, messages after a cached thinking block drop out of the cache; the documentation says Opus 4.5 and later, Sonnet 4.6 and later, and Haiku 5.5 preserve them by default.
+
+Isolation is part of the key as well. Claude caches are never shared across organisations, and on the Claude API they are isolated per workspace inside an organisation, so moving traffic to a new workspace starts cold. OpenAI caches are not shared across organisations and cannot be reused across regional processing boundaries.
+
+## Prices, and the break-even read count
+
+Anthropic prices a 5-minute write at 1.25 times base input and a 1-hour write at 2 times. Reads are 0.1 times base on most models, 0.05 times on Opus 5.5 and Sonnet 5.5, and 0.025 times on Fable 5.1 and Mythos 5.1. Per million tokens, on 28 October 2026:
+
+| Model | Base input | 5-minute write | 1-hour write | Cache hit | Output |
+|---|---|---|---|---|---|
+| Opus 5.5 | $4.00 | $5.00 | $8.00 | $0.20 | $20.00 |
+| Sonnet 5.5 | $2.00 | $2.50 | $4.00 | $0.10 | $10.00 |
+| Opus 4.8 | $5.00 | $6.25 | $10.00 | $0.50 | $25.00 |
+| Haiku 5.5 (prompts up to 100,000 tokens) | $0.10 | $0.125 | $0.20 | $0.01 | $0.50 |
+
+The multipliers stack with the Batch API discount and with data-residency pricing.
+
+OpenAI changed its scheme at GPT-5.6. On GPT-5.6 and later, reads cost 0.1 times input (0.05 times on GPT-6.1 Sol and Terra), and writes cost 1.25 times for the default 30-minute retention or 2.5 times for 12 hours; on GPT-5.5 and earlier there is no write charge. The minimum is 1,024 visible input tokens on GPT-5.6 and later. Gemini caches implicitly on 2.5 and newer, with a 2,048-token minimum on 2.5 Flash and Pro and 4,096 on the newer models its page lists; on Gemini 4 Argon and newer a new turn must add at least 2,050 tokens for the whole previous request to be cached. The Gemini caching page states no discount rate, so take it from the pricing page of the model you run.
+
+The write premium means a cache can cost more than no cache. With a write multiplier *w*, a read multiplier *r*, and *n* requests sharing a prefix inside one lifetime, caching wins when *w* + (*n* − 1)*r* < *n*. On Opus 5.5 with 5-minute writes, 1.25 + 0.05(*n* − 1) < *n* gives *n* > 1.26, so the second request already pays for the write.
+
+<Predict id="ce-1h-breakeven" question="On Opus 5.5, how many requests must share a prefix inside the hour before a 1-hour cache write costs less than sending the prefix uncached every time?" answer={3} tolerance={0} unit="requests">
+From 2 + 0.05(n − 1) < n, n must exceed 2.05, so the third request is the first where the 1-hour write has paid for itself. At OpenAI's 12-hour write on GPT-5.6, 2.5 + 0.1(n − 1) < n gives n > 2.67, also three requests. A prefix that a user touches twice, an hour apart, is a loss at either price.
+</Predict>
+
+Rate limits differ by provider. Claude's caching page says cache hits are not deducted against the rate limit, so a higher read share also raises throughput under an input-tokens-per-minute cap. OpenAI's page says cached input tokens count toward tokens-per-minute limits. OpenAI also says its entries live on individual machines and traffic above about 15 requests per minute for one prefix can overflow to machines that do not hold it; before GPT-5.6 a stable `prompt_cache_key` steers related requests together, and from GPT-5.6 routing is automatic and the key mostly separates cache accounting.
+
+## Predict a hit rate from a layout
+
+Scenario numbers. A chat assistant on Opus 5.5 with automatic caching. Tools and system prompt are 10,000 tokens. Each request appends 1,000 tokens (the previous assistant reply and the new user message), so request *k*, for *k* from 1 to 10, sends 10,000 + 1,000*k* tokens. Turns arrive less than five minutes apart.
+
+Request 1 writes everything. Each later request reads the whole previous request from cache and writes its 1,000 new tokens, because the moving breakpoint writes a new entry at the end.
+
+<Predict id="ce-read-share" question="Over the ten requests, what percentage of all input tokens is billed as a cache read? Round to the nearest whole percent." answer={87} tolerance={1} unit="percent">
+Total input is the sum of 10,000 + 1,000k for k = 1 to 10: 100,000 + 55,000 = 155,000 tokens. Reads are the previous request's size for k = 2 to 10: 9 × 10,000 + 1,000 × (1 + 2 + ... + 9) = 90,000 + 45,000 = 135,000. 135,000 / 155,000 = 87.1 percent. The other 20,000 tokens are writes: 11,000 on the first request and 1,000 on each of the nine others.
+</Predict>
+
+The read share approaches 100 percent only as conversations get long. On the same layout, a product whose conversations are two turns long reads 11,000 of 23,000 tokens, 48 percent, whatever else is tuned.
+
+## Measure it from the usage fields
+
+Claude reports three input fields. `cache_read_input_tokens` and `cache_creation_input_tokens` are reads and writes, and `input_tokens` counts only the tokens after the last breakpoint. Total input is the sum of all three. A dashboard that charts `input_tokens` alone sees a small, flat number while the bill moves, which is how a cache regression ships unnoticed. OpenAI reports reads as `usage.input_tokens_details.cached_tokens` and, on GPT-5.6 and later in the Responses API, writes as `cache_write_tokens`.
+
+```python
+def cache_report(usages, base, write, read):
+    """usages: Claude usage dicts. Prices in USD per million tokens."""
+    r = sum(u["cache_read_input_tokens"] for u in usages)
+    w = sum(u["cache_creation_input_tokens"] for u in usages)
+    i = sum(u["input_tokens"] for u in usages)
+    total = r + w + i
+    cost = (r * read + w * write + i * base) / 1e6
+    return {"read_share": round(r / total, 3), "cost": round(cost, 3), "uncached_cost": round(total * base / 1e6, 3)}
+
+# The ten-request conversation above, Opus 5.5 prices.
+usages = [{"cache_read_input_tokens": 0, "cache_creation_input_tokens": 11_000, "input_tokens": 0}]
+usages += [{"cache_read_input_tokens": 10_000 + 1_000 * (k - 1), "cache_creation_input_tokens": 1_000, "input_tokens": 0}
+           for k in range(2, 11)]
+print(cache_report(usages, base=4.00, write=5.00, read=0.20))
+# {'read_share': 0.871, 'cost': 0.127, 'uncached_cost': 0.62}
+```
+
+The ten requests cost $0.127 in input with caching against $0.62 without. Of the $0.127, $0.10 is writes, so on this layout the next saving comes from writing less, not from reading more cheaply.
+
+Alert on the read share per prompt template rather than on cost: a share that falls from 0.85 to 0.05 after a deploy is a cache regression even while traffic and spend look normal for the first hour.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+A multi-tenant support assistant on Opus 5.5 has a 22 percent cache-read share. Finance wants input spend halved this quarter. Product has just added each user's name and plan tier to the top of the system prompt and will not remove them. What do you change, and what do you refuse?
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Move the per-user lines below the shared tool definitions and tenant documents, into a short block after an explicit breakpoint at the end of the stable system content. Serialise tools deterministically, give tenant documents their own breakpoint, and track the read share per template. The name and tier stay in the prompt; only their position changes. The risk is behavioural: moving instructions can change answers, so the change ships behind the eval suite.</p>
+</Fragment>
+<Fragment slot="long">
+<p>First, find the cap on the prefix. Render two requests from different users of the same tenant and diff them: the first differing byte is where every read stops. With the name at the top of the system prompt, only the tools can be shared across users, and only if a breakpoint sits right after them.</p>
+<p>Second, restructure by volatility: tools in a fixed order, shared instructions, tenant documents with a breakpoint, the per-user block, then the conversation with the automatic breakpoint. If tenant documents change hourly and instructions weekly, they get separate breakpoints so a document update does not rewrite the instructions.</p>
+<p>Third, size the gain before promising it. With read share s and reads at 0.05 times base, input cost per token is roughly (1 − s) + 0.05s before write premiums. At s = 0.22 that is 0.79; halving it to 0.395 needs s of about 0.64. Whether that is reachable depends on how many requests per tenant arrive within five minutes of each other, which is a traffic measurement, not a prompt change. Idle tenants never get there, and for them a 1.25-times write on every request costs more than no caching.</p>
+<p>What to refuse: removing the personalisation, which product owns, and a 1-hour lifetime for everyone, which pays only for tenants whose gaps fall between five and sixty minutes.</p>
+<p>Failure mode of the plan: instructions now follow user-specific text, and the model may weigh them differently in the new position. The eval suite runs on the new layout before rollout, and any template change that drops the read share pages the owning team.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The diff shows the tool list differs between two pods. What is the fix, and how do you stop it recurring?</em> Sort tools by name at serialisation and add a CI test that renders the same request in two processes and compares bytes up to the last breakpoint.</li>
+<li><em>Finance pushes back: the restructure needs three weeks of eval work. Which half do you cut?</em> Ship the tool-order fix and the tenant breakpoint first, since neither changes what the model reads, and defer moving the user block, accepting the lower share in writing.</li>
+<li><em>What would make you reverse the restructure?</em> An instruction-following regression above the threshold the product owner signed, or a read share that does not rise because traffic per tenant is too sparse for a 5-minute lifetime.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The prefix model here is exact and deterministic; provider caches are best effort. OpenAI says a cache key influences routing without guaranteeing a hit, and overflow routing means a hot prefix can miss on some machines. Budget for a hit rate below what the layout predicts and measure it.
+
+The invalidation table, minimums and multipliers are per model and per date. Claude's minimum is 4,096 tokens on Opus 4.5 and 512 on Opus 5.5, and OpenAI moved from free writes to charged writes at GPT-5.6. A design document that quotes a saving names the model and the date the prices were read.
+
+Caching changes cost and time to first token, not the answer. If a layout change alters model behaviour, the cause is the moved text, and only an eval run shows it.
+
+<SelfRate id="lesson:apis/context-engineering/caching-mechanics" />

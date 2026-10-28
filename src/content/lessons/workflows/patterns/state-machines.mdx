@@ -1,0 +1,157 @@
+---
+title: State machines and DAGs for model pipelines
+track: workflows
+module: patterns
+order: 3
+kind: lesson
+level: senior
+minutes: 12
+summary: Explicit per-item states, transitions guarded by deterministic validation, per-state retry limits and a terminal needs-human state make a model pipeline operable, and a DAG scheduler is the right shape only when items depend on each other.
+prerequisites: [workflows/patterns/five-patterns]
+updated: 2026-10-28
+sources:
+  - title: Airbnb Engineering, Accelerating Large-Scale Test Migration with LLMs (Charles Covey-Brandt)
+    url: https://airbnb.tech/?p=366
+    note: nearly 3.5K Enzyme test files moved to React Testing Library; per-file state machine (Enzyme refactor, fix Jest, fix lint and tsc, mark complete) advancing only after validation; hundreds of files run concurrently; configurable attempt limit with validation errors in each retry prompt; most successes within 10 attempts; long-tail files retried 50 to 100 times; prompts of 40,000 to 100,000 tokens with up to 50 related files; 75% in about 4 hours; 97% after 4 days of sample, tune, sweep; just under 100 files fixed by hand in about another week; about 6 weeks against a 1.5-year manual estimate
+  - title: InfoQ, How Airbnb Used LLMs to Accelerate Test Migration (Sergio De Simone, 28 March 2025)
+    url: https://www.infoq.com/news/2025/03/airbnb-llm-test-migration/
+    note: dates the Airbnb post to March 2025; the Airbnb page itself shows no date
+  - title: AWS Step Functions developer guide, Handling errors in Step Functions workflows (checked 2026-10-28)
+    url: https://docs.aws.amazon.com/step-functions/latest/dg/concepts-error-handling.html
+    note: Retry defaults IntervalSeconds 1, MaxAttempts 3, BackoffRate 2.0, JitterStrategy NONE; Catch routes to a named state after retries are exhausted; retries are billed as state transitions; Distributed Map tolerated failure threshold
+  - title: Apache Airflow 3.3.2 documentation, Dags (checked 2026-10-28)
+    url: https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html
+    note: default trigger rule all_success; one_failed, none_failed, all_done and other rules; skips cascade through all_success; joins after a branch need none_failed_min_one_success
+  - title: PracHub, Design a Streaming Job Scheduler (candidate report, Scale AI, posted 9 April 2026)
+    url: https://prachub.com/interview-questions/design-a-streaming-job-scheduler
+    note: earliest deadline first among runnable tasks with deterministic tie-break; prerequisites; a task never leased to two workers at once; at-least-once acceptable with idempotent workers; a crashed worker's task becomes runnable again; reject cycles
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Four parts that make a pipeline operable
+
+A model pipeline becomes something you can operate when it has four parts, and most prototypes have one of them. Explicit states, persisted per item, so "where is file 1,812" has an answer that does not depend on reading logs. Transitions guarded by deterministic validation, so the model's output is a candidate and code decides whether the item moves. A retry limit per state, so a hard item has a bounded cost. A terminal needs-human state that carries the last candidate and its errors, so the work that automation could not finish lands somewhere a person can pick it up.
+
+It is a CI pipeline per item, with one difference that changes the retry policy: a failed CI job is retried with the same input, and a failed model step is retried with a different input, because the validation errors go into the next prompt. A model step's retry is a new attempt with feedback, not a replay, so its limit is set from the measured pass curve rather than from a generic default such as the 3 retry attempts AWS Step Functions applies when `MaxAttempts` is unset.
+
+## The reference case
+
+Airbnb's test migration, published in March 2025, is the cleanest public example. The team moved nearly 3,500 React component test files from Enzyme to React Testing Library. Each file moved through Enzyme refactor, fix Jest, fix lint and tsc, and mark complete, and in the post's words they "modeled this flow like a state machine, moving the file to the next state only after validation". Each step was per file, so files could be tracked, rerun and run concurrently; the post says hundreds of files ran at once.
+
+Retries carried the validation errors and the file's latest version into the next prompt, up to a configurable attempt limit. Most files that succeeded did so within 10 attempts. The first bulk run migrated 75% of files in about four hours. Four days of a sample, tune and sweep loop took that to 97%, leaving just under 100 files, which engineers finished by hand in about another week, starting from the failing model output. The whole migration took about six weeks against a manual estimate of 1.5 years. The teardown later in this module goes through the system component by component; this lesson takes the mechanism.
+
+## The mechanism in code
+
+The state, the attempt counts and the last errors are the checkpoint. Everything else can be recomputed.
+
+```python
+from dataclasses import dataclass, field
+
+STATES = ["refactor", "fix_tests", "fix_lint_types"]  # then "complete"
+MAX_ATTEMPTS = {"refactor": 3, "fix_tests": 10, "fix_lint_types": 5}
+
+@dataclass
+class Item:
+    path: str
+    source: str
+    state: str = "refactor"
+    attempts: dict = field(default_factory=dict)
+    errors: list = field(default_factory=list)
+
+def advance(item, generate, validate, save):
+    while item.state in STATES:
+        n = item.attempts.get(item.state, 0)
+        if n >= MAX_ATTEMPTS[item.state]:
+            item.state = "needs_human"  # keeps the last candidate's errors for the person
+            break
+        item.attempts[item.state] = n + 1
+        save(item)  # count the attempt before the call, so a crash cannot reset the budget
+        candidate = generate(item.state, item.source, item.errors)
+        item.errors = validate(item.state, candidate)
+        if not item.errors:
+            item.source = candidate
+            i = STATES.index(item.state)
+            item.state = STATES[i + 1] if i + 1 < len(STATES) else "complete"
+        save(item)
+    return item
+
+# Mock model: fixes a test failure only once the error text is in the prompt.
+def generate(state, source, errors):
+    return f"{source} |{state}{' +fixed' if errors else ''}"
+
+def validate(state, candidate):
+    if state == "fix_tests" and "+fixed" not in candidate.split("|")[-1]:
+        return ["2 of 14 tests failed: expected role 'button'"]
+    return []
+
+item = advance(Item("Button.test.js", "enzyme"), generate, validate, lambda it: None)
+print(item.state, item.attempts)  # complete {'refactor': 1, 'fix_tests': 2, 'fix_lint_types': 1}
+```
+
+Three lines carry the design. The attempt is counted and saved before the model call, so a worker that crashes mid-call cannot reset the budget; the cost is that a crash consumes an attempt, which is the right side to err on when attempts are metered. The validator, not the model, decides the transition. And `needs_human` is a state like any other, so a dashboard can count it and a CLI can rerun it.
+
+`advance` is safe to call again on an item that crashed, because it resumes from the saved state. It is not safe to run twice concurrently on the same item; that needs a lease on the item, which is the scheduler's job.
+
+## Retry limits are arithmetic you can do
+
+If each attempt in a state passed validation independently with probability s, a limit of R attempts would let 1 − (1 − s)^R of items through the state.
+
+<Predict id="wfl-retry-limit" question="An attempt in the fix-tests state passes validation 30% of the time, independently of earlier attempts. With a limit of 10 attempts, what percentage of files leave the state for the next one?" answer={97.2} tolerance={0.2} unit="%">
+1 − 0.7¹⁰ = 1 − 0.0282 = 0.9718, so 97.2%. Three attempts would give 1 − 0.7³ = 65.7%. Under independence the limit buys a lot and the long tail is short. Airbnb's long tail says attempts are not independent: some files had been retried 50 to 100 times and still failed. For those files s was close to zero on every attempt, because the missing piece was context or a rule, not luck.
+</Predict>
+
+The arithmetic gives the limit's upper bound on usefulness. The data gives the real shape: plot the attempt number at which items passed, per state. If passes cluster in the first few attempts and almost nothing passes after attempt 10, attempts past 10 are spend with no yield, and the item belongs in needs-human or in the next tuning sample. Airbnb's "most by 10 attempts" observation is that plot in one sentence.
+
+Per-attempt cost is not constant either. Airbnb's prompts grew to 40,000 to 100,000 tokens for hard files, pulling in up to 50 related files, so the attempts spent on the long tail were also the most expensive attempts. Budget the limit in tokens per item per state, not only in attempts.
+
+## State machines and DAG schedulers
+
+A per-item state machine and a DAG scheduler answer different questions. The state machine answers "what happens next to this item"; the DAG answers "which tasks may run now, given what has finished".
+
+A DAG runs tasks in topological order, fans out and fans back in. Its hard questions are about partial failure. Airflow's default trigger rule is `all_success`: a task runs only when every upstream task succeeded, and a failed or skipped upstream propagates (`upstream_failed`, or a cascaded skip). That default is wrong after a branch, and the Airflow docs say so: a join downstream of a branching task needs `none_failed_min_one_success`, or the skipped branch skips the join. For model pipelines the same question appears at every fan-in: when one of five section summaries fails, does the report wait, ship without it, or fail? Each answer is a policy you set per node, and the default is rarely the one you want.
+
+Step Functions puts the two shapes together. A state has `Retry` (defaults: first retry after 1 second, 3 attempts, backoff rate 2.0, no jitter) and `Catch`, which routes to a named state once retries are exhausted; the docs note that retries are billed as state transitions. A Map state runs a sub-machine per item, and the Distributed Map variant fails the whole run when failed items exceed a tolerated threshold. That threshold is the batch-level version of needs-human: below it, failed items are routed for handling; above it, the run stops because something systematic is wrong.
+
+Choose by dependency between items. Airbnb's files were independent, so the right shape was thousands of small state machines run concurrently, with no DAG at all. When items depend on each other (a schema migration where a table must move before the views that read it), you need the DAG for ordering and a state machine inside each node for the model step. The scheduler interview question Scale AI candidates reported (via PracHub, April 2026) is the DAG half: earliest deadline first among runnable tasks with a deterministic tie-break, prerequisites, never leasing a task to two workers, and a crashed worker's task becoming runnable again, with at-least-once execution accepted because workers are idempotent. It is the same lease that makes `advance` above safe under concurrency.
+
+<Callout kind="gotcha">A transition the model chooses ("go back to refactor") turns the state machine into an agent with extra steps. Keep backward edges explicit in code, with their own limit, or the retry budget no longer bounds the run.</Callout>
+
+## Sample, tune, sweep
+
+The attempt limit handles items that are unlucky. Items that are systematically hard need the pipeline to change, and Airbnb's loop for that is short enough to adopt as written: run the remaining failures, find a common failure, take 5 to 10 example files with it, tune the prompts or scripts, check the tuned version on the sample, then sweep every remaining file. Their status tooling made this possible: each file carried a generated comment recording its per-step results, and a CLI could rerun files filtered by stuck step and path pattern (`--step=fix-jest --match=project-abc/**`).
+
+The decision the loop forces is when to stop. After four days of sweeps the remainder was just under 100 files; finishing them by hand took about a week, so the manual rate was just under 20 files per working day if that week was five working days. A sweep is worth running while its expected yield per engineer-day exceeds that manual rate. Once the last tuning round fixes fewer files than an engineer would fix by hand in the time it took, stop and hand the rest over with the failing output attached, which is what Airbnb did.
+
+## In the room
+
+<Depth>
+  <Fragment slot="short">
+    <p>You have eight weeks before a warehouse contract ends to move about 2,000 SQL queries to a new dialect, three engineers, and analysts who will not accept a query whose results changed. I would build a per-query state machine (translate, compile on the target, compare results on a sampled dataset, complete) with results comparison as the gate, attempt limits per state from the first sweep's pass curve, and a needs-human queue owned by the analysts' leads. Dependent views get a DAG for ordering.</p>
+  </Fragment>
+  <Fragment slot="long">
+    <p>The deadline and the correctness requirement conflict at the gate. Comparing full results on production data is the strongest check and the slowest; comparing on a sample is fast and can miss edge cases such as null handling in rare rows. I would gate on sampled results plus row counts and aggregates on full data, and write down that sampled comparison can pass a query that differs on rare rows, with the analysts signing that risk for low-traffic queries only.</p>
+    <p>Queries that feed other queries go through a DAG so a view is migrated before its readers; independent queries run concurrently as separate state machines. Week one is a full sweep to get the pass curve per state, which sets the attempt limits and the tuning samples. The stop rule is explicit: when a sweep fixes fewer queries per engineer-day than an engineer migrates by hand, the remainder goes to people. What I give up is uniformity: the hand-migrated tail will not follow the generated style, and I would accept that over missing the contract date.</p>
+  </Fragment>
+  <Fragment slot="followups">
+    <ul>
+      <li>At week six, 85% are complete and the sweep yield has dropped to a handful per day. Finance asks for a month's contract extension at a price you know. How do you decide between paying it and staffing the tail by hand?</li>
+      <li>An analyst finds a migrated query that passed the results comparison and is wrong on month-end data. What do you change in the gate, and do you rerun completed queries?</li>
+      <li>Two senior engineers disagree: one wants the model to choose when to go back to the translate state, the other wants only fixed transitions. How do you decide without deciding by rank?</li>
+    </ul>
+  </Fragment>
+</Depth>
+
+## When this is wrong
+
+The model assumes the validator is a good oracle. Tests passing after a migration show the tests run, not that they test the same things; Airbnb reports that coverage and test intent were preserved but publishes no coverage figures. A gate that checks less than the requirement turns the state machine into a fast way to ship plausible output. When the gate is weak, sample completed items for human audit and report that error rate next to the completion rate.
+
+It assumes items are independent. When files share types or fixtures, migrating one changes whether another passes, and per-item retries chase a moving target. Order those items with a DAG, or migrate the shared piece first and freeze it.
+
+It assumes the states are known. Airbnb's states matched the validation tools they already had (Jest, the linter, tsc). A pipeline whose states are invented to fit a diagram, with no deterministic check behind each one, has the overhead of a state machine and none of the guarantees.
+
+The stop rule compares sweep yield with a manual rate measured on the tail, and the tail is the hardest work. Early in the project the manual rate on average items is higher, so the same rule applied in week one would stop automation too soon.
+
+<SelfRate id="lesson:workflows/patterns/state-machines" />

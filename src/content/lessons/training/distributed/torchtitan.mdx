@@ -1,0 +1,160 @@
+---
+title: TorchTitan
+track: training
+module: distributed
+order: 9
+kind: teardown
+level: staff
+minutes: 14
+summary: TorchTitan is PyTorch's reference pre-training stack, composing FSDP2, tensor, pipeline and context parallelism on one DTensor device mesh with Float8, regional compilation and asynchronous distributed checkpoints, and its paper reports what each layer of that stack bought on Llama 3.1 from 8B to 405B.
+prerequisites: [training/distributed/zero-fsdp, training/distributed/pipeline-schedules]
+updated: 2026-10-28
+sources:
+  - title: Liang et al., TorchTitan, One-stop PyTorch native solution for production ready LLM pre-training (arXiv 2410.06511v3)
+    url: https://arxiv.org/html/2410.06511v3
+    note: submitted 2024-10-09, revised 2025-06-07; FSDP2 per-parameter DTensor sharding, about 7% lower memory and 1.5% average throughput gain over FSDP1 on Llama 2 7B; HSDP 2D mesh; TP and SP via DTensor ColwiseParallel and RowwiseParallel bundled under the TP degree; loss parallel on by default; CP after TP in the mesh; TP within nodes, FSDP across; six PP schedules including GPipe, 1F1B, Interleaved 1F1B, Looped-BFS, Flexible-Interleaved-1F1B and ZeroBubble; full, op-level and layer-level activation checkpointing per TransformerBlock; regional torch.compile per block; AsyncTP with SymmetricMemory on H100 or newer with NVSwitch; Float8 with dynamic, delayed and static per-tensor scaling via torchao; BF16 all-gather and compute, FP32 reduce-scatter by default; async DCP reduces checkpoint overhead 5-15x against synchronous on Llama 3.1 8B; Flight Recorder logs start, end and enqueue times of collectives and p2p ops; Llama 3.1 8B on 128 GPUs, FSDP 5,645 tokens/s per GPU at 67.0 GiB, compile 6,482 (+14.82%) at 62.1 GiB, Float8 9,319 (+65.08%) at 61.8 GiB; 70B on 256 GPUs FSDP 32 TP 8 with Float8 and compile 897 to 1,010 with AsyncTP (+12.59%), 70.3 to 67.7 GiB; 405B on 512 GPUs FSDP 4 TP 8 PP 16, 100 with 1F1B to 130 with Interleaved 1F1B (+30%), 78.0 to 80.3 GiB; CP on 8B with 8 GPUs, 3,890 tokens/s at 32,768 and 548 at 262,144, about 84 GiB; 405B 4D at 262,144 tokens, 16 tokens/s per GPU at 84.9 GiB; abstract lists elastic scaling, checkpointing, debugging tools, Float8 and SymmetricMemory. Checked 2026-10-28.
+  - title: PyTorch 2.14 documentation, Distributed Checkpoint (torch.distributed.checkpoint)
+    url: https://docs.pytorch.org/docs/2.14/distributed.checkpoint.html
+    note: saves and loads from multiple ranks in parallel; load-time resharding across topologies; at least one file per rank plus a global .metadata file with rank coordination; each rank saves only its local shards of DTensor and ShardedTensor; in-place load into pre-allocated tensors, each rank reading the least data it needs; async_save stages the state dict to CPU memory by default, then saves in a separate thread or process and returns a Future; Stateful protocol; get_state_dict and set_state_dict use canonical FQNs across FSDP, DDP and unparallelised models and are labelled experimental; no backward-compatibility guarantee for saved state dicts across PyTorch versions; page last updated 2026-07-08. Checked 2026-10-28.
+  - title: Dubey et al., The Llama 3 Herd of Models (arXiv 2407.21783)
+    url: https://arxiv.org/html/2407.21783
+    note: 466 job interruptions in a 54-day snapshot, 419 unexpected, higher than 90% effective training time on up to 16K H100s. Checked 2026-10-28.
+  - title: PyTorch 2.14 documentation, torch.distributed.fsdp.fully_shard
+    url: https://docs.pytorch.org/docs/2.14/distributed.fsdp.fully_shard.html
+    note: parameters as DTensors sharded on dim 0; root-only application gives two large blocking operations with no overlap; reshard_after_forward options; MixedPrecisionPolicy. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Diagram from '../../../../components/Diagram.astro';
+import Trace from '../../../../components/Trace.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What it is and who runs it
+
+TorchTitan is a pre-training codebase from the PyTorch team, described in a paper first posted in October 2024 and revised in June 2025. Its claim is that the pieces earlier lessons treated separately, FSDP2, tensor and sequence parallelism, pipeline schedules, context parallelism, Float8 and distributed checkpointing, compose in plain PyTorch on one abstraction, the DTensor on a device mesh, without a separate framework on top. It is the closest public answer to "what does a production training loop look like in PyTorch today", with measurements on Llama 3.1 at 8B, 70B and 405B on H100s.
+
+Studying it answers a question the published model reports do not: what each layer of the stack is worth, measured one at a time on the same code.
+
+## The system
+
+<Diagram
+  title="TorchTitan's composition on a device mesh"
+  nodes={[
+    { id: "mesh", label: "Device mesh", note: "PP, DP, CP, TP dimensions" },
+    { id: "pp", label: "Pipeline stages", note: "6 schedules" },
+    { id: "fsdp", label: "FSDP2", note: "DTensor dim-0 shards, across nodes" },
+    { id: "tp", label: "TP + SP", note: "Colwise/Rowwise, inside node" },
+    { id: "cp", label: "Context parallel", note: "after TP in the mesh" },
+    { id: "fp8", label: "Float8 linears", note: "per-tensor scaling, torchao" },
+    { id: "compile", label: "Regional compile", note: "per TransformerBlock" },
+    { id: "dcp", label: "Distributed checkpoint", note: "per-rank shards, async" },
+    { id: "elastic", label: "Elastic restart", note: "reshard on load" }
+  ]}
+  edges={[
+    { from: "mesh", to: "pp" },
+    { from: "mesh", to: "fsdp" },
+    { from: "mesh", to: "tp" },
+    { from: "mesh", to: "cp" },
+    { from: "tp", to: "fp8", label: "DTensor linears" },
+    { from: "fsdp", to: "fp8", label: "sharded linears" },
+    { from: "fp8", to: "compile" },
+    { from: "fsdp", to: "dcp", label: "sharded state" },
+    { from: "dcp", to: "elastic", label: "load-time reshard" }
+  ]}
+  rows={[["mesh"], ["pp", "fsdp", "tp", "cp"], ["fp8", "compile"], ["dcp", "elastic"]]}
+/>
+
+**FSDP2.** The data-parallel dimension. Each parameter becomes a DTensor sharded on dimension 0 across the data-parallel ranks, replacing FSDP1's flattened FlatParameter. The paper reports about 7% lower per-GPU memory and a 1.5% average throughput gain over FSDP1 on Llama 2 7B. Per-parameter sharding is what lets the same parameter also carry a tensor-parallel placement and a Float8 representation. By default parameters are all-gathered and computed in BF16 and gradients are reduce-scattered in FP32. A 2D mesh with a replicate dimension gives HSDP.
+
+**Tensor and pipeline parallelism.** TP and SP are applied by annotating modules with DTensor ColwiseParallel and RowwiseParallel plans and are bundled under one TP degree, the column-then-row pairing from the tensor-parallelism lesson. The paper places TP inside nodes and FSDP across them. AsyncTP overlaps TP communication with the matmuls using SymmetricMemory and requires H100-class GPUs with NVSwitch. Pipeline parallelism splits the model into stages and offers six schedules: GPipe, 1F1B, Interleaved 1F1B, Looped-BFS, Flexible-Interleaved-1F1B and ZeroBubble. Context parallelism is applied in the next mesh dimension out from TP.
+
+**Float8 training.** Linear layers run in Float8 through torchao, with dynamic, delayed or static per-tensor scaling. This is coarser than DeepSeek-V3's 1x128 and 128x128 tiles: one scale per tensor is simpler and composes with FSDP's all-gather, at more exposure to outliers.
+
+**Distributed checkpointing.** Checkpoints use PyTorch's DCP. Each rank writes only its own shards of each DTensor, in parallel, plus a global metadata file; on load, each rank reads the least data it needs and the checkpoint can be loaded into a different topology. Asynchronous saving copies the state to CPU memory and writes it from a separate thread or process, so training resumes after the copy rather than after the write. The paper reports asynchronous checkpointing cutting checkpoint overhead 5 to 15 times against synchronous DCP on Llama 3.1 8B.
+
+**Elastic scaling.** The abstract lists elastic scaling among the features. The mechanism that makes it possible is DCP's load-time resharding: a checkpoint written with one mesh can be loaded with another, so a job that loses nodes can restart on fewer GPUs, or grow, without converting the checkpoint offline.
+
+Two more pieces matter operationally. Regional torch.compile compiles each TransformerBlock separately, and because the blocks are identical, compiles once and reuses it, which keeps compile time bounded. Flight Recorder logs the start, end and enqueue times of every collective and point-to-point operation, which is what an engineer needs when a 512-GPU job hangs and every rank reports a timeout.
+
+## One training step
+
+<Trace
+  title="A training step with FSDP, TP and PP, ending in an asynchronous checkpoint"
+  note="structure from the paper and the DCP documentation; no per-step timings are published"
+  steps={[
+    { actor: "system", text: "The pipeline schedule (Interleaved 1F1B in the 405B run) issues micro-batch forwards to this rank's stage chunks." },
+    { actor: "tool", text: "FSDP2 all-gathers the next TransformerBlock's parameter shards across the data-parallel dimension in BF16, prefetched during the current block." },
+    { actor: "system", text: "The block runs: column-parallel then row-parallel Float8 matmuls on this rank's TP shard, sequence-parallel norms, all inside a compiled region.", note: "TP collectives stay on NVLink inside the node." },
+    { actor: "tool", text: "Activations go point-to-point to the next pipeline stage; backward chunks come back the other way." },
+    { actor: "system", text: "Backward for each block computes gradients; FSDP2 reduce-scatters them in FP32 across the data-parallel dimension." },
+    { actor: "system", text: "The optimizer updates this rank's parameter shards only." },
+    { actor: "tool", text: "At a checkpoint step, DCP async_save stages this rank's shards of model and optimizer state into CPU memory.", note: "The documentation gives separate completion signals for staging and for the upload." },
+    { actor: "system", text: "Training resumes; a background thread or process writes this rank's files and the coordinator writes the global metadata." },
+    { actor: "system", text: "The returned future completes when the write finishes; the next checkpoint should wait on it." }
+  ]}
+/>
+
+The step shows the stack's central bet: one sharding abstraction carries through compute, communication, precision and storage. The parameter that FSDP2 shards on dimension 0 is the same DTensor that TP splits by column, that Float8 casts, and that DCP saves as a shard with enough metadata to reshard on load.
+
+## Measured gains, one layer at a time
+
+The paper's results are cumulative, each row adding one technique on the same model and GPU count.
+
+**Llama 3.1 8B, 128 GPUs, FSDP only.** 5,645 tokens per second per GPU at 67.0 GiB. Adding torch.compile: 6,482, 14.82% faster, at 62.1 GiB. Adding Float8: 9,319, 65.08% over the FSDP baseline, at 61.8 GiB. Float8 contributes most of the gain at this scale.
+
+**Llama 3.1 70B, 256 GPUs, FSDP 32 and TP 8 with Float8 and compile.** 897 tokens per second per GPU; with AsyncTP, 1,010, 12.59% more, with memory falling from 70.3 to 67.7 GiB.
+
+**Llama 3.1 405B, 512 GPUs, FSDP 4, TP 8, PP 16.** 100 tokens per second per GPU with 1F1B; 130 with Interleaved 1F1B, 30% more, at 80.3 GiB against 78.0. That is the bubble arithmetic from the pipeline lesson in a measurement: with FSDP 4, each pipeline gets a quarter of the global batch, which bounds m, and interleaving's division of the bubble by v pays.
+
+**Long context.** On Llama 3.1 8B with 8 GPUs, context parallelism reached 262,144 tokens; throughput fell from 3,890 tokens per second at 32,768 tokens to 548 at 262,144 while memory stayed near 84 GiB. The 405B model with 4D parallelism ran at 262,144 tokens at 16 tokens per second per GPU and 84.9 GiB.
+
+To compare against the Llama 3 report's 405B MFU, convert with the same formula on both sides; the TorchTitan paper reports tokens per second, and a conversion needs FLOPs per token for the exact configuration, which is easy to get wrong for attention at long context.
+
+## Checkpointing in detail
+
+The checkpoint path is the part most training stacks get wrong, and the documentation is specific about its contract.
+
+A DCP checkpoint is a directory with at least one file per rank, not one file. Loading is in place: the model and optimizer are constructed and sharded first, on the target mesh, and DCP fills their existing storage, reading only the shards each rank needs. That is what makes resharding cheap: a checkpoint from FSDP 32 and TP 8 can be loaded into FSDP 16 and TP 8 by reading different byte ranges.
+
+The `get_state_dict` and `set_state_dict` helpers translate between parallelism-specific keys and canonical fully qualified names, so the same checkpoint loads into FSDP, DDP or an unsharded model. The documentation labels these helpers experimental, and states that saved state dicts carry no backward-compatibility guarantee across PyTorch versions. For a run that lasts months, the PyTorch version is effectively pinned for the run, or the checkpoint format is converted and verified before an upgrade.
+
+Asynchronous save moves the cost from the write to the copy. The state is staged into CPU memory first, and the documentation gives separate completion signals for staging and for the upload; parameters must not change until staging completes, and the write proceeds in the background. Two limits follow: host memory must hold a copy of the rank's shards, and a new checkpoint should wait on the previous one's upload.
+
+## Failure modes
+
+A hang in a collective is the characteristic failure of composed parallelism: one rank enters a different collective than its peers, or never enters, and every other rank waits until a timeout. Flight Recorder's per-operation timestamps are the instrument for finding which rank and which operation diverged.
+
+Composition makes ordering bugs possible that single-dimension parallelism does not: a parameter wrapped by TP after FSDP instead of before, or a pipeline stage whose FSDP group does not match its peers', produces wrong shapes or silent mis-sharding. A stack that fixes the order in which the parallelisms are applied removes this class of bug for its users, which is part of what a stack provides beyond the primitives.
+
+Asynchronous checkpointing has a gap: between staging and the completion of the write, the latest checkpoint exists only in host memory. A node failure in that window loses it, and recovery falls back to the previous checkpoint. The checkpoint interval has to account for that.
+
+## What is not public
+
+Production cluster failure data is not public. The paper describes the features for recovery, checkpointing, resharding on load and Flight Recorder, and reports throughput and memory, but it does not publish how often jobs on its clusters failed, how long restarts took, or how much training time was lost to failures. Questions about TorchTitan's effective training time at scale cannot be answered from the paper; Llama 3's report, from a different stack, is the public reference for that number at 16K GPUs.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your team runs a 70B pre-training job on TorchTitan with FSDP 32 and TP 8 on 256 H100s. Checkpoints are synchronous and take long enough that the team saves every two hours. The cluster loses a node about every other day. Leadership wants more frequent checkpoints without losing throughput, and the storage team warns the shared filesystem cannot take more write bandwidth. What do you change?"**
+</Callout>
+
+<p class="tiny">The cluster, failure rate and constraints are a scenario.</p>
+
+<Depth>
+<Fragment slot="short">
+<p>Switch to DCP async_save, which takes the write off the critical path; the paper measured 5 to 15 times lower checkpoint overhead on 8B. That allows shorter intervals at the same throughput, but not more storage bandwidth, so the interval is set by write bandwidth, not training stalls. Check host memory can hold each rank's staged shards. If storage is the limit, keep the interval and add a faster local tier for the most recent checkpoint.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Expected loss per failure is about half the interval plus the restart time, so at one failure every two days and a two-hour interval, roughly an hour of compute plus restart per failure. Async DCP removes most of the stall: the loop waits only for the copy to host memory. That makes a one-hour interval cheap in step time, and it halves the expected loss per failure.</p>
+<p>The storage team's constraint is separate. Halving the interval doubles the average write bandwidth, regardless of async. Options: write the frequent checkpoints to node-local or a nearby fast tier and copy every Nth to the shared filesystem, accepting that a failure of the node holding the recent copy falls back further; or checkpoint only model and optimizer shards that changed, which for a dense model is all of them, so it does not help. I would ship async DCP at a one-hour interval if the storage budget allows it, and a two-tier scheme if not. Failure mode: async leaves a window in which the newest checkpoint is in host memory only; a failure in that window loses it, so the interval should be measured from the last completed write, not from the last save call.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>After moving to async, step time shows a spike at every checkpoint. What is it, and what do you change?</li>
+<li>The job loses a node and restarts on 248 GPUs. What breaks in an FSDP 32, TP 8 layout, and what does DCP's resharding let you do instead?</li>
+<li>The team wants to upgrade PyTorch mid-run for a kernel fix. What do you need to verify first, given the documented compatibility guarantee?</li>
+</ul>
+</Fragment>
+</Depth>
+
+<SelfRate id="lesson:training/distributed/torchtitan" />

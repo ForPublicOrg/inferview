@@ -1,0 +1,247 @@
+---
+title: Ingestion as a batch pipeline with quality gates
+track: rag
+module: ingestion
+order: 3
+kind: lesson
+level: senior
+minutes: 17
+summary: An ingestion job is a batch pipeline with contracts, so re-runs are idempotent on a content hash, every chunk carries lineage to its source version, deduplication and PII detection run as stages, and gates on rates fail the batch instead of dropping documents silently.
+prerequisites: [rag/ingestion/chunking]
+updated: 2026-10-28
+sources:
+  - title: NVIDIA NeMo Curator documentation, overview (v1.4.0, 26.09, checked 2026-10-28)
+    url: https://docs.nvidia.com/nemo/curator/latest/about/index.html
+    note: "text curation stages: download, extraction, language detection, rule-based quality filtering, exact, fuzzy and semantic deduplication, model-based quality filtering; pipeline architecture on Ray"
+  - title: NeMo Curator documentation, exact deduplication (checked 2026-10-28)
+    url: https://docs.nvidia.com/nemo/curator/latest/curate-text/process-data/deduplication/exact.html
+    note: "MD5 of each document's text field; normalize_text off by default (lowercase, collapse whitespace, trim when on); identification writes IDs to remove; perform_removal defaults to False"
+  - title: NeMo Curator documentation, fuzzy deduplication (checked 2026-10-28)
+    url: https://docs.nvidia.com/nemo/curator/latest/curate-text/process-data/deduplication/fuzzy.html
+    note: "MinHash over character n-grams, LSH candidates, a duplicate graph, groups; defaults char_ngrams 24, num_bands 20, minhashes_per_band 13; threshold rule of thumb (1/num_bands)^(1/minhashes_per_band); output is IDs to remove; GPU required"
+  - title: NeMo Curator documentation, semantic deduplication (checked 2026-10-28)
+    url: https://docs.nvidia.com/nemo/curator/latest/curate-text/process-data/deduplication/semdedup.html
+    note: "embeddings from google/embeddinggemma-300m, K-means with n_clusters 100, pairwise cosine within clusters; eps 0.01, a pair is a duplicate at similarity 1 - eps or more; input order is the preservation preference; GPU required"
+  - title: "Lee et al., Deduplicating Training Data Makes Language Models Better (ACL 2022)"
+    url: https://arxiv.org/abs/2107.06499
+    note: "a single 61-word sentence repeated over 60,000 times in C4; deduplicated models emit memorized text ten times less often; train-test overlap affects over 4% of standard validation sets"
+  - title: Presidio documentation, home (checked 2026-10-28)
+    url: https://presidio.dataprivacystack.org/
+    note: "Analyzer, Anonymizer, Image Redactor and Structured components; detection by named entity recognition, regular expressions, rule-based logic and checksums with context; no guarantee that Presidio finds all sensitive information"
+  - title: Presidio documentation, Analyzer (checked 2026-10-28)
+    url: https://presidio.dataprivacystack.org/analyzer/
+    note: "analyze returns RecognizerResult objects with entity_type, start, end and score; predefined recognizers; LemmaContextAwareEnhancer raises scores from context words"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import CodeRunner from '../../../../components/CodeRunner.astro';
+
+export const starter = String.raw`import hashlib
+
+def normalise(text):
+    return " ".join(text.split())
+
+def chunk_words(text, size=4):
+    words = text.split()
+    return [" ".join(words[i:i + size]) for i in range(0, len(words), size)]
+
+def plan(index, source, chunker=chunk_words):
+    """Return (ops, new_index): the operations that make the vector store match source.
+
+    index: doc_id -> {"hash": str, "chunks": [chunk_id, ...]}, what the store holds now.
+    source: doc_id -> text, the complete current listing of the source system.
+    ops: ("insert", chunk_id, text) and ("delete", chunk_id) tuples, all inserts before
+    any delete, so a reader never finds a live document with no chunks.
+    """
+    ops, new_index = [], {}
+    for doc_id, text in source.items():
+        ids = []
+        for n, piece in enumerate(chunker(text)):
+            cid = f"{doc_id}:{n}"
+            ops.append(("insert", cid, piece))
+            ids.append(cid)
+        new_index[doc_id] = {"hash": "", "chunks": ids}
+    return ops, new_index
+`;
+
+export const tests = String.raw`def apply(store, ops):
+    for op in ops:
+        if op[0] == "insert":
+            store[op[1]] = op[2]
+        else:
+            store.pop(op[1], None)
+    return store
+
+src = {"leave": "Contractors give 14 days notice in writing to the manager", "pay": "Final pay arrives on the next payroll date"}
+ops, idx = plan({}, src)
+store = apply({}, ops)
+assert len(store) == 5, "10 words and 8 words make 3 and 2 chunks of at most 4 words"
+assert plan(idx, src)[0] == [], "a second run over unchanged sources does nothing"
+assert plan(idx, {"leave": "Contractors  give 14 days notice in writing\nto the manager", "pay": src["pay"]})[0] == [], "whitespace-only edits do not re-embed"
+ops4, idx4 = plan(idx, {"leave": "Contractors give 30 days notice", "pay": src["pay"]})
+store = apply(store, ops4)
+assert sorted(k for k in store if k.startswith("leave")) == sorted(idx4["leave"]["chunks"]), "an edit that shortens a document leaves no stale tail"
+assert "14 days" not in " ".join(store.values()), "the old text is gone from the store"
+`;
+
+export const hidden = String.raw`def apply(store, ops):
+    for op in ops:
+        if op[0] == "insert":
+            store[op[1]] = op[2]
+        else:
+            store.pop(op[1], None)
+    return store
+
+src = {"a": "one two three four five", "b": "six seven"}
+ops, idx = plan({}, src)
+store = apply({}, ops)
+ops2, idx2 = plan(idx, {"b": "six seven"})
+store = apply(store, ops2)
+assert all(not k.startswith("a") for k in store) and "a" not in idx2, "a document missing from the listing loses every chunk"
+ops3, idx3 = plan(idx2, {"b": "six seven eight", "c": "nine"})
+kinds = [o[0] for o in ops3]
+assert kinds == sorted(kinds, key=lambda k: k != "insert"), "inserts come before deletes"
+assert not set(idx2["b"]["chunks"]) & set(idx3["b"]["chunks"]), "a new version never reuses an old chunk id"
+store = apply(store, ops3)
+assert set(store) == {c for d in idx3.values() for c in d["chunks"]}, "store and index agree after every run"
+ops4, idx4 = plan(idx3, {"b": "six seven", "c": "nine"})
+store = apply(store, ops4)
+assert set(store) == {c for d in idx4.values() for c in d["chunks"]} and store[idx4["b"]["chunks"][0]] == "six seven", "reverting to an earlier version works"
+`;
+
+export const solution = String.raw`import hashlib
+
+def normalise(text):
+    return " ".join(text.split())
+
+def chunk_words(text, size=4):
+    words = text.split()
+    return [" ".join(words[i:i + size]) for i in range(0, len(words), size)]
+
+def plan(index, source, chunker=chunk_words):
+    inserts, deletes, new_index = [], [], {}
+    for doc_id in sorted(source):
+        text = normalise(source[doc_id])
+        h = hashlib.sha256(text.encode()).hexdigest()
+        old = index.get(doc_id)
+        if old and old["hash"] == h:
+            new_index[doc_id] = old
+            continue
+        ids = []
+        for n, piece in enumerate(chunker(text)):
+            cid = f"{doc_id}:{h[:12]}:{n}"
+            inserts.append(("insert", cid, piece))
+            ids.append(cid)
+        new_index[doc_id] = {"hash": h, "chunks": ids}
+        if old:
+            deletes.extend(("delete", c) for c in old["chunks"])
+    for doc_id in sorted(set(index) - set(source)):
+        deletes.extend(("delete", c) for c in index[doc_id]["chunks"])
+    return inserts + deletes, new_index
+`;
+
+## Four contracts
+
+An ingestion job is a batch pipeline whose output other systems trust without reading it. A retrieval index that silently lost a folder looks exactly like a healthy one until a user asks about that folder. So the job is held to the contracts any data pipeline feeding a production read path is held to, stated here for retrieval:
+
+1. **Idempotent.** Running the job twice over the same sources leaves the index unchanged, and a run killed halfway converges on the next run. The key is the normalised content hash together with the pipeline version, which is the parser, the chunker configuration and the embedding model.
+2. **Lineage.** Every chunk records the source document id, the content hash it was cut from, the pipeline version, and the access labels of the source. A chunk with no lineage cannot be deleted precisely, re-embedded selectively or explained in an incident.
+3. **Accounting.** Documents in equals documents indexed plus documents quarantined with a reason. The identity is checked on every batch, with no tolerance.
+4. **Gates.** Rates that describe a healthy batch (empty text, duplicates, PII hits, chunk length) are compared against a band from accepted batches, and a rate outside its band fails the batch. A failed batch publishes nothing and the last good index keeps serving.
+
+The difference from a typical ETL job is the failure signal. A broken join produces nulls that someone's dashboard shows. A broken parser produces fluent chunks of the wrong text, and retrieval returns them with normal-looking scores.
+
+## Idempotency and deletes
+
+The job computes a plan by comparing two states, the source listing and what the index holds, rather than replaying a change log. That is what makes a killed run safe: the next run sees whatever half-state the store is in and computes the remaining operations.
+
+Three defects recur in jobs that skip this design. An upsert-only job never deletes: a document removed at the source is absent from the "changed" list, so its chunks stay searchable indefinitely. You need tombstones from the source, or a full listing to diff against. Positional chunk ids (`doc_id:n`) leave stale tails: when an edit shortens a document from 12 chunks to 9, chunks 10 to 12 survive with old text. Ids that include the content hash avoid both the tail and any reuse of an old id for new text. And a job that deletes before inserting leaves a window in which a live document has no chunks; inserting the new version first and deleting the old one second leaves, at worst, both versions briefly retrievable, which a reader of the index tolerates better than neither.
+
+Hash the normalised text, not the file bytes: a PDF re-exported with a new timestamp should not re-embed. Hash access labels separately. A permission change must update every chunk's labels in the same run, and it should not trigger a re-embed, because the text has not changed.
+
+Write the planner. The starter is the upsert-only job with positional ids; the tests describe the contract.
+
+<CodeRunner id="lesson-rag-ingestion-plan" title="An idempotent ingestion planner" starter={starter} tests={tests} hidden={hidden} solution={solution} gradable={false} />
+
+The exercise holds the pipeline version fixed. In production the skip condition is "same content hash and same pipeline version", so a chunker change re-plans every document whose chunks it would alter, and the index can hold two pipeline versions during a migration with lineage saying which is which. Changing the embedding model is the extreme case: vectors from two models cannot be compared, so it is a parallel index, a backfill and a cutover. Ten million chunks of 800 tokens is 8 billion tokens to embed again, and the backfill time and the double storage during cutover usually cost more than the embedding calls.
+
+## The stages, with NeMo Curator as the reference
+
+NVIDIA's NeMo Curator (v1.4.0, documentation checked October 2026) is a data-curation framework built for training corpora, and its text pipeline is a useful checklist of stages: download, extraction, language detection, rule-based quality filters, exact, fuzzy and semantic deduplication, and model-based quality filtering, running on Ray. A retrieval corpus needs most of the same stages with different policies.
+
+**Language detection and rule filters** catch the parser's failure output: pages of extracted glyph garbage, empty text from image-only PDFs, cookie banners captured by a web crawler. They are cheap and they feed the empty-text gate.
+
+**Exact deduplication** in NeMo Curator hashes each document's text with MD5. Normalisation (lowercase, collapse whitespace, trim) is off by default, so two copies differing only in line breaks are not exact duplicates unless you turn it on.
+
+**Fuzzy deduplication** computes MinHash signatures over character 24-grams and uses locality-sensitive hashing with 20 bands of 13 hashes each. A pair becomes a candidate when all 13 hashes in at least one band match, so for two documents with Jaccard similarity s the probability is 1 − (1 − s¹³)²⁰. The documentation's rule of thumb for the threshold is (1/20)^(1/13) ≈ 0.79.
+
+<Predict id="rag-ingest-minhash-candidate" question="With 20 bands of 13 hashes, what is the probability, in percent, that two documents with Jaccard similarity 0.7 become a duplicate candidate?" answer={17.7} tolerance={1.5} unit="%">
+<p>One band matches with probability 0.7¹³ ≈ 0.0097. The chance that none of 20 bands matches is (1 − 0.0097)²⁰ ≈ 0.823, so the pair is a candidate with probability <b>about 17.7%</b>. The same formula gives 67.7% at s = 0.8 and 99.7% at s = 0.9. The curve is steep but not a step: some pairs below the threshold are flagged and some above it are missed, and band and row counts are how you move it. Two versions of a contract that differ in one clause sit high on this curve, which matters for the next paragraph.</p>
+</Predict>
+
+**Semantic deduplication** embeds documents (the default model is `google/embeddinggemma-300m`), clusters them with K-means into 100 clusters, and marks pairs within a cluster whose cosine similarity is at least 1 − eps, with eps defaulting to 0.01. Input order decides which copy survives: earlier rows are kept. In a retrieval corpus that is a policy decision, so sort the input so the authoritative copy comes first, the current version from the system of record ahead of the copy someone pasted into a wiki.
+
+Deduplication goals differ between the two settings. For training data, Lee et al. found a single 61-word sentence repeated more than 60,000 times in C4 and report that models trained on deduplicated data emit memorised text ten times less often. For retrieval, duplicates cost differently: five copies of the same boilerplate paragraph can fill a top-5, pushing the one chunk that answers the question out of the prompt. And retrieval has near-duplicates that must not be merged. Version 3 and version 4 of a contract are near-duplicates by any similarity measure and are both legitimate; the index should hold the current one and know the other exists. NeMo Curator's fuzzy and exact stages write the ids to remove and leave removal to a separate step by default, which is the right shape: identification is a measurement, and removal is a policy applied with lineage.
+
+**PII detection at ingest.** Presidio's analyzer returns, per finding, an entity type, a character span and a score, from a combination of named-entity recognition, regular expressions, rules and checksums, with context words raising the score. Its own documentation says there is no guarantee it finds all sensitive information. Treat it as a detector with a miss rate you measure on a labelled sample, not as a control that guarantees an outcome. At ingest the decision per entity type is to redact before chunking, to restrict the document's access labels, or to quarantine it for review. The PII hit rate per batch is also a gate, because a sudden rise usually means a new source was connected, an HR export or a support-ticket dump, not that existing documents changed.
+
+## Gates that fail the batch
+
+Per-document failures go to quarantine with a reason, and the batch continues. The gates watch the rates, because a rate is what moves when something systemic breaks: a parser upgrade, a connector that lost permissions, a source that changed format. Four gates cover the common breaks.
+
+- **Empty-text rate.** The share of documents whose extracted text is empty or below a minimum length. A rise means the parser or the OCR path broke, or a connector began returning access-denied pages as content.
+- **Duplicate rate.** The share flagged by exact and fuzzy deduplication. A spike usually means a connector re-ingested a folder under new ids.
+- **PII hit rate.** The share of documents with at least one finding above the score threshold you chose, per entity type.
+- **Chunk-length drift.** The median and 95th-percentile chunk length against the last accepted batch. A parser change that drops table text, or starts emitting headers into every page, moves these before any retrieval metric does.
+
+For the rate gates, the band comes from the base rate and the batch size, so a small batch does not trip on noise and a large one does not hide a real shift.
+
+<Predict id="rag-ingest-gate-threshold" question="Using a three-standard-error band, above what empty-text rate, in percent, does the gate fail the batch?" answer={0.65} tolerance={0.02} unit="%">
+<Fragment slot="prompt">
+<p>Scenario inputs: over the last 30 accepted batches, 0.5% of documents had empty text. Tonight's batch has 20,000 documents. The gate fails when the batch rate exceeds the base rate by more than three binomial standard errors.</p>
+</Fragment>
+<p>The standard error is √(0.005 × 0.995 / 20,000) ≈ 0.0005, or 0.05 percentage points. Three of them put the threshold at 0.5% + 0.15% = <b>0.65%</b>, which is 130 empty documents in this batch against an expected 100. On a 500-document batch the same rule gives a standard error of about 0.32 points and a threshold near 1.45%, so small batches need either a wider tolerance or pooling across runs. Three standard errors is a choice that trades false alarms against detection delay. A one-sided two-standard-error band is exceeded by noise 2.28% of the time; with four gates checked every night and independent noise, that fails about 4 × 0.0228 × 30 ≈ 2.7 batches a month for nothing, against 4 × 0.00135 × 30 ≈ 0.16 at three.</p>
+</Predict>
+
+The chunk-length gate has no binomial model. Take its band from the spread of the median and the 95th percentile over recent accepted batches, and fail on movement outside that spread. The accounting identity has no band at all.
+
+A failed gate keeps the previous index serving. That requires publishing as a unit: write the batch to a staged version of the index, run the gates and a small retrieval check against the staged version, and only then move reads to it. Gates are also asymmetric. A batch that fails on PII hits should still apply its deletions, because deletions only reduce what the index exposes; holding them back to keep the batch atomic would trade a compliance obligation for tidiness.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Tonight's ingest batch fails the PII gate at 03:00. It also carries 300 deletions that legal requires to be unsearchable within 24 hours, and the next scheduled run is tomorrow night. Two engineers are on call. What happens before 09:00?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Split the batch. Deletions publish now, because they only shrink exposure and the plan computes them from the source listing, independent of the new documents. Inserts and updates stay unpublished, the previous index keeps serving them, and the PII spike is triaged by source: if one connector explains it, that connector's documents are quarantined and the rest of the batch is re-gated and published. The 24-hour deletion deadline is met in either case.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The conflict is a hard deadline against a gate that exists for a reason. The way through is that the gate protects against adding content, and deletions add nothing.</p>
+<p>First, apply the deletions from the staged plan to the live index and verify with a query per deleted document id that no chunk returns. That is the legal obligation, done within the first hour.</p>
+<p>Second, break the PII hits down by source and entity type. The usual cause is a new or changed source. If one connector accounts for the spike, quarantine its documents, re-run the gates on the remainder, and publish if they pass. If the hits are spread across sources, suspect the detector or its configuration changed with the pipeline version, and publish nothing new.</p>
+<p>What I give up: freshness for the held documents until the next run, and an index that briefly reflects a partial batch. Lineage makes that state explainable. I write up the source, the hit count against the band and the decision, and I ask whether the gate should have been per-source from the start.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The spike is spread evenly across every source, and the detector did not change. What does that tell you, and do you still hold the inserts?</em></li>
+<li><em>Your gates fail one batch in ten and the team has started overriding them by habit. Which gate do you widen, and what risk do you accept in writing?</em></li>
+<li><em>The source system cannot produce a full listing, only a change feed without deletes. What do you build instead, and what does it cost to run?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+For a small corpus, all of this is overhead. If a full rebuild of the index finishes well inside the freshness requirement, rebuild from scratch on every run: a full rebuild is idempotent by construction, deletes propagate for free, and the gates run on the whole index. Incremental planning earns its complexity when a rebuild costs more than the freshness window allows.
+
+Rate gates assume batches are comparable. Onboarding a new source changes every base rate at once, so the first batches from it need their own band or a manual accept.
+
+NeMo Curator is built for training corpora at a scale where GPUs and Ray are justified; its fuzzy and semantic stages require GPUs. The stages and their parameters transfer to a retrieval corpus; the infrastructure transfers only at that scale, and a corpus that fits on one machine does not need a Ray cluster to compute MinHash signatures.
+
+Presidio, like any detector, measures what it was configured to find. A gate on its hit rate catches changes in the input, not a document type it never recognised.
+
+<SelfRate id="lesson:rag/ingestion/ingestion-pipelines" />

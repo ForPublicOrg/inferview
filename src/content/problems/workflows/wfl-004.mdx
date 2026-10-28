@@ -1,0 +1,315 @@
+---
+id: wfl-004
+title: Lease tasks by deadline without double dispatch
+subtitle: a scheduler with prerequisites and worker crashes
+track: workflows
+module: patterns
+type: code
+difficulty: hard
+seniority: [senior, staff]
+minutes: 45
+tags: [scheduling, leases, dag, earliest-deadline-first, at-least-once]
+companies:
+  - name: Scale AI
+    url: https://prachub.com/interview-questions/design-a-streaming-job-scheduler
+updated: 2026-10-28
+sources:
+  - title: PracHub, Design a Streaming Job Scheduler
+    url: https://prachub.com/interview-questions/design-a-streaming-job-scheduler
+    note: candidate report attributed to Scale AI, technical screen, posted 2026-04-09; earliest-deadline dispatch, prerequisites, at-least-once execution and no task leased to two workers at once. The problem below is original material on that topic; checked 2026-10-28
+  - title: Martin Kleppmann, How to do distributed locking (2016-02-08)
+    url: https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
+    note: a paused client can act on an expired lease; fencing tokens let storage reject the stale write
+  - title: PostgreSQL 18 documentation, SELECT, the locking clause
+    url: https://www.postgresql.org/docs/current/sql-select.html
+    note: FOR UPDATE SKIP LOCKED skips rows that cannot be locked immediately and is meant for queue-like tables
+  - title: Anthropic, Building effective agents (2024-12-19)
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: workflows orchestrate model calls through predefined code paths; a scheduler like this one is the code path
+code:
+  starter: |
+    class Scheduler:
+        """Leases runnable tasks to workers, earliest deadline first.
+
+        Time is passed in by the caller and never goes backwards. A lease taken at
+        time t lives while now < t + lease_seconds.
+        """
+
+        def __init__(self, lease_seconds):
+            self.lease_seconds = lease_seconds
+
+        def add(self, task_id, deadline, prereqs=()):
+            """Register a task. Raise ValueError for a duplicate id or an unknown prerequisite."""
+            raise NotImplementedError
+
+        def lease(self, worker, now):
+            """Lease the runnable task with the earliest deadline to worker and return its id, or None."""
+            raise NotImplementedError
+
+        def heartbeat(self, task_id, worker, now):
+            """Extend worker's live lease on task_id to now + lease_seconds. Return True if extended."""
+            raise NotImplementedError
+
+        def complete(self, task_id, worker, now):
+            """Mark task_id done if worker may complete it. Return True if accepted."""
+            raise NotImplementedError
+  tests: |
+    s = Scheduler(lease_seconds=30)
+    s.add("a", deadline=50)
+    s.add("b", deadline=10)
+    s.add("c", deadline=20, prereqs=["b"])
+    assert s.lease("w1", now=0) == "b"
+    assert s.lease("w2", now=1) == "a"
+    assert s.lease("w3", now=2) is None
+    assert s.complete("b", "w1", now=5) is True
+    assert s.lease("w3", now=6) == "c"
+    assert s.lease("w4", now=20) is None
+    assert s.heartbeat("c", "w3", now=30) is True
+    assert s.lease("w4", now=31) == "a"
+    assert s.lease("w5", now=40) is None
+    assert s.complete("a", "w2", now=41) is False
+    assert s.complete("a", "w4", now=42) is True
+    assert s.complete("a", "w4", now=43) is False
+    try:
+        s.add("a", deadline=5)
+        raise AssertionError("adding a duplicate id must raise ValueError")
+    except ValueError:
+        pass
+    import time
+    big = Scheduler(lease_seconds=60)
+    _t0 = time.perf_counter()
+    for i in range(20000):
+        big.add(f"c{i}", deadline=20000 - i, prereqs=[f"c{i-1}"] if i else [])
+        big.add(f"f{i}", deadline=(i * 7919) % 20000)
+    _order = []
+    for step in range(40000):
+        t = big.lease("w", now=step)
+        _order.append(t)
+        big.complete(t, "w", now=step)
+    _elapsed = time.perf_counter() - _t0
+    assert None not in _order and len(set(_order)) == 40000
+    assert _elapsed < 5, f"40,000 adds, leases and completions took {_elapsed:.1f} s; the budget is 5 s"
+  hidden: |
+    import random
+
+    def _simulate(seed, n_tasks=200, lease_seconds=10):
+        rng = random.Random(seed)
+        s = Scheduler(lease_seconds=lease_seconds)
+        deadline, prereqs, done, held = {}, {}, set(), {}
+        added = []
+        now = 0
+
+        def live(t, at):
+            return t in held and at < held[t][1]
+
+        def available(at):
+            return [t for t in added if t not in done and all(p in done for p in prereqs[t]) and not live(t, at)]
+
+        for step in range(4 * n_tasks):
+            now += rng.choice([0, 1, 1, 2, 5])
+            op = rng.random()
+            if len(added) < n_tasks and (op < 0.3 or not added):
+                t = f"t{len(added)}"
+                ps = rng.sample(added, min(len(added), rng.choice([0, 0, 1, 2, 3])))
+                if ps and rng.random() < 0.2:
+                    ps = ps + [ps[0]]
+                deadline[t] = rng.randint(0, 50)
+                prereqs[t] = set(ps)
+                s.add(t, deadline=deadline[t], prereqs=ps)
+                added.append(t)
+                continue
+            w = f"w{rng.randint(1, 4)}"
+            if op < 0.65:
+                got = s.lease(w, now=now)
+                avail = available(now)
+                if got is None:
+                    if avail:
+                        return f"lease returned None with {len(avail)} runnable tasks"
+                    continue
+                if got not in avail:
+                    return f"lease returned {got!r}, which is done, blocked or leased to another worker"
+                if deadline[got] != min(deadline[t] for t in avail):
+                    return f"lease returned {got!r} but a runnable task has an earlier deadline"
+                held[got] = (w, now + lease_seconds)
+            else:
+                mine = [t for t, (hw, _) in held.items() if hw == w]
+                t = rng.choice(mine) if mine and rng.random() < 0.9 else rng.choice(added)
+                holds_live = t in held and held[t][0] == w and live(t, now)
+                other_live = t in held and held[t][0] != w and live(t, now)
+                if op < 0.8:
+                    ok = s.heartbeat(t, w, now=now)
+                    if holds_live and not ok:
+                        return f"heartbeat refused {w} on {t!r} while its lease was live"
+                    if ok and (other_live or t in done or t not in held or held[t][0] != w):
+                        return f"heartbeat granted {w} a lease on {t!r} it did not hold"
+                    if ok:
+                        held[t] = (w, now + lease_seconds)
+                else:
+                    ok = s.complete(t, w, now=now)
+                    if holds_live and not ok and t not in done:
+                        return f"complete refused {w} on {t!r} while its lease was live"
+                    if ok and (other_live or t in done or t not in held or held[t][0] != w):
+                        return f"complete accepted {w} on {t!r} without its lease, or twice"
+                    if ok:
+                        done.add(t)
+                        del held[t]
+        return None
+
+    assert all(_simulate(seed) is None for seed in range(25))
+    s2 = Scheduler(lease_seconds=5)
+    try:
+        s2.add("x", deadline=1, prereqs=["missing"])
+        raise AssertionError
+    except ValueError:
+        pass
+    s3 = Scheduler(lease_seconds=5)
+    s3.add("p", deadline=9)
+    assert s3.lease("w", now=0) == "p" and s3.complete("p", "w", now=1)
+    s3.add("q", deadline=3, prereqs=["p", "p"])
+    assert s3.lease("w", now=2) == "q"
+    import time
+    fan = Scheduler(lease_seconds=100)
+    _t0 = time.perf_counter()
+    fan.add("root", deadline=0)
+    for i in range(20000):
+        fan.add(f"leaf{i}", deadline=i % 977, prereqs=["root"])
+    fan.add("sink", deadline=-1, prereqs=[f"leaf{i}" for i in range(20000)])
+    assert fan.lease("w", now=0) == "root" and fan.complete("root", "w", now=0)
+    for i in range(20000):
+        _t = fan.lease("w", now=1)
+        assert _t is not None and _t.startswith("leaf")
+        fan.complete(_t, "w", now=1)
+    assert fan.lease("w", now=2) == "sink"
+    assert time.perf_counter() - _t0 < 5
+  solution: |
+    import heapq
+
+
+    class Scheduler:
+        def __init__(self, lease_seconds):
+            self.lease_seconds = lease_seconds
+            self.deadline = {}
+            self.waiting_on = {}      # task -> number of prerequisites not yet done
+            self.dependents = {}      # task -> tasks that wait on it
+            self.done = set()
+            self.ready = []           # heap of (deadline, task) for runnable, unleased tasks
+            self.holder = {}          # task -> (worker, expires_at) for leased tasks
+            self.expiries = []        # heap of (expires_at, task, worker); stale entries are skipped
+
+        def add(self, task_id, deadline, prereqs=()):
+            if task_id in self.deadline:
+                raise ValueError(f"duplicate task {task_id!r}")
+            for p in prereqs:
+                if p not in self.deadline:
+                    raise ValueError(f"unknown prerequisite {p!r}")
+            self.deadline[task_id] = deadline
+            self.dependents[task_id] = []
+            pending = 0
+            for p in set(prereqs):
+                if p not in self.done:
+                    pending += 1
+                    self.dependents[p].append(task_id)
+            self.waiting_on[task_id] = pending
+            if pending == 0:
+                heapq.heappush(self.ready, (deadline, task_id))
+
+        def _reclaim(self, now):
+            while self.expiries and self.expiries[0][0] <= now:
+                expires_at, task, worker = heapq.heappop(self.expiries)
+                if self.holder.get(task) == (worker, expires_at):
+                    del self.holder[task]
+                    heapq.heappush(self.ready, (self.deadline[task], task))
+
+        def lease(self, worker, now):
+            self._reclaim(now)
+            while self.ready:
+                _, task = heapq.heappop(self.ready)
+                if task in self.done or task in self.holder:
+                    continue
+                expires_at = now + self.lease_seconds
+                self.holder[task] = (worker, expires_at)
+                heapq.heappush(self.expiries, (expires_at, task, worker))
+                return task
+            return None
+
+        def heartbeat(self, task_id, worker, now):
+            self._reclaim(now)
+            held = self.holder.get(task_id)
+            if held is None or held[0] != worker:
+                return False
+            expires_at = now + self.lease_seconds
+            self.holder[task_id] = (worker, expires_at)
+            heapq.heappush(self.expiries, (expires_at, task_id, worker))
+            return True
+
+        def complete(self, task_id, worker, now):
+            self._reclaim(now)
+            held = self.holder.get(task_id)
+            if task_id in self.done or held is None or held[0] != worker:
+                return False
+            del self.holder[task_id]
+            self.done.add(task_id)
+            for d in self.dependents[task_id]:
+                self.waiting_on[d] -= 1
+                if self.waiting_on[d] == 0:
+                    heapq.heappush(self.ready, (self.deadline[d], d))
+            return True
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Coding round">
+"Model pipelines hand out work to a pool of workers. Write the in-process scheduler that decides which task a worker gets next."
+</Callout>
+
+Implement `Scheduler(lease_seconds)` with four methods. Time is an argument (`now`, a number that never goes backwards), so the tests can move the clock.
+
+- `add(task_id, deadline, prereqs=())` registers a task. It raises `ValueError` for a duplicate id or for a prerequisite that has not been added.
+- `lease(worker, now)` gives `worker` the runnable task with the earliest deadline and returns its id, or `None` when nothing is runnable. A task is runnable when every prerequisite is complete, it is not complete itself, and nobody holds a live lease on it. A lease taken at time `t` is live while `now < t + lease_seconds`.
+- `heartbeat(task_id, worker, now)` extends a live lease held by `worker` to `now + lease_seconds` and returns `True`; otherwise it returns `False`.
+- `complete(task_id, worker, now)` returns `True` when the completion is accepted and the task is done. A worker holding a live lease can always complete. A worker whose lease passed to another worker cannot. A task completes at most once.
+
+Workers crash without telling anyone; a crashed worker stops sending heartbeats. Execution is at least once: a task may run twice across a crash, but no task is ever leased to two workers whose leases are live at the same time.
+
+Two decisions are yours, and the hidden tests accept either answer as long as the rules above hold: how to break a tie between equal deadlines, and what to do with a late completion from a worker whose lease expired while nobody else took the task. Write your choice and its cost next to the code.
+
+The visible tests end with 40,000 tasks pushed through `add`, `lease` and `complete` in under 5 seconds; the hidden tests add a fan-out and a fan-in of the same size.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how many tasks are pending at peak and how many lease calls arrive per second; that pair decides whether any per-call scan over all tasks is affordable.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the downstream system does when a task's side effect happens twice, and whether it can tell the two apart.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask whether a task can ever name a prerequisite that has not been submitted yet, and what should happen to it.</p></details>
+
+## Answer
+
+The reference solution keeps five structures. `ready` is a min-heap of `(deadline, task_id)` holding runnable, unleased tasks. `holder` maps a leased task to `(worker, expires_at)`. `expiries` is a min-heap of `(expires_at, task_id, worker)`. `waiting_on` counts each task's unfinished prerequisites, and `dependents` is the reverse edge list. Every public method first pops the `expiries` entries with `expires_at <= now`; an entry reclaims its task only if `holder` still has exactly that `(worker, expires_at)` pair, so a heartbeat, which pushes a new entry, makes the old one stale without a delete. `lease` pops `ready` until it finds a task that is neither done nor held. `complete` checks the holder, marks the task done and decrements `waiting_on` for each dependent, pushing the ones that reach zero.
+
+Each call costs `O(log n)` amortised, and each completion touches only its own dependents, so prerequisite bookkeeping for the whole graph is `O(V + E)`. A scan that rechecks every task on each `lease` is `O(n)` per call: at 40,000 calls that is 40,000 × 40,000 / 2 = 800 million task visits, far past the test's budget in any Python interpreter.
+
+Requiring prerequisites to exist at `add` time makes the graph acyclic by construction, since an edge always points to an older task, so no cycle check is needed. Prerequisite lists are deduplicated with `set(prereqs)`; counting `len(prereqs)` leaves a task with a repeated prerequisite blocked forever, and the hidden tests include one.
+
+The two policy decisions:
+
+- Tie-break. Breaking ties by `task_id` makes runs reproducible, which matters when a replay of a production trace must hand out the same order. Breaking ties by submission order is fairer to callers who submit early. The heap tuple decides; the tests check only that the returned deadline is the minimum among runnable tasks.
+- Late completion with nobody else holding the task. The reference rejects it: the expired lease is reclaimed on the next call, the task goes back into `ready`, and it runs again. That costs a second execution of work that already finished. Accepting it saves the rerun, but `complete` must then also pull the task out of `ready`, and the scheduler has taken a result from a worker it had already declared dead, which is the case where that worker may have been paused rather than crashed and may still be writing.
+
+The constraint conflict is recovery time against duplicate work. A short `lease_seconds` recovers a crashed worker's task quickly but turns every slow run into a duplicate; a long one avoids duplicates and leaves a crashed worker's task idle for the whole lease. Choose it from the measured run time of the task type: without heartbeats, a lease below the p99 run time duplicates at least the slowest one percent of runs; with a heartbeat every third of the lease, the lease can stay short.
+
+A failure mode of this answer: the `expiries` heap grows by one entry per heartbeat and shrinks only as entries come due. A worker heartbeating every second on a 60-second lease keeps about 60 entries per task in the heap. Memory stays bounded by heartbeat rate × lease length × leased tasks, which is fine at this scale; with frequent heartbeats, rebuild the heap from `holder` when stale entries outnumber live ones by a factor you pick.
+
+## Follow-ups
+
+- *What changes to run this against a real database with several scheduler processes?* The in-memory `holder` becomes a row with a lease version. `lease` becomes `SELECT ... ORDER BY deadline LIMIT 1 FOR UPDATE SKIP LOCKED` followed by an update that sets the holder and the expiry from the database clock, never the worker's. `complete` becomes a conditional update on the lease version, and the version doubles as a fencing token that the side-effect target checks, so a worker that paused past its lease cannot write after its successor.
+- *Pushback: fencing means every downstream system checks a version you own, and two of them are third-party APIs that cannot. Which guarantee do you drop, and what goes in the runbook?* For those targets, send the idempotency key the API accepts, keyed on the task id; accept in writing that a paused worker can still race inside the provider's key window; and before rerunning a task whose holder expired mid-call, query the target for the outcome.
+- *Reversal: what would you need to see in production to switch from rejecting late completions to accepting them?* A measured cost per duplicate run (model spend or downstream rework) that outweighs the rare unsafe acceptance, and lease logs showing that expired-lease completions almost never come from a worker that is still running.
+- *The pool is overloaded and some tasks will miss their deadlines whatever you do. Do you keep earliest deadline first?* Under overload it keeps serving tasks that will miss anyway and drags others past their deadlines with them. Admission control (refuse or demote a task whose deadline is closer than its expected run time) or ordering by the cost of a miss can do better; decide from the measured miss cost per task class.
+
+## Common mistakes
+
+- Scanning every task on each `lease`, or rechecking every blocked task on each `complete`.
+- Deleting from the middle of a heap on heartbeat instead of leaving the old entry to be skipped.
+- Accepting a completion from a worker whose lease has passed to another worker.
+- Counting a repeated prerequisite twice, so the task never becomes runnable.
+- Using the worker's clock to decide lease expiry once the scheduler is distributed.

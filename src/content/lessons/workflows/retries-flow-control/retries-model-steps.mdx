@@ -1,0 +1,204 @@
+---
+title: Idempotency and retries when a step is a model call
+track: workflows
+module: retries-flow-control
+order: 1
+kind: lesson
+level: senior
+minutes: 14
+summary: A durable engine runs each step at least once, so a model step needs one retry layer, a classifier that refuses to retry the errors that cannot succeed, and an idempotency key derived from the business step rather than the attempt.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Timeouts, retries and backoff with jitter (Marc Brooker, Amazon Builders' Library, 2019-12-05)
+    url: https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter
+    note: five-deep stack with three retries per layer puts 243 times the load on the database; retry at a single point in the stack; local token bucket for retries added to the AWS SDK in 2016; side effects are not safe to retry without idempotency; timeouts from a chosen false-timeout rate such as 0.1 percent (p99.9)
+  - title: Temporal docs, retry policies
+    url: https://docs.temporal.io/encyclopedia/retry-policies
+    note: default Activity policy of 1 s initial interval, coefficient 2.0, maximum interval 100 times the initial, unlimited attempts and no non-retryable errors; Workflows do not retry by default; non_retryable ApplicationError; next retry delay override
+  - title: Temporal docs, detecting Activity failures
+    url: https://docs.temporal.io/encyclopedia/detecting-activity-failures
+    note: Start-To-Close has no default and is strongly recommended; must exceed the longest possible Activity time; Schedule-To-Close defaults to infinity; Heartbeat Timeout capped at Start-To-Close
+  - title: Temporal docs, Activity Definition
+    url: https://docs.temporal.io/activity-definition
+    note: Activities may execute more than once and partially complete more than once; Workflow Run ID plus Activity ID as an idempotency key; Worker crash after completion and before reporting
+  - title: Temporal docs, Workflow Id and Run Id
+    url: https://docs.temporal.io/workflow-execution/workflowid-runid
+    note: Retry, Reset, Cron and Continue-As-New change the current Run Id; a closed Workflow Id can be reused under the reuse policy
+  - title: Stripe API reference, idempotent requests
+    url: https://docs.stripe.com/api/idempotent_requests
+    note: API v1 saves the status code and body of the first request once execution begins, including 500s; keys up to 255 characters; keys can be pruned after at least 24 hours and a reused key then creates a new request; parameters compared with the original
+  - title: Claude docs, rate limits
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: spend-cap 429 is rate_limit_error with error_code enforced_spend_limit_reached and no retry-after, paused until 00:00 UTC on the first of the next month; a user-set spend limit returns 400
+  - title: Claude docs, Python SDK
+    url: https://platform.claude.com/docs/en/cli-sdks-libraries/sdks/python
+    note: 2 automatic retries by default on connection errors, 408, 409, 429 and 5xx; max_retries=0 disables them; 10-minute default timeout and timed-out requests are retried
+  - title: OpenAI API docs, flex processing
+    url: https://developers.openai.com/api/docs/guides/flex-processing
+    note: 429 Resource Unavailable is not charged; retry with backoff or retry on the standard tier with service_tier auto; examples raise the 10-minute SDK timeout to 15 minutes
+  - title: OpenAI API docs, rate limits
+    url: https://developers.openai.com/api/docs/guides/rate-limits
+    note: unsuccessful requests count toward the per-minute limit; do not retry quota or billing errors
+  - title: Claude docs, batch processing
+    url: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+    note: a Messages request can carry server tools such as web search, web fetch, code execution and MCP connectors; results matched by custom_id; errored and expired requests are not billed
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The guarantee you actually get
+
+A durable execution engine gives each step at-least-once execution. Temporal's own wording is that, with retries allowed, an Activity is "observed as completed exactly once", and the same page warns that it may run several times and may partially complete more than once. The case it describes is the one that bites: the Activity finishes, the Worker crashes before reporting, the history shows no completion, and the engine runs it again. Exactly-once outcomes come from pairing that at-least-once step with an effect the far side deduplicates, which means an idempotency key or a provider that deduplicates on its own.
+
+A model step breaks two assumptions that make this pairing routine for ordinary RPCs.
+
+The first is that a retry reproduces the request's result. A retried model call returns a different completion, so "the step's output" is whatever the last successful attempt happened to say. If a later step derives its parameters from that text, two attempts of the same logical step can send two different payloads under one key.
+
+The second is that a failed attempt is cheap. Every attempt that reaches the provider spends rate-limit headroom, and OpenAI's rate-limit guide states that unsuccessful requests count toward the per-minute limit. A retry policy that is harmless for a database read can drain a shared token bucket for every other run on the same organisation.
+
+## Retry in one place
+
+Marc Brooker's Builders' Library article describes a five-deep stack where every layer retries three times: the database at the bottom sees 3<sup>5</sup> = 243 times the load, which makes recovery unlikely. His rule for cheap operations is to retry at a single point in the stack.
+
+A workflow with a model step has more layers than it looks. The engine retries the Activity. Inside the Activity, the Anthropic Python SDK retries connection errors, 408, 409, 429 and 5xx twice by default, so one SDK call is up to three HTTP requests. Put an LLM gateway with its own retry between the SDK and the provider and there is a third multiplier.
+
+<Predict id="wfl-rfc-stacked-attempts" question="An Activity has maximum attempts 4. It calls the Anthropic SDK with default retries, through a gateway that retries twice. How many provider requests can one logical step send?" answer={36} tolerance={0} unit="requests">
+<p><b>36.</b> The engine makes 4 attempts; each runs one SDK call of up to 3 requests (1 plus 2 retries); each of those passes a gateway that makes up to 3 (1 plus 2 retries): 4 × 3 × 3 = 36. With Temporal's default policy the first factor is unlimited, so there is no ceiling at all.</p>
+</Predict>
+
+For a model step inside a durable workflow, the engine is the right single point. Its retries are recorded in the event history, survive a Worker crash, respect a schedule-wide deadline, and can be stopped by marking an error non-retryable. The SDK's retries are invisible to the history and restart from zero when the Worker dies. Set `max_retries=0` on the client used inside Activities and make the gateway pass errors through.
+
+What this gives up: a connection reset the SDK would have retried at once now waits for an Activity retry and its 1-second initial interval. If resets dominate your failures, one SDK retry for connection errors is defensible, provided you count it in the multiplication above.
+
+Placement bounds the multiplier; a retry budget bounds the total. Brooker describes the AWS SDK's local token bucket (added in 2016): calls retry while tokens remain, then at a fixed rate. That caps retries at a fraction of successful traffic, which matters when the provider is shared and one workflow's retries are another's 429s.
+
+## The default policy retries forever
+
+Temporal's default Activity retry policy is an initial interval of 1 second, a backoff coefficient of 2.0, a maximum interval of 100 times the initial (100 seconds), unlimited attempts, and an empty list of non-retryable errors. Workflows themselves do not retry by default; Activities do.
+
+Run that policy against an error that can never succeed, such as a 400 from a prompt that exceeds the context window or a malformed tool schema.
+
+<Predict id="wfl-rfc-default-policy" question="Under Temporal's default Activity retry policy, ignoring the time each failed call takes, how many attempts does a permanently failing Activity make in its first 24 hours?" answer={870} tolerance={30} unit="attempts">
+<p><b>About 870.</b> The waits before attempts 2 to 8 are 1, 2, 4, 8, 16, 32 and 64 seconds, so attempt 8 starts at 127 s. Every later wait is capped at 100 s. Attempts that start by 86,400 s: 8 + floor((86,400 − 127) / 100) = 8 + 862 = 870. After the first hour (42 attempts) it settles at 36 per hour, with no end, because nothing in the default policy says stop.</p>
+</Predict>
+
+Each attempt counts toward per-minute limits on OpenAI, and the run is stuck with nobody alerted. The fix is classification at the boundary of the Activity, before the error reaches the engine. In the Python SDK, raising `ApplicationError(..., non_retryable=True)` stops retries regardless of policy; Temporal also lets a failure carry a next-retry delay that overrides the computed interval, which is where a provider's `retry-after` belongs.
+
+Three classes cover model providers:
+
+**Retry with backoff.** 408, 409, 5xx, connection errors, and a 429 that carries `retry-after`. Use the header as the next delay. OpenAI's flex tier adds one more: its 429 Resource Unavailable is not charged, and the guide offers two responses, back off and retry on flex, or retry once with `service_tier` set to `auto` and pay standard prices. That choice is a cost decision per step, not a transport detail.
+
+**Fail the step.** 400, 401, 403, 404, 413 and anything else where the same request produces the same answer. Mark it non-retryable and route the run to a repair path or a person.
+
+**Pause the whole workflow class.** Claude's spend-cap response is a 429 of type `rate_limit_error`, the same type as an ordinary rate limit, but it carries no `retry-after` and `error.details.error_code` is `enforced_spend_limit_reached`. Usage stays paused until 00:00 UTC on the first day of the next month unless the tier is raised. The SDK's automatic retries retry it, because they key on the status code. A classifier that reads only the status turns this into hundreds of thousands of doomed attempts across a fleet; the right response is to stop admitting new runs and page someone. A spend limit you set yourself below the tier cap returns a 400 `invalid_request_error`, which a status-only classifier fails as a bad request.
+
+<Callout kind="gotcha">
+OpenAI's rate-limit guide says not to retry quota or billing errors. Claude's spend-cap 429 is the same kind of error wearing a retryable status code. Classify on the error body, not on the status alone.
+</Callout>
+
+## Timeouts that agree with each other
+
+Temporal's Start-To-Close timeout bounds one attempt. It has no default, the docs strongly recommend setting it, and they require it to be longer than the longest time the Activity can take, because the server does not otherwise notice a Worker that crashed or lost its connection. Schedule-To-Close bounds the whole Activity across attempts and defaults to infinity.
+
+A model step has a second clock inside it. Both official Python SDKs default to a 10-minute request timeout, and the Anthropic SDK retries timed-out requests twice. OpenAI's flex examples raise the timeout to 15 minutes because flex requests queue. If Start-To-Close is shorter than the SDK's timeout times its attempts, the engine abandons an attempt while the SDK is still waiting on, or retrying, a request the provider may still be processing. Either size Start-To-Close above the SDK's worst case, or, better, set the SDK timeout from the step's latency distribution and let Start-To-Close be that plus a margin.
+
+Brooker's procedure for picking the number applies unchanged: choose an acceptable false-timeout rate, such as 0.1 percent, and read the matching percentile, p99.9, from the step's own latency history. Model latency scales with output length, so measure it per step and per model, not per provider. Long steps, such as a batch poll or a long generation, need heartbeats; Temporal caps the Heartbeat Timeout at Start-To-Close and recommends a short heartbeat timeout with frequent heartbeats for long-running Activities.
+
+## Keys from the step, not the attempt
+
+Temporal suggests combining the Workflow Run ID and the Activity ID as an idempotency key, because that pair is stable across retry attempts and unique across executions. It is stable across attempts. It is not stable across runs: Retry, Reset, Cron and Continue-As-New each create a new run with a new Run ID. Reset a stuck workflow after a payout Activity succeeded but before the history recorded it, and the run-scoped key changes, so the provider sees a new request.
+
+For an effect that must happen once per business event, derive the key from the business identity and the step name: the claim ID and "payout", the invoice ID and "send". That survives every run operation. It also exposes a second hazard: Temporal lets a closed Workflow ID be reused under its reuse policy, so if the Workflow ID is the key's only input and IDs are recycled, two business events can share a key.
+
+Stripe's semantics show the two ways a correct key still fails.
+
+**The window.** Under API v1, Stripe may prune a key once it is at least 24 hours old, and a request that reuses a pruned key is processed as a new request. Under Temporal's default policy the Activity can still be retrying on day two. Set Schedule-To-Close on any keyed effect below the provider's key retention, and fail to a person after that.
+
+**The parameters.** Stripe compares an incoming request's parameters with the original and returns an error if they differ. If the step that calls Stripe also calls the model, and the model writes the description or picks the amount, the second attempt sends different parameters under the same key. The fix is structural: the model call is its own Activity, its result lands in the event history once, and the effect Activity reads that recorded result. A retry of the effect then sends byte-identical parameters, and a retry of the model step happens before any key exists.
+
+Stripe v1 also saves 500 responses, so retrying a 500 under the same key returns the same 500, while validation failures and concurrent-request conflicts are not saved and can be retried. API v2 instead retries failed work to completion on Stripe's side. "Has idempotency keys" is not one behaviour; read each provider's.
+
+## The step boundary in code
+
+The classifier, the key and the budget fit in a page of standard-library Python. The Activity wrapper would call `classify` on every provider error and raise a non-retryable `ApplicationError` for "fail" and "pause".
+
+```python
+import hashlib
+
+def classify(status, body):
+    """Map one provider response to retry, fail or pause."""
+    if status == 429:
+        code = body.get("error", {}).get("details", {}).get("error_code")
+        # Claude's spend-cap 429 has no retry-after and lasts until the next month.
+        return "pause" if code == "enforced_spend_limit_reached" else "retry"
+    if status in (408, 409) or status >= 500:
+        return "retry"
+    return "fail"  # 400, 401, 403, 404, 413: the same request fails the same way
+
+def effect_key(business_id, step):
+    """Same key on every attempt, every run reset and every Continue-As-New."""
+    return hashlib.sha256(f"{business_id}:{step}".encode()).hexdigest()
+
+class RetryBudget:
+    """Retries spend a token; each success refunds a fraction of one."""
+    def __init__(self, capacity=50.0, refund=0.1):
+        self.tokens = self.capacity = capacity
+        self.refund = refund
+    def allow_retry(self):
+        if self.tokens < 1:
+            return False
+        self.tokens -= 1
+        return True
+    def on_success(self):
+        self.tokens = min(self.capacity, self.tokens + self.refund)
+
+spend_cap = {"error": {"type": "rate_limit_error",
+                       "details": {"error_code": "enforced_spend_limit_reached"}}}
+assert classify(429, spend_cap) == "pause"
+assert classify(429, {"error": {"type": "rate_limit_error"}}) == "retry"
+assert classify(400, {}) == "fail"
+assert effect_key("claim-8812", "payout") == effect_key("claim-8812", "payout")
+
+budget = RetryBudget(capacity=5)
+print([budget.allow_retry() for _ in range(7)])  # five retries, then the budget is dry
+```
+
+With a refund of 0.1, sustained retries are capped at one per ten successes per Worker. A shared budget across Workers needs a shared counter, which is the admission-control problem the next lesson takes up.
+
+## In the room
+
+A claims workflow reads each claim with a model, then issues a payout through a payments API. The provider is failing 20 percent of model calls this morning, the payout file must reach the bank by 06:00, and finance will not accept a duplicate payout. Where do retries live, what are the keys, and what do you give up?
+
+<Depth>
+<Fragment slot="short">
+<p>Two Activities per claim: the model read, then the payout. Retries live only in the engine, with SDK retries off and a classifier that fails 4xx and pauses on a spend cap. The model's output is recorded once in history and the payout reads it, so the payout's parameters are identical on every attempt. The payout key is the claim ID plus "payout", never the Run ID, and the payout's Schedule-To-Close sits inside both the 06:00 cut-off and the provider's key retention. Claims that miss the cut-off go to the next cycle, not to an unbounded retry.</p>
+</Fragment>
+<Fragment slot="long">
+<p>At a 20 percent independent failure rate, each successful call costs on average 1 / 0.8 = 1.25 attempts, which is affordable; the risk is correlated failure, where the rate climbs and every run retries at once. A fleet-wide retry budget caps the extra load at a fixed fraction of successes, and runs that cannot get a retry token wait in the queue rather than hitting the provider.</p>
+<p>The deadline sets the model step's Schedule-To-Close: the latest moment a claim can still be read, have its payout built and make the file. Past that, the run stops retrying and lands in a list for the next cycle with the reason attached. That is the cost written down: some claims are paid a day late, which finance has to accept in writing in exchange for no duplicates.</p>
+<p>The failure mode of this design: the claim-ID key prevents a duplicate payout only for the same claim and step. A claim reopened as a new business event needs a new key, and if someone reuses the claim ID for the reopening inside the key's retention, the provider either returns the original payout's saved response or rejects the changed parameters. Either way the reopened claim is not paid. Key inputs belong in the design review.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Finance asks you to drop retries on the model step entirely so the file is never late. What fraction of claims misses the cycle at today's 20 percent failure rate, and who signs off on that number?</li>
+<li>Connection resets are 70 percent of today's failures and each Activity retry adds a second of scheduling. What would you need to measure before putting one SDK retry back, and how does it change the multiplication?</li>
+<li>The payments provider is replaced by one whose keys expire after one hour. Which timeout changes, and what happens to a claim whose payout Activity is still retrying at minute 61?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The lesson treats the model call as free of side effects. A Messages request can carry server tools that run on the provider's side, including web search, web fetch, code execution and MCP connectors. A retried call with an MCP connector that writes to a ticketing system is an effect with no idempotency key, and the engine cannot help: either the tool server deduplicates, or the tool call moves out of the model request into its own keyed Activity.
+
+"Retry in one place" assumes the lower layers fail cheaply and quickly. A step that streams a long generation and loses the connection at minute eight has spent the tokens; an Activity retry starts from zero. For long generations, the provider's batch interface (results matched by `custom_id`, errored and expired requests not billed, per Anthropic's batch docs) or checkpointing the partial output can beat any retry policy.
+
+The keyed-effect pattern assumes one effect per step. A step that writes to two systems needs two keys and a decision about what happens when the first succeeds and the second is rejected; that is an outbox or a saga, not a retry policy.
+
+Every default quoted here was read from the vendor docs on 28 October 2026, and they change between SDK and API versions.
+
+<SelfRate id="lesson:workflows/retries-flow-control/retries-model-steps" />

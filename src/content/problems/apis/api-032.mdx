@@ -1,0 +1,128 @@
+---
+id: api-032
+title: Research runs finish early after a dependency bump
+subtitle: rank the causes, then fix
+track: apis
+module: frameworks
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [langgraph, langchain, upgrades, step-limits, error-handling, debugging]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: langgraph, libs/langgraph/langgraph/_internal/_config.py on main (checked 2026-10-28)
+    url: https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/_internal/_config.py
+    note: "DEFAULT_RECURSION_LIMIT reads LANGGRAPH_DEFAULT_RECURSION_LIMIT, fallback 10007; merge_configs skips only the sentinel default instance, so an explicit limit equal to the default now applies"
+  - title: "langgraph commit 6c4ceb1, fix: apply an explicit recursion_limit equal to the default (#9417, 2026-10-24)"
+    url: https://github.com/langchain-ai/langgraph/commit/6c4ceb1332
+    note: "merge_configs used to compare recursion_limit with DEFAULT_RECURSION_LIMIT, so an explicit limit equal to the default was dropped; with LANGGRAPH_DEFAULT_RECURSION_LIMIT=1000, agent.with_config(recursion_limit=1000) silently kept the 9999 that create_agent binds"
+  - title: langgraph releases 1.2.17 and 1.2.18 (GitHub, 2026-10-24 and 2026-10-26)
+    url: https://github.com/langchain-ai/langgraph/releases
+    note: "1.2.17 includes #9417; 1.2.18 streams the last checkpoint of a run stopped by the recursion limit"
+  - title: langchain, libs/langchain_v1/langchain/agents/factory.py on master (checked 2026-10-28)
+    url: https://github.com/langchain-ai/langchain/blob/master/libs/langchain_v1/langchain/agents/factory.py
+    note: "create_agent binds recursion_limit 9_999; middleware hooks become graph nodes such as <name>.after_agent"
+  - title: LangGraph docs, Graph API (checked 2026-10-28)
+    url: https://docs.langchain.com/oss/python/langgraph/graph-api
+    note: "the recursion limit caps super-steps and raises GraphRecursionError; recursion_limit is a top-level config key; RemainingSteps for proactive routing"
+choices:
+  - text: The upgrade now honours the explicit with_config limit of 60, which older releases dropped because it equalled the default
+    correct: true
+    why: Since langgraph 1.2.17 an explicit limit equal to the env default applies instead of being skipped, so the 9,999 bound by create_agent no longer wins and runs stop near 60 super-steps.
+  - text: The lower summarisation trigger compacts history sooner, so the agent loses its search plan and decides to stop early
+    correct: false
+    why: Earlier compaction can shorten plans, but it would not produce a hard ceiling on tool batches with no run above it, and it does not explain answers that announce a next search.
+  - text: The except branch turns a recursion error into a completed answer, so runs that hit the step cap are reported as successes
+    correct: false
+    why: This is a real defect and it hides the failure, but the branch predates the deploy; it explains why there is no error, not why runs started hitting a cap.
+  - text: langchain 1.4.7 binds a lower recursion limit inside create_agent than before, so every compiled agent now halts sooner
+    correct: false
+    why: create_agent on master binds 9,999, far above the observed ceiling; the ceiling matches the service's own configured value.
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+A research agent answers analysts' questions by searching internal filings in a loop and writing a cited summary. It runs on LangChain's `create_agent` with summarisation middleware and a Postgres checkpointer. On 27 October a deploy shipped a lockfile refresh and a settings change. Since then analysts report answers that are shorter, cite fewer filings, and sometimes end with a sentence such as "Next I will search the 2025 annual report." There are no errors in the service's logs and every run is recorded as `completed`.
+
+What the team has (scenario data):
+
+```text
+lockfile diff (27 Oct deploy)
+  langgraph            1.2.16 -> 1.2.18
+  langchain            1.4.5  -> 1.4.7
+  langchain-anthropic  minor bump
+settings.py diff (same deploy)
+  SUMMARY_TRIGGER_TOKENS   120_000 -> 80_000
+
+base image (platform team, unchanged since August)
+  ENV LANGGRAPH_DEFAULT_RECURSION_LIMIT=60
+
+tool batches per run         before deploy    after deploy
+  median                     9                8
+  p99                        41               19
+  max                        47               19
+```
+
+```python
+# settings.py
+MAX_STEPS = int(os.environ.get("LANGGRAPH_DEFAULT_RECURSION_LIMIT", "60"))
+SUMMARY_TRIGGER_TOKENS = 80_000
+
+# agent.py
+agent = create_agent(
+    MODEL,
+    tools=SEARCH_TOOLS,
+    middleware=[SummarizationMiddleware(model=SUMMARY_MODEL, **summary_kwargs(SUMMARY_TRIGGER_TOKENS))],
+    checkpointer=saver,
+)
+agent = agent.with_config(recursion_limit=MAX_STEPS)
+
+def run(question, thread_id):
+    cfg = {"configurable": {"thread_id": thread_id}}
+    try:
+        state = agent.invoke({"messages": [("user", question)]}, cfg)
+    except GraphRecursionError:
+        log.debug("step budget reached", extra={"thread": thread_id})
+        state = agent.get_state(cfg).values
+    return {"answer": state["messages"][-1].content, "status": "completed"}
+```
+
+Which cause explains why runs started ending early after the deploy?
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the super-step count at which each run since the deploy stopped, next to the limit the graph actually ran with.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the release notes of every package in the lockfile diff that touch configuration merging.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Which of the observed numbers is a ceiling rather than a shift in the distribution?</p></details>
+
+## Answer
+
+The ceiling is the tell. The median barely moved and the p99 and the maximum collapsed onto one value, which is what a hard cap does and what earlier summarisation does not. With summarisation middleware, each loop iteration runs a middleware node, the model node and the tools node, so a limit of 60 super-steps leaves room for about 19 tool batches, which is the observed maximum.
+
+The cap was in the code since August: `with_config(recursion_limit=MAX_STEPS)` with `MAX_STEPS` read from the same environment variable that sets LangGraph's default. Before langgraph 1.2.17, `merge_configs` decided whether a limit was explicit by comparing it with the default; 60 equalled 60, so the explicit value was dropped and the 9,999 that `create_agent` binds stayed in force. The fix merged on 24 October (#9417) makes the default a sentinel, so an explicit 60 now applies. The team's guard started working, at a value nobody had sized.
+
+The except branch is the second defect and the reason nobody saw it. It turns `GraphRecursionError` into `completed`, returns the last message (often an AI turn announcing its next tool call), and logs at debug level. It predates the deploy.
+
+**What the evidence does not show.** No stop reason or step count is recorded per run. Collect both before changing anything: log the effective `recursion_limit` from the merged config and the step at which each run ended. Without that data, a one-line test on a staging copy (run one long question with 1.2.16 and 1.2.18) confirms the mechanism in minutes.
+
+**The fix, with two defensible choices.** Choice 1: remove `with_config` and rely on a cost budget (tokens or wall time per run) enforced in the service, accepting that `create_agent`'s 9,999 is the only step cap. Cost: a looping run burns budget before it stops. Choice 2: keep a step cap, decoupled from the platform variable, sized from data (the pre-deploy maximum was 47 tool batches, so at three super-steps per batch something above 141 plus headroom), and alert when runs reach a fraction of it. Cost: the cap must be revisited whenever middleware adds a node. Choose 2, plus three changes to `run`: return a distinct status such as `step_limit`, log it at warning level, and show analysts that the answer is partial.
+
+**Failure mode of the fix.** A cap sized from last month's maximum fails on the next long question type; the alert at a fraction of the cap is what catches that, and it needs an owner.
+
+## Follow-ups
+
+- *The platform team says the environment variable exists to stop runaway costs and refuses to let services opt out. Which half of the guard do you keep, and what risk do you accept in writing?*
+- *What would you need to see in a month of step-count data to reverse the decision and drop the step cap in favour of a cost budget alone?*
+- *Two engineers disagree: one wants to pin langgraph 1.2.16 until the incident review, the other wants to forward-fix today. How do you decide without deciding by rank?*
+
+## Common mistakes
+
+- Blaming the summarisation change because it is the only line the team edited.
+- Fixing the except branch and calling the incident closed, which makes the failures visible but leaves runs capped at 60.
+- Raising the platform variable for every service to fix one.
+- Setting `recursion_limit` inside `configurable`, where it is ignored.

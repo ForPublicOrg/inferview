@@ -1,0 +1,151 @@
+---
+id: wfl-008
+title: A deploy stalls a share of running workflows
+subtitle: rank the causes, then ship the change
+track: workflows
+module: durable-execution
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: true
+tags: [temporal, determinism, versioning, replay, deploys]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Temporal docs, Workflow Definition (deterministic constraints)
+    url: https://docs.temporal.io/workflow-definition
+    note: starting or cancelling a Timer and scheduling an Activity produce Commands that must not be reordered, added or removed; a generated Command that does not match the Event History is a non-determinism error; only changing a Timer's duration from or to 0 is called out as non-deterministic in Java, Python and Go
+  - title: Temporal docs, Python SDK versioning
+    url: https://docs.temporal.io/develop/python/workflows/versioning
+    note: patched(), deprecate_patch() and removal once pre-patch Workflows leave retention; Workflow cutovers to a new type name; replay testing to check whether a change needs a patch
+  - title: Temporal docs, Worker Versioning
+    url: https://docs.temporal.io/worker-versioning
+    note: Pinned Workflows complete on one Worker Deployment Version; Auto-Upgrade Workflows move to the latest version and must be kept replay-safe with patching; Draining and Drained states
+  - title: temporalio/sdk-python README
+    url: https://github.com/temporalio/sdk-python/blob/main/README.md
+    note: exceptions other than the configured failure types fail the workflow task, and the workflow retries until the code is fixed; workflow_failure_exception_types changes this
+  - title: Temporal docs, Retry Policies
+    url: https://docs.temporal.io/encyclopedia/retry-policies
+    note: a Maximum Attempts of 0 means unlimited, which is also the Activity default
+choices:
+  - text: Lengthening the sleep from 10 to 15 minutes, so a replayed run starts a timer that differs from the one it recorded
+    correct: false
+    why: Temporal names only a change from or to a zero duration as non-deterministic; a new duration on an existing timer still matches the recorded command type.
+  - text: Moving fetch_ticket_updates ahead of the sleep, so a replayed run schedules an activity where it recorded a timer
+    correct: true
+    why: Every run that had passed classify_ticket before the deploy recorded a TimerStarted at that position, and the new code emits ScheduleActivityTask there.
+  - text: Appending record_metrics at the end, because adding any command changes the sequence every open run has to replay
+    correct: false
+    why: No open history has reached the end of the workflow, so the new command is generated after replay finishes and has nothing to mismatch.
+  - text: Raising the draft_reply temperature, so a replayed run gets model text that differs from the result in its history
+    correct: false
+    why: Activities are not re-executed on replay; the recorded result is returned, so a new prompt or temperature cannot make replay diverge.
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"We shipped this PR at 11:40 and drafts stopped for most open tickets. Tell me what broke, what you would check before you touch anything, and how you get the change out without breaking more runs."
+</Callout>
+
+Scenario. A support platform runs one Temporal workflow per new ticket, written with the Python SDK. A model classifies the ticket, the workflow waits a cooling-off window so the customer can add detail, fetches what changed, drafts a reply with a second model call and parks the draft for an agent. The PR is titled "Fetch context before the window, longer window, prompt v7, metrics". Its workflow diff:
+
+```diff
+ @workflow.defn
+ class TriageTicket:
+     @workflow.run
+     async def run(self, ticket_id: str) -> str:
+         label = await workflow.execute_activity(
+             classify_ticket, ticket_id,
+             start_to_close_timeout=timedelta(seconds=60),
+-            retry_policy=RetryPolicy(maximum_attempts=5),
++            retry_policy=RetryPolicy(maximum_attempts=0),
+         )
+-        workflow.logger.info("classified %s", ticket_id)
++        workflow.logger.info("classified %s as %s", ticket_id, label)
+-        await workflow.sleep(timedelta(minutes=10))
+-        updates = await workflow.execute_activity(
+-            fetch_ticket_updates, ticket_id,
+-            start_to_close_timeout=timedelta(seconds=30),
+-        )
++        updates = await workflow.execute_activity(
++            fetch_ticket_updates, ticket_id,
++            start_to_close_timeout=timedelta(seconds=30),
++        )
++        await workflow.sleep(timedelta(minutes=15))
+         draft = await workflow.execute_activity(
+             draft_reply, args=[ticket_id, label, updates],
+             start_to_close_timeout=timedelta(seconds=120),
+         )
++        await workflow.execute_activity(
++            record_metrics, ticket_id,
++            start_to_close_timeout=timedelta(seconds=10),
++        )
+         return draft
+```
+
+The same PR changes `activities.py`: `draft_reply` now loads prompt template v7 and samples at temperature 0.7 instead of 0.2.
+
+What you know at 12:20 (scenario figures):
+
+- The rolling deploy replaced six workers between 11:40 and 11:46.
+- About 2,900 `TriageTicket` runs were open at 11:40.
+- From 11:50, workflow task failures tagged as non-determinism errors climb; 1,960 distinct runs are affected so far, and the count is still rising.
+- Runs started after 11:46 complete normally.
+- The log pipeline truncates lines at 512 bytes, so the part of each error that names the expected and received commands is cut off.
+- Nobody has pulled an event history yet. Support leads want drafts flowing again within 30 minutes.
+
+Pick the change that explains the failures. Then rank the other defects in the PR, and say how you ship the intended change.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Which open runs would you expect to be healthy if your hypothesis is right? Ask for the state each failing run was in at 11:40.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for one full event history from a failing run and one from a run started at 12:00, and compare the event at the same position.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what each cohort's history contains: runs started before 11:40, during the rollout, and after 11:46. Will the same code replay all three?</p></details>
+
+## Answer
+
+The reorder is the cause. Workflow code is replayed against its event history, and the commands it emits must match the recorded events in order. A run that had finished `classify_ticket` before the deploy has a `TimerStarted` event at the next position; the new code emits `ScheduleActivityTask` for `fetch_ticket_updates` there, and the worker raises a non-determinism error. The Python SDK's default treats that as a workflow task failure, so the runs are stuck retrying rather than failed: they will proceed once a worker can replay them. Runs still inside `classify_ticket` at 11:40 had no timer recorded yet, so they took the new path without complaint. That gives you a prediction to test before acting: every failing run passed classify before 11:46, and no run that was still classifying fails.
+
+Why the wrong picks are tempting. The 15-minute duration is in the same hunk as the cause and reads like the change "to the timer"; Temporal only calls out a change from or to a zero duration, and a different duration still matches the recorded command. The temperature change is the classic belief that replay re-calls the model; it does not, because `draft_reply` is an activity and its recorded result is returned. The appended `record_metrics` is a command addition, which the docs list as unsafe in general, but no open history extends past `draft_reply`, so there is nothing for it to mismatch.
+
+The secondary defects, ranked. First, `maximum_attempts=0` means unlimited attempts in Temporal: during a provider outage every open run retries a paid model call with no cap, so this is a cost and quota incident waiting for the next outage. Second, prompt v7 and the new temperature reached every open run at its next `draft_reply` call, because activity code is not versioned with the workflow; runs that started under v6 now finish under v7 with no eval of v7 behind it. Third, the reorder also changed the product: updates are now fetched before the window, so anything the customer adds during the 15 minutes is never read. Nothing else in the diff is a defect; the log line is not a command.
+
+<Depth>
+<Fragment slot="short">
+<p>Moving the activity ahead of the timer changes the command sequence for every run that had passed classify, so replay fails with a non-determinism error and those runs stall on workflow task retries. Confirm with one failing history and the Replayer. Then roll forward with <code>workflow.patched()</code> around the new order rather than reverting, because a revert breaks the runs that started on the new code. Those post-deploy runs have no patch marker, so they need a reset or a start-time branch. Separately, cap the classify retries and stop shipping prompt changes inside activity code without a version.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Collect before acting.</strong> Pull one failing history and replay it against the new code locally; the error will name the expected and received commands that the log pipeline cut. Pull a history from a run started at 12:00 to see the new order. Query open runs by start time and by whether a <code>TimerStarted</code> follows the classify result. If failing runs include ones that were still classifying at 11:40, the hypothesis is wrong and you stop. If you cannot get histories quickly, the cohort pattern (only pre-deploy runs fail, starting ten minutes after the deploy, when their timers fire) is enough to choose an action, but not enough to choose a reset point.</p>
+<p><strong>Three cohorts, one code base.</strong> Runs started before 11:40 have the old order. Runs started after 11:46 have the new order and no patch marker. Runs started during the rollout have whichever order the worker that processed their second workflow task ran. Reverting fixes the first cohort and breaks the third: every post-deploy run now replays old code against a new-order history. Rolling forward with a patch fixes the first cohort and all future runs, because <code>patched("fetch-before-window")</code> returns true for new runs and records a marker, and returns false when replaying a history without the marker. It does not fix the post-deploy cohort: those histories have the new order and no marker, so they take the old branch and fail.</p>
+<p><strong>The decision for that cohort.</strong> Option one: reset each post-deploy and rollout run to the workflow task after classify, so it re-runs from there on the patched code. Cost: everything after the reset point executes again; here that is a read and a draft, so the cost is model spend and agents seeing a second draft. Option two: branch on <code>workflow.info().start_time</code>, which comes from history and is deterministic, so runs started after 11:46 take the new order without a marker. Cost: a hard-coded timestamp in workflow code until the cohort closes, and the rollout window is still ambiguous, so those runs need a reset anyway. I would take option one when the cohort is small and the steps after the reset point have no external effects, and option two when it is large or a step after the divergence point sends something.</p>
+<p><strong>The quantity you choose: when the patch can go.</strong> Deprecate it once no open run predates the patch, and remove it after those runs leave retention, which is the order the Temporal docs give. With runs that close within an hour and a namespace retention of 7 days (scenario values), removal is safe 7 days plus the longest run after the patch deploy; removing it after one week flat leaves no margin for runs stuck in retries, which is exactly the population this incident created.</p>
+<p><strong>What changes going forward.</strong> These runs are short, so Pinned Worker Versioning is cheap: each run completes on the build it started on, and old builds drain within the hour. Add a CI job that replays a sample of recent production histories against the PR's workflow code, which would have failed this PR before it merged. Pull prompt templates out of activity code into versioned inputs recorded when the run starts.</p>
+<p><strong>Where the recommended answer fails.</strong> A reset re-executes every activity after its reset point, so if <code>record_metrics</code> or a later step had external effects, the reset would duplicate them. A patch marker id that differs between two workers during the next rollout puts you back where you started. And patching only works while someone remembers to remove it; a workflow that accumulates patches becomes a set of code paths nobody tests.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Pushback.</em> Product says resetting a few hundred runs shows agents a second, different draft, and asks you to terminate them and let agents write those replies by hand. What do you accept in writing, and who signs off?</li>
+<li><em>Reversal.</em> What would you need to see in production to move this workflow from patching to Pinned Worker Versioning for every deploy, and what run-length distribution makes you move back?</li>
+<li><em>Operating.</em> The replay job in CI needs production histories, which contain ticket text. How do you get a representative sample into CI without copying customer data into build logs?</li>
+<li><em>Two senior engineers disagree.</em> One wants unlimited retries on classify because tickets must never be dropped; the other wants five. How do you settle it without deciding by rank?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- The workflow sets `workflow_failure_exception_types` to include non-determinism errors. What changes about this incident, and about your recovery options?
+- A teammate proposes a new workflow type, `TriageTicketV2`, for the new order. What does that fix, and what does it leave stuck?
+- How would you detect a reorder like this in code review without relying on the reviewer knowing Temporal's rules?
+
+## Common mistakes
+
+- Reverting the deploy as the safe default. It breaks every run that started on the new code.
+- Blaming the prompt or temperature change. Replay returns recorded activity results; it never calls the model again.
+- Treating the stalled runs as failed and restarting them from scratch, which re-runs classify and loses the time customers already waited.
+- Wrapping the new order in `patched()` and assuming every open run is now covered, without checking which histories carry the marker.
+- Fixing the reorder and shipping the PR's `maximum_attempts=0` along with it.

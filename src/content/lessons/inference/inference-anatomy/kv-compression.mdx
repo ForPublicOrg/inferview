@@ -1,0 +1,166 @@
+---
+title: "Playbook: shrinking the KV cache"
+track: inference
+module: inference-anatomy
+order: 3
+kind: playbook
+level: staff
+minutes: 15
+summary: Architectural changes, eviction, quantisation and top-k sparse attention each shrink a different thing and fail in a different way, so the choice is made on whether the limit is resident bytes or bytes read per step, whether the model can change, and task accuracy at length measured with long-context tasks rather than needle tests.
+prerequisites: [inference/inference-anatomy/kv-capacity]
+updated: 2026-10-28
+sources:
+  - title: "Fast Transformer Decoding: One Write-Head is All You Need (Shazeer, 2019)"
+    url: https://arxiv.org/abs/1911.02150
+    note: "Multi-query attention shares keys and values across all heads to cut the memory bandwidth of incremental decoding, with only minor quality degradation in the paper's experiments."
+  - title: "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints (Ainslie et al., EMNLP 2023)"
+    url: https://arxiv.org/abs/2305.13245
+    note: "Uptraining a multi-head checkpoint with 5% of original pre-training compute; uptrained GQA reaches quality close to multi-head at speed comparable to MQA."
+  - title: "DeepSeek-V2 (DeepSeek-AI, 2024)"
+    url: https://arxiv.org/abs/2405.04434
+    note: "MLA reduces the KV cache by 93.3% against DeepSeek 67B; Table 1 gives MLA's cache as (d_c + d_h^R) l elements per token, equal to GQA with 2.25 groups."
+  - title: "DeepSeek-V3 Technical Report (DeepSeek-AI, 2024)"
+    url: https://arxiv.org/abs/2412.19437
+    note: "671B total parameters, 37B activated per token; MLA and DeepSeekMoE."
+  - title: "Jamba: A Hybrid Transformer-Mamba Language Model (AI21, 2024), Table 1"
+    url: https://arxiv.org/html/2403.19887
+    note: "One attention layer per seven Mamba layers, 4 attention layers in 32; KV cache at 256K context in 16-bit: Jamba 4 GB, Mixtral 32 GB, Mistral 32 GB."
+  - title: "H2O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models (Zhang et al., 2023)"
+    url: https://arxiv.org/abs/2306.14048
+    note: "Keeps 20% heavy hitters; up to 29x throughput over DeepSpeed Zero-Inference and Hugging Face Accelerate and 3x over FlexGen on OPT-6.7B and OPT-30B; up to 1.9x lower latency at the same batch size."
+  - title: "SnapKV: LLM Knows What You are Looking for Before Generation (Li et al., 2024)"
+    url: https://arxiv.org/abs/2404.14469
+    note: "Selects KV positions using an observation window at the end of the prompt; at 16K-token inputs 3.6x faster generation and 8.2x better memory efficiency than the baseline; up to 380K tokens on one A100-80GB; negligible drop on Needle-in-a-Haystack."
+  - title: "Efficient Streaming Language Models with Attention Sinks (Xiao et al., ICLR 2024)"
+    url: https://arxiv.org/html/2309.17453
+    note: "Window attention collapses once even the first token's KV is evicted (Llama-2-13B perplexity 5158.07 with a 1,024-token window); four initial tokens kept as attention sinks restore it."
+  - title: "KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache (Liu et al., ICML 2024)"
+    url: https://arxiv.org/abs/2402.02750
+    note: "Keys quantised per channel, values per token, 2 bits; about 2.6x lower peak memory including weights, up to 4x larger batch, 2.35x to 3.47x throughput on Llama, Falcon and Mistral."
+  - title: "DeepSeek-V3.2 (DeepSeek-AI, 2025)"
+    url: https://arxiv.org/html/2512.02556
+    note: "DeepSeek Sparse Attention: a lightning indexer scores preceding tokens and attention runs over the top-k = 2,048 entries, cutting core attention from O(L^2) to O(Lk) while the indexer stays O(L^2) but cheap; built on MLA in MQA mode; indexer warm-up of about 2.1B tokens, then about 943.7B tokens of sparse training at 128K; no substantial degradation against V3.1-Terminus reported."
+  - title: "HELMET: How to Evaluate Long-Context Language Models Effectively and Thoroughly (Yen et al., ICLR 2025)"
+    url: https://arxiv.org/abs/2410.02694
+    note: "Seven application-centric categories up to 128K tokens, 59 models; synthetic tasks like NIAH do not reliably predict downstream performance; its RAG tasks predict other downstream performance better."
+  - title: "RULER: What's the Real Context Size of Your Long-Context Language Models? (Hsieh et al., COLM 2024)"
+    url: https://arxiv.org/abs/2404.06654
+    note: "Adds multi-hop tracing and aggregation beyond retrieval; of 17 models that all claim 32K or more, only half maintain satisfactory performance at 32K."
+  - title: vLLM engine arguments (latest docs)
+    url: https://docs.vllm.ai/en/latest/configuration/engine_args.html
+    note: "--kv-cache-dtype choices include fp8, fp8_e4m3, fp8_e5m2, fp8_ds_mla, int8_per_token_head, int4_per_token_head and nvfp4; --gpu-memory-utilization default 0.92. Checked 2026-10-28."
+  - title: vLLM design docs, Metrics
+    url: https://docs.vllm.ai/en/latest/design/metrics.html
+    note: "vllm:kv_cache_usage_perc, vllm:num_requests_waiting, vllm:inter_token_latency_seconds, prefix cache counters. Checked 2026-10-28."
+  - title: gpt-oss-120b config.json
+    url: https://huggingface.co/openai/gpt-oss-120b/raw/main/config.json
+    note: "Alternating sliding-window (128) and full-attention layers over 36 layers, 8 KV heads, head_dim 64. Checked 2026-10-28."
+  - title: NVIDIA H100 product page
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: "H100 SXM 80 GB, 3.35 TB/s. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+When a long-context workload does not fit, there are four families of fix, and "shrinking the KV cache" means two different things among them. Three families reduce resident bytes, which sets how many sequences a replica holds. One reduces the bytes and FLOPs each decode step spends on attention while keeping every entry resident. The families also differ in who can apply them: architectural changes are made at training time, so the serving team's only lever is which model it runs; eviction and quantisation are engine settings; top-k sparse attention needs a model trained with it.
+
+## The inputs that change it
+
+**Which limit binds.** If `vllm:kv_cache_usage_perc` sits near 1 with requests waiting, the limit is resident bytes. If the cache fits and inter-token latency misses its objective at long context, the limit is bytes read per step: for Llama 3 70B a 64K-token sequence adds 21.5 GB of BF16 cache to every step it is in.
+
+**Whether the model can change.** Changing the model is a product decision with its own evaluation cost, and often the largest saving available.
+
+**What later turns need.** A single question over a long document needs the cache once. A multi-turn assistant whose users ask follow-ups about earlier parts of the context needs entries that the first question did not use, which rules out methods that discard on the basis of the current question.
+
+**Task accuracy at length.** This is the input that decides between the families that fit. Measure it with long-context tasks at the lengths you serve, paired against the uncompressed cache on the same prompts. Needle tests do not qualify: HELMET evaluated 59 models and found that synthetic tasks like needle-in-a-haystack do not reliably predict downstream performance, and RULER found that of 17 models claiming 32K or more, only half held satisfactory performance at 32K once tasks required multi-hop tracing and aggregation.
+
+**Engine support.** A method without a kernel in your engine is a fork you will maintain. vLLM's `--kv-cache-dtype` choices, as of the docs checked for this lesson, include `fp8`, `fp8_ds_mla`, `int8_per_token_head`, `int4_per_token_head` and `nvfp4`.
+
+## The options, and when each wins
+
+**Architectural: fewer KV heads, latents, or fewer attention layers.** Multi-query attention shares one key and value head across all query heads; Shazeer reported only minor quality degradation. Grouped-query attention keeps a few KV heads, and an existing multi-head checkpoint can be uptrained into it with 5% of the original pre-training compute, at quality close to multi-head and speed comparable to MQA. MLA caches a compressed latent per layer; DeepSeek-V2 reports a 93.3% smaller cache than DeepSeek 67B, and its Table 1 equates MLA's cache to GQA with 2.25 groups. Hybrids replace most attention layers with layers that keep a fixed-size state: Jamba has one attention layer per seven Mamba layers and reports 4 GB of cache at 256K tokens in 16-bit against 32 GB for Mixtral. gpt-oss-120b's sliding-window layers are a milder form, with half its 36 layers capped at 128 cached tokens. These win when a model change is on the table, since they shrink both residency and reads with no serving-time accuracy trade beyond the model's own. They fail by being unavailable: you cannot retrofit them at serve time.
+
+**Eviction: keep the entries that matter.** H2O keeps the "heavy hitter" tokens that accumulate the most attention plus recent tokens, 20% of the cache in its implementation, and reports up to 29x throughput over DeepSpeed Zero-Inference and Hugging Face Accelerate and 3x over FlexGen on OPT-6.7B and OPT-30B. Those baselines offload to CPU or disk, so the multiplier measures avoiding offload as much as compression. SnapKV picks entries per head using an observation window at the end of the prompt, and at 16K-token inputs reports 3.6x faster generation and 8.2x better memory efficiency, with up to 380K tokens on one A100-80GB. Eviction wins for single-shot tasks over long inputs where the question is at the end of the prompt. It fails on two things. It is irreversible and query-dependent, so a follow-up about a passage the first question did not touch finds nothing there. And naive windows break the model: StreamingLLM showed window attention collapsing once even the first token's entry is evicted, a perplexity of 5,158 for Llama-2-13B, and recovering when four initial tokens are kept as attention sinks.
+
+**Quantisation: fewer bits per entry.** FP8 halves the BF16 cache, keeps every entry, and is an engine flag. KIVI goes to 2 bits by quantising keys per channel and values per token, because the two tensors have their outliers along different axes, and reports about 2.6x lower peak memory including weights, up to 4x larger batches and 2.35x to 3.47x throughput on Llama, Falcon and Mistral models, without tuning. Quantisation wins when every entry may be needed later, which makes it the default for multi-turn work. It fails gradually and unevenly: error grows with length and depends on the model's outlier structure, and the 2-bit layout needs kernels your engine may not have.
+
+**Top-k sparse attention: read fewer entries per step.** DeepSeek Sparse Attention adds a lightning indexer that scores every preceding token, and the main attention runs only over the top 2,048 entries, cutting core attention from O(L²) to O(Lk). The indexer stays O(L²) but is much cheaper than MLA. At 128K tokens a query reads 2,048 / 131,072 = 1.6% of the entries. The indexer must score every earlier token, so every entry stays resident: this family cuts bandwidth and compute per step, not capacity. DeepSeek trained it in, with an indexer warm-up of about 2.1B tokens and a sparse stage of about 943.7B tokens at 128K, and reports no substantial degradation against V3.1-Terminus. It wins when long-context decode cost is the limit and a model with it fits your hardware. It is unavailable otherwise.
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Family</th><th>Shrinks</th><th>Who applies it</th><th>Typical failure</th></tr></thead>
+<tbody>
+<tr><td>Architectural (MQA, GQA, MLA, hybrid)</td><td>resident bytes and reads</td><td>model trainer</td><td>not available for the model you run</td></tr>
+<tr><td>Eviction (H2O, SnapKV)</td><td>resident bytes and reads</td><td>engine, per request</td><td>follow-ups about discarded context; broken sinks</td></tr>
+<tr><td>Quantisation (FP8, KIVI)</td><td>resident bytes and reads</td><td>engine flag or kernel</td><td>accuracy loss growing with length; missing kernels</td></tr>
+<tr><td>Top-k sparse (DSA)</td><td>reads and attention FLOPs only</td><td>model trainer and engine</td><td>no capacity gain; model-specific</td></tr>
+</tbody>
+</table>
+</div>
+
+## A worked decision
+
+Scenario: an assistant over long documents, Llama 3 70B with FP8 weights on one 8x H100 node at tensor parallel 8, which the budget fixes. Peak load is 48 concurrent sessions, logs put the duration-weighted resident size at 65,536 tokens, the maximum context is 131,072, and users routinely ask follow-ups about earlier sections. Before measured overhead the replica has 8 × 80 × 0.92 − 70 = 518.8 GB for cache (0.92 is vLLM's default memory fraction).
+
+<Predict id="inf-kvc-sessions-fp8" question="With an FP8 cache (1 byte per element, so 163,840 bytes per token for Llama 3 70B), how many 65,536-token sessions fit in 518.8 GB?" answer={48.3} tolerance={1} unit="sessions">
+<p>65,536 × 163,840 = 10.74 GB per session, and 518.8 / 10.74 = <b>48.3 sessions</b>, before overhead. FP8 meets the peak with no room for the runtime's own memory or for a burst of long sessions. In BF16 the same budget holds 24.2.</p>
+</Predict>
+
+The BF16 cache needs 48 × 65,536 × 327,680 = 1,030.8 GB, twice the budget. The options against this case:
+
+- FP8 alone needs 515.4 GB, which does not survive overhead. FP8 with an admission cap of 40 sessions needs 429.5 GB, 83% of the budget, and queues the rest at peak.
+- 2-bit quantisation needs about 128.9 GB before scales, but it requires a kernel outside the listed engine options and carries the most accuracy risk at 128K.
+- Eviction is ruled out by the follow-up pattern: the entries a later question needs are the ones selected away.
+- A model change to gpt-oss-120b needs 48 × 36,864 × (65,536 + 128) = 116.2 GB with sliding layers allocated by window, but it is a different model with its own quality evaluation. DeepSeek-V3's 671B parameters need about 671 GB in FP8, more than the 588.8 GB the node can give the engine, so MLA and DSA are out on this hardware.
+
+Decision: ship FP8 KV with a cap of 40 concurrent sessions, gated on a paired accuracy check against the BF16 cache at 32K, 64K and 128K on the product's own follow-up tasks plus RULER-style multi-hop and aggregation tasks. Start the gpt-oss-120b evaluation in parallel as the path to removing the cap. If FP8 fails the gate, fall back to BF16 with a cap of 20 sessions (20 × 21.47 = 429.5 GB) while the model evaluation runs. What this gives up: queueing for the 17% of peak sessions above the cap, and, on the fallback, more than half of peak capacity.
+
+The decision also lowers step time. With BF16 the per-GPU step at peak would read (70 + 1,030.8) / 8 = 137.6 GB, a 41 ms floor at 3.35 TB/s before any MBU loss; FP8 at 40 sessions reads (70 + 429.5) / 8 = 62.4 GB, an 18.6 ms floor.
+
+## What to measure after deciding
+
+- Task accuracy by length bucket, paired against the BF16 cache on the same prompts, from the product's follow-up tasks and long-context task suites rather than needle scores; re-run on every engine or model upgrade.
+- `vllm:kv_cache_usage_perc` and `vllm:num_requests_waiting` at peak, to confirm that the cap, not preemption, is what holds sessions back.
+- p99 `vllm:inter_token_latency_seconds` at peak, since quantised-cache kernels change step time as well as size.
+- Time to first token for capped sessions, which is the cost the decision accepted.
+- Prefix cache hit rate, so shared documents are not counted once per session in the next sizing.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Two weeks before launch of the 128K assistant, a researcher proposes SnapKV: it passes needle tests at 128K with an eighth of the memory, which would remove the session cap. Do you take it?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Not on that evidence. Needle tests are a weak predictor of downstream long-context performance, and SnapKV discards entries using the end of the current prompt, so our follow-up questions about other sections are the case it is worst at. I would keep FP8 with the cap for launch and give SnapKV a paired test on our multi-turn tasks after launch.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The proposal fixes capacity, which is real: an eighth of the memory removes the cap. Its risk is concentrated where our product is: multi-turn sessions over one long document. SnapKV selects per head from an observation window at the end of the prompt, so the compressed cache is shaped by the first question. A follow-up about a passage that question ignored attends over entries that are no longer there, and the model answers from what remains rather than failing visibly.</p>
+<p>Two weeks is enough to run a paired test, not to fix what it finds. I would run SnapKV against the FP8 cache on recorded multi-turn sessions, scored on the follow-up turns, at 64K and 128K, and on RULER-style aggregation tasks. If it holds within the tolerance product signs off on, it goes in after launch behind a flag for single-question traffic first. Launch keeps FP8 with the cap, and I write down that the cap costs queueing at peak and that SnapKV's gain is unproven for follow-ups.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The researcher re-runs on your multi-turn set and SnapKV loses 2 points on follow-ups while removing all queueing at peak. Product prefers no queueing. Which do you ship, and who signs the risk note?</em></li>
+<li><em>Could you re-prefill the full document on each follow-up instead of keeping the compressed cache? Price it in prefill FLOPs at 128K against the capacity you freed.</em></li>
+<li><em>Someone suggests a fixed window of the most recent 32K tokens instead. What breaks first, and what would you keep alongside the window?</em></li>
+<li><em>What production signal would make you remove the session cap without any compression?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The published multipliers come from specific models, lengths and baselines: H2O against offloading systems on OPT models, SnapKV at 16K inputs, KIVI on Llama, Falcon and Mistral checkpoints of 2024. They show a method can work, not what it will do to your model at 128K, which only the paired test answers.
+
+Families compose, and their errors compound. FP8 on top of an evicted cache, or on an MLA latent, multiplies the savings and stacks two sources of error that were each validated alone. Test the combination you will ship.
+
+Per-request eviction pulls against prefix caching. A shared document compressed for one request's question is not the cache another request needs, so eviction can lower the hit rate that made a shared-document workload cheap. Quantisation keeps prefixes shareable.
+
+The worked case treats overhead as unknown and the 65,536-token resident size as measured. If the logs were sampled at quiet hours, or long sessions cluster at the same time of day, the cap is set too high. Recompute it from the peak hour's distribution before trusting the 40.
+
+<SelfRate id="lesson:inference/inference-anatomy/kv-compression" />

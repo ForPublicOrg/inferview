@@ -1,0 +1,112 @@
+---
+title: Attention sinks and streaming
+track: multimodal
+module: long-context
+order: 3
+kind: paper
+level: senior
+minutes: 10
+summary: Why window attention collapses when the first tokens leave the cache, how StreamingLLM keeps four of them to stream millions of tokens, how gpt-oss builds a sink into every head, and what that means for any KV eviction policy you write.
+prerequisites:
+  - multimodal/long-context/rope-scaling
+updated: 2026-10-28
+sources:
+  - title: Xiao, Tian, Chen, Han and Lewis, Efficient Streaming Language Models with Attention Sinks (arXiv 2309.17453, v4 2024-04-07)
+    url: https://arxiv.org/abs/2309.17453
+    note: abstract; window attention fails once text exceeds the cache; models put strong attention on initial tokens even when they are not semantically important; keeping their KV recovers performance; up to 4 million tokens and more; up to 22.2x speedup over sliding window with recomputation; Llama-2, MPT, Falcon and Pythia; a placeholder sink token in pretraining helps streaming; checked 2026-10-28
+  - title: StreamingLLM, full text (arXiv HTML)
+    url: https://arxiv.org/html/2309.17453
+    note: four initial tokens suffice and one or two do not fully restore performance; rolling cache of sinks plus recent tokens; positions assigned within the cache, for example cached tokens [0, 1, 2, 3, 6, 7, 8] get positions 0 to 7; Table 1 on Llama-2-13B, PG19 first book, perplexity 5158.07 for window attention (0 + 1024), 5.40 for 4 initial + 1020 recent, 5.60 with four linebreak tokens as sinks; softmax sums to one, so unneeded attention goes to tokens visible to all later ones; does not extend the context window or add long-term memory; checked 2026-10-28
+  - title: OpenAI, gpt-oss-120b and gpt-oss-20b model card (arXiv 2508.10925, card dated 2025-08-05)
+    url: https://arxiv.org/html/2508.10925
+    note: each attention head has a learned bias in the denominator of the softmax, similar to off-by-one attention and attention sinks; layers alternate banded-window (128 tokens) and dense attention; 36 layers in 120b; 64 query heads of dimension 64; 8 key-value heads; dense layers extended to 131,072 tokens with YaRN; checked 2026-10-28
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The problem the paper solves
+
+A chat or agent session that runs for hours produces more tokens than any context window, and the key-value cache grows with every one of them. The obvious bound is a sliding window: keep the last *W* tokens' keys and values and evict the rest, a FIFO buffer over the cache. StreamingLLM (Xiao et al., 2023) measured what that does, and the answer is that it breaks completely, not gradually, at the moment the first tokens are evicted.
+
+The paper's Table 1, on Llama-2-13B reading the first book of PG19 with a 1,024-token cache:
+
+| Cache contents | Perplexity |
+| --- | --- |
+| Window attention: the most recent 1,024 tokens | 5,158.07 |
+| The first 4 tokens plus the most recent 1,020 | 5.40 |
+| Four linebreak tokens in place of the first 4, plus the most recent 1,020 | 5.60 |
+
+Keeping four tokens out of 1,024, 0.4% of the cache, is the difference between a working model and noise. The third row is the clue to why: it does not matter much what those four tokens say.
+
+## The mechanism in engineering terms
+
+Softmax forces every query's attention weights to sum to one. A head that finds nothing relevant for the current token still has to put its weight somewhere. During training, the tokens at the very start of the sequence are visible to every later token, so heads learn to park unneeded attention on them. The paper calls them attention sinks: tokens that receive large attention scores without being semantically important.
+
+Evict them and every head that relied on parking weight there redistributes it across the remaining tokens, which changes the output of a large share of heads at once. The linebreak experiment shows the sink is positional: any tokens in the first positions work almost as well (5.60 against 5.40). The paper also found that one or two sink tokens do not fully restore performance, four generally do, and more gives diminishing returns.
+
+**StreamingLLM's cache** is therefore two parts: the four initial tokens, pinned, and a rolling window of recent tokens. Positions are assigned by place in the cache, not in the original text: if the cache holds tokens 0, 1, 2, 3, 6, 7 and 8 while decoding the next one, they get positions 0 to 7. With RoPE this has a cost the paper's design implies: a key cannot be stored rotated for its original position, because its position changes as the window slides, so rotation happens when the cache is read.
+
+The paper's results: stable language modelling over 4 million tokens and more on Llama-2, MPT, Falcon and Pythia, and up to a 22.2 times speedup over a sliding window that recomputes the window's keys and values for each new token. It also found that pretraining with a dedicated placeholder token as a sink improves streaming further.
+
+What it does not do, by the paper's own statement: it does not extend the context window or give the model long-term memory. The model uses only what is in the cache. Text that has slid out of the window is gone; StreamingLLM keeps the model fluent over an unbounded stream, not informed about all of it.
+
+## What changed in practice
+
+The idea moved from a cache policy into model architecture. The gpt-oss model card (August 2025) says each attention head has a learned bias in the denominator of the softmax, similar to off-by-one attention and attention sinks. In effect the head gets a slot that absorbs attention without being a token, so it can attend to nothing without borrowing the first token for it, and that slot cannot be evicted because it is a parameter.
+
+gpt-oss pairs this with banded-window attention, with a band of 128 tokens, in alternate layers. A banded layer is a sliding window by construction, which is exactly where a head with nowhere to put its weight would otherwise depend on whichever tokens are in the band.
+
+The cache arithmetic shows why banded layers are attractive at long lengths. Each layer stores, per token, a key and a value for each of 8 key-value heads of dimension 64: 2 × 8 × 64 = 1,024 numbers.
+
+<Predict id="sinks-gpt-oss-kv" question="With a 2-byte (bf16) cache, how many GiB of keys and values does one 131,072-token sequence need in gpt-oss-120b's dense layers?" answer={4.5} tolerance={0.1} unit="GiB">
+<Fragment slot="prompt">
+<p>From the model card: 36 layers alternating banded-window and dense attention, so 18 of each; 8 key-value heads of dimension 64; dense layers extended to 131,072 tokens. The 2-byte cache is an assumption for this exercise: engines can store it in other formats.</p>
+</Fragment>
+<p>Per token per layer: 1,024 numbers × 2 bytes = 2,048 bytes. Dense layers: 18 × 131,072 × 2,048 bytes = 4,831,838,208 bytes = <b>4.5 GiB</b>. The 18 banded layers hold at most 128 tokens each: 18 × 128 × 2,048 bytes ≈ 4.7 MB, about a thousandth of the dense layers' cache. Half the layers cost almost nothing at long length; the dense half is the whole bill.</p>
+</Predict>
+
+## The engineering consequence
+
+Any KV eviction policy you write, whether a fixed window, a score-based policy that drops low-attention tokens, or a compression scheme, must pin the sink positions of models that use them. Low-attention scoring is the dangerous one: the sinks receive high attention, so most policies keep them, but a policy that scores by something else (recency, semantic relevance to the query, a document boundary) can drop the first tokens of the conversation because they are a system prompt preamble or a beginning-of-sequence token that "carries no information". The paper's Table 1 is what that looks like.
+
+Three checks for a cache or context-management change:
+
+1. Does it ever remove the first positions of the sequence? If yes, does the model have a built-in sink (a learned softmax bias, as in gpt-oss) or does it rely on initial tokens?
+2. Does it re-assign positions after eviction? Then keys must be stored before rotation, and the cost of rotating on read belongs in the latency budget.
+3. Does it claim to extend what the model knows? Eviction never does; the only test is a task that needs the evicted content, run at the lengths where eviction happens.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Our support agent runs sessions of several hours on a self-hosted model. Memory per session is capped, and we evict old KV entries when we hit the cap. Quality falls off a cliff in long sessions. The team proposes a bigger cap, which halves the sessions per GPU. What do you do?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>First check whether the eviction drops the first tokens. If the model relies on initial tokens as attention sinks, pin a few of them and the cliff should go, at a cost of a few cache slots. A bigger cap only delays the cliff. Pinning sinks fixes fluency, not memory, so anything the agent must remember from early in the session has to be written into a summary or a state store.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The symptom, a sudden collapse rather than a gradual decline, matches what StreamingLLM measured when the first tokens leave a window cache. I would confirm it directly: replay a long session with the same cap, once with the first four positions pinned and once without, and compare quality at the point of the first eviction.</p>
+<p>Two defensible fixes. Pin sinks and keep the cap: sessions per GPU unchanged, the cliff gone if this is the cause, but the agent still forgets everything outside the window. Or compact: at the cap, summarise the session into a new prompt and restart the cache, so the model's own first tokens are always present and the important facts survive in the summary. Cost: a summarisation call per compaction and the risk that the summary drops a fact the user needs.</p>
+<p>The quantity I choose is the cap itself: the shortest window at which the replayed sessions keep their task quality with sinks pinned, measured, not the largest window memory allows. The failure mode of pinning is that it hides the memory problem: the agent stays fluent and confidently wrong about what the user said two hours ago.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The model is gpt-oss, which has a learned sink in every head. Does pinning still matter, and how would you find out without reading the kernel?</em></li>
+<li><em>Product wants the agent to remember account details for the whole session. Which half of the fix do you keep, and what do you put in writing about the other?</em></li>
+<li><em>What would you need to see in replayed sessions to drop compaction and rely on pinning alone?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The measurements are from 2023 models on language modelling perplexity. Perplexity shows fluency; it does not show whether a long-running agent still follows its instructions or uses facts from the evicted part of the stream. A model that streams with stable perplexity can still have lost its system prompt's meaning if the window no longer holds it.
+
+The sink count of four comes from the models in the paper. Other models, and models trained with a placeholder sink token or a learned softmax bias, may need a different number or none. Treat it as something to measure on the model you serve.
+
+Positions re-assigned inside the cache mean the model sees a sequence whose positions do not match the text's order of arrival beyond the window. That is fine for fluency, which is what the paper tested, and untested for tasks that depend on relative distance across the eviction boundary.
+
+<SelfRate id="lesson:multimodal/long-context/attention-sinks" />

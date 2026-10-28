@@ -1,0 +1,139 @@
+---
+title: LoRA in practice
+track: training
+module: adapting
+order: 1
+kind: lesson
+level: senior
+minutes: 12
+summary: A LoRA run is four settings (which matrices, which rank, which learning rate, which batch size), and the published evidence says to adapt every linear layer including the MLP, use about ten times the full fine-tuning learning rate, keep batches small, and size the rank to the information in the data rather than to a library default.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: "LoRA Without Regret (John Schulman and Thinking Machines Lab, 2025-09-29)"
+    url: https://thinkingmachines.ai/blog/lora/
+    note: "Optimal LoRA learning rate about 10x full fine-tuning, fitted multiplier 9.8 across 14 Llama and Qwen models, about 15x for runs under roughly 100 steps (anecdotal); attention-only rank 256 (0.25B parameters) underperformed MLP-only rank 128 (0.24B), adding attention to MLP gave no further gain, on Llama-3.1-8B and Qwen3-30B-A3B-Base; loss gap at large batch sizes that grows with batch and is independent of rank (10,000-example OpenThoughts3 subset), smaller and shrinking at batch 32; LoRA matches full fine-tuning when trainable parameters exceed the information in the data, about 2 bits per parameter (prior work), about 1 bit per token of loss; rank 1 matches full fine-tuning for policy-gradient RL on GSM8K and MATH (Llama-3.1-8B) and DeepMath-103K (Qwen3-8B-Base); MATH estimate 10,000 problems x 32 samples = 320,000 bits against about 3M rank-1 parameters; ranks 1 to 512 tested, optimal learning rate varies by less than 2x between rank 4 and 512, somewhat lower at rank 1; alpha 32 throughout, W' = W + (alpha/r)BA, the 1/r factor makes the initial learning curve identical across ranks; LoRA costs slightly more than 2/3 of full fine-tuning FLOPs per pass (2N^2 + 6NR against 3N^2), attention FLOPs excluded. Checked 2026-10-28."
+  - title: "PEFT documentation, LoRA package reference (main branch)"
+    url: https://huggingface.co/docs/peft/main/en/package_reference/lora
+    note: "LoraConfig defaults r=8, lora_alpha=8, lora_dropout=0.0, target_modules=None (chosen by architecture; the training notes say the defaults target the query and value layers; 'all-linear' selects every linear layer except the output layer), use_rslora=False (scaling lora_alpha/r; True gives lora_alpha/sqrt(r)), init_lora_weights=True (A Kaiming-uniform, B zero, a no-op before training), bias='none'. The page states no PEFT version for these defaults. Checked 2026-10-28."
+  - title: "LoRA: Low-Rank Adaptation of Large Language Models (Hu et al., arXiv 2106.09685 v2, 2021-10-16)"
+    url: https://arxiv.org/abs/2106.09685
+    note: "The paper reports 10,000x fewer trainable parameters and 3x less GPU memory than full fine-tuning; models RoBERTa, DeBERTa, GPT-2 and GPT-3. Checked 2026-10-28."
+  - title: "LoRA Learns Less and Forgets Less (Biderman et al., arXiv 2405.09673 v2, 2024-09-20)"
+    url: https://arxiv.org/abs/2405.09673
+    note: "Llama-2-7B; best LoRA learning rate about 5e-4 (code) and 2e-4 (math) against 5e-5 and 1e-5 for full fine-tuning; attention-only LoRA underperforms MLP-only and all-module LoRA, most gains from MLP; alpha = 2r best in their sweeps. Checked 2026-10-28."
+  - title: "QLoRA: Efficient Finetuning of Quantized LLMs (Dettmers et al., arXiv 2305.14314, 2023-05-23)"
+    url: https://arxiv.org/abs/2305.14314
+    note: "LoRA on query and value projections only does not match 16-bit full fine-tuning; LoRA on all linear transformer-block layers does, and rank is then unrelated to final performance over r in 8 to 256; alpha held fixed while the learning rate was searched. Checked 2026-10-28."
+  - title: Qwen3-8B config.json
+    url: https://huggingface.co/Qwen/Qwen3-8B/raw/main/config.json
+    note: "hidden_size 4,096, intermediate_size 12,288, 36 layers, 32 attention heads, 8 KV heads, head_dim 128. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Four settings, and why the defaults are not the answer
+
+A LoRA run is decided by four settings: which weight matrices get adapters, the rank, the learning rate, and the batch size. Libraries ship defaults for the first three. PEFT's `LoraConfig` defaults are `r=8`, `lora_alpha=8`, `lora_dropout=0.0`, and `target_modules=None`, which picks modules by architecture; the PEFT training notes say those defaults target the query and value projections. Those values make a config construct without error. They are not what the published comparisons against full fine-tuning recommend, and on two of the four settings the evidence points the other way.
+
+## The mechanism, in the terms that set the knobs
+
+For a frozen weight `W` of shape `d_out x d_in`, LoRA adds a trainable product:
+
+`W' = W + (alpha / r) * B A`, with `A` of shape `r x d_in` and `B` of shape `d_out x r`.
+
+PEFT's default initialisation draws `A` Kaiming-uniform and sets `B` to zero, so the adapted layer is exactly the base layer at step 0. The forward pass never needs `B A` as a matrix: it computes `x A^T`, a vector of length `r`, multiplies that by `B^T`, and adds the scaled result to `x W^T`. That is why an adapter costs `r * (d_in + d_out)` parameters per matrix instead of `d_in * d_out`, and why one base model can serve many adapters at once.
+
+Thinking Machines put the per-pass compute for a square `N x N` layer at `2N^2 + 6NR` FLOPs against `3N^2` for full fine-tuning, slightly more than two thirds. The saving is the weight-gradient matmul for the frozen matrix; the forward and input-gradient matmuls still run at full size. LoRA saves memory (no gradients or optimizer state for `W`) far more than it saves compute.
+
+<Predict id="trn-lora-params" question="Qwen3-8B has 36 layers, hidden size 4,096, intermediate size 12,288, 32 query heads and 8 KV heads of dimension 128. With rank 16 on all seven linear projections per layer (q, k, v, o, gate, up, down), how many trainable parameters, in millions?" answer={43.6} tolerance={0.5} unit="M">
+Query and output projections map 4,096 to 4,096; key and value map 4,096 to 8 x 128 = 1,024; gate and up map 4,096 to 12,288; down maps 12,288 to 4,096. Per layer: 16 x (8,192 + 5,120 + 5,120 + 8,192 + 3 x 16,384) = 16 x 75,776 = 1,212,416. Times 36 layers: 43,646,976, about 0.6% of the 6.9B parameters in those projections. The query and value adapters alone hold 7.7M of that; the three MLP adapters hold 28.3M.
+</Predict>
+
+## Targets: the MLP carries the adaptation
+
+Three independent sets of experiments agree. QLoRA found that adapters on the query and value projections alone did not match 16-bit full fine-tuning, and adapters on every linear layer of the transformer block did. Biderman et al. found attention-only LoRA underperformed MLP-only and all-module LoRA on Llama-2-7B, with most of the all-module gain coming from the MLP. Thinking Machines matched parameter counts to rule out the obvious objection: attention-only at rank 256 (0.25B trainable parameters) still lost to MLP-only at rank 128 (0.24B), and adding attention adapters on top of MLP adapters gave no further improvement. That held on a dense model (Llama-3.1-8B) and on a mixture-of-experts model (Qwen3-30B-A3B-Base), where "all layers" includes the experts.
+
+The query-and-value default comes from the original LoRA paper, which adapted attention weights to keep the trainable count small on GPT-3. In PEFT, `target_modules="all-linear"` selects every linear layer except the output head.
+
+## Learning rate: about ten times full fine-tuning
+
+Thinking Machines swept learning rates on 14 Llama and Qwen models and fitted the ratio of the best LoRA rate to the best full fine-tuning rate at 9.8, consistent across supervised and RL runs. For runs shorter than roughly 100 steps they put the ratio nearer 15 and label that evidence anecdotal. Biderman et al. found the same order independently: best LoRA rates of about 5e-4 for code and 2e-4 for maths, against 5e-5 and 1e-5 for full fine-tuning.
+
+Two operational consequences. A team that reuses its full fine-tuning learning rate for LoRA gets an adapter that barely moves and concludes that LoRA does not work for the task. And a comparison in which LoRA loses to full fine-tuning at a shared learning rate compares a tuned run with an untuned one.
+
+### Why the best rate barely depends on rank
+
+The `alpha / r` factor is what separates rank from learning rate. With `B` at zero, the first changes to `W'` come through `B`. Under Adam each entry of `B` moves by roughly the learning rate per step whatever the rank, and the change to `W'` sums `r` such column contributions, so without the factor the update would grow with `r`; dividing by `r` cancels that. Thinking Machines report the consequence: with the `1/r` factor the initial learning curves are identical across ranks, and the optimal learning rate varied by less than 2x between rank 4 and rank 512, somewhat lower at rank 1. Two corollaries:
+
+- `alpha` and the learning rate are one knob. With `alpha / r` scaling, doubling `alpha` acts like doubling the adapter's learning rate, which is why QLoRA held `alpha` fixed and searched the rate. Thinking Machines used `alpha = 32` throughout; Biderman et al. found `alpha = 2r` best in their sweeps. Those are different rules, and with a learning-rate sweep either works: fix `alpha`, sweep the rate.
+- PEFT's `use_rslora=True` changes the scale to `alpha / sqrt(r)`. At the same `alpha` and rank 16 that is 4 times the `alpha / r` scale, so flipping the flag invalidates a learning-rate sweep done without it.
+
+## Batch size: the setting that is not in the config
+
+Thinking Machines ran LoRA and full fine-tuning on a 10,000-example subset of OpenThoughts3 at several batch sizes. LoRA showed a persistent loss gap at large batches that grew with batch size and did not depend on rank; at batch 32 the gap was small and shrank over training. Both methods reached their best loss at small batches. They attribute the rank independence to the `B A` product parametrisation, which means a higher rank does not buy the gap back. A team that raises the batch to fill memory freed by LoRA's smaller optimizer state can lose the quality it was trying to keep.
+
+## Rank: size it to the information in the data
+
+LoRA matches full fine-tuning when its trainable parameters can store the information the dataset carries; past that, it learns less efficiently, with no hard floor. The post uses prior work's figure of about 2 bits per parameter, and about 1 bit per token of loss for typical LLM data. That gives an order-of-magnitude check, not a formula. A supervised set of 20M tokens carries on the order of 20M bits by that rule; a rank-16 adapter on all linear layers of Qwen3-8B (43.6M parameters, computed above) stores on the order of 87M bits. Typical post-training sets fit. Continued pretraining on billions of tokens does not, which is where Biderman et al. found LoRA well short of full fine-tuning.
+
+Policy-gradient RL sits at the other extreme. Each episode returns a scalar reward, so the post estimates O(1) bits per episode. Its MATH example: about 10,000 problems x 32 samples is 320,000 bits, against about 3M parameters in a rank-1 adapter on Llama-3.1-8B. LoRA at rank 1 matched full fine-tuning on GSM8K and MATH with Llama-3.1-8B and on DeepMath-103K with Qwen3-8B-Base. Rank 1 on all linear layers of Qwen3-8B is 2.7M parameters by the arithmetic above.
+
+## A run, setting by setting
+
+A supervised run adapting Qwen3-8B to a 50,000-example instruction set, where the full fine-tuning baseline used a learning rate of 1e-5 (scenario):
+
+| Setting | Value | Defence |
+|---|---|---|
+| `target_modules` | `"all-linear"` | MLP adapters carry the gain; attention-only loses even at matched parameters. |
+| `r` | 32 | Capacity well above the dataset by the bits-per-parameter check; above rank 4 the best rate moves little, so rank can change later without a full re-sweep. |
+| `lora_alpha` | 32, fixed | `alpha` and learning rate are one knob; fix one, sweep the other. |
+| learning rate | sweep 5e-5 to 3e-4 | About 10x the full fine-tuning rate sits in the middle; nearer 15x if the run is under about 100 steps. |
+| batch size | 32 sequences | The LoRA gap grows with batch, and rank does not close it. |
+| `use_rslora` | False | Keeps the best learning rate roughly rank-independent. |
+
+The setting most likely to be wrong in that table is the batch size, because it trades against throughput. If 32 sequences per step leaves the GPUs underused, packing longer sequences raises tokens per step without raising the number of sequences, and whether the LoRA gap tracks sequences or tokens is a measurement to make, not an assumption.
+
+```python
+def lora_params(layers, shapes, r):
+    # shapes: (d_in, d_out) for each adapted projection in one layer
+    return layers * sum(r * (d_in + d_out) for d_in, d_out in shapes)
+
+qwen3_8b = [(4096, 4096), (4096, 1024), (4096, 1024), (4096, 4096),
+            (4096, 12288), (4096, 12288), (12288, 4096)]
+print(lora_params(36, qwen3_8b, 16))  # 43646976
+print(lora_params(36, qwen3_8b, 1))   # 2727936
+```
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+A team's LoRA run on an 8B model trails their full fine-tuning baseline by a wide margin on a 40,000-example supervised task. They used PEFT defaults with the full fine-tuning learning rate and a batch of 512 to use the freed memory. They have two days of GPU time before a launch review, enough for about six short runs. What do you change, in what order, and what do you report if the gap persists?
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Three settings are off the published evidence: query and value targets, the full fine-tuning learning rate, and batch 512. I would spend one run moving to all-linear targets at batch 32, three on a learning-rate sweep at 3x, 10x and 20x the old rate with rank fixed, and two on confirmation. If the gap persists, the dataset may exceed the adapter's capacity, and the review gets a choice between a rank sweep and full fine-tuning, with the measured gap.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Order.</strong> Targets and batch first, together, because neither moves the sweep's centre much and both are known to cost quality: attention-only adapters lose to MLP adapters at matched parameters, and the LoRA gap at large batch grows with batch independently of rank. The learning rate next, because the full fine-tuning rate is about ten times too low and anything measured before fixing it understates LoRA.</p>
+<p><strong>The conflict.</strong> Changing two things in one run confounds attribution; isolating each uses runs the sweep needs. With six runs I would bundle targets and batch, sweep the rate, and accept that the report cannot say which of the first two mattered. The other defensible plan spends two runs separating targets from batch and sweeps only two rates, buying attribution at the cost of confidence in the operating point. For a launch review the operating point matters more; for a team that will run LoRA on many tasks, attribution might.</p>
+<p><strong>Rank.</strong> Last. Above rank 4 the best rate moves by less than 2x, and 40,000 examples is a typical post-training size. If the gap persists at a tuned rate and small batch, a rank sweep is the capacity test.</p>
+<p><strong>How this plan fails.</strong> Batch 32 can cut throughput on the same hardware enough that six runs do not finish in two days. If so, cut the confirmation runs, not the sweep, and report the result as unconfirmed.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The sweep's best point is at the edge of the range, 20x. Do you extend the range or ship the edge, and what does each cost before the review?</em></li>
+<li><em>A reviewer argues the old run was the fair comparison because both methods used the same rate. What do you answer, and what result would change your mind?</em></li>
+<li><em>What would you need to see to choose full fine-tuning over LoRA here, given that LoRA lets one base model serve many adapters?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The learning-rate ratio, target ablations and batch results come from Llama and Qwen models at the sizes tested and from the datasets named: Tulu3, OpenThoughts3, MATH, GSM8K and DeepMath-103K. A different optimizer, a different `A` initialisation or a non-standard parametrisation changes the ratio; Thinking Machines kept PEFT's standard setup and found no improvement over it, which describes their sweeps rather than proving optimality. The capacity rule is order-of-magnitude reasoning: bits per token depends on how far the data is from what the model already predicts, so data close to the base distribution carries less than its token count suggests and a new domain more. The 2/3 FLOPs figure excludes attention, which dominates at long context, so long-context LoRA saves less compute than the ratio implies. And "matches full fine-tuning" is measured on loss and the named benchmarks; a task whose quality shows only in human review needs its own comparison.
+
+<SelfRate id="lesson:training/adapting/lora-practice" />

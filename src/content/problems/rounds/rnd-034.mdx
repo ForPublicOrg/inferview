@@ -1,0 +1,394 @@
+---
+id: rnd-034
+title: Fix, extend and speed up a usage ledger
+subtitle: one codebase, three phases
+track: rounds
+module: codebase-rounds
+type: repo
+difficulty: hard
+seniority: [senior, staff]
+minutes: 60
+tags: [repo, multi-phase, prompt-caching, billing, indexing, decimal, ai-enabled-round]
+companies:
+  - name: Meta
+    url: https://www.hellointerview.com/blog/meta-ai-enabled-coding
+updated: 2026-10-28
+sources:
+  - title: Hello Interview, Meta's AI-enabled coding interview
+    url: https://www.hellointerview.com/blog/meta-ai-enabled-coding
+    note: "candidate reports gathered by Evan King, a former Meta staff engineer, not official Meta documentation: 60 minutes in a multi-file project; phase 1 fixes a usually non-algorithmic bug, phase 2 builds the core feature with AI allowed, phase 3 runs tiered test files with larger inputs that can force a change of algorithm. Checked 2026-10-28."
+  - title: OpenAI API docs, prompt caching
+    url: https://developers.openai.com/api/docs/guides/prompt-caching
+    note: "Responses API usage reports cached reads in input_tokens_details.cached_tokens; the page's cost example subtracts cached and cache-write tokens from input_tokens to get ordinary input, so input_tokens includes them. Checked 2026-10-28."
+  - title: Claude API docs, prompt caching
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: "input_tokens counts only tokens after the last cache breakpoint; total input = cache_read_input_tokens + cache_creation_input_tokens + input_tokens. Checked 2026-10-28."
+code:
+  files:
+    usage/__init__.py: |
+      """usage: per-tenant spend on model API calls, from the usage records the gateway writes."""
+    usage/billing.py: |
+      """Spend per tenant. Windows are half-open: [start, end) in Unix seconds, like every range in this package."""
+      from decimal import Decimal
+
+      from usage.prices import PER, price_for
+
+
+      def record_cost(record):
+          """Dollars for one call, unrounded."""
+          p = price_for(record.model)
+          return (
+              record.input_tokens * p.input
+              + record.cached_tokens * p.cached
+              + record.output_tokens * p.output
+          ) / PER
+
+
+      def tenant_spend(store, tenant, start, end):
+          """Dollars a tenant spent in [start, end)."""
+          total = Decimal(0)
+          for r in store.scan():
+              if r.tenant == tenant and start <= r.ts < end:
+                  total += record_cost(r)
+          return total
+
+
+      def top_tenants(store, start, end, k):
+          """The k tenants with the highest spend in [start, end), highest first, as (tenant, dollars) pairs.
+          Only tenants with at least one record in the window are candidates."""
+          raise NotImplementedError
+
+
+      class SpendIndex:
+          """Answers many spend and top-k questions about one store. Built from at most one scan."""
+
+          def __init__(self, store):
+              raise NotImplementedError
+
+          def spend(self, tenant, start, end):
+              """Same answer as tenant_spend."""
+              raise NotImplementedError
+
+          def top(self, start, end, k):
+              """Same contract as top_tenants."""
+              raise NotImplementedError
+    usage/invoice.py: |
+      """Invoice lines. The only place money is rounded: half-even to the cent, once per line."""
+      from decimal import ROUND_HALF_EVEN, Decimal
+
+      from usage.billing import tenant_spend
+
+      CENT = Decimal("0.01")
+
+
+      def invoice_line(store, tenant, start, end):
+          """(tenant, amount in dollars rounded to the cent) for usage in [start, end)."""
+          return tenant, tenant_spend(store, tenant, start, end).quantize(CENT, rounding=ROUND_HALF_EVEN)
+    usage/prices.py: |
+      """Prices in US dollars per million tokens. Money is a Decimal in dollars everywhere in this package and is only
+      rounded when an invoice line is printed (see invoice.py). These are the team's scenario prices, not a provider's."""
+      from dataclasses import dataclass
+      from decimal import Decimal
+
+      PER = 1_000_000
+
+
+      @dataclass(frozen=True)
+      class Price:
+          input: Decimal    # uncached input
+          cached: Decimal   # input read from the prompt cache
+          output: Decimal
+
+
+      PRICES = {
+          "model-s": Price(input=Decimal("0.40"), cached=Decimal("0.10"), output=Decimal("1.60")),
+          "model-l": Price(input=Decimal("2.00"), cached=Decimal("0.50"), output=Decimal("8.00")),
+      }
+
+
+      class UnknownModel(KeyError):
+          pass
+
+
+      def price_for(model):
+          try:
+              return PRICES[model]
+          except KeyError:
+              raise UnknownModel(model) from None
+    usage/records.py: |
+      """One usage record per model call, as the gateway logs it."""
+      import json
+      from dataclasses import dataclass
+
+
+      @dataclass(frozen=True)
+      class Record:
+          """Token counts follow the OpenAI Responses API usage object: input_tokens is every input token of the call,
+          and cached_tokens is the part of input_tokens that was read from the prompt cache. ts is Unix seconds."""
+
+          ts: int
+          tenant: str
+          model: str
+          input_tokens: int
+          cached_tokens: int
+          output_tokens: int
+
+
+      def parse_line(line):
+          """A Record from one JSON line of the gateway log."""
+          d = json.loads(line)
+          u = d["usage"]
+          return Record(
+              ts=int(d["ts"]),
+              tenant=d["tenant"],
+              model=d["model"],
+              input_tokens=u["input_tokens"],
+              cached_tokens=u.get("input_tokens_details", {}).get("cached_tokens", 0),
+              output_tokens=u["output_tokens"],
+          )
+    usage/store.py: |
+      """The usage table. In production it lives in the warehouse and every scan is a full read billed by bytes, so code
+      that answers many questions reads it once. max_scans makes that a rule in tests."""
+
+
+      class ScanBudgetExceeded(RuntimeError):
+          pass
+
+
+      class Store:
+          def __init__(self, records, max_scans=None):
+              self._records = sorted(records, key=lambda r: r.ts)
+              self.max_scans = max_scans
+              self.scans = 0
+
+          def scan(self):
+              """Every record, oldest first. Each call is one full scan."""
+              self.scans += 1
+              if self.max_scans is not None and self.scans > self.max_scans:
+                  raise ScanBudgetExceeded(f"scan {self.scans} of a table allowed {self.max_scans}")
+              return iter(self._records)
+
+          def __len__(self):
+              return len(self._records)
+  target: usage/billing.py
+  tests: |
+    from decimal import Decimal
+    from usage.records import Record
+    from usage.store import Store
+    from usage.billing import record_cost, top_tenants, SpendIndex
+
+    # Phase 1: the bug
+    assert record_cost(Record(100, "acme", "model-s", 1_000_000, 600_000, 0)) == Decimal("0.22")
+
+    # Phase 2: the feature
+    recs = [
+        Record(10, "a", "model-s", 1_000_000, 0, 0),
+        Record(20, "b", "model-l", 1_000_000, 0, 0),
+        Record(30, "c", "model-s", 0, 0, 1_000_000),
+        Record(40, "a", "model-s", 1_000_000, 0, 0),
+    ]
+    assert top_tenants(Store(recs), 0, 100, 2) == [("b", Decimal("2.00")), ("c", Decimal("1.60"))]
+    assert top_tenants(Store(recs), 0, 40, 3) == [("b", Decimal("2.00")), ("c", Decimal("1.60")), ("a", Decimal("0.40"))]
+
+    # Phase 3: many questions, one scan
+    idx = SpendIndex(Store(recs, max_scans=1))
+    assert idx.spend("a", 0, 100) == Decimal("0.80")
+    assert idx.spend("a", 10, 40) == Decimal("0.40")
+    assert idx.top(0, 100, 1) == [("b", Decimal("2.00"))]
+  hidden: |
+    import random
+    from bisect import bisect_left
+    from usage.prices import PRICES
+    from usage.store import ScanBudgetExceeded
+
+    def _cost(r):
+        p = PRICES[r.model]
+        return ((r.input_tokens - r.cached_tokens) * p.input + r.cached_tokens * p.cached + r.output_tokens * p.output) / 1_000_000
+
+    _rng = random.Random(20261028)
+    _tenants = [f"t{i:02d}" for i in range(25)]
+    _recs = []
+    for _ in range(30_000):
+        _in = _rng.randrange(0, 200_000)
+        _recs.append(Record(_rng.randrange(0, 30 * 86_400), _rng.choice(_tenants), _rng.choice(["model-s", "model-l"]),
+                            _in, _rng.randrange(0, _in + 1), _rng.randrange(0, 4_000)))
+    _recs += [Record(500, "t00", "model-s", 10, 10, 0), Record(500, "t01", "model-l", 7, 0, 3)]
+
+    assert all(record_cost(r) == _cost(r) for r in _recs[:2_000])
+    assert record_cost(Record(1, "x", "model-l", 5, 5, 0)) == Decimal("0.0000025")
+
+    _by = {}
+    for r in sorted(_recs, key=lambda r: r.ts):
+        _ts, _ps = _by.setdefault(r.tenant, ([], [Decimal(0)]))
+        _ts.append(r.ts)
+        _ps.append(_ps[-1] + _cost(r))
+
+    def _spend(t, a, b):
+        if t not in _by or a >= b:
+            return Decimal(0)
+        _ts, _ps = _by[t]
+        return _ps[bisect_left(_ts, b)] - _ps[bisect_left(_ts, a)]
+
+    def _active(a, b):
+        return {t: _spend(t, a, b) for t, (_ts, _) in _by.items() if bisect_left(_ts, b) > bisect_left(_ts, a)}
+
+    def _valid_top(got, a, b, k):
+        want = _active(a, b)
+        names = [t for t, _ in got]
+        if len(got) != min(k, len(want)) or len(set(names)) != len(names):
+            return False
+        if any(want.get(t) != s for t, s in got):
+            return False
+        if any(got[i][1] < got[i + 1][1] for i in range(len(got) - 1)):
+            return False
+        floor = got[-1][1] if got else None
+        return all(s <= floor for t, s in want.items() if t not in names) if got else not want or k <= 0
+
+    _windows = [(0, 30 * 86_400), (500, 501), (86_400, 2 * 86_400), (123_456, 123_457), (10, 5)]
+    _windows += [tuple(sorted((_rng.randrange(0, 31 * 86_400), _rng.randrange(0, 31 * 86_400)))) for _ in range(40)]
+    _store = Store(_recs, max_scans=12)
+    assert all(_valid_top(top_tenants(_store, a, b, k), a, b, k) for (a, b), k in zip(_windows[:12], [5, 3, 1, 25, 4] + [7] * 7))
+
+    _idx = SpendIndex(Store(_recs, max_scans=1))
+    _qs = [(_rng.choice(_tenants + ["nobody"]),) + tuple(sorted((_rng.randrange(-10, 31 * 86_400), _rng.randrange(-10, 31 * 86_400)))) for _ in range(5_000)]
+    assert all(_idx.spend(t, a, b) == _spend(t, a, b) for t, a, b in _qs)
+    assert _idx.spend("t00", 500, 501) == _spend("t00", 500, 501) and _idx.spend("t00", 501, 500) == 0
+    assert all(_valid_top(_idx.top(a, b, k), a, b, k) for (a, b), k in zip(_windows * 20, [3, 10, 25, 30, 1] * 180))
+
+    _s = Store(_recs, max_scans=1)
+    SpendIndex(_s)
+    assert _s.scans == 1
+  solution: |
+    """Spend per tenant. Windows are half-open: [start, end) in Unix seconds, like every range in this package."""
+    import heapq
+    from bisect import bisect_left
+    from decimal import Decimal
+
+    from usage.prices import PER, price_for
+
+
+    def record_cost(record):
+        """Dollars for one call, unrounded. input_tokens includes cached_tokens (see records.py)."""
+        p = price_for(record.model)
+        uncached = record.input_tokens - record.cached_tokens
+        return (
+            uncached * p.input
+            + record.cached_tokens * p.cached
+            + record.output_tokens * p.output
+        ) / PER
+
+
+    def tenant_spend(store, tenant, start, end):
+        """Dollars a tenant spent in [start, end)."""
+        total = Decimal(0)
+        for r in store.scan():
+            if r.tenant == tenant and start <= r.ts < end:
+                total += record_cost(r)
+        return total
+
+
+    def _top(spends, k):
+        # Highest spend first; equal spends in tenant order, so the answer does not depend on scan order.
+        return heapq.nsmallest(k, spends.items(), key=lambda item: (-item[1], item[0])) if k > 0 else []
+
+
+    def top_tenants(store, start, end, k):
+        """The k tenants with the highest spend in [start, end), highest first, as (tenant, dollars) pairs.
+        Only tenants with at least one record in the window are candidates."""
+        spends = {}
+        for r in store.scan():
+            if start <= r.ts < end:
+                spends[r.tenant] = spends.get(r.tenant, Decimal(0)) + record_cost(r)
+        return _top(spends, k)
+
+
+    class SpendIndex:
+        """Answers many spend and top-k questions about one store. Built from at most one scan.
+
+        Per tenant: timestamps in order and prefix sums of cost, so a window is two binary searches and a subtraction.
+        Decimal keeps the subtraction exact, so the answer equals tenant_spend to the last digit."""
+
+        def __init__(self, store):
+            self._ts = {}
+            self._sums = {}
+            for r in store.scan():  # oldest first, so each tenant's list stays sorted
+                ts = self._ts.setdefault(r.tenant, [])
+                sums = self._sums.setdefault(r.tenant, [Decimal(0)])
+                ts.append(r.ts)
+                sums.append(sums[-1] + record_cost(r))
+
+        def _window(self, tenant, start, end):
+            ts = self._ts.get(tenant)
+            if not ts or start >= end:
+                return 0, 0, None
+            return bisect_left(ts, start), bisect_left(ts, end), self._sums[tenant]
+
+        def spend(self, tenant, start, end):
+            """Same answer as tenant_spend."""
+            lo, hi, sums = self._window(tenant, start, end)
+            return sums[hi] - sums[lo] if sums else Decimal(0)
+
+        def top(self, start, end, k):
+            """Same contract as top_tenants."""
+            spends = {}
+            for tenant in self._ts:
+                lo, hi, sums = self._window(tenant, start, end)
+                if sums and hi > lo:
+                    spends[tenant] = sums[hi] - sums[lo]
+            return _top(spends, k)
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The format, as candidates report it">
+One hour in an existing multi-file project, in three phases: fix a bug, build the feature, then make it hold up when larger test tiers run. An AI assistant can read the project. Hello Interview describes this shape for Meta's AI-enabled round; the codebase below is original.
+</Callout>
+
+`usage/` turns the records an LLM gateway writes, one per model call, into dollars per tenant. `records.py` defines the record, `prices.py` the price table (the team's scenario prices, not a provider's), `store.py` the usage table and `invoice.py` the one place money is rounded. You edit `usage/billing.py`.
+
+**Phase 1.** Finance says tenants with high prompt-cache hit rates are billed more than the provider charges the company for their calls. Find and fix the bug.
+
+**Phase 2.** Implement `top_tenants(store, start, end, k)`: the k tenants with the highest spend in a half-open window, highest first. Decide how ties are ordered and say why.
+
+**Phase 3.** The finance dashboard asks thousands of spend and top-k questions per page load. In production every `store.scan()` is a full read of a warehouse table, billed by bytes; the tests turn that into a rule by creating the store with `max_scans=1`. Implement `SpendIndex` so it answers every question from at most one scan. Choose the data structure and say what it costs in memory, and what happens to it as new records arrive.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which provider's usage format the gateway writes, and read the docstring in the file that defines a record.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask whether two tenants can tie, and whether the dashboard needs the same order on every load.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask how many records a month the table holds, how often the dashboard reloads, and how late a record can arrive after its timestamp.</p></details>
+
+## Answer
+
+**Phase 1: cached tokens billed twice.** `records.py` says the gateway writes the OpenAI Responses usage shape, where `input_tokens` is every input token and `cached_tokens` is the part of it read from cache. `record_cost` prices all of `input_tokens` at the full rate and then prices `cached_tokens` again at the cached rate. For the visible record, 1,000,000 input tokens of which 600,000 cached on `model-s`, the shipped code computes 1.0 × $0.40 + 0.6 × $0.10 = $0.46; the correct cost is 0.4 × $0.40 + 0.6 × $0.10 = $0.16 + $0.06 = $0.22. The fix prices `input_tokens - cached_tokens` at the full rate. The bug is non-algorithmic, which is the class the phase is reported to use, and it is found by reading the record's contract in another file, not by reading `billing.py` harder.
+
+The fix has its own failure mode, and it belongs in the answer. Anthropic's `input_tokens` excludes cache reads, which are reported separately. If the gateway ever logs Claude usage in its raw shape, the fixed code subtracts cached tokens from a number that never contained them, under-bills, and goes negative when cached exceeds input. Normalise at ingestion, in `parse_line`, per provider, and reject a record whose `cached_tokens` exceeds `input_tokens` instead of billing it.
+
+**Phase 2: top-k.** One scan sums spend per tenant inside `[start, end)`, then `heapq.nsmallest(k, ..., key=(-spend, tenant))` returns the top k with ties broken by tenant name. Sorting everything is also fine at this size. The tie-break is the decision: break ties by name and the dashboard is stable across loads; leave them in dict order and two loads of the same page can disagree. The hidden tests accept any order among equal spends and check the invariants: descending order, exactly min(k, active tenants) entries, each value equal to the direct sum, and no tenant left out that spent more than the last one included.
+
+**Phase 3: one scan, many questions.** The shipped `tenant_spend` scans the table per call, so the second question raises `ScanBudgetExceeded`; that is the larger tier. Two structures are defensible.
+
+- **Per-tenant prefix sums.** In the one scan, append each record's timestamp and running total to its tenant's lists (the scan is in time order, so the lists stay sorted). A window is two `bisect_left` calls and a subtraction; top-k is that per tenant. Cost: memory proportional to the number of records, and a record that arrives late with an old timestamp has to be inserted in the middle, which shifts every later running total.
+- **Per-tenant buckets** (hourly or daily totals). Memory proportional to tenants times buckets, independent of record count, and late records only touch one bucket. Cost: a window that does not start and end on a bucket edge needs the raw records at its edges, which the one-scan rule forbids, so the answers are exact only on bucket boundaries. You choose the bucket width; it is the precision the dashboard promises.
+
+The reference solution uses prefix sums, because invoices need exact windows. Money stays `Decimal`, as `prices.py` requires, and that matters more here than anywhere else: a prefix-sum subtraction in `float` differs from the direct sum in the last digits, and an invoice rounded half-even to the cent can flip. With `Decimal` the subtraction is exact, so `SpendIndex.spend` equals `tenant_spend` to the last digit, which is what the hidden tests check on 5,000 random windows over 30,000 records.
+
+The index is a snapshot. Records written after it is built are not in it, and nothing in the code says so. In production it needs a build time the dashboard shows, a rebuild trigger, and a watermark for late records: either rebuild the affected tenant's lists or keep a small unsorted tail of late records that every query scans.
+
+On the assistant: phase 2 and phase 3 are the parts where generated code is plausible and wrong in the details (a closed window instead of half-open, a float accumulator, a tie order that depends on dict order). The invariant tests are the check; run them on whatever the assistant writes before reading it closely.
+
+## Follow-ups
+
+- *The table grows past what one process can hold. Which questions do you stop answering exactly, and who has to agree to that in writing?* Keep exact answers for invoice windows, which are month-aligned and can be precomputed; move dashboard windows to hourly buckets; finance signs off on the dashboard's precision.
+- *What would you need to see to move this out of Python into a daily rollup table in the warehouse?* Scan cost of the rollup job against the dashboard's per-load cost, and how often windows that do not align to days are actually asked for.
+- *Two engineers disagree: one wants prefix sums for exactness, the other buckets for memory. How do you decide without deciding by rank?* Log a week of dashboard queries and count how many windows fall on bucket edges; if nearly all do, buckets win.
+- *How does this change in a real engine?* The gateway writes records from many hosts, so timestamps arrive out of order and some arrive twice; the index needs a dedupe key per call (the provider's response id) and a lateness bound after which a correction goes on the next invoice instead.
+
+## Common mistakes
+
+- Fixing phase 1 by dropping the cached term, which bills cached tokens at the full rate.
+- Treating the window as closed, which counts a record at `end` in two adjacent windows.
+- Building the index on `float` and comparing to the direct sum with a tolerance, which hides an invoice-level difference.
+- Caching `tenant_spend` results per (tenant, start, end), which still rescans for every new window.
+- Breaking top-k ties by dict order, so the dashboard reorders tenants between loads.

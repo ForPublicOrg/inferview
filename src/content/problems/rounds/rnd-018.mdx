@@ -1,0 +1,391 @@
+---
+id: rnd-018
+title: A KV-cache decode step that matches the full recompute
+subtitle: grouped-query heads, rotary positions, and an overflow policy you choose
+track: rounds
+module: hand-write
+type: code
+difficulty: hard
+seniority: [senior, staff]
+minutes: 45
+core: true
+tags: [kv-cache, gqa, rope, decode, hand-write, invariants]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: amitshekhariitbhu/ai-engineering-interview-questions (Apache-2.0)
+    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
+    note: a synthesised question bank that lists "Implement a KV cache and single-step decode for causal multi-head attention" and "Implement multi-head attention, then convert it to grouped-query attention"; checked 2026-10-28
+  - title: Ainslie et al., GQA (arXiv 2305.13245, EMNLP 2023)
+    url: https://arxiv.org/abs/2305.13245
+    note: grouped-query attention uses more than one and fewer key/value heads than query heads; checked 2026-10-28
+  - title: Su et al., RoFormer (arXiv 2104.09864)
+    url: https://arxiv.org/abs/2104.09864
+    note: rotary embedding encodes absolute position with a rotation and gives relative-position dependence in attention; checked 2026-10-28
+  - title: Hugging Face Transformers, modeling_llama.py (main branch)
+    url: https://raw.githubusercontent.com/huggingface/transformers/main/src/transformers/models/llama/modeling_llama.py
+    note: repeat_kv is documented as equivalent to torch.repeat_interleave over the head axis, so query head h reads key/value head h // n_rep; rotate_half pairs the two halves of the head dimension; checked 2026-10-28
+  - title: unsloth/Meta-Llama-3.1-70B-Instruct, config.json
+    url: https://huggingface.co/unsloth/Meta-Llama-3.1-70B-Instruct/blob/main/config.json
+    note: 80 layers, hidden size 8,192, 64 attention heads, 8 key/value heads, bfloat16; checked 2026-10-28
+  - title: Jiang et al., Mistral 7B (arXiv 2310.06825)
+    url: https://arxiv.org/abs/2310.06825
+    note: a model trained with sliding window attention and grouped-query attention; checked 2026-10-28
+  - title: Xiao et al., Efficient Streaming Language Models with Attention Sinks (arXiv 2309.17453, ICLR 2024)
+    url: https://arxiv.org/abs/2309.17453
+    note: window attention fails once the text is longer than the cache; keeping the first tokens' KV largely recovers it; checked 2026-10-28
+  - title: Kwon et al., Efficient Memory Management for Large Language Model Serving with PagedAttention (arXiv 2309.06180, SOSP 2023)
+    url: https://arxiv.org/abs/2309.06180
+    note: KV memory per request is large and grows during generation; the authors report 2 to 4 times the throughput of FasterTransformer and Orca at the same latency; checked 2026-10-28
+code:
+  starter: |
+    import math
+
+    # A toy decoder: n_layers blocks of grouped-query attention, each added to its input (a residual), no MLP, no norm.
+    # cfg keys: d_model, n_heads, n_kv_heads, head_dim, n_layers. A layer is {"wq", "wk", "wv", "wo"}, each a list of rows:
+    # wq is d_model x (n_heads * head_dim), wk and wv are d_model x (n_kv_heads * head_dim), wo is (n_heads * head_dim) x d_model.
+    # Query head h reads key/value head h // (n_heads // n_kv_heads), as repeat_kv does in Hugging Face's Llama code.
+
+
+    def matvec(x, w):
+        out = [0.0] * len(w[0])
+        for xi, row in zip(x, w):
+            for j, wij in enumerate(row):
+                out[j] += xi * wij
+        return out
+
+
+    def rope(v, pos, base=10000.0):
+        # Rotary embedding on one head vector, rotate-half layout: pairs (i, i + half).
+        half = len(v) // 2
+        out = list(v)
+        for i in range(half):
+            theta = pos * base ** (-2 * i / len(v))
+            c, s = math.cos(theta), math.sin(theta)
+            out[i] = v[i] * c - v[i + half] * s
+            out[i + half] = v[i + half] * c + v[i] * s
+        return out
+
+
+    def full_forward(xs, layers, cfg, window=None):
+        """The reference: recompute every position from scratch. Position t attends to positions max(0, t - window + 1)..t,
+        or to 0..t when window is None. Returns one output vector per position. O(T^2) per call."""
+        H, KV, D = cfg["n_heads"], cfg["n_kv_heads"], cfg["head_dim"]
+        group = H // KV
+        hs = [list(x) for x in xs]
+        for layer in layers:
+            qs = [matvec(h, layer["wq"]) for h in hs]
+            ks = [matvec(h, layer["wk"]) for h in hs]
+            vs = [matvec(h, layer["wv"]) for h in hs]
+            out = []
+            for t in range(len(hs)):
+                lo = 0 if window is None else max(0, t - window + 1)
+                heads = []
+                for h in range(H):
+                    g = h // group
+                    q = rope(qs[t][h * D:(h + 1) * D], t)
+                    scores = []
+                    for u in range(lo, t + 1):
+                        k = rope(ks[u][g * D:(g + 1) * D], u)
+                        scores.append(sum(a * b for a, b in zip(q, k)) / math.sqrt(D))
+                    m = max(scores)
+                    e = [math.exp(s - m) for s in scores]
+                    z = sum(e)
+                    acc = [0.0] * D
+                    for w, u in zip(e, range(lo, t + 1)):
+                        vv = vs[u][g * D:(g + 1) * D]
+                        for i in range(D):
+                            acc[i] += w / z * vv[i]
+                    heads.extend(acc)
+                o = matvec(heads, layer["wo"])
+                out.append([a + b for a, b in zip(hs[t], o)])
+            hs = out
+        return hs
+
+
+    class Decoder:
+        """Decode one token at a time with a KV cache. State your overflow policy here: what step does when
+        max_len positions are already cached, and why."""
+
+        def __init__(self, layers, cfg, max_len):
+            raise NotImplementedError
+
+        def step(self, x):
+            """x is the next position's input vector (length d_model). Return the last layer's output at that position."""
+            raise NotImplementedError
+
+        def cached_tokens(self):
+            """Positions currently held in the cache (the same for every layer)."""
+            raise NotImplementedError
+
+        def cache_floats(self):
+            """Floats your cache holds, over all layers."""
+            raise NotImplementedError
+  tests: |
+    import random, time
+
+    def make(cfg, seed):
+        rng = random.Random(seed)
+        d, H, KV, D = cfg["d_model"], cfg["n_heads"], cfg["n_kv_heads"], cfg["head_dim"]
+        mat = lambda r, c: [[rng.gauss(0, 0.3) for _ in range(c)] for _ in range(r)]
+        layers = [{"wq": mat(d, H * D), "wk": mat(d, KV * D), "wv": mat(d, KV * D), "wo": mat(H * D, d)} for _ in range(cfg["n_layers"])]
+        xs = [[rng.gauss(0, 1) for _ in range(d)] for _ in range(64)]
+        return layers, xs
+
+    def close(a, b, tol=1e-9):
+        return all(abs(p - q) <= tol * (1 + abs(q)) for p, q in zip(a, b)) and len(a) == len(b)
+
+    CFG = {"d_model": 8, "n_heads": 4, "n_kv_heads": 2, "head_dim": 4, "n_layers": 2}
+    layers, xs = make(CFG, 1)
+    ref = full_forward(xs[:12], layers, CFG)
+    dec = Decoder(layers, CFG, max_len=32)
+    outs = [dec.step(x) for x in xs[:12]]
+    assert close(outs[0], ref[0]), "the first position attends only to itself"
+    assert all(close(o, r) for o, r in zip(outs, ref)), "every decoded position equals the full recompute"
+    assert dec.cached_tokens() == 12
+    assert dec.cache_floats() == 2 * 2 * 2 * 4 * 12, f"cache holds {dec.cache_floats()} floats; grouped-query size is {2 * 2 * 2 * 4 * 12}"
+    BIG = {"d_model": 16, "n_heads": 4, "n_kv_heads": 2, "head_dim": 4, "n_layers": 2}
+    big_layers, _ = make(BIG, 2)
+    _rng = random.Random(3)
+    _dec, _t0, _done = Decoder(big_layers, BIG, max_len=256), time.perf_counter(), 0
+    for _ in range(256):
+        _dec.step([_rng.gauss(0, 1) for _ in range(16)])
+        _done += 1
+        if time.perf_counter() - _t0 > 4:
+            break
+    assert _done == 256, f"decoded {_done} of 256 positions in the 4 s budget"
+  hidden: |
+    import random, math
+
+    def _hx_make(cfg, seed, n=40):
+        rng = random.Random(seed)
+        d, H, KV, D = cfg["d_model"], cfg["n_heads"], cfg["n_kv_heads"], cfg["head_dim"]
+        mat = lambda r, c: [[rng.gauss(0, 0.3) for _ in range(c)] for _ in range(r)]
+        layers = [{"wq": mat(d, H * D), "wk": mat(d, KV * D), "wv": mat(d, KV * D), "wo": mat(H * D, d)} for _ in range(cfg["n_layers"])]
+        xs = [[rng.gauss(0, 1) for _ in range(d)] for _ in range(n)]
+        return layers, xs
+
+    def _hx_close(a, b, tol=1e-9):
+        return len(a) == len(b) and all(abs(p - q) <= tol * (1 + abs(q)) for p, q in zip(a, b))
+
+    _hx_cfgs = [
+        {"d_model": 8, "n_heads": 4, "n_kv_heads": 4, "head_dim": 4, "n_layers": 1},
+        {"d_model": 8, "n_heads": 4, "n_kv_heads": 1, "head_dim": 4, "n_layers": 2},
+        {"d_model": 12, "n_heads": 6, "n_kv_heads": 2, "head_dim": 6, "n_layers": 3},
+        {"d_model": 6, "n_heads": 8, "n_kv_heads": 4, "head_dim": 2, "n_layers": 2},
+    ]
+    for _hx_i, _hx_cfg in enumerate(_hx_cfgs):
+        _hx_layers, _hx_xs = _hx_make(_hx_cfg, 100 + _hx_i, 20)
+        _hx_ref = full_forward(_hx_xs, _hx_layers, _hx_cfg)
+        _hx_dec = Decoder(_hx_layers, _hx_cfg, max_len=20)
+        _hx_out = [_hx_dec.step(x) for x in _hx_xs]
+        assert all(_hx_close(o, r) for o, r in zip(_hx_out, _hx_ref))
+        _hx_per = 2 * _hx_cfg["n_layers"] * _hx_cfg["n_kv_heads"] * _hx_cfg["head_dim"]
+        assert _hx_dec.cached_tokens() == 20 and _hx_dec.cache_floats() == _hx_per * 20
+
+    _hx_cfg = {"d_model": 8, "n_heads": 4, "n_kv_heads": 2, "head_dim": 4, "n_layers": 2}
+    _hx_layers, _hx_xs = _hx_make(_hx_cfg, 7, 30)
+    _hx_a, _hx_b = Decoder(_hx_layers, _hx_cfg, 30), Decoder(_hx_layers, _hx_cfg, 30)
+    for x in _hx_xs[:5]:
+        _hx_a.step(x)
+    _hx_first = _hx_b.step(_hx_xs[0])
+    assert _hx_b.cached_tokens() == 1 and _hx_close(_hx_first, full_forward(_hx_xs[:1], _hx_layers, _hx_cfg)[0])
+
+    _hx_x = list(_hx_xs[0])
+    Decoder(_hx_layers, _hx_cfg, 4).step(_hx_x)
+    assert _hx_x == _hx_xs[0]
+
+    _hx_W = 6
+    _hx_dec = Decoder(_hx_layers, _hx_cfg, max_len=_hx_W)
+    _hx_outs = [_hx_dec.step(x) for x in _hx_xs[:_hx_W]]
+    _hx_raised = False
+    try:
+        _hx_more = [_hx_dec.step(x) for x in _hx_xs[_hx_W:16]]
+    except ValueError:
+        _hx_raised = True
+    if _hx_raised:
+        assert _hx_dec.cached_tokens() == _hx_W
+        assert _hx_close(_hx_outs[-1], full_forward(_hx_xs[:_hx_W], _hx_layers, _hx_cfg)[-1])
+    else:
+        _hx_ref = full_forward(_hx_xs[:16], _hx_layers, _hx_cfg, window=_hx_W)
+        assert all(_hx_close(o, r) for o, r in zip(_hx_outs + _hx_more, _hx_ref))
+        assert _hx_dec.cached_tokens() == _hx_W
+        assert _hx_dec.cache_floats() == 2 * 2 * 2 * 4 * _hx_W
+
+    _hx_cfg2 = {"d_model": 8, "n_heads": 4, "n_kv_heads": 2, "head_dim": 4, "n_layers": 1}
+    _hx_l2, _hx_x2 = _hx_make(_hx_cfg2, 11, 24)
+    _hx_x2 = [[v * 40 for v in x] for x in _hx_x2]
+    _hx_d2 = Decoder(_hx_l2, _hx_cfg2, 24)
+    _hx_o2 = [_hx_d2.step(x) for x in _hx_x2]
+    assert all(math.isfinite(v) for o in _hx_o2 for v in o)
+    assert all(_hx_close(o, r, 1e-7) for o, r in zip(_hx_o2, full_forward(_hx_x2, _hx_l2, _hx_cfg2)))
+  solution: |
+    import math
+
+    # A toy decoder: n_layers blocks of grouped-query attention, each added to its input (a residual), no MLP, no norm.
+    # cfg keys: d_model, n_heads, n_kv_heads, head_dim, n_layers. A layer is {"wq", "wk", "wv", "wo"}, each a list of rows:
+    # wq is d_model x (n_heads * head_dim), wk and wv are d_model x (n_kv_heads * head_dim), wo is (n_heads * head_dim) x d_model.
+    # Query head h reads key/value head h // (n_heads // n_kv_heads), as repeat_kv does in Hugging Face's Llama code.
+
+
+    def matvec(x, w):
+        out = [0.0] * len(w[0])
+        for xi, row in zip(x, w):
+            for j, wij in enumerate(row):
+                out[j] += xi * wij
+        return out
+
+
+    def rope(v, pos, base=10000.0):
+        # Rotary embedding on one head vector, rotate-half layout: pairs (i, i + half).
+        half = len(v) // 2
+        out = list(v)
+        for i in range(half):
+            theta = pos * base ** (-2 * i / len(v))
+            c, s = math.cos(theta), math.sin(theta)
+            out[i] = v[i] * c - v[i + half] * s
+            out[i + half] = v[i + half] * c + v[i] * s
+        return out
+
+
+    def full_forward(xs, layers, cfg, window=None):
+        """The reference: recompute every position from scratch. Position t attends to positions max(0, t - window + 1)..t,
+        or to 0..t when window is None. Returns one output vector per position. O(T^2) per call."""
+        H, KV, D = cfg["n_heads"], cfg["n_kv_heads"], cfg["head_dim"]
+        group = H // KV
+        hs = [list(x) for x in xs]
+        for layer in layers:
+            qs = [matvec(h, layer["wq"]) for h in hs]
+            ks = [matvec(h, layer["wk"]) for h in hs]
+            vs = [matvec(h, layer["wv"]) for h in hs]
+            out = []
+            for t in range(len(hs)):
+                lo = 0 if window is None else max(0, t - window + 1)
+                heads = []
+                for h in range(H):
+                    g = h // group
+                    q = rope(qs[t][h * D:(h + 1) * D], t)
+                    scores = []
+                    for u in range(lo, t + 1):
+                        k = rope(ks[u][g * D:(g + 1) * D], u)
+                        scores.append(sum(a * b for a, b in zip(q, k)) / math.sqrt(D))
+                    m = max(scores)
+                    e = [math.exp(s - m) for s in scores]
+                    z = sum(e)
+                    acc = [0.0] * D
+                    for w, u in zip(e, range(lo, t + 1)):
+                        vv = vs[u][g * D:(g + 1) * D]
+                        for i in range(D):
+                            acc[i] += w / z * vv[i]
+                    heads.extend(acc)
+                o = matvec(heads, layer["wo"])
+                out.append([a + b for a, b in zip(hs[t], o)])
+            hs = out
+        return hs
+
+
+    class Decoder:
+        # Overflow policy: raise. This model was trained with full causal attention, so dropping old positions would
+        # return outputs that full_forward never produces; the caller decides whether to stop, truncate or re-prefill.
+
+        def __init__(self, layers, cfg, max_len):
+            self.layers, self.cfg, self.max_len = layers, cfg, max_len
+            self.pos = 0
+            # Per layer: roped keys and values, one list per KV head, appended per position. Keys are stored after rope,
+            # so a step never re-rotates the past.
+            self.k = [[[] for _ in range(cfg["n_kv_heads"])] for _ in layers]
+            self.v = [[[] for _ in range(cfg["n_kv_heads"])] for _ in layers]
+
+        def step(self, x):
+            if self.pos >= self.max_len:
+                raise ValueError(f"cache full at {self.max_len} positions")
+            H, KV, D = self.cfg["n_heads"], self.cfg["n_kv_heads"], self.cfg["head_dim"]
+            group, scale, t = H // KV, 1 / math.sqrt(D), self.pos
+            h_in = list(x)
+            for li, layer in enumerate(self.layers):
+                q_all = matvec(h_in, layer["wq"])
+                k_all = matvec(h_in, layer["wk"])
+                v_all = matvec(h_in, layer["wv"])
+                for g in range(KV):
+                    self.k[li][g].append(rope(k_all[g * D:(g + 1) * D], t))
+                    self.v[li][g].append(v_all[g * D:(g + 1) * D])
+                heads = []
+                for h in range(H):
+                    g = h // group
+                    q = rope(q_all[h * D:(h + 1) * D], t)
+                    scores = [sum(a * b for a, b in zip(q, k)) * scale for k in self.k[li][g]]
+                    m = max(scores)
+                    e = [math.exp(s - m) for s in scores]
+                    z = sum(e)
+                    acc = [0.0] * D
+                    for w, vv in zip(e, self.v[li][g]):
+                        w /= z
+                        for i in range(D):
+                            acc[i] += w * vv[i]
+                    heads.extend(acc)
+                o = matvec(heads, layer["wo"])
+                h_in = [a + b for a, b in zip(h_in, o)]
+            self.pos += 1
+            return h_in
+
+        def cached_tokens(self):
+            return self.pos
+
+        def cache_floats(self):
+            D = self.cfg["head_dim"]
+            return sum(len(head) * D for layer in self.k + self.v for head in layer)
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Coding round">
+"Here is a toy decoder and the function that runs it over a whole sequence. Make generation incremental: one position per call, with a KV cache, and the same outputs as the full recompute."
+</Callout>
+
+The editor starts with three helpers you keep: `matvec`, `rope` (rotary embedding in the rotate-half layout) and `full_forward`, the reference that recomputes every position from scratch. The decoder is `n_layers` blocks of grouped-query attention, each added to its input, with no MLP and no normalisation, so the whole round is about the cache. Query head `h` reads key/value head `h // (n_heads // n_kv_heads)`.
+
+Write `Decoder(layers, cfg, max_len)` with:
+
+- `step(x)`: take the next position's input vector and return the last layer's output at that position. It must equal `full_forward(inputs so far, layers, cfg)[-1]` to a relative 1e-9, for any layer count and any head counts where `n_kv_heads` divides `n_heads`. Do not modify `x`.
+- `cached_tokens()` and `cache_floats()`: the positions held, and the floats your cache holds over all layers. The budget is 2 × n_layers × n_kv_heads × head_dim floats per cached position and nothing else.
+
+One decision is yours: what `step` does when `max_len` positions are already cached. Either raise `ValueError` and leave the cache as it was, or evict the oldest position in every layer so that outputs equal `full_forward(..., window=max_len)`. The hidden tests accept either; the comment at the top of your class says which and why.
+
+The visible tests end with 256 positions of a two-layer model with `d_model` 16, decoded within 4 seconds.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which position index the rotary embedding of a new key uses, and whether the cache stores keys before or after that rotation.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask how many key/value heads the checkpoint has, and request the per-token cache size the serving team budgets for it.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask whether the model was trained with a sliding window, and what callers do today when a request reaches the context limit.</p></details>
+
+## Answer
+
+**What the cache holds.** Per layer and per key/value head: the rotated key and the value of every past position. A step projects only the new row to q, k and v, rotates q and k at the absolute position t, appends k and v, attends q over the cache, adds the result to the input and passes it to the next layer. Layer 2's input at position t is layer 1's output at t, which is why each layer keeps its own cache and why the cache cannot be filled from the raw inputs. The reference stores keys after the rotation, so a past key is rotated once in its life, not once per step.
+
+**Grouped-query heads.** The cache has `n_kv_heads` entries per position, not `n_heads`. Expanding keys to every query head before storing them multiplies memory by the group size; for Llama 3.1 70B, with 64 query heads over 8 key/value heads, that is 8 times its 327,680 bytes per token (2 × 80 layers × 8 heads × 128 dims × 2 bytes). The visible test pins the float count for one configuration and the hidden tests pin it for multi-head (group 1), multi-query (one key/value head) and groups of 2 and 3. The common head-mapping bug, `h % n_kv_heads`, gives the right answer whenever the group is 1 or there is a single key/value head, and wrong outputs in between.
+
+**Cost.** A cached step does the projections for one row plus attention over t cached positions: linear in t per step, quadratic over a sequence. Calling `full_forward` at every step recomputes all earlier positions in every layer and is cubic over a sequence. When this problem was checked in CPython 3.12.6, the reference decoded the 256 positions of the visible test in 0.22 s; the recompute version had decoded 108 of them when the 4-second budget ran out.
+
+**The overflow decision.** Raising keeps every output equal to what the model computes with full attention; the cost lands on the caller, which must stop the request or truncate the prompt and pay a fresh prefill near the limit. Sliding keeps memory bounded at `max_len` positions per layer; the cost is that outputs stop matching full attention at the first eviction. That is the trained behaviour for a model trained with a window, as Mistral 7B was, and a quality risk for one that was not: Xiao et al. report that window attention fails once the text is longer than the cache, and that keeping the first tokens' keys and values largely recovers it. The reference raises, because `full_forward` is a full-attention model. If you slide, rotate with the original position t, not the slot index in the window: a version that renumbers positions passes every test until the first eviction.
+
+**The tolerance is a quantity you choose.** In float64 the reference's cached outputs for the visible test's model equal the recompute exactly over 64 positions, because both paths add the same terms in the same order. On a GPU in bf16 they will not match bit for bit, because the cached path sums in a different order; bf16 stores 7 fraction bits, so neighbouring values near 1 are 2^-7 = 0.0078 apart, and a tolerance tighter than a few of those steps flags reduction order rather than a bug. Comparing the argmax token over a few hundred prompts, with the logit tolerance stated, is the check that survives the move to bf16.
+
+**How the reference fails.** It appends Python lists per position, so memory grows one position at a time and a long request holds its full cache until it ends. Raising at `max_len` also means a request can spend its whole decode budget and then fail on the last token, which is worse for the user than truncating the prompt up front. A serving engine allocates the cache in fixed-size blocks and decides at admission whether a request can reach its maximum length.
+
+## Follow-ups
+
+- *What changes to run this in a real engine?* The prompt is prefilled in one batched matrix multiply that fills the cache for all prompt positions, and decode steps then run for many sequences of different lengths at once. The cache lives in preallocated blocks with a per-sequence block table, as in PagedAttention, whose authors report 2 to 4 times the throughput of FasterTransformer and Orca at the same latency. Rotary cos and sin tables are precomputed per position, and the cache dtype (bf16 or fp8) becomes a quality decision you measure.
+- *Pushback: product wants 128K context on the GPUs you have, and one 131,072-token sequence of Llama 3.1 70B is 131,072 × 327,680 bytes = 40 GiB of cache. You propose a sliding window with sink tokens; the research lead says quality drops on long documents. What do you give up, and what do you write down?* Either fewer concurrent long sequences at full attention, or a window with a measured regression on the long-document eval set; write down which tasks regress, by how much, and who accepted it.
+- *Reversal: what would make you switch the reference from raising to sliding?* A checkpoint trained with a window, or an eval on the product's own long conversations showing no regression at window W with the first tokens kept.
+- *Two engineers disagree about storing keys before or after the rotation. How do you decide without deciding by rank?* Before the rotation lets you renumber positions (after eviction, or for a context-extension scheme) at the cost of rotating every cached key on every step; after costs nothing per step. Measure the step time both ways at the target context and check whether any planned feature needs renumbering.
+
+## Common mistakes
+
+- Rotating the new key at `len(cache)` after appending it, which shifts every position by one.
+- Mapping query head `h` to key/value head `h % n_kv_heads`.
+- Expanding keys and values to every query head before caching them.
+- Feeding every layer the raw input instead of the previous layer's output at that position.
+- Adding the residual into `x` in place, which corrupts the caller's copy of the input.
+- Exponentiating scores without subtracting the row maximum; the hidden tests scale inputs by 40.

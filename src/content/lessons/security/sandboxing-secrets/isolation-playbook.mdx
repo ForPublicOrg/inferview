@@ -1,0 +1,143 @@
+---
+title: "Playbook: choosing an isolation boundary for agent code execution"
+track: security
+module: sandboxing-secrets
+order: 1
+kind: playbook
+level: staff
+minutes: 14
+summary: How tenancy, code trust, start-up budget and compatibility decide between seccomp, Landlock, an OS sandbox, a hardened container, gVisor and a microVM for agent-run code, worked through a hosted multi-tenant interpreter, a local coding agent and a CI job, with egress treated as a separate decision none of them makes for you.
+prerequisites: [security/secure-architecture/capability-matrix]
+updated: 2026-10-28
+sources:
+  - title: Linux kernel documentation, Seccomp BPF (SECure COMPuting with filters)
+    url: https://docs.kernel.org/userspace-api/seccomp_filter.html
+    note: "\"System call filtering isn't a sandbox\"; a tool for sandbox developers; BPF programs may not dereference pointers; requires no_new_privs or CAP_SYS_ADMIN in the namespace; SECCOMP_RET_KILL_PROCESS has the highest precedence; seccomp-based sandboxes must not allow ptrace. Checked 2026-10-28."
+  - title: Linux kernel documentation, Landlock unprivileged access control
+    url: https://docs.kernel.org/userspace-api/landlock.html
+    note: "stackable LSM since Linux 5.13; any process can restrict its own filesystem and network access; TCP port rules from ABI 4, UDP from ABI 10; at most 16 stacked layers; chdir, stat, chmod, chown and others cannot yet be restricted; query the ABI and degrade best-effort. Checked 2026-10-28."
+  - title: CVE-2024-21626 record (runc, published 2024-01-31)
+    url: https://cveawg.mitre.org/api/cve/CVE-2024-21626
+    note: "runc 1.0.0-rc93 to 1.1.11 leaks an internal file descriptor so a process started by runc exec, or a malicious image under runc run, gets a working directory in the host filesystem namespace; fixed in 1.1.12; CVSS 3.1 base score 8.6. Checked 2026-10-28."
+  - title: gVisor documentation, What is gVisor?
+    url: https://gvisor.dev/docs/
+    note: "an application kernel written in Go that runs in user space; the Sentry does not pass system calls through to the host kernel; the Gofer mediates file access; does not implement every system call, /proc or /sys file; higher per-system-call overhead and poor performance for system-call-heavy workloads. Checked 2026-10-28."
+  - title: Firecracker design document
+    url: https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md
+    note: "vCPU threads treated as running malicious code once started; jailer sets up cgroups and chroot then drops privileges; per-thread seccomp filters loaded before guest code; virtio net, block and vsock; \"Firecracker does not perform any network traffic filtering\", egress should be filtered at host level. Checked 2026-10-28."
+  - title: Firecracker specification
+    url: https://github.com/firecracker-microvm/firecracker/blob/main/SPECIFICATION.md
+    note: "at most 125 ms from the InstanceStart API call to the start of the guest's user-space init process and at most 5 MiB VMM memory overhead, each with 1 vCPU, 128 MiB RAM and a Firecracker-tuned guest kernel (boot also with serial console disabled and a minimal kernel and rootfs), on M5D.metal with hyperthreading off or M6G.metal; overhead is workload dependent. Checked 2026-10-28."
+  - title: Claude Code docs, Securely deploying AI agents
+    url: https://code.claude.com/docs/en/agent-sdk/secure-deployment
+    note: "Anthropic's comparison of sandbox runtime, containers, gVisor and VMs; Docker's default seccomp profile blocks about 44 syscalls; gVisor overhead about 0% for CPU-bound work, about 2x for simple syscalls, up to 10-200x for heavy open/close file I/O (Anthropic's figures); hardened docker run flags; VMs not automatically more secure than gVisor. Checked 2026-10-28."
+  - title: Anthropic Engineering, How we contain Claude across products (25 May 2026)
+    url: https://www.anthropic.com/engineering/how-we-contain-claude
+    note: "claude.ai code execution runs in a gVisor container on isolated infrastructure; Claude Code uses Seatbelt or bubblewrap; Cowork uses a full VM on the platform hypervisor; match isolation strength to the user's capacity for oversight; standard primitives held where custom components failed."
+  - title: OpenAI Codex docs, Agent approvals and security
+    url: https://learn.chatgpt.com/docs/agent-approvals-security
+    note: "the Linux sandbox moved to bwrap from Codex 0.115; 0.114 was the last version supporting WSL1. Checked 2026-10-28."
+  - title: GitHub Docs, Risks and mitigations for Copilot cloud agent
+    url: https://docs.github.com/en/copilot/concepts/agents/coding-agent/risks-and-mitigations
+    note: "firewall on the agent's internet access; pushes to one branch only; workflows wait for approval by a user with write access. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+Which boundary sits between code an agent wrote and the things you care about: other tenants, the host, the developer's machine, the credentials in CI. The candidates differ in what they share with the host. A seccomp filter shares everything and removes system calls. Landlock shares the kernel and removes filesystem paths and ports. An OS sandbox such as bubblewrap or Seatbelt composes namespaces and policy around one command tree. A container shares the host kernel through a runtime. gVisor puts a second kernel, written in Go and running in user space, between the code and the host kernel. A microVM gives the code its own guest kernel behind a hypervisor and a small device model.
+
+The second half of the decision is separate: none of these boundaries decides where the code's network traffic may go. Landlock's network rules are TCP and UDP port numbers, not hosts. Firecracker's design document says it "does not perform any network traffic filtering" and leaves egress to the host. A gVisor container has whatever network the runtime gives it. Domain-level egress, and keeping credentials out of reach, are proxy decisions you make in addition to the boundary, and the next two lessons cover them.
+
+## The inputs that change it
+
+**Tenancy.** Whether code from different principals shares a host. Single-user tools on the user's own machine have no other tenant to protect; the asset is the user's home directory and their credentials.
+
+**Code trust.** Who can influence the code that runs. Model-written code is as trusted as the least trusted text in the context that produced it, so an interpreter fed by user uploads or web pages runs hostile code by assumption. Anthropic's containment post (May 2026) states the operating rule: match isolation strength to how much oversight the user can give.
+
+**Start-up budget.** How often a fresh boundary is created and how long the caller waits. A coding agent wraps every shell command, so its budget is close to zero. A hosted interpreter creates one per session and a CI job one per run.
+
+**Compatibility.** What the code needs from the kernel. gVisor's own documentation says it does not implement every system call, `/proc` file or `/sys` file and is slow for system-call-heavy workloads. An OS sandbox breaks tools that need user namespaces, Docker, or a non-HTTP network path.
+
+## The options, and when each wins
+
+**seccomp alone.** The kernel documentation is blunt: "System call filtering isn't a sandbox." It is a tool for people building one. A filter runs as BPF over the system call number and raw argument registers and may not dereference pointers, so it can refuse `ptrace` or `mount` but cannot decide anything about the path an `openat` call names. It wins as a layer inside every other option: Docker applies a default profile that, per Anthropic's deployment guide, blocks about 44 system calls; Firecracker loads a filter per thread before guest code runs; Claude Code's optional seccomp filter adds Unix domain socket blocking to its sandbox. On its own it does not answer "what can this code read".
+
+**Landlock.** An LSM any unprivileged process can use to restrict itself and its children, available since Linux 5.13. Rules grant rights on file hierarchies and, from ABI 4, TCP ports (UDP from ABI 10). Domains are inherited and only ever tighten, up to 16 stacked layers. It wins when a tool wants to drop its own rights without root or a setuid helper. It loses when you need a complete policy: the documentation lists operations it cannot yet restrict, including `chdir`, `stat`, `chmod` and `chown`, and kernels differ in ABI, so you write best-effort code that queries the version and degrades.
+
+**OS sandbox (bubblewrap on Linux, Seatbelt on macOS).** Namespaces plus a filesystem and network policy around one command and its children, with traffic forced through a proxy outside the sandbox. Claude Code and Codex both use this design on Linux and macOS, and Codex moved its Linux sandbox to bubblewrap at 0.115. It wins on a developer's machine: start-up is a process spawn and most of the developer's toolchain works. The kernel is the host kernel, which Anthropic's deployment guide states plainly: a kernel vulnerability could enable escape.
+
+**Hardened container.** Namespaces, cgroups and a seccomp profile set up by a runtime. The deployment guide's hardened `docker run` drops all capabilities, sets `no-new-privileges`, mounts a read-only root, sets `--network none` and gives the agent a Unix socket to a proxy on the host. It wins when you already run containers and the code is yours or semi-trusted. The runtime is attack surface in its own right: CVE-2024-21626 (published 31 January 2024, CVSS 8.6) was a file descriptor leak in runc 1.0.0-rc93 to 1.1.11 that gave a process started by `runc exec`, or by a malicious image under `runc run`, a working directory in the host's filesystem namespace. No kernel bug was needed.
+
+**gVisor.** The Sentry implements the Linux interface itself and does not pass system calls to the host kernel; the Gofer mediates file access. Anthropic's guide gives its overhead as about 0% for CPU-bound code, about 2 times for simple system calls, and up to 10 to 200 times for workloads that open and close many files. It wins for multi-tenant code execution that is mostly computation, and it is what Anthropic says claude.ai's code execution runs on.
+
+**MicroVM (Firecracker).** A guest kernel per sandbox behind KVM, with a device model limited to virtio net, block and vsock, a jailer that sets up cgroups and a chroot and drops privileges, and per-thread seccomp filters. Its threat model treats every vCPU thread as malicious from the moment it starts. The specification promises at most 125 ms from the `InstanceStart` call to the guest's init process and at most 5 MiB of VMM memory overhead, each measured with 1 vCPU, 128 MiB of guest memory and a Firecracker-tuned kernel on M5D.metal or M6G.metal hosts. It wins when tenants run arbitrary binaries, need full kernel behaviour, or the risk owner wants a hardware virtualisation boundary. The deployment guide warns that VMs are not automatically more secure than gVisor: the boundary is only as good as the hypervisor and device emulation code.
+
+| Option | Shares with host | Start-up | Compatibility cost | Domain egress control |
+|---|---|---|---|---|
+| seccomp | everything except filtered syscalls | none | low | none |
+| Landlock | kernel | none | low; incomplete policy | ports only |
+| OS sandbox | kernel | process spawn | user namespaces, Docker, non-proxy tools | through its proxy |
+| Hardened container | kernel and runtime | container start | low | none without a proxy |
+| gVisor | Go user-space kernel, Gofer | container start | missing syscalls, slow file I/O | none without a proxy |
+| MicroVM | hypervisor and device model | at most 125 ms to init (spec conditions) | guest kernel needed | none; host must filter |
+
+## The worked cases
+
+**Case 1: a hosted interpreter for a multi-tenant product.** Scenario: a data-analysis feature runs model-written Python against user-uploaded files. Tenancy is shared, the code is untrusted by assumption, sessions are interactive and the workload is mostly numeric with occasional package installs.
+
+A container alone puts every tenant one runtime or kernel bug from every other, so it is out. gVisor fits the numeric workload and the existing container tooling; its cost lands on package installs, which are open-and-close heavy. A microVM costs a guest kernel and a VMM per session and removes the compatibility question. Choose gVisor if measured install time under it stays inside the session budget, and a microVM if it does not or if tenants may run arbitrary binaries. In both cases: no network by default, a proxy that allows only the package index, a per-session ephemeral filesystem, and no credential of any kind inside.
+
+<Predict id="sec-isolation-microvm-overhead" question="How much host memory does the Firecracker VMM overhead alone take at peak, in GiB?" answer={88} tolerance={2} unit="GiB">
+<Fragment slot="prompt">
+<p>Scenario inputs: at peak, 150 sessions start per second and each lives 120 seconds on average. Each session gets one Firecracker microVM sized like the specification's test configuration: 1 vCPU, 128 MiB of guest memory, and VMM overhead at the specification's bound of 5 MiB.</p>
+</Fragment>
+<p>Concurrent microVMs: 150 × 120 = 18,000. VMM overhead: 18,000 × 5 MiB = 90,000 MiB, which is 90,000 / 1,024 = <b>about 88 GiB</b>. Guest memory is 18,000 × 128 MiB = 2,250 GiB, so the overhead is 5 / 128 of it, under 4%. The term that decides the bill is guest memory per session, and the lever is the guest size and how much of it you overcommit, not the choice of VMM. The 5 MiB is a bound under one configuration; the specification says it rises with workload, for example with many vsock connections.</p>
+</Predict>
+
+**Case 2: a local coding agent.** One user, the user's own machine, code shaped by the repository and whatever the agent reads, a boundary per shell command and a toolchain that must keep working. A VM per command fails the start-up budget and breaks the toolchain. An OS sandbox with a proxy fits, and it is what Claude Code and Codex ship. Two conditions change the answer. If the user cannot review what the agent does, as with non-developers, move the whole agent into a VM, which is what Anthropic did for Cowork. If processes the harness starts itself, such as hooks and MCP servers, must also be bounded, wrap the whole agent process rather than its commands; the next lesson shows how much a per-command sandbox leaves out.
+
+**Case 3: an agent in CI.** Scenario: a job runs an agent on every pull request, including those from forks, to triage and propose fixes. The runner is created per job, so start-up is cheap relative to the job. The deciding input is that pull request text is attacker-written and the job sits next to the repository's secrets. Run the agent step in a hardened container or under gVisor on the runner, with `--network none` and a proxy, and with no deploy or publish credential in the job's environment for that step. GitHub's Copilot cloud agent shows the shape at the platform level: a firewall on its internet access, pushes limited to one branch, and workflows on its pull requests held until someone with write access approves them.
+
+## What to measure after deciding
+
+Start-up latency at the percentile the product cares about, measured on your hosts and images rather than the specification's minimal kernel. The share of sessions or commands that fail only under the boundary, and what happens next: a retry outside it, a new exclusion rule, or a support ticket. A growing exclusion list is the boundary eroding. Runtime and kernel patch lag, since the runc CVE was fixed in 1.1.12 and every host still on 1.1.11 stayed exposed. Memory per sandbox at peak against the arithmetic above. And every egress allowlist entry, reviewed for whether the destination accepts uploads.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your hosted notebook product runs customer code in Docker containers with the default seccomp profile. After a runc escape advisory, security wants VM-grade isolation this quarter. Finance caps the infrastructure increase at 15%, and about a third of sessions install packages. What do you move to, and what do you put in writing?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Patch runc now; that closes the advisory, not the class. Then move execution to gVisor first, because the notebook workload is mostly computation and it reuses the container pipeline, and measure package-install time under it before committing. If installs break the session budget or the cost cap, move only the install step or the affected tenants to microVMs. Egress and credentials are fixed in the same change, because neither boundary does them.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Separate the incident from the architecture. Upgrading runc past the vulnerable range is the incident response. The architecture question is whether customers should share a kernel and a runtime at all, and for untrusted multi-tenant code the answer is no.</p>
+<p>Between gVisor and microVMs the inputs are the workload and the cost cap. Most notebook cells are numeric and pay little under gVisor, but Anthropic's published figure for open-and-close-heavy file I/O is up to 10 to 200 times, and package installs are that workload. I would replay a sample of real sessions under gVisor and compare. MicroVMs cost a guest kernel and memory per session; the dominant term is guest memory, so whether they fit the cap depends on how small a guest the product tolerates.</p>
+<p>A plausible split: gVisor for execution, a prebuilt image with the common packages to cut installs, and a microVM pool for tenants that need arbitrary binaries. Network is off by default with a proxy for the package index only. In writing: the residual risk of a gVisor or hypervisor bug, the measured slowdown per workload class, and the rule for moving a tenant to a microVM.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The replay shows installs at four times their current time under gVisor, and product says that kills onboarding. Which do you give up: the isolation level for installs, the package freedom, or the cost cap, and who signs?</em></li>
+<li><em>A security engineer argues microVMs are strictly stronger and wants them everywhere; a platform engineer says gVisor's Go kernel is a smaller attack surface than KVM plus device emulation. How do you decide without deciding by rank?</em></li>
+<li><em>What would you need to see in the first month of production to reverse the gVisor choice?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The boundary contains the code's access to the host, not its use of what you handed it. An agent that holds a credential, or can reach an allowed domain that accepts uploads, leaks through the front door of any of these boundaries. Anthropic's containment post describes exactly that failure in Cowork: the VM held, and files went to an attacker's account through an allowed API.
+
+The ordering in the table is not a strict ranking. A microVM with a large device model can be weaker than gVisor, and a misconfigured gVisor container (shared host network, a mounted Docker socket) is weaker than a tight container. The deployment guide's "with correct setup" qualifier carries most of the weight.
+
+The published numbers are under stated conditions. Firecracker's 125 ms is to guest init with a minimal kernel and root filesystem, not to an interpreter ready for its first cell, and the gVisor overhead figures are Anthropic's summary, not a benchmark of your workload.
+
+The glue fails more often than the primitive. Anthropic says standard primitives held while its own surrounding components exposed flaws. Most of the risk in a new isolation design sits in the proxy, the file-mount code and the exclusion list, not in the choice between gVisor and Firecracker.
+
+<SelfRate id="lesson:security/sandboxing-secrets/isolation-playbook" />

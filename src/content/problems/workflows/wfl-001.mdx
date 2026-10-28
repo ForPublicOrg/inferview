@@ -1,0 +1,111 @@
+---
+id: wfl-001
+title: Vendor-invoice intake with a refund branch
+subtitle: steps, gates, keys, timeouts and review routing
+track: workflows
+module: patterns
+type: workflow
+difficulty: hard
+seniority: [senior, staff]
+minutes: 40
+core: true
+tags: [workflow-design, idempotency, human-in-the-loop, approvals, structured-outputs, budgets]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Anthropic, Building effective agents (2024-12-19)
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: workflows run model calls through predefined code paths; agents direct their own process; programmatic gates between chained steps; checked 2026-10-28
+  - title: OpenAI, A practical guide to building agents (PDF)
+    url: https://cdn.openai.com/business-guides-and-resources/a-practical-guide-to-building-agents.pdf
+    note: build an agent for complex decisions, hard-to-maintain rules or unstructured data, otherwise a deterministic solution may suffice; human intervention on exceeded failure thresholds and on high-risk actions such as authorising large refunds or making payments
+  - title: OpenAI Agents SDK, Human-in-the-loop
+    url: https://openai.github.io/openai-agents-python/human_in_the_loop/
+    note: approval permits a tool call to execute and does not guarantee exactly-once execution; use a stable idempotency key per logical action and reconcile before retrying; store a version marker when approvals may sit for a while; checked 2026-10-28
+  - title: Stripe API reference, Idempotent requests
+    url: https://docs.stripe.com/api/idempotent_requests
+    note: for API v1, keys can be removed once they are at least 24 hours old, and a reused key after pruning creates a new request; checked 2026-10-28
+  - title: HumanLayer, 12-Factor Agents
+    url: https://github.com/humanlayer/12-factor-agents
+    note: factors 5 to 8, unify execution state and business state, launch/pause/resume, contact humans with tool calls, own your control flow
+checklist:
+  - Draws the steps in advance and keeps control flow in code; model calls only for classification and field extraction, with every other step deterministic
+  - Puts a deterministic gate after extraction (schema, totals, vendor master, PO match, duplicate check) and routes failures to a needs-human state with a reason code
+  - Derives each side-effect key from business identity (vendor, invoice number, amount, action), stores it before the call and reuses it on every retry
+  - Handles the ERP's lack of idempotency by marking the posting in progress, then reading back by vendor and invoice number before any retry
+  - Notices that a two-day approval outlives a 24-hour provider key window and reconciles with the provider before re-sending a payment
+  - Waits for approval in durable state with a version marker; on timeout escalates to a named delegate and never approves by default
+  - Chooses an amount threshold for human review from reviewer capacity and states the expected queue size against it
+  - Sends any change of vendor bank details to out-of-band verification whatever the model or the gates say
+  - Sets a per-invoice retry and token budget and a daily spend stop that parks work instead of failing it
+  - Writes a rollout with shadow mode, a first cohort and named rollback triggers
+  - States what is given up, such as straight-through processing for high-value invoices and refund speed
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Workflow round">
+"Accounts payable wants vendor invoices processed without anyone retyping them. Some of what arrives is a refund request, and refunds need the controller's approval. Design it."
+</Callout>
+
+The scenario's facts, which are invented for this problem: vendors email PDFs to one inbox, about 3,000 a month, with the month's last three working days carrying a large share. Most messages are invoices; some are credit notes or requests that you refund an overpayment. Two accounts-payable clerks can review about 60 documents each per working day. Refunds of any amount need the controller's approval, and finance policy gives the controller two days to answer.
+
+Operating constraints:
+
+- The ERP stays. It accepts a payable through an API with no idempotency support; posting the same invoice twice creates two payables.
+- Payments and refunds go out through a provider whose idempotency keys can be pruned once they are 24 hours old.
+- Two engineers, six weeks to the first production invoice, and an external auditor who will ask who approved each refund.
+
+Design the workflow: the steps, which steps are model calls, the gates between them, the state you keep, the idempotency key for each side effect, timeout behaviour, budgets, review routing and the rollout. Choose the amount above which an invoice goes to a clerk even when every check passes, and defend it.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what the ERP returns when it is asked for a payable by vendor and invoice number, and whether that read is consistent right after a write.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask who may approve a refund when the controller is away, and what finance wants to happen when nobody answers in two days.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request last quarter's daily document counts and the share of invoices clerks corrected by hand; both bound the review queue.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>This is a workflow, not an agent: every step can be drawn in advance, the refund is an irreversible payment that OpenAI's guide lists as a trigger for human oversight, and the only unstructured work is reading the PDF. Two model calls (classify the document, extract fields against a schema) feed a deterministic gate; everything that writes to the ERP or moves money is code with a key derived from the business identity. Refunds wait in durable state for the controller, escalate to a named delegate at the deadline and never approve by default. Invoices above the review threshold, and any invoice that changes a vendor's bank details, go to a clerk. Ship in shadow mode first.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>States.</strong> <code>received</code>, <code>classified</code>, <code>extracted</code>, <code>validated</code>, then either <code>posting</code>, <code>posted</code> and <code>scheduled</code> for an invoice, or <code>awaiting_approval</code>, <code>approved</code>, <code>paying</code> and <code>paid</code> for a refund; <code>needs_human</code> with a reason code is reachable from every state, and <code>rejected</code> ends a refund. The state row holds the document hash, the model and prompt versions used, the extracted fields, every gate result and the keys below, so execution state and business state are one record and an auditor reads one row per document.</p>
+<p><strong>Model calls.</strong> Classification (invoice, credit note, refund request, other) and extraction into a JSON Schema (vendor, invoice number, dates, lines, tax, total, PO number, bank details). Both have a timeout and two retries with backoff, then <code>needs_human</code>. Nothing else calls a model; matching a PO, checking a total and choosing a route are rules finance can read.</p>
+<p><strong>The gate after extraction.</strong> Lines sum to the subtotal and subtotal plus tax to the total; the vendor exists in the vendor master; the PO exists, is open and matches within finance's tolerance; no payable already exists for the same vendor and invoice number; the bank details equal the master record. Any failure sets <code>needs_human</code> with the failed check named.</p>
+<p><strong>The decision with two defensible answers.</strong> Where does an invoice that fails a check wait? Post it to the ERP in a held status and let clerks clear it there: their existing queue, and the payment-terms clock starts on time, at the cost of a payable in the ERP that may be wrong and must be reversed if the check was right. Or keep it in the workflow's <code>needs_human</code> queue until a clerk fixes it: the ERP only ever holds checked payables, at the cost of a second queue clerks must watch and invoices that can miss early-payment discounts while they wait. With two engineers and six weeks, the held-in-ERP route is less to build; the workflow queue is safer if reversing a payable is painful in this ERP. Ask finance which hurts more.</p>
+<p><strong>Keys.</strong> Each side effect gets a key from its business identity, never a random value per attempt: <code>post:vendor_id:invoice_no</code> for the payable and <code>refund:vendor_id:document_hash:amount</code> for a refund, written to the state row before the call. The ERP ignores keys, so the step sets <code>posting</code>, calls the API, then sets <code>posted</code>; a retry from <code>posting</code> first reads the ERP by vendor and invoice number and posts only if nothing is there. The provider honours keys but may prune them after 24 hours, and a refund can sit in approval for two days and then fail mid-call; so a retry from <code>paying</code> first lists the provider's payments by the key stored in metadata and sends only if none exists. Inside 24 hours the key alone would have protected the retry; after that only the lookup does. Approval permits the call; it does not make it happen once.</p>
+<p><strong>Approval.</strong> The run serialises its state with a version marker for the prompts and code and stops; it holds no worker while it waits. At 24 hours it reminds the controller; at 48 hours it routes to the controller's named delegate; if the delegate chain is empty it stays in <code>awaiting_approval</code> and pages the finance lead. The approval record stores who, when and the amount shown, which answers the auditor.</p>
+<p><strong>Review threshold, computed.</strong> 3,000 documents over about 21 working days is about 143 a day on average, more at month end, against 120 clerk reviews a day. Reviewing everything does not fit even on an average day. The queue is the gate's exceptions plus everything over the threshold, and the threshold is chosen so that queue stays well under 120 on a month-end day. Shadow mode gives the exception rate; if it comes out at 15 percent, that is about 21 a day on average, and the amount threshold can take the queue to, say, 70 a day and still leave month-end headroom. Reasonable choices put the expected average queue at roughly half to two-thirds of capacity; a threshold chosen from invoice value alone, without the queue arithmetic, is not defensible.</p>
+<p><strong>Budgets.</strong> A per-document cap on model retries and tokens; a document that exceeds it parks in <code>needs_human</code>. A daily spend stop pauses new runs and leaves documents in <code>received</code>, which is safe because nothing has happened to them yet.</p>
+<p><strong>What you give up.</strong> High-value invoices are never straight-through, refunds take up to two days or longer, and clerks still see documents the model would have handled. That is the price of keeping irreversible actions behind a human and a deterministic gate.</p>
+<p><strong>Where this design fails.</strong> The gate checks consistency, not truth. An extraction that reads the wrong but existing PO whose amount also matches passes every check, and so does a well-formed invoice from a compromised vendor mailbox. Two defences: any bank-detail change is a <code>needs_human</code> reason that clerks verify by calling a number already on file, and a weekly random sample of auto-posted invoices is re-keyed by a clerk to measure field-level error.</p>
+<p><strong>Written down: rollout with rollback triggers.</strong> Two weeks of shadow mode (the workflow extracts and validates, clerks still key everything, and the two are compared field by field). Then auto-posting below the threshold for one vendor group. Roll back to shadow on any duplicate payable or payment, on a field error rate in the weekly sample above the bound finance signs off before launch, or on a review queue over capacity for two consecutive working days.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Shadow mode has ended. How do you keep measuring field-level extraction error?</em></li>
+<li><em>The extraction model is retired while forty refunds sit in approval. What happens to those runs?</em></li>
+<li><em>A vendor resends an invoice with the number formatted differently. Which check catches it, and which does not?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Pushback: the CFO wants most invoice value straight through, and your threshold sends most of it to clerks. Which check do you remove, and what loss do you accept in writing?* Raising the amount threshold is the lever; the bank-detail rule and the duplicate check stay because each failure is a payment that is hard to recover. The written note names the expected error rate from the weekly sample times the average invoice value as the accepted exposure.
+- *Reversal: what would you need to see in production before refunds under an amount skip the controller?* Months of approvals where the controller changed nothing below that amount, a measured false-approval rate of zero in an audit of those refunds, and finance's written agreement; the amount comes from the refunds' distribution, not from a round number.
+- *Operating: the controller is away for a week, the delegate chain is empty, and refunds are piling up with vendors calling. Who decides, and what does the workflow do meanwhile?* The workflow keeps them in `awaiting_approval` and pages the finance lead; it does not widen who may approve. Naming a delegate is a finance decision recorded in the approval policy, and the refunds that were waiting are approved under the new name with the gap visible in the audit trail.
+- *Two engineers disagree: one wants an agent with ERP and payment tools, the other this state machine. How do you decide without deciding by rank?* Run both on last month's documents in shadow and compare the share that leaves the happy path, cost per document and human-review rate; and ask which design can show the auditor a fixed sequence of checks for every refund.
+
+## Common mistakes
+
+- Letting a model decide whether a refund is paid, or treating an approval click as a guarantee the payment happens once.
+- Generating a fresh idempotency key per attempt, which makes every retry a new request.
+- Retrying an ERP post without reading back first, against an API that ignores keys.
+- Approving by default when the approval deadline passes.
+- Picking the review threshold from invoice value without checking it against clerk capacity.
+- Trusting extracted bank details because the totals and the PO match.

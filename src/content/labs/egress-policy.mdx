@@ -1,0 +1,1078 @@
+---
+title: An egress policy that survives SSRF tricks
+track: security
+module: sandboxing-secrets
+kind: lab
+minutes: 120
+summary: Build the gate behind an agent's fetch tool over six steps, from a scheme allowlist to a host index, one DNS lookup per hop, an address rule that looks inside IPv6, checked redirects and a body cap that a gzip bomb cannot pass.
+updated: 2026-10-28
+sources:
+  - title: Model Context Protocol, Security Best Practices (specification revision 2026-07-28)
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/security_best_practices
+    note: "the SSRF list the tests are built from: internal IPs, 169.254.169.254, localhost services, DNS rebinding and redirect chains; HTTPS except loopback in development behind an explicit opt-out; reject javascript:, data:, file: and vbscript:; the private, loopback, link-local and IPv6 ranges to block; octal, hex and IPv4-mapped IPv6 tricks; validate each redirect hop; pin DNS between check and use"
+  - title: Claude Code docs, Sandboxing (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/sandboxing
+    note: "the sandbox proxy decides from the client-supplied hostname and does not inspect TLS by default; allowedDomains does not limit the WebFetch tool; an allowedDomains entry with no port allows every port"
+  - title: Python documentation, ipaddress (checked 2026-10-28)
+    url: https://docs.python.org/3/library/ipaddress.html
+    note: "is_global and is_private follow the IANA registries and changed for 192.0.0.0/24, 64:ff9b:1::/48 and 2002::/16 in 3.13; ipv4_mapped, sixtofour and teredo; leading zeros are an error since 3.9.5"
+  - title: Codex docs, Agent approvals and security (checked 2026-10-28)
+    url: https://learn.chatgpt.com/docs/agent-approvals-security
+    note: "its DNS check reduces DNS rebinding risk but does not eliminate it; enforce egress at a lower layer if hostile DNS is in scope"
+steps:
+  - title: Scheme allowlist
+    brief: |
+      The fetch tool takes URLs the model wrote, often copied from a page an attacker controls. Before anything resolves, parse the URL into a Target and refuse what the gate does not speak: any scheme but http and https, and any scheme the deployment did not list. The MCP security page (revision 2026-07-28) has clients require https for the URLs a server hands them, except loopback during development behind an explicit opt-out, and reject javascript:, data:, file: and vbscript: URLs; the same rules suit a fetch tool, and Policy.dev_loopback is the opt-out. Refuse userinfo, a backslash and control characters, because parsers disagree about where such a URL points. Normalise the host (lowercase, no trailing dot, no IPv6 brackets) so later steps compare one spelling. Anything malformed raises Denied and never another exception: the agent gets the reason as a tool result, and a crash in the gate is a crash in the tool.
+    starter: |
+      from collections import namedtuple
+      from urllib.parse import urlsplit
+
+      Target = namedtuple("Target", "scheme host port url")
+
+      DEFAULT_PORTS = {"https": 443, "http": 80}
+      LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
+
+
+      class Denied(Exception):
+          """The gate refused the request. str(e) is the reason the agent sees."""
+
+
+      class Policy:
+          """schemes: the schemes the deployment allows. hosts: the allowlist (step 2).
+          dev_loopback: a local development opt-out that lets http reach loopback and nothing else."""
+
+          def __init__(self, schemes=("https",), hosts=(), dev_loopback=False):
+              self.schemes = {s.lower() for s in schemes}
+              self.hosts = list(hosts)
+              self.dev_loopback = dev_loopback
+
+
+      def parse_target(url, policy):
+          """Return Target(scheme, host, port, url) for a URL the agent asked for, or raise Denied.
+
+          host is lowercase, without a trailing dot and without IPv6 brackets; port is explicit or the
+          scheme's default. Only http and https are ever spoken, and only those in policy.schemes.
+          http is refused unless policy.dev_loopback is set and the host is a loopback name.
+          """
+          raise NotImplementedError
+    tests: |
+      def refused(url, policy):
+          try:
+              parse_target(url, policy)
+          except Denied:
+              return True
+          return False
+
+      P = Policy(schemes=("https",))
+      t = parse_target("https://Docs.Python.org./3/library/", P)
+      assert (t.scheme, t.host, t.port) == ("https", "docs.python.org", 443)
+      assert parse_target("https://example.com:8443/x", P).port == 8443
+      assert refused("http://example.com/", P), "plain http is refused in production"
+      assert all(refused(u, P) for u in ["javascript:alert(1)", "data:text/html,hi", "file:///etc/passwd", "vbscript:msgbox(1)"])
+      assert refused("https://user@example.com/", P), "userinfo is refused"
+      DEV = Policy(schemes=("https", "http"), dev_loopback=True)
+      assert parse_target("http://localhost:8080/callback", DEV).port == 8080, "the development opt-out reaches loopback over http"
+      assert refused("http://example.com/", DEV), "the opt-out covers loopback only"
+    hidden: |
+      import random as _random
+
+      def _refused(url, policy):
+          try:
+              parse_target(url, policy)
+          except Denied:
+              return True
+          return False
+
+      _P = Policy(schemes=("https",))
+      assert all(_refused(u, _P) for u in [
+          "https://example.com\\@evil.example/", "https://exa mple.com/", "https://example.com/\r\nHost: evil",
+          "https://example.com:99999/", "https://example.com:-1/", "https:///path", "https://", "", "//example.com/",
+          "ftp://example.com/", "ws://example.com/", "https://a:b@example.com/", "https://@example.com/",
+          "https://example.com\t/", "HTTP://example.com/",
+      ])
+      assert not _refused("HTTPS://EXAMPLE.COM/", _P) and parse_target("HTTPS://EXAMPLE.COM/", _P).scheme == "https"
+      _t = parse_target("https://[2606:4700::1111]:444/x?y=1", _P)
+      assert (_t.host, _t.port, _t.url) == ("2606:4700::1111", 444, "https://[2606:4700::1111]:444/x?y=1")
+      assert _refused("http://localhost/", Policy(schemes=("https", "http"))), "http to loopback needs the opt-out"
+      assert _refused("http://localhost/", Policy(schemes=("https",), dev_loopback=True)), "the opt-out does not add a scheme"
+      _DEV = Policy(schemes=("https", "http"), dev_loopback=True)
+      assert all(not _refused(u, _DEV) for u in ["http://127.0.0.1:3000/", "http://[::1]:3000/", "http://LOCALHOST./"])
+      assert all(_refused(u, _DEV) for u in ["http://127.0.0.2/", "http://localhost.example.com/", "http://0x7f000001/"])
+
+      def _fuzz(seed, n):
+          rng = _random.Random(seed)
+          alphabet = "htps:/[]@\\.%?#:0123456789abcdefx-_ \t\n"
+          for _ in range(n):
+              s = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 30)))
+              if rng.random() < 0.5:
+                  s = rng.choice(["https://", "http://", "HTTPS://", "https:"]) + s
+              try:
+                  parse_target(s, _P)
+              except Denied:
+                  pass
+              except Exception:
+                  return False
+          return True
+
+      assert _fuzz(5, 3000)
+      assert issubclass(Denied, Exception)
+    solution: |
+      from collections import namedtuple
+      from urllib.parse import urlsplit
+
+      Target = namedtuple("Target", "scheme host port url")
+
+      DEFAULT_PORTS = {"https": 443, "http": 80}
+      LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
+
+
+      class Denied(Exception):
+          """The gate refused the request. str(e) is the reason the agent sees."""
+
+
+      class Policy:
+          """schemes: the schemes the deployment allows. hosts: the allowlist (step 2).
+          dev_loopback: a local development opt-out that lets http reach loopback and nothing else."""
+
+          def __init__(self, schemes=("https",), hosts=(), dev_loopback=False):
+              self.schemes = {s.lower() for s in schemes}
+              self.hosts = list(hosts)
+              self.dev_loopback = dev_loopback
+
+
+      def parse_target(url, policy):
+          if not isinstance(url, str) or not url:
+              raise Denied("no URL")
+          # Clients disagree about where a URL with a backslash or a control character points, so refuse it.
+          if "\\" in url or any(ord(c) < 33 or ord(c) == 127 for c in url):
+              raise Denied("malformed URL")
+          try:
+              parts = urlsplit(url)
+              port = parts.port
+          except ValueError:
+              raise Denied("malformed URL or port")
+          scheme = parts.scheme.lower()
+          if scheme not in DEFAULT_PORTS or scheme not in policy.schemes:
+              raise Denied("scheme not allowed: " + (scheme or "none"))
+          if "@" in parts.netloc:
+              raise Denied("userinfo in URL")
+          host = (parts.hostname or "").rstrip(".")
+          if not host:
+              raise Denied("no host")
+          if scheme == "http" and not (policy.dev_loopback and host in LOOPBACK_NAMES):
+              raise Denied("http is allowed only to loopback in development")
+          return Target(scheme, host, port if port is not None else DEFAULT_PORTS[scheme], url)
+  - title: Host allowlist
+    brief: |
+      The allowlist has exact names, "*.suffix" entries that match any name under the suffix at any depth but never the suffix itself, and IP entries compared as addresses, so 2606:4700:0:0::1111 matches 2606:4700::1111. A bare "*" is refused when the policy is built, because it turns the allowlist off. In this scenario the list is generated from every tenant's configured mirrors and webhooks and runs to hundreds of thousands of entries, and the gate runs on every fetch, so build an index once in __init__ instead of walking the list per call; the hidden test times lookups against 200,000 entries. Match suffixes at label boundaries, or evilgithubusercontent.com passes as a githubusercontent.com host.
+    starter: |
+      class Policy(Policy):
+          def __init__(self, schemes=("https",), hosts=(), dev_loopback=False):
+              super().__init__(schemes, hosts, dev_loopback)
+              # Build whatever allows_host needs here, once. A bare "*" is refused with ValueError.
+              raise NotImplementedError
+
+          def allows_host(self, host):
+              """True for an exact entry, a "*.suffix" entry the host sits under (at any depth, never the
+              suffix itself), the same IP address written as an entry, or a loopback name when
+              dev_loopback is set. Names compare without case and without a trailing dot."""
+              raise NotImplementedError
+
+
+      def check_target(url, policy):
+          """parse_target, then refuse a host the policy does not allow."""
+          raise NotImplementedError
+    tests: |
+      def denied(url, policy):
+          try:
+              check_target(url, policy)
+          except Denied:
+              return True
+          return False
+
+      P = Policy(hosts=["docs.python.org", "*.githubusercontent.com", "PyPI.org."])
+      assert check_target("https://docs.python.org/3/", P).host == "docs.python.org"
+      assert check_target("https://raw.githubusercontent.com/o/r/main/a.py", P).host == "raw.githubusercontent.com"
+      assert check_target("https://pypi.org./simple/", P).host == "pypi.org", "case and a trailing dot do not matter"
+      assert denied("https://githubusercontent.com/", P), "a wildcard does not match its apex"
+      assert denied("https://evilgithubusercontent.com/", P), "a suffix match starts at a label boundary"
+      assert denied("https://docs.python.org.evil.example/", P), "an allowed name as a prefix is not allowed"
+      assert denied("https://example.com/", P)
+    hidden: |
+      import random as _random
+      import time as _time
+
+      def _denied(url, policy):
+          try:
+              check_target(url, policy)
+          except Denied:
+              return True
+          return False
+
+      def _raises_value_error(hosts):
+          try:
+              Policy(hosts=hosts)
+          except ValueError:
+              return True
+          return False
+
+      assert _raises_value_error(["docs.python.org", "*"])
+      _P = Policy(hosts=["docs.python.org", "*.githubusercontent.com", "2606:4700::1111", "8.8.8.8"])
+      assert not _denied("https://a.b.c.githubusercontent.com/", _P)
+      assert not _denied("https://[2606:4700:0:0::1111]/", _P), "an IP entry matches the same address in any spelling"
+      assert not _denied("https://8.8.8.8/", _P)
+      assert _denied("https://8.8.4.4/", _P)
+      assert _denied("https://localhost/", _P)
+      assert _denied("https://python.org/", _P) and _denied("https://xdocs.python.org/", _P)
+      _DEV = Policy(schemes=("https", "http"), hosts=["docs.python.org"], dev_loopback=True)
+      assert not _denied("http://localhost:8080/", _DEV) and _denied("http://docs.python.org/", _DEV)
+
+      def _rule(entries, host):
+          host = host.lower().rstrip(".")
+          for e in entries:
+              e = e.lower().rstrip(".")
+              if e == host or (e.startswith("*.") and host.endswith("." + e[2:])):
+                  return True
+          return False
+
+      def _agrees(seed, n):
+          rng = _random.Random(seed)
+          labels = ["a", "b", "api", "cdn", "example", "com", "org", "io", "x-y"]
+          for _ in range(n):
+              entries = []
+              for _ in range(rng.randint(1, 5)):
+                  name = ".".join(rng.choice(labels) for _ in range(rng.randint(1, 3)))
+                  entries.append(("*." if rng.random() < 0.4 else "") + name)
+              pol = Policy(hosts=entries)
+              for _ in range(10):
+                  host = ".".join(rng.choice(labels) for _ in range(rng.randint(1, 5)))
+                  if pol.allows_host(host) != _rule(entries, host):
+                      return False
+          return True
+
+      assert _agrees(11, 400)
+
+      def _perf():
+          entries = ["svc%d.mirror.example.org" % i for i in range(100000)]
+          entries += ["*.tenant%d.example.net" % i for i in range(100000)]
+          t = _time.perf_counter()
+          pol = Policy(hosts=entries)
+          built = _time.perf_counter() - t
+          hosts = ["x.y.tenant%d.example.net" % (i * 37 % 100000) for i in range(100)]
+          hosts += ["nope%d.example.com" % i for i in range(100)]
+          t = _time.perf_counter()
+          hits = sum(pol.allows_host(h) for h in hosts)
+          return hits == 100 and built < 2.0 and _time.perf_counter() - t < 0.5
+
+      assert _perf()
+    solution: |
+      import ipaddress
+
+
+      def _as_address(text):
+          """The address a host or entry names, or None for a name. Cheap for names, which are most entries."""
+          if ":" not in text and not text.replace(".", "").isdigit():
+              return None
+          try:
+              return ipaddress.ip_address(text.strip("[]"))
+          except ValueError:
+              return None
+
+
+      class Policy(Policy):
+          def __init__(self, schemes=("https",), hosts=(), dev_loopback=False):
+              super().__init__(schemes, hosts, dev_loopback)
+              self.exact, self.suffixes, self.addresses = set(), set(), set()
+              for entry in self.hosts:
+                  e = entry.strip().lower().rstrip(".")
+                  if e == "*" or e == "*.":
+                      raise ValueError("a bare * turns the allowlist off; list the hosts")
+                  if e.startswith("*."):
+                      self.suffixes.add(e[2:])
+                      continue
+                  address = _as_address(e)
+                  if address is not None:
+                      self.addresses.add(address)
+                  else:
+                      self.exact.add(e)
+
+          def allows_host(self, host):
+              h = host.lower().rstrip(".")
+              if self.dev_loopback and h in LOOPBACK_NAMES:
+                  return True
+              address = _as_address(h)
+              if address is not None:
+                  return address in self.addresses
+              if h in self.exact:
+                  return True
+              # One set probe per label, so the cost does not grow with the size of the allowlist.
+              i = h.find(".")
+              while i != -1:
+                  if h[i + 1:] in self.suffixes:
+                      return True
+                  i = h.find(".", i + 1)
+              return False
+
+
+      def check_target(url, policy):
+          target = parse_target(url, policy)
+          if not policy.allows_host(target.host):
+              raise Denied("host not allowed: " + target.host)
+          return target
+  - title: Resolve then pin to defeat DNS rebinding
+    brief: |
+      A check that resolves the name and a client that resolves it again are two lookups, and a rebinding server answers them differently: a public address for the check, 169.254.169.254 for the connection. Resolve once, check every address in the answer, and hand the first one to the transport, which connects to that address and sends the name only as the Host header and TLS name. The MCP page names this time-of-check to time-of-use gap and suggests pinning; Codex's documentation says its own DNS check reduces rebinding risk but does not eliminate it. Refuse the whole answer if any address fails rather than filtering it: a mixed answer is what a rebinding setup looks like, at the cost of refusing hosts with split-horizon DNS. An IP literal is not looked up. FakeDNS plays the attacker's resolver; address_allowed stays a stub that refuses non-addresses until the next step.
+    starter: |
+      def _numeric_name(name):
+          """What getaddrinfo makes of a numeric name: 1 to 4 parts, each decimal, 0x hex or 0-led octal."""
+          parts = name.split(".")
+          if not 1 <= len(parts) <= 4:
+              return None
+          vals = []
+          for p in parts:
+              try:
+                  if p.lower().startswith("0x"):
+                      v = int(p[2:] or "0", 16)
+                  elif len(p) > 1 and p.startswith("0"):
+                      v = int(p, 8)
+                  else:
+                      v = int(p, 10)
+              except ValueError:
+                  return None
+              vals.append(v)
+          *head, last = vals
+          if any(v > 255 for v in head) or last >= 256 ** (4 - len(head)):
+              return None
+          n = 0
+          for v in head:
+              n = n * 256 + v
+          n = (n << (8 * (4 - len(head)))) | last
+          return ".".join(str((n >> s) & 255) for s in (24, 16, 8, 0))
+
+
+      class FakeDNS:
+          """A scripted resolver standing in for the attacker's DNS server. answers maps a name to a list of
+          answers (each a list of address strings); lookup k returns answer k and the last one repeats, which
+          is how a rebinding server behaves. A name not in the table resolves the way getaddrinfo resolves a
+          numeric name, or raises LookupError. Every lookup is logged in calls."""
+
+          def __init__(self, answers):
+              self.answers = {k.lower(): [list(a) for a in v] for k, v in answers.items()}
+              self.calls = []
+
+          def resolve(self, name):
+              n = name.lower().rstrip(".")
+              self.calls.append(n)
+              if n in self.answers:
+                  seq = self.answers[n]
+                  k = sum(1 for c in self.calls if c == n) - 1
+                  return list(seq[min(k, len(seq) - 1)])
+              numeric = _numeric_name(n)
+              if numeric is None:
+                  raise LookupError(name)
+              return [numeric]
+
+
+      class FakeResponse:
+          """A response whose body arrives in chunks. pulled counts the chunks read so far."""
+
+          def __init__(self, status=200, headers=None, chunks=(b"ok",)):
+              self.status = status
+              self.headers = {k.lower(): v for k, v in (headers or {}).items()}
+              self._chunks = chunks
+              self.pulled = 0
+
+          def iter_chunks(self):
+              for c in self._chunks:
+                  self.pulled += 1
+                  yield c
+
+
+      class FakeTransport:
+          """One HTTP exchange per request(address, target, headers): connect to address, send target.host as the
+          Host header and TLS name, never follow redirects. routes maps a URL to a FakeResponse or to a function
+          of the request number that returns one. Every request is logged in sent as (address, target, headers)."""
+
+          def __init__(self, routes=None):
+              self.routes = routes or {}
+              self.sent = []
+
+          def request(self, address, target, headers):
+              self.sent.append((address, target, dict(headers)))
+              r = self.routes.get(target.url)
+              if callable(r):
+                  r = r(len(self.sent))
+              return r if r is not None else FakeResponse()
+
+
+      class Policy(Policy):
+          def address_allowed(self, address):
+              """Step 4 fills this in. For now refuse only a string that is not an IP address."""
+              raise NotImplementedError
+
+
+      def open_request(url, policy, dns, transport, headers=None):
+          """check_target, then resolve the host once, check every address in the answer with
+          policy.address_allowed (refuse the request if any fails), and send one request to the first
+          address. An IP-literal host is not looked up. Return the transport's response."""
+          raise NotImplementedError
+    tests: |
+      class NoTenNet(Policy):
+          """A stand-in until step 4: refuses 10.0.0.0/8 only."""
+          def address_allowed(self, address):
+              return super().address_allowed(address) and not address.startswith("10.")
+
+      P = NoTenNet(hosts=["api.example.com", "8.8.8.8"])
+      dns = FakeDNS({"api.example.com": [["93.184.215.14"], ["10.0.0.1"]]})
+      net = FakeTransport()
+      open_request("https://api.example.com/v1", P, dns, net)
+      assert dns.calls == ["api.example.com"], "one lookup per request"
+      assert net.sent[0][0] == "93.184.215.14" and net.sent[0][1].host == "api.example.com", "connect to the checked address, send the name as Host"
+
+      def denied(fn):
+          try:
+              fn()
+          except Denied:
+              return True
+          return False
+
+      assert denied(lambda: open_request("https://api.example.com/v1", P, dns, net)) and len(net.sent) == 1, "the rebound answer is checked and refused"
+      assert denied(lambda: open_request("https://api.example.com/", P, FakeDNS({"api.example.com": [["93.184.215.14", "10.0.0.9"]]}), net)), "every address in the answer is checked"
+      dns = FakeDNS({})
+      open_request("https://8.8.8.8/", P, dns, net)
+      assert dns.calls == [] and net.sent[-1][0] == "8.8.8.8", "an IP literal is not looked up"
+      assert denied(lambda: open_request("https://api.example.com/", P, FakeDNS({}), net)), "a name that does not resolve is refused"
+    hidden: |
+      import random as _random
+
+      class _Block(Policy):
+          def address_allowed(self, address):
+              return super().address_allowed(address) and address not in ("10.0.0.1", "169.254.169.254")
+
+      def _denied(fn):
+          try:
+              fn()
+          except Denied:
+              return True
+          return False
+
+      _P = _Block(hosts=["a.example.com", "b.example.com"])
+      assert not Policy().address_allowed("not-an-ip") and Policy().address_allowed("93.184.215.14")
+      assert _denied(lambda: open_request("https://a.example.com/", _P, FakeDNS({"a.example.com": [[]]}), FakeTransport()))
+      assert _denied(lambda: open_request("https://a.example.com/", _P, FakeDNS({"a.example.com": [["garbage"]]}), FakeTransport()))
+      assert _denied(lambda: open_request("https://c.example.com/", _P, FakeDNS({"c.example.com": [["93.184.215.14"]]}), FakeTransport())), "the host check still runs first"
+
+      def _no_lookup_for_refused_host():
+          dns = FakeDNS({"c.example.com": [["93.184.215.14"]]})
+          try:
+              open_request("https://c.example.com/", _P, dns, FakeTransport())
+          except Denied:
+              pass
+          return dns.calls == []
+
+      assert _no_lookup_for_refused_host()
+
+      def _property(seed, n):
+          rng = _random.Random(seed)
+          pool = ["93.184.215.14", "151.101.0.223", "10.0.0.1", "169.254.169.254", "2606:4700::1111"]
+          for _ in range(n):
+              answers = {h: [rng.sample(pool, rng.randint(1, 3)) for _ in range(rng.randint(1, 3))]
+                         for h in ("a.example.com", "b.example.com")}
+              dns, net = FakeDNS(answers), FakeTransport()
+              for _ in range(4):
+                  host = rng.choice(["a.example.com", "b.example.com"])
+                  before = len(dns.calls)
+                  seen = None
+                  try:
+                      open_request("https://%s/" % host, _P, dns, net, {"x-run": "1"})
+                      seen = net.sent[-1]
+                  except Denied:
+                      pass
+                  if len(dns.calls) != before + 1:
+                      return False
+                  if seen is not None:
+                      k = dns.calls.count(host) - 1
+                      answer = answers[host][min(k, len(answers[host]) - 1)]
+                      if seen[0] != answer[0] or not all(_P.address_allowed(a) for a in answer):
+                          return False
+                      if seen[1].host != host or seen[2] != {"x-run": "1"}:
+                          return False
+          return True
+
+      assert _property(3, 300)
+    solution: |
+      def _numeric_name(name):
+          """What getaddrinfo makes of a numeric name: 1 to 4 parts, each decimal, 0x hex or 0-led octal."""
+          parts = name.split(".")
+          if not 1 <= len(parts) <= 4:
+              return None
+          vals = []
+          for p in parts:
+              try:
+                  if p.lower().startswith("0x"):
+                      v = int(p[2:] or "0", 16)
+                  elif len(p) > 1 and p.startswith("0"):
+                      v = int(p, 8)
+                  else:
+                      v = int(p, 10)
+              except ValueError:
+                  return None
+              vals.append(v)
+          *head, last = vals
+          if any(v > 255 for v in head) or last >= 256 ** (4 - len(head)):
+              return None
+          n = 0
+          for v in head:
+              n = n * 256 + v
+          n = (n << (8 * (4 - len(head)))) | last
+          return ".".join(str((n >> s) & 255) for s in (24, 16, 8, 0))
+
+
+      class FakeDNS:
+          """A scripted resolver standing in for the attacker's DNS server. answers maps a name to a list of
+          answers (each a list of address strings); lookup k returns answer k and the last one repeats, which
+          is how a rebinding server behaves. A name not in the table resolves the way getaddrinfo resolves a
+          numeric name, or raises LookupError. Every lookup is logged in calls."""
+
+          def __init__(self, answers):
+              self.answers = {k.lower(): [list(a) for a in v] for k, v in answers.items()}
+              self.calls = []
+
+          def resolve(self, name):
+              n = name.lower().rstrip(".")
+              self.calls.append(n)
+              if n in self.answers:
+                  seq = self.answers[n]
+                  k = sum(1 for c in self.calls if c == n) - 1
+                  return list(seq[min(k, len(seq) - 1)])
+              numeric = _numeric_name(n)
+              if numeric is None:
+                  raise LookupError(name)
+              return [numeric]
+
+
+      class FakeResponse:
+          """A response whose body arrives in chunks. pulled counts the chunks read so far."""
+
+          def __init__(self, status=200, headers=None, chunks=(b"ok",)):
+              self.status = status
+              self.headers = {k.lower(): v for k, v in (headers or {}).items()}
+              self._chunks = chunks
+              self.pulled = 0
+
+          def iter_chunks(self):
+              for c in self._chunks:
+                  self.pulled += 1
+                  yield c
+
+
+      class FakeTransport:
+          """One HTTP exchange per request(address, target, headers): connect to address, send target.host as the
+          Host header and TLS name, never follow redirects. routes maps a URL to a FakeResponse or to a function
+          of the request number that returns one. Every request is logged in sent as (address, target, headers)."""
+
+          def __init__(self, routes=None):
+              self.routes = routes or {}
+              self.sent = []
+
+          def request(self, address, target, headers):
+              self.sent.append((address, target, dict(headers)))
+              r = self.routes.get(target.url)
+              if callable(r):
+                  r = r(len(self.sent))
+              return r if r is not None else FakeResponse()
+
+
+      class Policy(Policy):
+          def address_allowed(self, address):
+              try:
+                  ipaddress.ip_address(address)
+              except ValueError:
+                  return False
+              return True
+
+
+      def resolve_and_pin(target, policy, dns):
+          literal = _as_address(target.host)
+          if literal is not None:
+              answer = [str(literal)]
+          else:
+              try:
+                  answer = list(dns.resolve(target.host))
+              except Exception:
+                  raise Denied("does not resolve: " + target.host)
+          if not answer:
+              raise Denied("empty answer for " + target.host)
+          # Check the whole answer: a client may fall back to the second address when the first fails.
+          for address in answer:
+              if not policy.address_allowed(address):
+                  raise Denied("address not allowed for %s: %s" % (target.host, address))
+          return answer[0]
+
+
+      def open_request(url, policy, dns, transport, headers=None):
+          target = check_target(url, policy)
+          address = resolve_and_pin(target, policy, dns)
+          # The connection goes to the checked address; the name travels only as Host and TLS name.
+          return transport.request(address, target, headers or {})
+  - title: Block private and link-local ranges, including IPv4-mapped IPv6 and odd encodings
+    brief: |
+      Write address_allowed so that only global unicast passes. The MCP page lists 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, ::1, 169.254.0.0/16, fc00::/7 and fe80::/10, and warns that octal, hex and IPv4-mapped IPv6 spellings get past hand-written parsers. Use ipaddress, and do not stop at is_global: measured on CPython 3.12.6 it is true for 224.0.0.1, ::127.0.0.1 and 64:ff9b::a9fe:a9fe, and the documentation records that 3.13 reclassified 2002::/16 and parts of 192.0.0.0/24, so check every IPv4 address an IPv6 address carries yourself. Then close the encoding gap at the front: ipaddress has rejected leading zeros since Python 3.9.5, so to it 0x7f.1 and 0177.0.0.1 are names, while getaddrinfo, which FakeDNS imitates, resolves them to 127.0.0.1. Refuse a host whose last label is numeric unless it is a canonical address, even when a tenant put it on the allowlist.
+    starter: |
+      class Policy(Policy):
+          def address_allowed(self, address):
+              """Allow only global unicast: refuse private, loopback, link-local, shared (100.64.0.0/10),
+              reserved, unspecified and multicast addresses, an IPv6 address with a zone, and an IPv6
+              address that carries a refused IPv4 address (IPv4-mapped, IPv4-compatible, NAT64 64:ff9b::/96,
+              6to4, Teredo). With dev_loopback, 127.0.0.0/8 and ::1 are allowed as well."""
+              raise NotImplementedError
+
+
+      def check_target(url, policy):
+          """As in step 2, and refuse a host whose last label is numeric (2130706433, 0x7f.1, 0177.0.0.1)
+          unless it is a canonical address, even when the allowlist names it."""
+          raise NotImplementedError
+    tests: |
+      P = Policy(hosts=["api.example.com"])
+      for bad in ["10.1.2.3", "172.16.0.1", "192.168.1.1", "127.0.0.1", "169.254.169.254", "0.0.0.0", "fd00::1", "fe80::1", "::1"]:
+          assert not P.address_allowed(bad), bad
+      assert P.address_allowed("93.184.215.14") and P.address_allowed("2606:4700::1111")
+      assert not P.address_allowed("::ffff:169.254.169.254"), "an IPv4-mapped address is the IPv4 address"
+
+      def denied(fn):
+          try:
+              fn()
+          except Denied:
+              return True
+          return False
+
+      dns = FakeDNS({"api.example.com": [["169.254.169.254"]]})
+      assert denied(lambda: open_request("https://api.example.com/", P, dns, FakeTransport())), "an allowed name that resolves to the metadata service"
+      T = Policy(hosts=["0x7f.1"])
+      assert denied(lambda: check_target("https://0x7f.1/", T)), "a tenant-supplied entry in hex is still loopback"
+      DEV = Policy(schemes=("https", "http"), hosts=["api.example.com"], dev_loopback=True)
+      assert DEV.address_allowed("127.0.0.1") and not DEV.address_allowed("10.0.0.1"), "the opt-out adds loopback and nothing else"
+    hidden: |
+      _P = Policy(hosts=["api.example.com"])
+      _REFUSED = ["100.64.0.1", "198.18.0.1", "192.0.0.8", "224.0.0.251", "239.255.255.250", "255.255.255.255", "240.0.0.1",
+                  "::", "ff02::1", "::ffff:127.0.0.1", "::ffff:7f00:1", "::ffff:10.0.0.1", "::127.0.0.1", "::a9fe:a9fe",
+                  "64:ff9b::a9fe:a9fe", "64:ff9b::7f00:1", "2002:a9fe:a9fe::1", "2002:7f00:1::", "fe80::1%eth0",
+                  "fe80::1%25eth0", "", "garbage", "127.0.0.1 ", "1.2.3"]
+      assert [a for a in _REFUSED if _P.address_allowed(a)] == []
+      assert [a for a in ["8.8.8.8", "1.1.1.1", "151.101.0.223", "2606:4700::1111", "2a00:1450:4001:81c::200e"] if not _P.address_allowed(a)] == []
+
+      def _denied(fn):
+          try:
+              fn()
+          except Denied:
+              return True
+          return False
+
+      _ODD = ["2130706433", "0x7f000001", "0x7f.1", "0177.0.0.1", "127.1", "017700000001", "0xa9fea9fe",
+              "0251.0376.0251.0376", "169.254.43518", "0x7f.0x0.0x0.0x1", "1.2.3.4.5"]
+
+      def _odd_refused():
+          out = []
+          for h in _ODD:
+              pol = Policy(hosts=[h])
+              dns, net = FakeDNS({}), FakeTransport()
+              if not _denied(lambda: open_request("https://%s/" % h, pol, dns, net)) or net.sent or dns.calls:
+                  out.append(h)
+          return out
+
+      assert _odd_refused() == []
+
+      def _literals_refused():
+          out = []
+          for lit in ["[::ffff:a9fe:a9fe]", "[64:ff9b::a9fe:a9fe]", "169.254.169.254", "[::1]", "127.0.0.1", "[fd00::1]"]:
+              pol = Policy(hosts=[lit])
+              net = FakeTransport()
+              if not _denied(lambda: open_request("https://%s/" % lit, pol, FakeDNS({}), net)) or net.sent:
+                  out.append(lit)
+          return out
+
+      assert _literals_refused() == []
+
+      def _answers_refused():
+          out = []
+          for bad in _REFUSED[:16] + ["169.254.169.254", "10.0.0.1"]:
+              net = FakeTransport()
+              dns = FakeDNS({"api.example.com": [["93.184.215.14", bad]]})
+              if not _denied(lambda: open_request("https://api.example.com/", _P, dns, net)) or net.sent:
+                  out.append(bad)
+          return out
+
+      assert _answers_refused() == []
+      _DEV = Policy(schemes=("https", "http"), hosts=["api.example.com"], dev_loopback=True)
+      assert _DEV.address_allowed("::1") and _DEV.address_allowed("127.0.0.2")
+      assert not _DEV.address_allowed("169.254.169.254") and not _DEV.address_allowed("192.168.0.1")
+      _net = FakeTransport()
+      open_request("http://localhost:8080/cb", _DEV, FakeDNS({"localhost": [["127.0.0.1"]]}), _net)
+      assert _net.sent[0][0] == "127.0.0.1"
+    solution: |
+      import re
+
+      _NAT64 = ipaddress.ip_network("64:ff9b::/96")
+      _V4COMPAT = ipaddress.ip_network("::/96")
+      _NUMERIC_LABEL = re.compile(r"^(0x[0-9a-f]*|[0-9]+)$")
+
+
+      def _carried_v4(a):
+          """IPv4 addresses an IPv6 address hands to a translator or a tunnel."""
+          out = []
+          if a.ipv4_mapped is not None:
+              out.append(a.ipv4_mapped)
+          if a.sixtofour is not None:
+              out.append(a.sixtofour)
+          if a.teredo is not None:
+              out.extend(a.teredo)
+          if a in _NAT64 or a in _V4COMPAT:
+              out.append(ipaddress.IPv4Address(int(a) & 0xFFFFFFFF))
+          return out
+
+
+      class Policy(Policy):
+          def address_allowed(self, address):
+              try:
+                  a = ipaddress.ip_address(address)
+              except ValueError:
+                  return False
+              if a.version == 6 and a.scope_id:
+                  return False
+              if self.dev_loopback and a.is_loopback:
+                  return True
+              # is_global alone passes 224.0.0.1, ::127.0.0.1 and 64:ff9b::a9fe:a9fe, so check what is carried too.
+              candidates = [a] + (_carried_v4(a) if a.version == 6 else [])
+              return all(x.is_global and not x.is_multicast for x in candidates)
+
+
+      _check_target_step2 = check_target
+
+
+      def check_target(url, policy):
+          target = parse_target(url, policy)
+          if _as_address(target.host) is None and _NUMERIC_LABEL.match(target.host.rsplit(".", 1)[-1]):
+              # A strict parser calls 0x7f.1 a name; getaddrinfo calls it 127.0.0.1.
+              raise Denied("non-canonical numeric host: " + target.host)
+          return _check_target_step2(url, policy)
+  - title: Re-validate every redirect hop
+    brief: |
+      A 302 from an allowed host to http://169.254.169.254/ is the redirect-chain attack on the MCP list. Treat each Location as a request the agent made: resolve it against the current URL and run steps 1 to 4 on it before anything is sent, which also means a fresh lookup per hop. Count hops against max_redirects, refuse a redirect without a Location, and leave a redirect's body unread. Drop Authorization, Proxy-Authorization and Cookie the first time the origin changes and keep them dropped: the token was issued for the first origin, and a redirect is the attacker choosing where it goes next. FakeTransport never follows redirects, so your loop is the only one.
+    starter: |
+      Result = namedtuple("Result", "url status headers body")
+      REDIRECTS = {301, 302, 303, 307, 308}
+      CREDENTIAL_HEADERS = {"authorization", "proxy-authorization", "cookie"}
+
+
+      def fetch(url, policy, dns, transport, headers=None, max_redirects=5):
+          """Fetch url and follow redirects, treating every Location as a new request from the agent:
+          resolve it against the current URL, then run the whole check (scheme, host, lookup, addresses).
+          Follow at most max_redirects; a redirect without a Location is refused. A redirect to another
+          origin (scheme, host, port) drops the credential headers, which stay dropped. Header names are
+          sent lowercase. Do not read a redirect's body.
+          Return Result(final_url, status, headers, body) with the body as bytes."""
+          raise NotImplementedError
+    tests: |
+      P = Policy(hosts=["docs.example.com", "cdn.example.net"])
+      DNS = {"docs.example.com": [["93.184.215.14"]], "cdn.example.net": [["151.101.0.223"]], "metadata.example.com": [["169.254.169.254"]]}
+
+      def denied(fn):
+          try:
+              fn()
+          except Denied:
+              return True
+          return False
+
+      net = FakeTransport({"https://docs.example.com/old": FakeResponse(301, {"Location": "/new"}, [])})
+      r = fetch("https://docs.example.com/old", P, FakeDNS(DNS), net)
+      assert (r.url, r.status, r.body) == ("https://docs.example.com/new", 200, b"ok"), "a relative Location resolves against the current URL"
+      net = FakeTransport({"https://docs.example.com/a": FakeResponse(302, {"location": "http://169.254.169.254/latest/meta-data/"}, [])})
+      assert denied(lambda: fetch("https://docs.example.com/a", P, FakeDNS(DNS), net)) and len(net.sent) == 1, "the hop is checked before it is sent"
+      net = FakeTransport({"https://docs.example.com/a": FakeResponse(302, {"location": "https://metadata.example.com/"}, [])})
+      assert denied(lambda: fetch("https://docs.example.com/a", P, FakeDNS(DNS), net)), "a hop to a host off the allowlist"
+      net = FakeTransport({"https://docs.example.com/a": FakeResponse(302, {"location": "https://cdn.example.net/f"}, [])})
+      fetch("https://docs.example.com/a", P, FakeDNS(DNS), net, headers={"Authorization": "Bearer t0k3n"})
+      assert "authorization" in net.sent[0][2] and "authorization" not in net.sent[1][2], "the token does not follow a redirect to another origin"
+    hidden: |
+      import random as _random
+      from urllib.parse import urlsplit as _urlsplit
+
+      _P = Policy(hosts=["a.example.com", "b.example.com"])
+      _DNS = {"a.example.com": [["93.184.215.14"]], "b.example.com": [["151.101.0.223"]]}
+
+      def _denied(fn):
+          try:
+              fn()
+          except Denied:
+              return True
+          return False
+
+      def _chain(n):
+          return {"https://a.example.com/%d" % i: FakeResponse(302, {"location": "/%d" % (i + 1)}, []) for i in range(n)}
+
+      _net = FakeTransport(_chain(5))
+      assert fetch("https://a.example.com/0", _P, FakeDNS(_DNS), _net, max_redirects=5).url == "https://a.example.com/5"
+      _net = FakeTransport(_chain(5))
+      assert _denied(lambda: fetch("https://a.example.com/0", _P, FakeDNS(_DNS), _net, max_redirects=4)) and len(_net.sent) == 5
+      _loop = {"https://a.example.com/x": FakeResponse(301, {"location": "https://b.example.com/y"}, []),
+               "https://b.example.com/y": FakeResponse(308, {"location": "https://a.example.com/x"}, [])}
+      _net = FakeTransport(_loop)
+      assert _denied(lambda: fetch("https://a.example.com/x", _P, FakeDNS(_DNS), _net)) and len(_net.sent) == 6
+      _net = FakeTransport({"https://a.example.com/n": FakeResponse(303, {}, [])})
+      assert _denied(lambda: fetch("https://a.example.com/n", _P, FakeDNS(_DNS), _net))
+      _net = FakeTransport({"https://a.example.com/d": FakeResponse(302, {"location": "http://a.example.com/"}, [])})
+      assert _denied(lambda: fetch("https://a.example.com/d", _P, FakeDNS(_DNS), _net)) and len(_net.sent) == 1
+
+      def _rebinding_on_second_hop():
+          dns = FakeDNS({"a.example.com": [["93.184.215.14"], ["127.0.0.1"]]})
+          net = FakeTransport({"https://a.example.com/1": FakeResponse(307, {"location": "/2"}, [])})
+          return _denied(lambda: fetch("https://a.example.com/1", _P, dns, net)) and len(net.sent) == 1
+
+      assert _rebinding_on_second_hop()
+
+      def _redirect_body_unread():
+          hop = FakeResponse(302, {"location": "/end"}, [b"x"] * 50)
+          net = FakeTransport({"https://a.example.com/start": hop})
+          fetch("https://a.example.com/start", _P, FakeDNS(_DNS), net)
+          return hop.pulled == 0
+
+      assert _redirect_body_unread()
+
+      def _same_origin_keeps_token():
+          net = FakeTransport({"https://a.example.com/1": FakeResponse(301, {"location": "https://A.example.com:443/2"}, [])})
+          fetch("https://a.example.com/1", _P, FakeDNS(_DNS), net, headers={"Authorization": "Bearer t", "Cookie": "s=1", "X-Trace": "9"})
+          return net.sent[1][2].get("authorization") == "Bearer t"
+
+      assert _same_origin_keeps_token()
+
+      def _property(seed, n):
+          rng = _random.Random(seed)
+          names = ["a.example.com", "b.example.com", "c.example.com", "a.example.com:8443"]
+          for _ in range(n):
+              routes = {}
+              for _ in range(rng.randint(0, 8)):
+                  src = "https://%s/%d" % (rng.choice(names), rng.randint(0, 3))
+                  dst = rng.choice(["https://%s/%d" % (rng.choice(names), rng.randint(0, 3)), "/%d" % rng.randint(0, 3),
+                                    "http://a.example.com/", "https://169.254.169.254/"])
+                  routes[src] = FakeResponse(rng.choice([301, 302, 303, 307, 308]), {"location": dst}, [b"r"])
+              net = FakeTransport(routes)
+              dns = FakeDNS({"a.example.com": [["93.184.215.14"]], "b.example.com": [["151.101.0.223"], ["10.0.0.3"]],
+                             "c.example.com": [["93.184.215.20"]]})
+              start = "https://%s/%d" % (rng.choice(names[:2]), rng.randint(0, 3))
+              try:
+                  fetch(start, _P, dns, net, headers={"authorization": "Bearer t"}, max_redirects=3)
+              except Denied:
+                  pass
+              if len(net.sent) > 4:
+                  return False
+              first = None
+              for address, target, hdrs in net.sent:
+                  if not _P.address_allowed(address) or not _P.allows_host(target.host) or target.scheme != "https":
+                      return False
+                  origin = (target.scheme, target.host, target.port)
+                  first = first or origin
+                  if "authorization" in hdrs and origin != first:
+                      return False
+          return True
+
+      assert _property(9, 400)
+    solution: |
+      from urllib.parse import urljoin
+
+      Result = namedtuple("Result", "url status headers body")
+      REDIRECTS = {301, 302, 303, 307, 308}
+      CREDENTIAL_HEADERS = {"authorization", "proxy-authorization", "cookie"}
+
+
+      def _origin(target):
+          return (target.scheme, target.host, target.port)
+
+
+      def follow(url, policy, dns, transport, headers=None, max_redirects=5):
+          """Return (final_url, response) for the first response that is not a redirect."""
+          current = url
+          sent_headers = {k.lower(): v for k, v in (headers or {}).items()}
+          origin = None
+          for _ in range(max_redirects + 1):
+              target = check_target(current, policy)
+              if origin is not None and _origin(target) != origin:
+                  # The token was issued for the first origin; a redirect must not carry it anywhere else.
+                  sent_headers = {k: v for k, v in sent_headers.items() if k not in CREDENTIAL_HEADERS}
+              origin = _origin(target)
+              address = resolve_and_pin(target, policy, dns)
+              response = transport.request(address, target, sent_headers)
+              if response.status not in REDIRECTS:
+                  return current, response
+              location = response.headers.get("location")
+              if not location:
+                  raise Denied("redirect without a location")
+              current = urljoin(current, location)
+          raise Denied("more than %d redirects" % max_redirects)
+
+
+      def fetch(url, policy, dns, transport, headers=None, max_redirects=5):
+          final, response = follow(url, policy, dns, transport, headers, max_redirects)
+          return Result(final, response.status, response.headers, b"".join(response.iter_chunks()))
+  - title: Response size cap
+    brief: |
+      A fetch result lands in the model's context and in the agent's memory, so an unbounded body costs money and availability as well as safety. Read through iter_chunks, count decoded bytes, and stop pulling chunks once the count passes max_bytes. Content-Length can refuse early but never vouches for a small body. Gzip is where the cap usually leaks: a few kilobytes expand to tens of megabytes, so decompress with zlib.decompressobj and pass max_length on each call, which bounds what one chunk can produce in memory. Refuse an encoding you cannot measure. The hidden test sends a gzip stream of 32 MiB of zeros in 1 KiB chunks and expects the refusal within the first two chunks. Then make fetch read its final body through read_body.
+    starter: |
+      import zlib
+
+
+      def read_body(response, max_bytes=1_000_000):
+          """Return the body as bytes, or raise Denied once it would pass max_bytes after decoding.
+          Refuse up front when Content-Length is larger than max_bytes, but never trust it to be small.
+          Content-Encoding identity (or none) and gzip are the only encodings; refuse the rest. Stop
+          pulling chunks as soon as the limit is passed, and never hold much more than max_bytes."""
+          raise NotImplementedError
+
+
+      def fetch(url, policy, dns, transport, headers=None, max_redirects=5, max_bytes=1_000_000):
+          """Step 5's fetch, reading the final body with read_body."""
+          raise NotImplementedError
+    tests: |
+      import gzip
+
+      P = Policy(hosts=["docs.example.com"])
+      DNS = {"docs.example.com": [["93.184.215.14"]]}
+
+      def denied(fn):
+          try:
+              fn()
+          except Denied:
+              return True
+          return False
+
+      def endless():
+          while True:
+              yield b"x" * 1024
+
+      big = FakeResponse(200, {}, endless())
+      net = FakeTransport({"https://docs.example.com/big": big})
+      assert denied(lambda: fetch("https://docs.example.com/big", P, FakeDNS(DNS), net, max_bytes=64 * 1024))
+      assert big.pulled <= 65, "stop reading once the limit is passed"
+      lying = FakeResponse(200, {"Content-Length": "10"}, [b"y" * 1024] * 100)
+      assert denied(lambda: read_body(lying, max_bytes=4096)), "Content-Length is a claim, not a limit"
+      assert denied(lambda: read_body(FakeResponse(200, {"Content-Length": "5000000"}, endless()), max_bytes=4096))
+      page = gzip.compress(b"<html>docs</html>")
+      assert read_body(FakeResponse(200, {"Content-Encoding": "gzip"}, [page[:7], page[7:]])) == b"<html>docs</html>"
+      assert denied(lambda: read_body(FakeResponse(200, {"Content-Encoding": "br"}, [b"\x00"]))), "an encoding the gate cannot measure"
+    hidden: |
+      import gzip as _gzip
+      import random as _random
+      import zlib as _zlib
+
+      def _denied(fn):
+          try:
+              fn()
+          except Denied:
+              return True
+          return False
+
+      def _bomb(megabytes):
+          # A gzip stream of zeros: about a thousand times smaller than what it expands to.
+          c = _zlib.compressobj(9, _zlib.DEFLATED, 16 + _zlib.MAX_WBITS)
+          block = bytes(1 << 20)
+          data = b"".join(c.compress(block) for _ in range(megabytes)) + c.flush()
+          return [data[i:i + 1024] for i in range(0, len(data), 1024)]
+
+      def _bomb_stopped():
+          chunks = _bomb(32)
+          r = FakeResponse(200, {"content-encoding": "gzip"}, chunks)
+          return len(chunks) > 20 and _denied(lambda: read_body(r, max_bytes=256 * 1024)) and r.pulled <= 2
+
+      assert _bomb_stopped()
+
+      def _exact_limit():
+          body = bytes(range(256)) * 16
+          ok = read_body(FakeResponse(200, {}, [body[:1000], body[1000:]]), max_bytes=len(body)) == body
+          over = _denied(lambda: read_body(FakeResponse(200, {}, [body, b"!"]), max_bytes=len(body)))
+          z = _gzip.compress(body)
+          gz_ok = read_body(FakeResponse(200, {"content-encoding": "gzip"}, [z]), max_bytes=len(body)) == body
+          gz_over = _denied(lambda: read_body(FakeResponse(200, {"content-encoding": "gzip"}, [z]), max_bytes=len(body) - 1))
+          return ok and over and gz_ok and gz_over
+
+      assert _exact_limit()
+      assert _denied(lambda: read_body(FakeResponse(200, {"content-length": "abc"}, [b"x"])))
+      assert _denied(lambda: read_body(FakeResponse(200, {"content-encoding": "deflate"}, [b"x"])))
+      assert read_body(FakeResponse(200, {"content-encoding": "identity"}, [b"a", b"b"])) == b"ab"
+
+      def _property(seed, n):
+          rng = _random.Random(seed)
+          for _ in range(n):
+              data = bytes(rng.getrandbits(8) for _ in range(rng.randint(0, 3000)))
+              cap = rng.randint(1, 3500)
+              gz = rng.random() < 0.5
+              raw = _gzip.compress(data) if gz else data
+              step = rng.randint(1, 700)
+              chunks = [raw[i:i + step] for i in range(0, len(raw), step)] or [b""]
+              r = FakeResponse(200, {"content-encoding": "gzip"} if gz else {}, chunks)
+              try:
+                  got = read_body(r, max_bytes=cap)
+                  if len(data) > cap or got != data:
+                      return False
+              except Denied:
+                  if len(data) <= cap:
+                      return False
+          return True
+
+      assert _property(4, 300)
+
+      def _redirects_and_cap():
+          pol = Policy(hosts=["docs.example.com"])
+          net = FakeTransport({"https://docs.example.com/a": FakeResponse(302, {"location": "/b"}, [b"z"] * 10_000),
+                               "https://docs.example.com/b": FakeResponse(200, {}, [b"q" * 100])})
+          r = fetch("https://docs.example.com/a", pol, FakeDNS({"docs.example.com": [["93.184.215.14"]]}), net, max_bytes=1000)
+          return r.body == b"q" * 100 and r.url == "https://docs.example.com/b"
+
+      assert _redirects_and_cap()
+    solution: |
+      import zlib
+
+
+      def read_body(response, max_bytes=1_000_000):
+          declared = response.headers.get("content-length")
+          if declared is not None:
+              if not str(declared).strip().isdigit():
+                  raise Denied("bad content-length")
+              if int(declared) > max_bytes:
+                  raise Denied("declared body over the limit")
+          encoding = response.headers.get("content-encoding", "identity").strip().lower()
+          if encoding not in ("identity", "gzip"):
+              raise Denied("unsupported content-encoding: " + encoding)
+          inflate = zlib.decompressobj(16 + zlib.MAX_WBITS) if encoding == "gzip" else None
+          out, size = [], 0
+
+          def take(piece):
+              nonlocal size
+              size += len(piece)
+              if size > max_bytes:
+                  raise Denied("body over %d bytes" % max_bytes)
+              out.append(piece)
+
+          for chunk in response.iter_chunks():
+              if inflate is None:
+                  take(chunk)
+                  continue
+              data = chunk
+              while data:
+                  # max_length caps each step, so a few compressed bytes cannot expand past the limit in memory.
+                  take(inflate.decompress(data, max_bytes - size + 1))
+                  data = inflate.unconsumed_tail
+          if inflate is not None:
+              take(inflate.flush())
+          return b"".join(out)
+
+
+      def fetch(url, policy, dns, transport, headers=None, max_redirects=5, max_bytes=1_000_000):
+          final, response = follow(url, policy, dns, transport, headers, max_redirects)
+          return Result(final, response.status, response.headers, read_body(response, max_bytes))
+---
+This lab builds the gate that sits between an agent's fetch tool and the network, as one program. Each step adds to the same file and runs its tests against everything you have written so far, so step 6 still depends on the parser from step 1 and the address rule from step 4.
+
+The tests come from the server-side request forgery list in the MCP specification's security page: internal addresses written directly, the cloud metadata endpoint, localhost services, DNS rebinding and redirect chains, plus the octal, hex and IPv4-mapped spellings the page warns about. Nothing touches a real network. FakeDNS answers from a script the way an attacker's DNS server would, including a different answer on the second lookup, and resolves numeric names the way getaddrinfo does. FakeTransport records which address each request went to and never follows a redirect. The tests assert behaviour: lookups made, addresses connected to, headers sent, chunks read.
+
+Where the gate runs matters as much as what it checks. If the agent can open a socket itself, from a shell command or a script, the gate is advice: the request never calls it. In production it belongs outside the agent's sandbox as the only route out: Claude Code's sandbox gives commands no direct route out except its proxy, and the MCP page recommends egress proxies such as Smokescreen for server-side clients. Two limits remain after the last step. A policy keyed on host names cannot see what a request carries, so an allowed host that accepts uploads is still a way out for data. And a proxy that decides from the client-supplied host name without terminating TLS, as Claude Code's documentation says of its own, can be steered by domain fronting.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

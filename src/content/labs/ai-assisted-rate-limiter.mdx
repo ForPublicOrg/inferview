@@ -1,0 +1,757 @@
+---
+title: An assistant's rate limiter, tested, fixed and defended
+track: rounds
+module: ai-collab-coding
+kind: lab
+minutes: 120
+summary: Take a token bucket an assistant wrote, pin its rules in an oracle, write the boundary tests that fail it, reproduce its race between servers, fix it with compare-and-set, and decide what it does when its store goes down.
+updated: 2026-10-28
+sources:
+  - title: PracHub, Design and implement a rate limiter with an AI assistant, then defend and test it (posted 2026-09-07, updated 2026-09-24)
+    url: https://prachub.com/interview-questions/design-and-implement-a-rate-limiter-with-an-ai-assistant-then-defend-and-test-it
+    note: "candidate report of a Snowflake onsite round: review the assistant's output for races and time-handling errors, test with a controlled clock and a concurrency test that fails on over-admission, then defend atomic check-and-update across servers, the store-outage behaviour and how rejected clients are told to retry. The build here is original."
+  - title: Hello Interview, Meta's AI-enabled coding interview (Evan King, checked 2026-10-28)
+    url: https://www.hellointerview.com/blog/meta-ai-enabled-coding
+    note: "vendor report: verification (running code often, checking AI output before moving on, testing edge cases) is one of four scored competencies"
+  - title: Python docs, time.monotonic and time.time (checked 2026-10-28)
+    url: https://docs.python.org/3/library/time.html
+    note: "a monotonic clock's reference point is undefined, so only differences within one process are meaningful; time() can go backwards when the system clock is set back"
+  - title: Redis docs, Scripting with Lua (checked 2026-10-28)
+    url: https://redis.io/docs/latest/develop/programmability/eval-intro/
+    note: "scripts execute atomically with all server activity blocked; with effects replication, the default since Redis 5.0, a script may call TIME"
+  - title: RFC 6585, section 4, 429 Too Many Requests
+    url: https://www.rfc-editor.org/rfc/rfc6585#section-4
+    note: "a 429 response MAY include a Retry-After header indicating how long to wait"
+steps:
+  - title: Read the assistant's token bucket
+    brief: |
+      The assistant answered "a token bucket shared by every server: rate tokens per second, up to burst, one bucket per key, with an injectable clock" with AssistantBucket, which talks to a MemoryStore standing in for Redis. Before testing it, write the rules down as code. oracle(times, rate, burst) returns which requests for one key a correct bucket admits: the bucket starts full at the key's first request, refills continuously at rate tokens per second up to burst, admits a request when at least one token is available and takes one, and takes nothing from a denied request. Then read the draft and return, from disagreement(), a small input on which the draft and your oracle disagree. Find it by tracing the draft by hand, not by trying random inputs.
+    starter: |
+      class StoreUnavailable(Exception):
+          """The shared store did not answer in time."""
+
+
+      class MemoryStore:
+          """Stands in for the store every server shares. get(key) returns (version, state), with state None for a
+          key never written; put(key, state) writes blindly; cas(key, version, state) writes only if the key is still
+          at that version and returns whether it did. Each call is one round trip, counted in calls. While down is
+          True, every call raises StoreUnavailable."""
+
+          def __init__(self):
+              self.data, self.calls, self.down = {}, 0, False
+
+          def _trip(self):
+              if self.down:
+                  raise StoreUnavailable("store timed out")
+              self.calls += 1
+
+          def get(self, key):
+              self._trip()
+              return self.data.get(key, (0, None))
+
+          def put(self, key, state):
+              self._trip()
+              version, _ = self.data.get(key, (0, None))
+              self.data[key] = (version + 1, state)
+
+          def cas(self, key, version, state):
+              self._trip()
+              current, _ = self.data.get(key, (0, None))
+              if current != version:
+                  return False
+              self.data[key] = (current + 1, state)
+              return True
+
+
+      class AssistantBucket:
+          """The assistant's token bucket: rate tokens per second, at most burst, one bucket per key in a store
+          that every server shares. Kept as written; later steps test against it."""
+
+          def __init__(self, store, rate, burst, clock):
+              self.store, self.rate, self.burst, self.clock = store, rate, burst, clock
+
+          def allow(self, key):
+              now = self.clock()
+              _, state = self.store.get(key)
+              tokens, last = state if state is not None else (self.burst, now)
+              tokens = min(self.burst, tokens + int((now - last) * self.rate))
+              if tokens >= 1:
+                  self.store.put(key, (tokens - 1, now))
+                  return True
+              self.store.put(key, (tokens, now))
+              return False
+
+
+      def oracle(times, rate, burst):
+          """The rules as a pure function, for one key: which of the requests at these times (non-decreasing,
+          in seconds) a correct token bucket admits, as a list of booleans."""
+          raise NotImplementedError
+
+
+      def disagreement():
+          """Return (rate, burst, times): an input on which AssistantBucket and your oracle disagree."""
+          raise NotImplementedError
+    tests: |
+      assert oracle([0, 0, 0], rate=1, burst=2) == [True, True, False]
+      assert oracle([0, 0, 1, 1], rate=1, burst=2) == [True, True, True, False], "one token back after one second"
+      assert oracle([0, 0, 0, 0.5, 1.0], rate=2, burst=1) == [True, False, False, True, True], "denied requests take nothing"
+      def run_draft(rate, burst, times):
+          now = [0.0]
+          b = AssistantBucket(MemoryStore(), rate, burst, lambda: now[0])
+          out = []
+          for t in times:
+              now[0] = t
+              out.append(b.allow("k"))
+          return out
+      rate, burst, times = disagreement()
+      assert list(times) == sorted(times), "times are non-decreasing"
+      assert run_draft(rate, burst, times) != oracle(times, rate, burst), "the draft and your oracle disagree on this input"
+    hidden: |
+      import random
+      def _ref(times, rate, burst):
+          out, tokens, last = [], float(burst), None
+          for t in times:
+              if last is not None:
+                  tokens = min(burst, tokens + (t - last) * rate)
+              last = t
+              ok = tokens >= 1
+              tokens -= ok
+              out.append(ok)
+          return out
+      rate, burst, times = disagreement()
+      assert oracle(times, rate, burst) == _ref(times, rate, burst)
+      rng = random.Random(11)
+      cases = []
+      for _ in range(300):
+          rate, burst = rng.choice([0.5, 1, 2, 4]), rng.choice([1, 2, 3, 5])
+          t, times = 0.0, []
+          for _ in range(rng.randint(1, 40)):
+              t += rng.choice([0, 0, 0.25, 0.5, 1, 2])
+              times.append(t)
+          cases.append((rate, burst, times))
+      assert all(oracle(ts, r, b) == _ref(ts, r, b) for r, b, ts in cases), "oracle disagrees with the rules on a random input"
+      assert all(sum(oracle(ts, r, b)) <= b + r * (ts[-1] - ts[0]) for r, b, ts in cases), "admitted more than burst plus rate times elapsed"
+      assert oracle([0.0], 1, 1) == [True] and oracle([5.0] * 4, 1, 3) == [True, True, True, False], "a new key starts full"
+    solution: |
+      class StoreUnavailable(Exception):
+          """The shared store did not answer in time."""
+
+
+      class MemoryStore:
+          """Stands in for the store every server shares. get(key) returns (version, state), with state None for a
+          key never written; put(key, state) writes blindly; cas(key, version, state) writes only if the key is still
+          at that version and returns whether it did. Each call is one round trip, counted in calls. While down is
+          True, every call raises StoreUnavailable."""
+
+          def __init__(self):
+              self.data, self.calls, self.down = {}, 0, False
+
+          def _trip(self):
+              if self.down:
+                  raise StoreUnavailable("store timed out")
+              self.calls += 1
+
+          def get(self, key):
+              self._trip()
+              return self.data.get(key, (0, None))
+
+          def put(self, key, state):
+              self._trip()
+              version, _ = self.data.get(key, (0, None))
+              self.data[key] = (version + 1, state)
+
+          def cas(self, key, version, state):
+              self._trip()
+              current, _ = self.data.get(key, (0, None))
+              if current != version:
+                  return False
+              self.data[key] = (current + 1, state)
+              return True
+
+
+      class AssistantBucket:
+          """The assistant's token bucket: rate tokens per second, at most burst, one bucket per key in a store
+          that every server shares. Kept as written; later steps test against it."""
+
+          def __init__(self, store, rate, burst, clock):
+              self.store, self.rate, self.burst, self.clock = store, rate, burst, clock
+
+          def allow(self, key):
+              now = self.clock()
+              _, state = self.store.get(key)
+              tokens, last = state if state is not None else (self.burst, now)
+              tokens = min(self.burst, tokens + int((now - last) * self.rate))
+              if tokens >= 1:
+                  self.store.put(key, (tokens - 1, now))
+                  return True
+              self.store.put(key, (tokens, now))
+              return False
+
+
+      def oracle(times, rate, burst):
+          out, tokens, last = [], float(burst), None
+          for t in times:
+              if last is not None:
+                  tokens = min(burst, tokens + (t - last) * rate)
+              last = t
+              if tokens >= 1:
+                  tokens -= 1
+                  out.append(True)
+              else:
+                  out.append(False)
+          return out
+
+
+      def disagreement():
+          # One token a second, polled every half second: the draft truncates each half-token refill to zero
+          # and then moves last forward, so the bucket never refills.
+          return 1, 1, [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+  - title: Boundary tests with an injectable clock
+    brief: |
+      Write boundary_suite(make), the tests the draft should have shipped with. make(rate, burst, clock) returns a limiter on a fresh store, and the suite raises AssertionError when the limiter breaks the rules and returns None when it keeps them. It runs against the draft, against correct buckets whose internals differ from the one in the visible tests, and against buckets that are wrong in ways an assistant plausibly writes. Your oracle from step 1 is available for differential checks. Use rates and clock values whose arithmetic is exact in binary floating point, such as halves and quarters, or a correct bucket that adds its refills in a different order will fail your suite.
+    starter: |
+      def boundary_suite(make):
+          """Tests for any token bucket. make(rate, burst, clock) returns a limiter with allow(key) on a fresh store.
+          Raise AssertionError if it breaks the rules; return None if it keeps them."""
+          raise NotImplementedError
+    tests: |
+      class _Good:
+          """A correct token bucket on the shared store, for one server."""
+          def __init__(self, store, rate, burst, clock):
+              self.store, self.rate, self.burst, self.clock = store, rate, burst, clock
+          def allow(self, key):
+              now = self.clock()
+              _, state = self.store.get(key)
+              tokens, last = state if state is not None else (self.burst, now)
+              tokens = min(self.burst, tokens + (now - last) * self.rate)
+              ok = tokens >= 1
+              self.store.put(key, (tokens - 1 if ok else tokens, now))
+              return ok
+      assert boundary_suite(lambda rate, burst, clock: _Good(MemoryStore(), rate, burst, clock)) is None, "your suite passes a correct bucket"
+      try:
+          boundary_suite(lambda rate, burst, clock: AssistantBucket(MemoryStore(), rate, burst, clock))
+          caught = False
+      except AssertionError:
+          caught = True
+      assert caught, "your suite fails the assistant's draft with an AssertionError"
+    hidden: |
+      def _fails(make):
+          try:
+              boundary_suite(make)
+          except AssertionError:
+              return True
+          return False
+      class _Lazy(_Good):
+          """Correct, a different shape: writes only when it admits."""
+          def allow(self, key):
+              now = self.clock()
+              _, state = self.store.get(key)
+              tokens, last = state if state is not None else (self.burst, now)
+              tokens = min(self.burst, tokens + (now - last) * self.rate)
+              if tokens >= 1:
+                  self.store.put(key, (tokens - 1, now))
+                  return True
+              return False
+      class _NoCap(_Good):
+          def allow(self, key):
+              now = self.clock()
+              _, state = self.store.get(key)
+              tokens, last = state if state is not None else (self.burst, now)
+              tokens = tokens + (now - last) * self.rate
+              ok = tokens >= 1
+              self.store.put(key, (tokens - 1 if ok else tokens, now))
+              return ok
+      class _NeedsMore(_Good):
+          def allow(self, key):
+              now = self.clock()
+              _, state = self.store.get(key)
+              tokens, last = state if state is not None else (self.burst, now)
+              tokens = min(self.burst, tokens + (now - last) * self.rate)
+              ok = tokens > 1
+              self.store.put(key, (tokens - 1 if ok else tokens, now))
+              return ok
+      class _OneBucket(_Good):
+          def allow(self, key):
+              return _Good.allow(self, "every key")
+      class _StartsEmpty(_Good):
+          def allow(self, key):
+              now = self.clock()
+              _, state = self.store.get(key)
+              tokens, last = state if state is not None else (0.0, now)
+              tokens = min(self.burst, tokens + (now - last) * self.rate)
+              ok = tokens >= 1
+              self.store.put(key, (tokens - 1 if ok else tokens, now))
+              return ok
+      class _DenyResets(_Good):
+          def allow(self, key):
+              now = self.clock()
+              _, state = self.store.get(key)
+              tokens, last = state if state is not None else (self.burst, now)
+              tokens = min(self.burst, tokens + (now - last) * self.rate)
+              ok = tokens >= 1
+              self.store.put(key, (tokens - 1 if ok else 0.0, now))
+              return ok
+      def _mk(cls):
+          return lambda rate, burst, clock: cls(MemoryStore(), rate, burst, clock)
+      assert not _fails(_mk(_Lazy)), "your suite rejects a correct bucket that writes only on admit"
+      assert _fails(_mk(_NoCap)), "a bucket with no cap"
+      assert _fails(_mk(_NeedsMore)), "admits only above one token"
+      assert _fails(_mk(_OneBucket)), "one bucket for every key"
+      assert _fails(_mk(_StartsEmpty)), "a new key starts empty"
+      assert _fails(_mk(_DenyResets)), "a denied request throws away the partial refill"
+    solution: |
+      def boundary_suite(make):
+          def run(rate, burst, times, key="k"):
+              now = [0.0]
+              limiter = make(rate, burst, lambda: now[0])
+              out = []
+              for t in times:
+                  now[0] = t
+                  out.append(limiter.allow(key))
+              return out
+
+          # Exactly burst at one instant, then nothing.
+          assert run(1, 3, [0, 0, 0, 0]) == [True, True, True, False], "burst, then deny"
+          # A token comes back at exactly 1 / rate, not later.
+          assert run(2, 1, [0, 0.5]) == [True, True], "refill at exactly 1 / rate"
+          # Fractional refills accumulate across calls: a client polling faster than the rate still gets the rate.
+          polls = [i * 0.25 for i in range(41)]
+          assert sum(run(1, 1, polls)) == 11, "polling every 0.25 s for 10 s at 1 per second admits 1 + 10"
+          # The bucket never holds more than burst, however long it sits idle.
+          assert run(1, 2, [0, 0, 100, 100, 100]) == [True, True, True, True, False], "capped at burst"
+          # Keys are independent.
+          now = [0.0]
+          limiter = make(1, 1, lambda: now[0])
+          assert limiter.allow("a") and limiter.allow("b") and not limiter.allow("a")
+          # Differential check against the oracle on inputs whose arithmetic is exact in binary floating point.
+          import random
+          rng = random.Random(5)
+          for _ in range(200):
+              rate, burst = rng.choice([0.5, 1, 2, 4]), rng.choice([1, 2, 3])
+              t, times = 0.0, []
+              for _ in range(rng.randint(1, 25)):
+                  t += rng.choice([0, 0.25, 0.5, 1, 3])
+                  times.append(t)
+              assert run(rate, burst, times) == oracle(times, rate, burst), (rate, burst, times)
+  - title: Reproduce the race between servers
+    brief: |
+      The draft reads a bucket with get and writes it back with put, two round trips. Another server's request can run in between, and a test that only ever calls one limiter cannot see it. Make the gap controllable instead of hoping a thread lands in it: PausingStore.after_get(fn) queues fn, and the next get reads its value, runs everything queued in order, then returns what it read. Then write race_demo(make), which puts two servers on one PausingStore, runs the second server's request inside the first one's gap for a single key at one instant, and returns how many were admitted. With burst 1, the draft admits 2.
+    starter: |
+      class PausingStore(MemoryStore):
+          """A MemoryStore that can run other servers' requests in the gap between a read and what the reader does
+          with it. after_get(fn) queues fn; the next get reads its value, then runs everything queued, in order,
+          then returns the value it read."""
+
+          def __init__(self):
+              super().__init__()
+              self.queued = []
+
+          def after_get(self, fn):
+              raise NotImplementedError
+
+          def get(self, key):
+              raise NotImplementedError
+
+
+      def race_demo(make):
+          """make(store) returns one server's limiter for rate 1, burst 1, with its clock stopped. Put two servers on one
+          PausingStore, interleave them for key "k" at a single instant, and return how many requests were admitted."""
+          raise NotImplementedError
+    tests: |
+      s = PausingStore()
+      seen = []
+      s.put("k", "v1")
+      s.after_get(lambda: (seen.append("ran"), s.put("k", "v2")))
+      assert s.get("k") == (1, "v1") and seen == ["ran"], "get reads first, then runs the queued callback"
+      assert s.get("k") == (2, "v2") and seen == ["ran"], "a queued callback runs once"
+      assert race_demo(lambda store: AssistantBucket(store, 1, 1, lambda: 0.0)) == 2, "one token, two servers, two admitted"
+    hidden: |
+      class _Cas:
+          def __init__(self, store, rate, burst, clock):
+              self.store, self.rate, self.burst, self.clock = store, rate, burst, clock
+          def allow(self, key):
+              for _ in range(5):
+                  now = self.clock()
+                  version, state = self.store.get(key)
+                  tokens, last = state if state is not None else (self.burst, now)
+                  tokens = min(self.burst, tokens + max(0.0, now - last) * self.rate)
+                  ok = tokens >= 1
+                  if self.store.cas(key, version, (tokens - 1 if ok else tokens, max(now, last))):
+                      return ok
+              return False
+      assert race_demo(lambda store: _Cas(store, 1, 1, lambda: 0.0)) == 1, "a limiter that checks the version admits one"
+      s = PausingStore()
+      order = []
+      s.after_get(lambda: order.append(1)); s.after_get(lambda: (order.append(2), s.get("x"), order.append(3)))
+      s.get("x")
+      assert order == [1, 2, 3], "queued callbacks run in order, and a get inside a callback does not rerun the queue"
+      s = PausingStore()
+      assert s.get("new") == (0, None) and s.calls == 1, "a PausingStore still counts round trips"
+    solution: |
+      class PausingStore(MemoryStore):
+          """A MemoryStore that can run other servers' requests in the gap between a read and what the reader does
+          with it. after_get(fn) queues fn; the next get reads its value, then runs everything queued, in order,
+          then returns the value it read."""
+
+          def __init__(self):
+              super().__init__()
+              self.queued = []
+
+          def after_get(self, fn):
+              self.queued.append(fn)
+
+          def get(self, key):
+              value = MemoryStore.get(self, key)
+              queued, self.queued = self.queued, []
+              for fn in queued:
+                  fn()
+              return value
+
+
+      def race_demo(make):
+          store = PausingStore()
+          a, b = make(store), make(store)
+          admitted = []
+          store.after_get(lambda: admitted.append(b.allow("k")))   # b runs between a's read and a's write
+          admitted.append(a.allow("k"))
+          return sum(admitted)
+  - title: Fix it, and write the concurrency test
+    brief: |
+      Write Limiter, a bucket that is correct with many servers, and concurrency_test(make), a test that fails the draft and passes a correct limiter. Limiter follows your oracle exactly for one server. It reads with get and writes with cas on the version it read; when the cas loses, it reads again and decides again, up to a number of attempts you choose (at most 10), then denies, because admitting a request the store never counted is the over-admission you are fixing. An uncontended request costs at most two round trips. Servers' clocks disagree by seconds in production, so a server whose clock is behind must never move the bucket's last-refill time backwards, or the next server collects refills nobody earned. concurrency_test(make) receives make(store, rate, burst, clock) and should drive several servers through interleavings with PausingStore, asserting that admissions never exceed burst plus rate times elapsed time. The hidden tests time 100,000 requests over 2,000 keys.
+    starter: |
+      class Limiter:
+          """Your fix: a token bucket on the shared store that stays correct with many servers. See the brief for the rules."""
+
+          def __init__(self, store, rate, burst, clock, attempts=4):
+              raise NotImplementedError
+
+          def allow(self, key):
+              raise NotImplementedError
+
+
+      def concurrency_test(make):
+          """make(store, rate, burst, clock) builds one server's limiter. Raise AssertionError if servers sharing one
+          store can admit more than the rules allow under some interleaving; return None if they cannot."""
+          raise NotImplementedError
+    tests: |
+      now = [0.0]
+      lim = Limiter(MemoryStore(), rate=1, burst=2, clock=lambda: now[0])
+      assert [lim.allow("k") for _ in range(3)] == [True, True, False]
+      now[0] = 0.5
+      assert not lim.allow("k")
+      now[0] = 1.0
+      assert lim.allow("k"), "half-token refills add up to a whole token"
+      assert race_demo(lambda store: Limiter(store, 1, 1, lambda: 0.0)) == 1, "the interleaving from step 3 admits one"
+      assert concurrency_test(lambda store, rate, burst, clock: Limiter(store, rate, burst, clock)) is None, "your test passes your fix"
+      try:
+          concurrency_test(lambda store, rate, burst, clock: AssistantBucket(store, rate, burst, clock))
+          caught = False
+      except AssertionError:
+          caught = True
+      assert caught, "your test fails the assistant's draft"
+    hidden: |
+      import random, time
+      def _ref(times, rate, burst):
+          out, tokens, last = [], float(burst), None
+          for t in times:
+              if last is not None:
+                  tokens = min(burst, tokens + (t - last) * rate)
+              last = t
+              ok = tokens >= 1
+              tokens -= ok
+              out.append(ok)
+          return out
+      def _one(rate, burst, times):
+          now = [0.0]
+          lim = Limiter(MemoryStore(), rate, burst, lambda: now[0])
+          out = []
+          for t in times:
+              now[0] = t
+              out.append(lim.allow("k"))
+          return out
+      rng = random.Random(23)
+      cases = []
+      for _ in range(300):
+          t, times = 0.0, []
+          for _ in range(rng.randint(1, 30)):
+              t += rng.choice([0, 0.25, 0.5, 1, 4])
+              times.append(t)
+          cases.append((rng.choice([0.5, 1, 2]), rng.choice([1, 2, 4]), times))
+      assert all(_one(r, b, ts) == _ref(ts, r, b) for r, b, ts in cases), "one server must follow the rules exactly"
+
+      class _Pause(MemoryStore):
+          def __init__(self):
+              super().__init__()
+              self.q = []
+          def get(self, key):
+              v = MemoryStore.get(self, key)
+              q, self.q = self.q, []
+              for fn in q:
+                  fn()
+              return v
+      def _fleet_ok(seed):
+          rng = random.Random(seed)
+          store, now = _Pause(), [0.0]
+          rate, burst, n = rng.choice([1, 2]), rng.choice([1, 3]), 4
+          fleet = [Limiter(store, rate, burst, lambda: now[0]) for _ in range(n)]
+          admitted = [0]
+          def go(i):
+              admitted[0] += fleet[i].allow("k")
+          for step in range(60):
+              now[0] += rng.choice([0, 0.25, 0.5])
+              order = rng.sample(range(n), n)
+              for i in order[1:]:
+                  store.q.append(lambda i=i: go(i))
+              go(order[0])
+              if admitted[0] > burst + rate * now[0]:
+                  return False
+          return True
+      assert all(_fleet_ok(s) for s in range(40)), "servers sharing the store admitted more than burst plus rate times elapsed"
+
+      store = MemoryStore()
+      now = [0.0]
+      lim = Limiter(store, 1, 5, lambda: now[0])
+      before = store.calls
+      for i in range(100):
+          now[0] = i * 0.5
+          lim.allow("k%d" % (i % 7))
+      assert store.calls - before <= 200, "an uncontended request costs at most two round trips"
+
+      class _Losing(MemoryStore):
+          def cas(self, key, version, state):
+              self._trip()
+              return False
+      store = _Losing()
+      lim = Limiter(store, 1, 5, lambda: 0.0)
+      assert lim.allow("k") is False and store.calls <= 20, "when every cas loses, deny within at most 10 attempts"
+
+      store = MemoryStore()
+      ahead = Limiter(store, 1, 1, lambda: 100.0)
+      behind = Limiter(store, 1, 1, lambda: 95.0)
+      got = [(ahead if i % 2 == 0 else behind).allow("k") for i in range(20)]
+      assert sum(got) <= 1, "a server whose clock is 5 s behind handed the other server refills it never earned"
+
+      def _fails(make):
+          try:
+              concurrency_test(make)
+          except AssertionError:
+              return True
+          return False
+      class _IgnoresCas:
+          """Calls cas and admits whatever cas answers."""
+          def __init__(self, store, rate, burst, clock):
+              self.store, self.rate, self.burst, self.clock = store, rate, burst, clock
+          def allow(self, key):
+              now = self.clock()
+              version, state = self.store.get(key)
+              tokens, last = state if state is not None else (self.burst, now)
+              tokens = min(self.burst, tokens + max(0.0, now - last) * self.rate)
+              ok = tokens >= 1
+              self.store.cas(key, version, (tokens - 1 if ok else tokens, max(last, now)))
+              return ok
+      class _NoRetry(_IgnoresCas):
+          """Denies on a lost cas instead of retrying: under-admits, never over-admits."""
+          def allow(self, key):
+              now = self.clock()
+              version, state = self.store.get(key)
+              tokens, last = state if state is not None else (self.burst, now)
+              tokens = min(self.burst, tokens + max(0.0, now - last) * self.rate)
+              ok = tokens >= 1
+              return self.store.cas(key, version, (tokens - 1 if ok else tokens, max(last, now))) and ok
+      assert not _fails(lambda store, rate, burst, clock: _NoRetry(store, rate, burst, clock)), "your test rejects a limiter that never over-admits"
+      assert _fails(lambda store, rate, burst, clock: _IgnoresCas(store, rate, burst, clock)), "a limiter that calls cas and ignores the answer"
+
+      store = MemoryStore()
+      now = [0.0]
+      lim = Limiter(store, 10, 20, lambda: now[0])
+      t0 = time.perf_counter()
+      for i in range(100_000):
+          now[0] = i / 4096
+          lim.allow(i % 2000)
+      elapsed = time.perf_counter() - t0
+      assert elapsed < 2.0, f"100,000 requests took {elapsed:.1f} s"
+    solution: |
+      class Limiter:
+          """Read with get, write with cas on the version read; on a lost race, read again and decide again."""
+
+          def __init__(self, store, rate, burst, clock, attempts=4):
+              self.store, self.rate, self.burst, self.clock = store, rate, burst, clock
+              self.attempts = attempts
+
+          def _decide(self, state, now):
+              tokens, last = state if state is not None else (float(self.burst), now)
+              # A server whose clock is behind sees negative elapsed time: no refill, and last never moves back.
+              tokens = min(self.burst, tokens + max(0.0, now - last) * self.rate)
+              last = max(last, now)
+              if tokens >= 1:
+                  return (tokens - 1, last), True
+              return (tokens, last), False
+
+          def allow(self, key):
+              for _ in range(self.attempts):
+                  now = self.clock()
+                  version, state = self.store.get(key)
+                  new_state, ok = self._decide(state, now)
+                  if self.store.cas(key, version, new_state):
+                      return ok
+              return False   # lost every race: deny rather than admit a request the store never counted
+
+
+      def concurrency_test(make):
+          import random
+          rng = random.Random(3)
+          for trial in range(100):
+              rate, burst, servers = rng.choice([0.5, 1, 2]), rng.choice([1, 2, 3]), rng.choice([2, 3, 4])
+              store, now = PausingStore(), [0.0]
+              fleet = [make(store, rate, burst, lambda: now[0]) for _ in range(servers)]
+              admitted = []
+              for step in range(rng.randint(1, 12)):
+                  now[0] += rng.choice([0, 0, 0.25, 0.5])
+                  order = rng.sample(range(servers), servers)
+                  for i in order[1:]:
+                      store.after_get(lambda i=i: admitted.append(fleet[i].allow("k")))
+                  admitted.append(fleet[order[0]].allow("k"))
+              assert sum(admitted) <= burst + rate * now[0], (trial, rate, burst, servers, sum(admitted))
+  - title: Decide what happens when the store is down, and write it down
+    brief: |
+      When the store raises StoreUnavailable, from the read or from the write, allow must still answer and never raise. With outage "closed" it denies. With outage "local" each server decides from its own bucket for the key with its share of the limit; across a fleet of servers, admissions for one key during an outage of T seconds may not exceed burst plus rate times T plus one token per server. self.local holds the local buckets and never more than max_local keys, whatever the traffic's key cardinality; which bucket to drop is yours to choose. When the store answers again, it decides. Then write worst_case_admits for your policy, the most a fleet can admit for one key during an outage, and fill NOTES: whose clock decides refills, how check-and-update stays atomic, which outage policy you default to and what it can over-admit, and what a denied client is told.
+    starter: |
+      class ResilientLimiter(Limiter):
+          """Limiter plus a decision for when the store does not answer. outage is "closed" (deny) or "local" (this
+          server decides from its own bucket for the key, with its share of the limit). servers is how many servers
+          share the limit. self.local holds the local buckets and never more than max_local keys."""
+
+          def __init__(self, store, rate, burst, clock, servers=1, outage="local", max_local=10_000):
+              super().__init__(store, rate, burst, clock)
+              self.servers, self.outage, self.max_local = servers, outage, max_local
+              self.local = {}
+
+          def allow(self, key):
+              raise NotImplementedError
+
+
+      def worst_case_admits(servers, rate, burst, seconds, outage):
+          """The most requests for one key that the whole fleet can admit during an outage of `seconds`, under your policy."""
+          raise NotImplementedError
+
+
+      NOTES = {
+          "clock": "",        # whose clock decides refills when servers' clocks disagree, and what skew costs
+          "atomicity": "",    # how check-and-update stays atomic across servers, and what a round trip costs
+          "outage": "",       # closed or local, why, and what the fleet can over-admit (use worst_case_admits)
+          "retry_after": "",  # what a denied client is told, and how you keep retries from arriving together
+      }
+    tests: |
+      store = MemoryStore()
+      closed = ResilientLimiter(store, 1, 2, lambda: 0.0, outage="closed")
+      store.down = True
+      assert closed.allow("k") is False, "closed denies while the store is down"
+      local = ResilientLimiter(store, 1, 2, lambda: 0.0, servers=1, outage="local")
+      assert [local.allow("k") for _ in range(3)] == [True, True, False], "one server, local: its own bucket"
+      store.down = False
+      assert local.allow("fresh") and "fresh" in store.data, "the store decides again once it answers"
+      assert worst_case_admits(4, 2, 4, 30, "closed") == 0
+      assert set(NOTES) == {"clock", "atomicity", "outage", "retry_after"} and all(len(v) >= 80 for v in NOTES.values()), "each note is written"
+    hidden: |
+      def _fleet(outage, servers=4, rate=2, burst=4, seconds=30):
+          store, now = MemoryStore(), [0.0]
+          fleet = [ResilientLimiter(store, rate, burst, lambda: now[0], servers=servers, outage=outage) for _ in range(servers)]
+          store.down = True
+          admitted, raised = 0, False
+          for i in range(int(seconds * 4)):
+              now[0] = i * 0.25
+              for lim in fleet:
+                  try:
+                      admitted += lim.allow("k")
+                  except Exception:
+                      raised = True
+          return admitted, raised
+      got, raised = _fleet("local")
+      assert not raised, "allow raised during an outage"
+      assert got <= 4 + 2 * 30 + 4, "local mode let the fleet admit more than burst + rate x seconds + one token per server"
+      assert got <= worst_case_admits(4, 2, 4, 30, "local") <= 4 + 2 * 30 + 4, "worst_case_admits is a true bound and within the limit"
+      assert got >= 30, "local mode still admits traffic during the outage"
+      got, raised = _fleet("closed")
+      assert got == 0 and not raised
+      class _CasDown(MemoryStore):
+          def cas(self, key, version, state):
+              raise StoreUnavailable("timed out after the read")
+      lim = ResilientLimiter(_CasDown(), 1, 1, lambda: 0.0, outage="local")
+      try:
+          r = lim.allow("k")
+      except Exception:
+          r = "raised"
+      assert r in (True, False), "a store that fails between the read and the write must not raise"
+      store, now = MemoryStore(), [0.0]
+      lim = ResilientLimiter(store, 1, 1, lambda: now[0], outage="local")
+      store.down = True
+      for i in range(50_000):
+          now[0] = i / 1024
+          lim.allow("ip-%d" % i)
+      assert len(lim.local) <= lim.max_local, "local buckets grew past max_local"
+      store.down = False
+      assert lim.allow("k") is True and store.calls >= 2, "after the outage the store decides"
+    solution: |
+      from collections import OrderedDict
+
+
+      class ResilientLimiter(Limiter):
+          """Limiter plus a decision for when the store does not answer. In "local" mode each server keeps its own
+          bucket per key with 1/servers of the rate and of the burst (at least one token), so the fleet admits about
+          the global limit while every server sees an even share of the traffic."""
+
+          def __init__(self, store, rate, burst, clock, servers=1, outage="local", max_local=10_000):
+              super().__init__(store, rate, burst, clock)
+              self.servers, self.outage, self.max_local = servers, outage, max_local
+              self.local = OrderedDict()   # key -> (tokens, last), least recently used first
+
+          def _local(self, key):
+              now = self.clock()
+              rate, burst = self.rate / self.servers, max(1.0, self.burst / self.servers)
+              tokens, last = self.local.pop(key, (burst, now))
+              tokens = min(burst, tokens + max(0.0, now - last) * rate)
+              ok = tokens >= 1
+              self.local[key] = (tokens - 1 if ok else tokens, max(last, now))
+              if len(self.local) > self.max_local:
+                  # Dropping a bucket forgets what that key spent; a returning key starts full again.
+                  self.local.popitem(last=False)
+              return ok
+
+          def allow(self, key):
+              try:
+                  return Limiter.allow(self, key)
+              except StoreUnavailable:
+                  if self.outage == "closed":
+                      return False
+                  return self._local(key)
+
+
+      def worst_case_admits(servers, rate, burst, seconds, outage):
+          if outage == "closed":
+              return 0
+          per_server = max(1.0, burst / servers) + (rate / servers) * seconds
+          return servers * per_server
+
+
+      NOTES = {
+          "clock": "The refill uses each server's wall clock, and last never moves backwards, so a server that is behind "
+                   "adds no refill and one that is ahead over-admits by at most its skew times the rate, capped at burst. "
+                   "In Redis, read TIME inside the script so one clock decides.",
+          "atomicity": "Each request is a get and a cas on the key's version, retried up to four times and then denied. "
+                       "In Redis the same decision runs as one Lua script, which is one round trip and cannot interleave.",
+          "outage": "Local by default: each server enforces 1/servers of the rate and burst, so the fleet admits at most "
+                    "worst_case_admits; this assumes even load balancing and a known server count. Closed when the "
+                    "limiter protects a dependency that falls over above its limit.",
+          "retry_after": "A denial returns 429 with Retry-After set to the time until one token refills, (1 - tokens) / rate, "
+                         "plus random jitter so clients denied together do not return together.",
+      }
+---
+This lab grows one program over five steps from a token bucket an assistant wrote. Each step adds to the same file and runs its tests against everything you have written so far, so step 4's fix is checked by the oracle from step 1 and the interleaving harness from step 3.
+
+The draft reads well and passes tests that step the clock in whole seconds. It has two seeded defects. One is in how it handles time: polled more often than its refill rate, it never refills. The other is a race between servers that share its store. Neither shows up in a test that uses whole seconds and one limiter. The steps follow the order the round runs in: read the code, write the tests that would have caught it, reproduce the race deterministically, fix it, then defend the parts code cannot settle.
+
+Nothing here starts a thread. The race is driven by a store that runs one server's request inside another's read-then-write gap, which makes the interleaving repeatable and the test exact. Every test asserts behaviour: which requests were admitted, how many round trips a request cost, whether a call raised, and whether admissions stayed under burst plus rate times elapsed time.
+
+Two limits stay after the last step. The servers' clocks still decide refills, so a server whose clock runs ahead over-admits by up to its skew times the rate, capped at the burst; in Redis the fix is to run the whole decision as one script that reads the server's own `TIME`, which also removes the compare-and-set retries. And the local outage mode divides the limit evenly across servers, which assumes the load balancer spreads one key's traffic evenly. A client pinned to one server gets a quarter of its limit on a four-server fleet.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

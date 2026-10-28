@@ -1,0 +1,162 @@
+---
+title: Rate limiting, abuse and denial of wallet
+track: security
+module: security-ops
+order: 2
+kind: lesson
+level: senior
+minutes: 13
+summary: Why request-count limits do not bound the cost of a model feature, how to meter per tenant in cost units with a reserve-and-settle bucket and a hard cap, what the provider's own limits do to you when one tenant misbehaves, and why abuse such as task-splitting and model extraction is visible only at the account level.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: OWASP, LLM10:2025 Unbounded Consumption
+    url: https://genai.owasp.org/llmrisk/llm102025-unbounded-consumption/
+    note: "vulnerability examples: variable-length input flood, denial of wallet, continuous input overflow, resource-intensive queries, model extraction via API, functional model replication, side-channel attacks; mitigations include input validation, limiting exposure of logits and logprobs, rate limiting, resource allocation management, timeouts and throttling, logging and anomaly detection, watermarking, graceful degradation, limiting queued actions"
+  - title: Claude API documentation, Rate limits (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: "token bucket algorithm, capacity continuously replenished; RPM, ITPM and OTPM per model class; Start tier Claude Sonnet 5.5: 1,000 RPM, 2,000,000 ITPM, 400,000 OTPM; monthly spend caps Start $500, Build $1,000, Scale $200,000; at the cap usage pauses until 00:00 UTC on the first of the next month and requests return 429 rate_limit_error with error_code enforced_spend_limit_reached and no retry-after header; a self-set spend limit returns 400 invalid_request_error; ITPM estimated at request start and adjusted; OTPM counts generated tokens and ignores max_tokens; for most models cache reads do not count toward ITPM; acceleration limits on sharp usage increases; workspace limits can be set below the organisation's"
+  - title: Claude API documentation, Pricing (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: "Claude Sonnet 5.5: $2 per million input tokens, $10 per million output tokens; cache hits 0.05x base input price on Sonnet 5.5; Claude Haiku 5.5 is priced higher for prompts over 100,000 tokens"
+  - title: "Anthropic, Disrupting the first reported AI-orchestrated cyber espionage campaign (13 November 2025, edited 14 November 2025)"
+    url: https://www.anthropic.com/news/disrupting-AI-espionage
+    note: "detected mid-September 2025; Anthropic assesses with high confidence a Chinese state-sponsored group; the actor manipulated Claude Code to attempt infiltration of roughly thirty targets, succeeding in a small number; AI performed 80-90% of the campaign with 4-6 critical human decision points; jailbreak by splitting the attack into small, seemingly innocent tasks and claiming to be a legitimate cybersecurity firm doing defensive testing; at peak thousands of requests, often multiple per second; over the following ten days Anthropic banned accounts, notified affected entities and coordinated with authorities; expanded detection and developed better classifiers"
+  - title: "Carlini et al., Stealing Part of a Production Language Model (arXiv 2403.06634, v2 9 July 2024)"
+    url: https://arxiv.org/abs/2403.06634
+    note: "with typical API access, extracted the embedding projection layer of OpenAI's Ada and Babbage for under $20, confirming hidden dimensions 1024 and 2048; recovered gpt-3.5-turbo's hidden dimension and estimated under $2,000 for its full projection matrix"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Requests are the wrong unit
+
+A rate limit on an ordinary API bounds load because requests cost roughly the same. A model call does not. At Claude Sonnet 5.5 list prices ($2 per million input tokens, $10 per million output, checked 2026-10-28), a chat turn with 500 input and 300 output tokens costs 500 × 2 / 10⁶ + 300 × 10 / 10⁶ = $0.004. A turn that pastes a long document, 150,000 input tokens and 8,000 output, costs $0.30 + $0.08 = $0.38. Same endpoint, same one request, 95 times the cost. A limit of 60 requests a minute sized for the first turn lets a user spend $22.80 a minute on the second.
+
+OWASP's LLM10:2025 entry, Unbounded Consumption, lists the ways this gets exploited: variable-length input floods, denial of wallet, continuous input overflow beyond the context window, resource-intensive queries, model extraction through the API, functional model replication, and side channels. Its mitigations include input size limits, rate limiting, resource allocation management, timeouts and throttling, limiting exposure of logits and logprobs, and anomaly detection on usage. The engineering question is which of these sits where, and in which unit.
+
+## Meter in cost, per principal
+
+The provider already does part of this, and its design is worth copying. Anthropic's rate-limits documentation says the API uses a token bucket, measures requests, input tokens and output tokens per minute separately per model class, estimates input tokens at the start of a request and adjusts during it, and counts output tokens as they are generated, ignoring `max_tokens`. For most models, tokens read from the prompt cache do not count toward the input limit.
+
+Your limiter has a harder job, because it decides before the call and the expensive part (output) is unknown. The conservative pattern is reserve and settle: charge the bucket the worst case (actual input tokens plus `max_tokens` at output price) before the call, refund the difference after. A tenant cannot overspend by starting many long generations at once, and a well-behaved tenant gets the refund back within the same second. Denominate the bucket in money, not tokens, so a model change or a long-context price tier changes the charge and not the limit.
+
+Above the bucket sits a hard cap per tenant per day or month. The bucket shapes bursts; the cap bounds the loss. They fail differently, so they answer differently: a bucket rejection is a throttle the client may retry after a computed wait, a cap rejection is a stop that pages a person and is never retried.
+
+```python
+# Claude Sonnet 5.5 list prices, USD per million tokens (pricing page, checked 2026-10-28).
+PRICE_IN, PRICE_OUT = 2.00, 10.00
+
+def cost(tokens_in, tokens_out):
+    return (tokens_in * PRICE_IN + tokens_out * PRICE_OUT) / 1e6
+
+class TenantBudget:
+    """Cost-denominated bucket plus a hard daily cap. Reserve before the call, settle after."""
+    def __init__(self, usd_per_min, burst_usd, daily_cap_usd, clock):
+        self.rate, self.cap, self.level = usd_per_min / 60, burst_usd, burst_usd
+        self.daily_cap, self.spent_today, self.clock, self.t = daily_cap_usd, 0.0, clock, clock()
+
+    def reserve(self, tokens_in, max_tokens):
+        now = self.clock()
+        self.level = min(self.cap, self.level + (now - self.t) * self.rate)
+        self.t = now
+        hold = cost(tokens_in, max_tokens)          # worst case: every allowed output token is generated
+        if self.spent_today + hold > self.daily_cap:
+            return None, "daily_cap"                # hard stop: page a human, do not retry
+        if hold > self.level:
+            return None, "throttle"                 # caller may retry after (hold - level) / rate seconds
+        self.level -= hold
+        self.spent_today += hold
+        return hold, "ok"
+
+    def settle(self, hold, tokens_in, tokens_out):
+        refund = hold - cost(tokens_in, tokens_out)
+        self.level = min(self.cap, self.level + refund)
+        self.spent_today -= refund
+
+t = [0.0]
+b = TenantBudget(usd_per_min=1.20, burst_usd=2.00, daily_cap_usd=50.00, clock=lambda: t[0])
+
+hold, why = b.reserve(500, 1_000)                   # chat turn: hold $0.011
+b.settle(hold, 500, 300)                            # actual $0.004, $0.007 refunded
+for _ in range(6):                                  # a burst of long-document turns at t = 0
+    hold, why = b.reserve(150_000, 8_000)
+print(why, round(b.level, 3), round(b.spent_today, 3))   # throttle 0.096 1.904
+t[0] = 60.0                                         # one minute later the bucket has refilled $1.20
+print(b.reserve(150_000, 8_000)[1])                 # ok
+```
+
+The per-request limits stay in front of the bucket because they bound the single worst call: an input size cap below the model's context window, a `max_tokens` ceiling per route, a cap on tool calls per agent turn, and a wall-clock timeout per turn. An agent loop that may call a model 40 times per user message needs the bucket charged per model call, not per user message, or one message buys 40 calls at the price of one check.
+
+## The provider's limits are shared by your tenants
+
+The provider's limits are per organisation. Every tenant of your product draws from one bucket, so a tenant who exhausts it denies service to all the others. Anthropic's documentation offers workspaces with their own rate and spend limits below the organisation's, which give a coarse partition (a workspace per tier of customer, or one for batch jobs); per-tenant fairness still has to be yours.
+
+The spend cap is the sharper edge. The same page lists monthly caps of $500 for the Start tier, $1,000 for Build and $200,000 for Scale. At the cap, usage pauses until 00:00 UTC on the first of the next month, and requests return HTTP 429 with error type `rate_limit_error`, `error_code` `enforced_spend_limit_reached` and no `retry-after` header. The documentation notes that retries, including the SDK's automatic retries, fail until access resumes, so a client that treats every 429 as retryable now spends the month retrying. Branch on the error code. A spend limit you set yourself below the cap returns 400 `invalid_request_error` instead, which is a different branch again.
+
+<Predict id="sec-dow-leaked-key" question="How many minutes until the Start tier's $500 monthly cap stops the traffic?" answer={62.5} tolerance={2} unit="minutes">
+<Fragment slot="prompt">
+<p>An organisation key on the Start tier leaks. The attacker sends uncached traffic to Claude Sonnet 5.5 at the tier's published limits: 2,000,000 input tokens and 400,000 output tokens a minute. Prices are $2 and $10 per million. Nothing else is using the key this month.</p>
+</Fragment>
+<p>Input: 2,000,000 × $2 / 10⁶ = $4 a minute. Output: 400,000 × $10 / 10⁶ = $4 a minute. $8 a minute reaches $500 in <b>62.5 minutes</b>. The cap bounded the money, and then it stopped your product for every tenant until the first of next month unless you request a higher limit. Denial of wallet against the provider cap becomes denial of service against you. The defence is a self-set limit or a workspace limit well below the cap, alerting on spend rate rather than spend total, and keys scoped per service so that revoking one does not take down the rest.</p>
+</Predict>
+
+## Abuse is account-level behaviour
+
+Cost limits stop volume. They do not stop a patient actor whose every request is cheap and individually acceptable. Anthropic's November 2025 report on an espionage campaign is the public case. Anthropic assesses with high confidence that a Chinese state-sponsored group manipulated Claude Code into attempting infiltration of roughly thirty targets, succeeding in a small number. The report says AI performed 80-90% of the campaign, with perhaps 4-6 critical human decision points per campaign. The operators got past the model's safeguards by splitting the attack into small, seemingly innocent tasks and by telling Claude it worked for a legitimate cybersecurity firm doing defensive testing. At peak the system made thousands of requests, often multiple per second.
+
+Each prompt in that campaign could pass a single-prompt classifier, because each was a plausible fragment of a security engagement. What did not look plausible was the account: request rates no human operator sustains, a sequence that runs reconnaissance, then exploit development, then credential harvesting, then data extraction, across many unrelated external organisations. Anthropic's response, over ten days, was account bans, notification of affected entities and coordination with authorities, then expanded detection and better classifiers for malicious activity.
+
+The engineering consequence is a second detection path that is stateful and runs off the request path:
+
+- **Features per account and per linked group of accounts**: sustained request rate against a human-plausible ceiling, distinct external targets touched by tool calls, the sequence of task categories within a session and across sessions, tool mix, and shared payment instruments or network origins across accounts.
+- **A stream job, not a middleware**: the inline filter sees one request; the abuse detector sees an account's last hour and last month, and its decisions arrive seconds to hours later.
+- **Graded actions**: throttle, step-up verification, human review, suspension. Each action is logged with the features that triggered it, because the account owner will appeal and the reviewer needs the evidence.
+
+<Callout kind="gotcha">
+"We are a security firm running an authorised test" is what the attackers in Anthropic's report said, and it is also what your legitimate security customers say. A detector that keys on that claim, in either direction, has learned the cover story. Key on behaviour the cover story does not change: rate, breadth of targets, and whether the targets are the customer's own.
+</Callout>
+
+## Extraction and replication
+
+Two of OWASP's examples are about the model rather than the bill: extraction through the API and functional replication, where an attacker uses your outputs as training data for an equivalent model. The extraction risk is not theoretical. Carlini and colleagues (2024) report extracting the embedding projection layer of OpenAI's Ada and Babbage models for under $20 in queries with typical API access, confirming hidden dimensions of 1024 and 2048, and estimate under $2,000 for the full matrix of gpt-3.5-turbo. OWASP's matching mitigation is to limit exposure of logits and logprobs: every extra number per token you return is information per query.
+
+For a product that serves its own fine-tuned model, the controls fall into two kinds. Some hold by construction: return no logprobs or only top-1, no logit bias parameter, a fixed decoding configuration per route. Others lower a rate: detectors for query sets with the shape of dataset generation (high volume, broad and systematic coverage of a task space, outputs never used in the product's own flows). Replication through ordinary outputs cannot be prevented by construction if the product's purpose is to produce those outputs; it can be priced, rate-limited and made contractually expensive.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your B2B assistant API serves 40 tenants from one provider organisation. Overnight one tenant's traffic tripled. Every key is valid, every prompt passes the content filter, and the tenant is in a renewal negotiation. Other tenants are starting to see 429s. You are on call. What do you do in the next hour, and what do you build this quarter?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>In the hour: cap that tenant's share of the provider limit so the other 39 recover, without blocking it outright, and look at what the tripled traffic is doing before calling it abuse. This quarter: per-tenant cost buckets with reserve and settle, hard per-tenant caps below the provider cap, a workspace partition, 429 handling that branches on the spend-cap error code, and an account-level detector that runs off the request path.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Two constraints conflict: availability for 39 tenants and a commercial relationship with the one causing the load. Blocking the tenant is fast and might be wrong; doing nothing degrades everyone. The proportionate first move is a throttle for that tenant at a fraction of the organisation's limit chosen so the others' error rate returns to baseline, with a message to their account contact that names the throttle and the reason.</p>
+<p>Then look at the traffic. A tripling with the same prompt mix and more users is growth, and the fix is a limit increase and a billing conversation. A tripling concentrated in one key, at a rate no human pace explains, with long inputs and a breadth of content unrelated to their product, is a leaked key or an integration bug. Revoke and reissue the key with the tenant. Traffic that looks like systematic dataset generation is a contract question first.</p>
+<p>The build is the cost-denominated bucket per tenant with a hard cap, both below the provider cap with headroom, and a workspace per customer tier so a tenant can only exhaust its own partition. What we give up is burst headroom for large tenants, which they will notice; the cap number is negotiated per contract and written down. The failure mode is that reserve-at-<code>max_tokens</code> under-admits tenants who set a high ceiling and use little of it; per-route ceilings fix most of that.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Sales says throttling a tenant mid-renewal will lose the deal. Engineering says leaving it costs the other 39 their SLO. Who decides, on what number, and how is the decision recorded?</em></li>
+<li><em>The tenant's traffic is legitimate but their agent now makes 25 model calls per user message instead of 6. Is that abuse, a bug, or a pricing problem, and which of your controls should have caught it?</em></li>
+<li><em>What would you need to see in the account-level detector's first month before letting it suspend accounts without a human review step?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Reserve and settle assumes you know the price at decision time. Cache reads on Sonnet 5.5 bill at 0.05 times the base input price, reasoning tokens are unknown until the call ends, and long-context pricing changes the rate above a prompt-size threshold on some models (Haiku 5.5 above 100,000 tokens). A bucket charged at list input price over-reserves cached traffic, which is the safe direction; a bucket that ignores reasoning tokens under-reserves, which is not.
+
+Cost metering protects a usage-billed product. A product sold per seat absorbs the cost itself, and there the cap is a margin control that users will experience as a feature limit. The number then comes from unit economics, not security.
+
+Account-level detection assumes accounts mean something. Free tiers with cheap sign-up let an actor spread behaviour across hundreds of accounts, each under every threshold. The linked-account features (payment, origin, timing) carry the load there, and they have high false-positive rates for customers behind shared corporate egress.
+
+The provider figures in this lesson (tiers, caps, error codes) come from Anthropic's documentation checked on 2026-10-28. Other providers name and enforce limits differently, and the same provider changes them; read the current page before building on an error code.
+
+<SelfRate id="lesson:security/security-ops/abuse-denial-of-wallet" />

@@ -1,0 +1,195 @@
+---
+title: "Teardown: Cursor agent"
+track: harness
+module: context-management
+order: 7
+kind: teardown
+level: staff
+minutes: 14
+summary: How the agent inside the Cursor editor assembles context from rules and a local search index, delegates exploration, and decides whether a command runs through an allowlist, a sandbox or a model classifier, from Cursor's public docs and posts as of October 2026.
+prerequisites:
+  - harness/context-management/finding-code
+updated: 2026-10-28
+sources:
+  - title: Cursor docs, Search (checked 2026-10-28)
+    url: https://cursor.com/docs/agent/tools/search
+    note: Instant Grep outperforms ripgrep on large codebases (no figure given), builds and queries its index on the local machine; no embeddings of the codebase stored for search; no upload of paths or code to build an index; opened matches can be sent in model requests; Explore subagent in its own context on a faster model
+  - title: Cursor docs, Agent security (checked 2026-10-28)
+    url: https://cursor.com/docs/agent/security
+    note: "reading and searching need no approval; workspace edits need none except configuration files; terminal commands need approval by default, and Run Modes relax that; Run Modes are best-effort guardrails, not a hard security boundary; MCP connections and each MCP tool call need approval unless allowlisted; with default settings tools reach only GitHub, direct link retrieval and web search providers; workspace trust off by default"
+  - title: Cursor docs, Run modes (checked 2026-10-28)
+    url: https://cursor.com/docs/agent/security/run-modes
+    note: "Auto-review, Allowlist and Run Everything; Auto-review shipped as the recommended default in 3.6, Ask Every Time deprecated in 3.5; the classifier covers shell, MCP and Fetch calls, runs on Cursor's backend on small models (currently Gemini 3.5 Flash Lite, Claude 4.5 Haiku as fallback), may make read-only local calls, and is not a security boundary; permissions.json allow_instructions and block_instructions, user and project files merged, team configuration overrides both; sandbox: workspace read and write, .git/config, .git/hooks and .vscode protected, network blocked by default and opened by network mode and sandbox.json (default sandbox.json + Defaults); macOS Seatbelt (v2.0+); Linux Landlock and seccomp needing kernel 6.2+ with Landlock v3 and unprivileged user namespaces, else approval prompts; a sandbox-blocked command can rerun outside with classifier review; read access setting System (default) or Workspace from 3.23"
+  - title: "Betts, Gaitonde and Haugland, Implementing a secure sandbox for local agents (Cursor, 2026-02-18)"
+    url: https://cursor.com/blog/agent-sandboxing
+    note: "sandboxed agents stop 40% less often than unsandboxed ones; a third of requests on supported platforms run sandboxed; Seatbelt profile generated at runtime from workspace and admin settings and .cursorignore; Linux uses seccomp for syscalls and Landlock for the filesystem with an overlay that replaces ignored files; on Windows the Linux sandbox runs inside WSL2; tool results now name the sandbox constraint behind a failure, where agents previously retried the same command"
+  - title: Cursor docs, Rules (checked 2026-10-28)
+    url: https://cursor.com/docs/context/rules
+    note: ".cursor/rules/*.mdc with description, globs and alwaysApply; four rule types; Team, Project, User order with earlier sources taking precedence; AGENTS.md in the root and subdirectories, more specific wins; referenced files read on demand rather than inlined; rules do not affect Tab"
+  - title: "Heule, Jia and Jain, Improving agent with semantic search (Cursor, 2025-11-06)"
+    url: https://cursor.com/en-US/blog/semsearch
+    note: historical; 12.5% higher average accuracy with semantic search in Cursor's own offline evaluation (6.5% to 23.5% by model); code retention +0.3% overall and +2.6% on codebases of 1,000+ files in an online A/B test
+  - title: "Shihipar, Building agents with the Claude Agent SDK (Anthropic, 2025-09-29)"
+    url: https://claude.com/blog/building-agents-with-the-claude-agent-sdk
+    note: start with agentic search and add semantic search only if you need faster results or more variations
+  - title: "Cognition, SWE-grep and SWE-grep-mini (2025-10-16)"
+    url: https://cognition.com/blog/swe-grep
+    note: RL-trained fast lexical retrieval with parallel searches, behind a retrieval subagent
+  - title: OpenAI Codex docs, Custom instructions with AGENTS.md (checked 2026-10-28)
+    url: https://learn.chatgpt.com/docs/agent-configuration/agents-md
+    note: files concatenated from the project root down; files closer to the working directory override earlier guidance because they appear later
+  - title: Claude Code docs, How Claude remembers your project (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/memory
+    note: CLAUDE.md files concatenated from the filesystem root down, so instructions closer to the working directory are read last
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Diagram from '../../../../components/Diagram.astro';
+import Trace from '../../../../components/Trace.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What it is and who runs it
+
+Cursor's agent is the component of the Cursor editor that plans, searches, edits and runs commands; Cursor builds and operates it. Cursor also runs agents in the cloud; this teardown covers the local agent, because that is what the cited documentation describes in detail. Everything here comes from Cursor's documentation as checked on 28 October 2026 and two Cursor engineering posts. Cursor's harness is closed source, so where the docs are silent, this page says so rather than filling the gap.
+
+Two design choices set Cursor apart from terminal-first harnesses. Context comes from a local search index and editor-native rules rather than a single memory file. And command execution is decided by a layered policy (an allowlist, an OS sandbox and a model classifier) that the user selects as a run mode.
+
+## The system
+
+<Diagram
+  title="Cursor's local agent as described in its public docs (October 2026)"
+  nodes={[
+    { id: 'dev', label: 'Developer in the editor' },
+    { id: 'rules', label: 'Rules', note: '.mdc, AGENTS.md, team rules' },
+    { id: 'agent', label: 'Agent loop' },
+    { id: 'model', label: 'Model provider' },
+    { id: 'explore', label: 'Explore sub-agent', note: 'faster model' },
+    { id: 'runmode', label: 'Run mode', note: 'allowlist, Auto-review classifier' },
+    { id: 'grep', label: 'Instant Grep', note: 'local index, no stored embeddings' },
+    { id: 'config', label: 'permissions.json and sandbox.json' },
+    { id: 'sandbox', label: 'OS sandbox', note: 'Seatbelt; Landlock and seccomp' },
+    { id: 'net', label: 'Network', note: 'blocked by default' },
+  ]}
+  edges={[
+    { from: 'dev', to: 'agent', label: 'prompt' },
+    { from: 'rules', to: 'agent', label: 'context' },
+    { from: 'agent', to: 'model', label: 'requests' },
+    { from: 'agent', to: 'explore', label: 'broad search' },
+    { from: 'explore', to: 'grep', label: 'queries' },
+    { from: 'agent', to: 'runmode', label: 'shell, MCP, Fetch' },
+    { from: 'config', to: 'runmode', label: 'instructions' },
+    { from: 'runmode', to: 'sandbox', label: 'unlisted shell' },
+    { from: 'config', to: 'sandbox', label: 'network allowlist' },
+    { from: 'sandbox', to: 'net' },
+  ]}
+  rows={[['dev'], ['rules', 'agent', 'model'], ['explore', 'runmode'], ['grep', 'config', 'sandbox'], ['net']]}
+/>
+
+**Rules.** Project rules are `.mdc` files under `.cursor/rules`, each typed by frontmatter: `alwaysApply: true` for every chat, `globs` to attach the rule when a matching file is in context, `description` alone for the agent to pull in when it judges the rule relevant, and neither for rules applied only when @-mentioned. A plain `.md` file in that folder is ignored. Team rules come from the dashboard on Team and Enterprise plans and can be enforced so users cannot disable them; user rules apply across projects. When guidance conflicts, team rules win over project rules and project rules over user rules. AGENTS.md is supported in the root and in subdirectories, with the more specific file winning. Files a rule references are read on demand rather than inlined.
+
+**Instant Grep.** Cursor's own search engine, which the docs say outperforms ripgrep on large codebases without giving a figure. Its index is built and queried on the user's machine. The docs state that Cursor does not store embeddings of the codebase for search and does not upload file paths or code to build an index; file content the agent opens can still be sent to the model.
+
+**Explore sub-agent.** Broad searches run in a sub-agent with its own context window on what the docs call a faster model, unnamed. The main agent starts it automatically or on request.
+
+**Run mode.** One of three policies for tool calls. In Auto-review, which shipped as the recommended default in version 3.6, allowlisted calls run immediately, other shell commands run in the sandbox where possible, and calls that do not go through the sandbox go to a classifier. Allowlist mode runs listed actions without approval and has no classifier. Run Everything runs every call with neither sandbox nor classifier.
+
+**Auto-review classifier.** A model call on Cursor's backend, covering shell, MCP and Fetch tool calls. The docs name the current models (Gemini 3.5 Flash Lite, with Claude 4.5 Haiku as fallback) and say the classifier may make read-only ReadFile, Grep, Glob and ListDir calls on the machine, for example to read a script a command would run. When it blocks a call, the agent can try another approach; if it still wants the action, the user gets an approval prompt. The docs state that it is not a security boundary and that it can allow a call the user would have blocked, or block one the user would have allowed.
+
+**permissions.json and sandbox.json.** `permissions.json` holds plain-English `allow_instructions` and `block_instructions` for the classifier, in `~/.cursor` and in the project's `.cursor`, merged; a team configuration overrides both. `sandbox.json` holds the network allowlist, combined with built-in defaults for common package managers in the default network mode.
+
+**OS sandbox.** Shell commands run with read and write access to the workspace, `/tmp` writable, `.git/config`, `.git/hooks` and `.vscode` protected, and files in `.cursorignore` hidden. On macOS it is Seatbelt, with a profile generated at runtime from workspace and admin settings; on Linux, seccomp blocks unsafe syscalls and Landlock restricts the filesystem, with ignored files replaced by unreadable copies in an overlay. Linux needs kernel 6.2 or later with Landlock v3 and unprivileged user namespaces; without them Cursor falls back to approval prompts. On Windows, Cursor runs its Linux sandbox inside WSL2.
+
+**Network.** Blocked by default inside the sandbox and opened by the network mode and `sandbox.json`. Outside the sandbox, the security page says that with default settings the agent's own tools reach only GitHub, direct link retrieval and web search providers.
+
+## One request
+
+<Trace
+  title="Fix a failing date-parsing test, in Auto-review mode on macOS"
+  note="steps follow the documented behaviour; the prompt text is a scenario"
+  steps={[
+    { actor: 'user', text: 'Asks the agent to fix the failing test in src/date.test.ts.' },
+    { actor: 'system', text: 'Always-apply rules, team rules and the root AGENTS.md are added to the request.', note: 'Glob rules attach later, when a matching file enters context.' },
+    { actor: 'assistant', text: 'Starts the Explore sub-agent to find where dates are parsed.' },
+    { actor: 'tool', text: 'Explore queries Instant Grep, whose index lives on this machine, and returns a short list of files.', note: 'No stored embeddings; the matches it opens can be sent to the model.' },
+    { actor: 'assistant', text: 'Reads src/date.ts and edits it.', note: 'Workspace edits run without approval; a rule with globs for src/**/*.ts attaches now.' },
+    { actor: 'assistant', text: 'Runs npm test -- date in the shell.' },
+    { actor: 'system', text: 'Not on the allowlist, so the command runs inside the Seatbelt sandbox with network blocked except sandbox.json and the defaults.' },
+    { actor: 'tool', text: 'If the test needs a blocked host, the result names the sandbox constraint that failed.', note: 'Before this change, agents retried the same command unchanged (Cursor, February 2026).' },
+    { actor: 'assistant', text: 'Asks to rerun outside the sandbox; the classifier reviews the rerun and allows or blocks it.', note: 'If blocked and the agent persists, the user sees an approval prompt.' },
+    { actor: 'assistant', text: 'Reports the fix and the passing test.' },
+  ]}
+/>
+
+## Context strategy
+
+Cursor's context is assembled from three sources with different timing. Rules and AGENTS.md arrive at the start or when a matching file enters context. Code arrives by search, through a local lexical index and a sub-agent that keeps exploration out of the main context. Referenced files arrive only when read.
+
+The most consequential fact is a change. In November 2025 Cursor published a post reporting that semantic search raised average accuracy by 12.5% in its own offline evaluation (6.5% to 23.5% by model) and code retention by 2.6% on codebases of 1,000 or more files, and concluded that grep and semantic search together worked best. Its current search docs describe a local index with no stored embeddings. The direction matches what Anthropic recommended in 2025 and what Cognition built with SWE-grep: fast lexical search, kept out of the main context by a sub-agent.
+
+## Tools and permission model
+
+The permission model has four layers, and each is documented as having a different strength:
+
+1. **Allowlist.** Deterministic, by match. Runs listed calls without asking.
+2. **OS sandbox.** The only layer enforced by the kernel. Bounds filesystem and network for shell commands, not for MCP or Fetch calls.
+3. **Classifier.** A model judging a call, with plain-English instructions as its policy. Documented as fallible and as not a boundary.
+4. **Approval prompt.** The user, as the last resort when the classifier blocks and the agent persists, or when the sandbox cannot be used.
+
+MCP is handled separately: every connection and, by default, every tool call needs approval unless an MCP allowlist pre-approves the tool. In Auto-review, MCP calls go to the classifier, and allowlisted MCP calls run outside the sandbox.
+
+Administrators can override available run modes, sandbox network rules and the read-access policy from the dashboard, and team settings take precedence over user and project files.
+
+## Cost and latency
+
+Cursor publishes two operational numbers. In its February 2026 sandboxing post, sandboxed agents stopped 40% less often than unsandboxed ones, mostly asking only when they needed the internet, and a third of requests on supported platforms ran with the sandbox. Both are Cursor's own measurements.
+
+The rest is structural. The classifier adds a model call on Cursor's backend for each shell, MCP or Fetch call it reviews, which is why it runs on small models; sandboxed and allowlisted calls skip it. Instant Grep moves search cost to a local index build, which avoids a network round trip per search. The Explore sub-agent runs on a faster model, trading the main model's quality for speed on a task where precision of the returned list matters more than reasoning depth. Cursor does not publish latency figures for any of these.
+
+## Failure modes
+
+- **Silent fallback to prompts on Linux.** Below kernel 6.2, or without Landlock v3 and unprivileged user namespaces, there is no sandbox and every unlisted command asks. In a fleet of older dev boxes this turns Auto-review back into approval fatigue.
+- **Classifier as the boundary.** A team that treats Auto-review as the security control has a model deciding, with plain-English instructions as policy. The docs say it is not a boundary, and a sandbox-blocked command can be rerun outside the sandbox on the classifier's say-so.
+- **Rule precedence surprises.** Team rules win over project rules in Cursor, while Codex and Claude Code concatenate from the root down so the most specific file comes last, and Codex documents that later files override earlier guidance. A repository that relies on its own rule overriding an organisation default behaves differently across tools.
+- **Glob rules arrive late.** A rule scoped by glob is absent until a matching file is in context, so a first plan made before any file is opened is made without it.
+- **Retry loops on sandbox failures.** Cursor's own post reports agents retrying the same command when the sandbox blocked it, fixed by naming the constraint in the tool result. A custom tool or MCP server that hides its own failure reason recreates the problem.
+
+## What is not public
+
+- **The system prompt.** Cursor does not publish the agent's system prompt or how rules are placed in the request.
+- **The classifier's accuracy.** The docs say it can make mistakes in both directions and give no false-allow or false-block rates, no evaluation set and no per-model comparison.
+- **When and why semantic search was removed.** The November 2025 post reports gains; the current docs say no embeddings are stored for search. Neither says when the change happened or why, so treat the 2025 numbers as describing an earlier product.
+- **How Instant Grep's index is built and refreshed.** The docs say it is local and faster than ripgrep on large codebases, without a figure or a description of updates.
+- **The Explore sub-agent's model.** The docs say "a faster model" and do not name it.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You are rolling Cursor out to 2,000 engineers. A third of them develop on Linux VMs with kernel 5.15, the rest on macOS. Security wants no unreviewed network egress from agents; the productivity team wants no approval prompts in normal work. Launch is in six weeks. What configuration ships?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Auto-review with the team-enforced network mode set to the sandbox allowlist only, listing our package mirrors and Git host, plus a network egress control outside Cursor for anything the sandbox does not cover. macOS users get the Seatbelt sandbox now. The kernel 5.15 VMs cannot run Cursor's Linux sandbox, so they either get a kernel upgrade inside the six weeks or ship with Allowlist mode and an explicit, written exception from security.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The constraints conflict exactly where the sandbox is missing. On macOS, Auto-review gives both teams what they want: most commands run sandboxed without a prompt, network is limited to the allowlist, and the classifier sees only calls that leave the sandbox. Cursor's own numbers say sandboxed agents stop 40% less often.</p>
+<p>On kernel 5.15 there is no sandbox, because Cursor needs 6.2 with Landlock v3, so Cursor falls back to approval prompts. That breaks the productivity requirement, and turning on Run Everything to remove the prompts breaks security's. The classifier alone is not an answer, because the docs say it is not a boundary.</p>
+<p>So the decision is about the VMs: upgrade the kernel image in the six weeks if the platform team can, or ship those users in Allowlist mode with a tight list and accept the prompts for everything else. In both cases egress is enforced at the network layer for the VMs, since MCP and Fetch calls do not go through the shell sandbox.</p>
+<p>What I give up: VM users get a worse experience until the upgrade, and the allowlist needs an owner. The failure mode is the allowlist growing under pressure until it covers most commands; I would track its size and the prompt rate per user weekly.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The productivity team asks for the classifier's false-block rate before agreeing. Cursor does not publish one. How do you measure it on your own traffic in two weeks?</em></li>
+<li><em>A team's project rule says "never run database migrations" and an enforced team rule says "run migrations after schema changes". Which does the agent see first, and how do you find such conflicts across 400 repositories?</em></li>
+<li><em>What would you need to see in a month of logs to allow Run Everything for a subset of repositories?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Cursor ships frequently, and version numbers run through every source above: Auto-review became the recommended default in 3.6, the read-access setting arrived in 3.23, and the search docs changed between November 2025 and now. Re-check each claim against the current docs before acting on it.
+
+The architecture is assembled from documentation, not observed. The diagram shows components and the flows the docs describe; the order in which context is assembled and where each rule sits in the request are not public.
+
+<SelfRate id="lesson:harness/context-management/cursor-agent" />

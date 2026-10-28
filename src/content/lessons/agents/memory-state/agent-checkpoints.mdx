@@ -1,0 +1,201 @@
+---
+title: Checkpoints, resume and rollback for long agent runs
+track: agents
+module: memory-state
+order: 3
+kind: lesson
+level: senior
+minutes: 16
+summary: An agent checkpoint captures the state the framework owns and none of the side effects the agent caused, so resuming needs idempotent tools, rolling back needs compensation, and a fresh session needs progress written where a model can read it.
+prerequisites: [agents/memory-state/memory-design]
+updated: 2026-10-28
+sources:
+  - title: LangGraph docs, checkpointers
+    url: https://docs.langchain.com/oss/python/langgraph/checkpointers
+    note: a checkpoint at every super-step, keyed by thread_id; pending writes from nodes that succeeded are not re-run; durability modes exit, async and sync, set with the durability argument; by default the full value of every channel is written at each super-step; DeltaChannel (langgraph 1.2 or later, beta) stores deltas, making blobs constant per step instead of growing; replay re-executes nodes after the chosen checkpoint, including model calls and interrupts; update_state creates a new checkpoint. Checked 2026-10-28.
+  - title: LangGraph docs, persistence
+    url: https://docs.langchain.com/oss/python/langgraph/persistence
+    note: InMemorySaver loses checkpoints on restart; PostgresSaver for production; thread_id under 255 characters in PostgresSaver; prune checkpoints on long threads. Checked 2026-10-28.
+  - title: LangGraph docs, interrupts
+    url: https://docs.langchain.com/oss/python/langgraph/interrupts
+    note: the node restarts from its beginning on resume; side effects before an interrupt should be idempotent; no bare try/except around interrupt; resume values matched by index. Checked 2026-10-28.
+  - title: OpenAI Agents SDK docs, human in the loop
+    url: https://openai.github.io/openai-agents-python/human_in_the_loop/
+    note: needs_approval and interruptions; RunState serialised with to_json and restored with from_json; approval does not guarantee exactly-once execution; a crash after the external action and before the state is saved can execute the tool again; assign a stable idempotency key per logical action. Checked 2026-10-28.
+  - title: Claude Code docs, checkpointing
+    url: https://code.claude.com/docs/en/checkpointing
+    note: a checkpoint before each prompt that starts a turn; snapshots for the 100 most recent checkpoints; snapshots removed about 30 days after last saved by default; files changed only by Bash, edits by most subagents, external changes and symlinked or hard-linked files are not restored; not a replacement for version control. Checked 2026-10-28.
+  - title: "Young, Effective harnesses for long-running agents (Anthropic Engineering, 2025-11-26)"
+    url: https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents
+    note: initializer agent writes init.sh, claude-progress.txt and an initial git commit; feature list of over 200 features as JSON, all failing at first, coding agents may change only the passes field; JSON chosen because the model is less likely to rewrite it than Markdown; session start routine; one feature at a time; compaction alone not sufficient. Checked 2026-10-28.
+  - title: Claude docs, memory tool
+    url: https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool
+    note: system-prompt instruction to assume the context may be reset at any moment; multisession pattern with an initializer session, a progress log and a feature checklist. Checked 2026-10-28.
+  - title: "Rajasekaran, Harness design for long-running apps (Anthropic Engineering, 2026-03-24)"
+    url: https://www.anthropic.com/engineering/harness-design-long-running-apps
+    note: Sonnet 4.5 needed context resets because compaction alone was not sufficient; with Opus 4.5 the resets were dropped and automatic compaction handled context growth. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import AgentsResume from '../../../../components/widgets/AgentsResume.astro';
+
+## A checkpoint covers state, not the world
+
+An agent checkpoint is a snapshot of the state the framework owns: the message list, the plan, intermediate results, which node runs next. It is the agent's write-ahead log in the sense that a restarted worker can rebuild the run from it. Unlike a database log, it records nothing about what the agent did to systems outside the framework. A refund issued, an email sent, a file deleted by a shell command and a ticket opened in another team's tracker are all facts about the world, and a checkpoint can only record that a step finished, not undo what the step did.
+
+Three consequences follow. Resume re-runs whatever was in flight at the crash, so tools with side effects must be idempotent. Rollback restores the snapshot and leaves the world as it is, so undoing an effect needs a compensating action. And a run that outlives its context window needs its progress written where a fresh model session can read it.
+
+## What LangGraph saves, and when
+
+LangGraph saves a checkpoint at every super-step boundary, where a super-step is one tick in which all scheduled nodes run, possibly in parallel. Checkpoints are keyed by the `thread_id` in the call's config; invoke again with the same ID and the graph continues from the latest checkpoint, with a new ID it starts empty. If one node in a super-step fails while others succeed, the successful nodes' writes are stored as pending writes and those nodes are not re-run on resume.
+
+When the write happens is a durability setting passed as `durability=` on any execution call, the same trade-off as when a database calls `fsync`. `"sync"` persists before the next step starts. `"async"` persists in the background while the next step runs, with a small risk of losing the latest checkpoint if the process crashes. `"exit"` persists only when the run finishes, errors or interrupts, which is fastest and cannot recover from a crash mid-run. A three-hour run on `"exit"` has no crash recovery at all.
+
+Two production details from the persistence docs catch teams. `InMemorySaver` keeps checkpoints in RAM, so a process restart loses every thread; production uses a database-backed saver such as `PostgresSaver`, whose `thread_id` column is length-limited, so keep IDs under 255 characters. And checkpoints accumulate: the docs say that by default the full value of every state channel is written at each super-step, which for a channel that grows every step, such as `messages`, makes storage grow with the square of the run's length.
+
+<Predict id="checkpoint-storage" question="How much checkpoint storage does one run write, in MB (1 MB = 1,000 KB)?" answer={438} tolerance={5} unit="MB">
+<Fragment slot="prompt">
+<p>Scenario inputs: a three-hour run with one super-step every 20 seconds. The messages channel grows by 3 KB each super-step, and each checkpoint stores the full channel value. Ignore every other channel.</p>
+</Fragment>
+<p>Three hours is 10,800 seconds, so 540 super-steps. Checkpoint k stores 3k KB, and the sum over k = 1 to 540 is 3 × 540 × 541 / 2 = 438,210 KB, about 438 MB for one run. Storing only the new messages per step would write 540 × 3 = 1,620 KB. LangGraph's <code>DeltaChannel</code> (langgraph 1.2 or later, in beta as of 2026-10-28) does this for append-heavy channels, and the docs describe the result as constant blob size per step instead of linear. The trade they name is storage against latency: reading a checkpoint now means reassembling the deltas.</p>
+</Predict>
+
+Resuming from an earlier checkpoint re-executes every node after it, including model calls and interrupts, so time travel costs tokens and can repeat side effects. `update_state` writes a new checkpoint and leaves the original intact: a fork, not an edit.
+
+## Crash, then resume
+
+A checkpoint records a step's result after the step finishes. It cannot record a side effect that happened inside a step that never finished.
+
+<Predict id="memory-double-refund" question="With checkpoints on and no idempotency key, how many refunds does the customer get?" answer={2} tolerance={0} unit="refunds">
+<Fragment slot="prompt">
+<p>Five steps: plan, read invoice, refund card, email receipt, write reply. Every finished step's result is checkpointed. The worker dies inside the refund step, after the payment provider accepted the refund but before the step's result was saved.</p>
+</Fragment>
+<p>Two. On restart, plan and read come back from the checkpoint, but the refund step has no saved result, so it runs again and the provider issues a second refund. Turn on the idempotency key in the simulator below and the provider recognises the repeat and does nothing.</p>
+</Predict>
+
+<AgentsResume />
+
+Try the other crash points. Without checkpoints, a crash after the email step re-sends the refund and the email. With checkpoints and no key, only a crash inside a side-effecting step hurts. With both, every crash point ends with one refund and one email. Checkpointing gives at-least-once execution of each step; an idempotency key, or a provider that deduplicates, turns that into an exactly-once outcome.
+
+The key has to be derived from the run and the step, so every retry of the same logical action sends the same key. A random UUID generated per attempt defeats the purpose. If the provider has no idempotency support, the deduplication moves to your side: an outbox table written in the same transaction as the intent, and a reconciliation job that asks the provider what actually happened.
+
+## Approval is not exactly-once
+
+Human approval uses the same machinery and inherits the same hole. In LangGraph, a node calls `interrupt()`, the graph saves state and pauses, and a later call with `Command(resume=value)` on the same thread makes `value` the return value of `interrupt()`. The node restarts from its first line on resume, so code before the `interrupt()` runs twice. The docs' rules follow: side effects before an interrupt should be idempotent (their examples are an audit record and a list append that duplicate on each resume), do not wrap `interrupt()` in a bare `try/except` that swallows the pause, and keep interrupt calls in a stable order because resume values are matched by index.
+
+The OpenAI Agents SDK states the general point outright. A tool with `needs_approval` pauses the run and returns interruptions; the run state serialises with `to_json` and resumes later. The docs then say that approval permits a tool call to execute and does not guarantee it executes exactly once: if the process crashes after the external action and before the run state is saved, resuming from the approved snapshot can execute the tool again, and an approval flag cannot make the external action and the saved state one atomic operation. Their prescription is a stable idempotency key per logical action. [Problem agt-012](/problems/agt-012) puts this in a refund flow that waits hours for a human.
+
+## Rollback needs compensation
+
+Claude Code's checkpoints show precisely what a snapshot-based rollback covers. Every prompt that starts a turn creates a checkpoint of the files Claude's editing tools touched; `/rewind` (or Esc twice) restores code, conversation, or both. Snapshots are kept for the 100 most recent checkpoints in a session and removed by the retention sweep about 30 days after the session last saved one, by default. The limitations are the instructive part. A file changed only by a Bash command is not tracked, so `rm` or a code generator run from the shell is not undone. Edits by most subagents are not restored. Changes made outside the session are not captured, and symlinked or hard-linked files are skipped. The docs say checkpoints are for quick session-level recovery and are not a replacement for version control.
+
+That is the general shape: a rollback restores what the system snapshotted, and nothing else. For effects outside the snapshot, rollback is a compensating action that you design per tool (reverse the refund, delete the created ticket, send a correction) and record before the effect happens, so that a crash between the effect and the record still leaves something to compensate. Compensations must tolerate the case where the original effect never happened, and some effects have none: an email that was read cannot be unsent.
+
+```python
+import hashlib, json
+
+def idem_key(run_id, step, args):
+    raw = json.dumps({"run": run_id, "step": step, "args": args}, sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+class Run:
+    """journal is persisted (synchronously) after every change; a restart rebuilds Run from it."""
+    def __init__(self, run_id, journal):
+        self.run_id, self.j = run_id, journal
+
+    def step(self, name, fn, args, undo=None):
+        if name in self.j["done"]:
+            return self.j["done"][name]                    # replay: saved result, no call
+        key = idem_key(self.run_id, name, args)
+        if undo:
+            self.j["intents"][name] = [undo, args, key]    # written before the side effect
+        result = fn(args, key)
+        self.j["done"][name] = result
+        return result
+
+    def rollback(self, actions):
+        for name in reversed(list(self.j["intents"])):     # newest effect first
+            undo, args, key = self.j["intents"].pop(name)
+            actions[undo](args, key)                       # must tolerate "never happened"
+
+class Payments:
+    def __init__(self):
+        self.refunds, self.balance = {}, 0
+    def refund(self, args, key):
+        if key not in self.refunds:                        # provider-side deduplication
+            self.refunds[key] = args["amount"]
+            self.balance -= args["amount"]
+        return f"refund:{key}"
+    def reverse(self, args, key):
+        self.balance += self.refunds.pop(key, 0)
+
+pay, journal = Payments(), {"done": {}, "intents": {}}
+crash = True
+def refund_then_maybe_crash(args, key):
+    out = pay.refund(args, key)
+    if crash:
+        raise SystemExit("worker died before the result was saved")
+    return out
+
+for attempt in (1, 2):
+    run = Run("run-42", journal)
+    try:
+        run.step("read", lambda a, k: {"invoice": "inv-7", "amount": 40}, {"id": "inv-7"})
+        run.step("refund", refund_then_maybe_crash, {"invoice": "inv-7", "amount": 40}, undo="reverse")
+    except SystemExit:
+        crash = False
+print(pay.balance, len(pay.refunds))
+run.rollback({"reverse": pay.reverse})
+print(pay.balance, len(pay.refunds))
+```
+
+It prints `-40 1`, then `0 0`. The second attempt replays `read` from the journal and re-runs `refund` with the same key, which the provider ignores. Rollback walks the intents newest first; writing each intent before the call is what lets rollback cover the attempt that crashed.
+
+## Progress files: state a fresh context can read
+
+A checkpoint resumes a run whose context still fits. A run that lasts hours outgrows its context window, and compaction or a reset leaves a model that has lost the detail of what it did. Anthropic's long-running harness post (November 2025) reports that compaction alone was not sufficient, because it does not always pass clear instructions to the next session, and describes what replaced it. An initializer session writes an `init.sh` that starts the app, a `claude-progress.txt` log and an initial git commit, plus a feature list (over 200 features for a claude.ai clone, all marked failing). Each later session runs `pwd`, reads the git log and the progress file, picks the highest-priority failing feature, starts the app and runs a basic end-to-end test before changing anything. It works on one feature, commits, and updates the log. Coding sessions may change only each feature's `passes` field; the post reports choosing JSON for the list because the model was less likely to rewrite JSON inappropriately than Markdown.
+
+Claude's memory tool builds the same assumption into its system prompt: when the tool is enabled, the API tells Claude to record progress because its context may be reset at any moment, and the docs describe the same initializer, progress log and checklist pattern.
+
+So a long run has two records of where it is. The checkpoint is machine state that the framework can resume exactly. The progress file and the git history are a summary the model writes, and the model can be wrong about what it finished. When they disagree, the checkpoint and the external systems of record (the repository, the provider's ledger) win for what happened; the progress file wins only for intent. [Problem agt-013](/problems/agt-013) is a run where the two disagree.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Scenario: an agent files expense reports for a finance team. A run takes about three hours: it reads receipts, calls a model per receipt, and submits each report to an internal API that has no idempotency support and that you cannot change this quarter. Workers are redeployed several times a day, and the model budget does not cover re-running a whole run. You have two weeks. How do you make a run survive a crash without double filing?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Checkpoint every step synchronously in a database-backed store keyed by run, so a restart replays finished steps from saved results and pays for no model call twice. Because the filing API cannot deduplicate, write an intent row with a stable key before each submission and, on resume, reconcile by querying the API for a report matching that key's content before submitting again. Keep a progress record outside the context so a compacted or restarted session knows which receipts are done.</p>
+</Fragment>
+<Fragment slot="long">
+<p>State. One run ID per batch; a checkpoint after each receipt with durability set to sync, because a lost step costs a model call and a possible duplicate filing, which is worth more than the write latency. Deploys drain or simply kill workers; either is safe once the step boundary is the unit.</p>
+<p>The filing API. Without idempotency keys, the deduplication is ours. Write an intent row (run, receipt, a hash of the report body) in the same transaction as the checkpoint, before the call. On resume, any intent without a recorded result is in an unknown state: query the API for a report with that employee, date and amount before re-submitting. That lookup is the reconciliation, and it is the slow path only after a crash.</p>
+<p>Two defensible alternatives. Serialise submissions into a separate step that a person approves in batches, which removes the race at the cost of latency. Or put a deduplicating proxy in front of the API, which is cleaner and does not fit two weeks if it needs another team's review. Write down which one you chose and why.</p>
+<p>Context. Three hours of receipts will not fit; keep the per-receipt status in the checkpointed state and in a progress table, and give each session only the remaining receipts.</p>
+<p>Failure mode of the recommendation: the reconciliation lookup can miss a report that the API accepted but has not indexed yet, and the agent files it again. Measure the API's indexing delay and wait at least that long before re-submitting an unknown intent.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Sync checkpoints add latency to every step and the run now takes four hours instead of three, missing the nightly window. Which durability guarantee do you relax, and what risk do you accept in writing?</li>
+<li>A mid-run deploy changes the prompt for receipt classification. Do resumed runs use the old prompt or the new one, and how do you know which one each filed report used?</li>
+<li>Finance asks for a way to undo a whole run. Which effects can you compensate, which can you not, and what does the undo report say about the rest?</li>
+<li>What would you need to see in production to move from sync to async durability?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The simulator and the code treat a step as a unit with a clean before and after. Real effects are messier: a payment can succeed at the provider while the response times out. An idempotency key makes that safe to resolve by retrying; without one, only reconciliation against the provider's records resolves it.
+
+Super-step checkpoints assume that a node's work is replaceable. A node that makes ten tool calls and crashes after the seventh re-runs all ten on resume. Splitting side effects into their own nodes, or journalling inside the node, is the fix, and it costs graph complexity and checkpoint writes.
+
+Compensation assumes the world held still. A refund reversed an hour later may now conflict with a manual adjustment made in between, and a compensating email is a second email, not the absence of the first. For effects with no clean inverse, the control is an approval before the effect, not a rollback after it.
+
+The progress-file pattern is tuned to one harness, one model generation and full-stack web apps, as its authors say. Later Anthropic work dropped context resets once a newer model stopped needing them ([context resets versus compaction](/learn/harness/context-management/context-resets)). Treat the specific files as one working design, and the separation of machine state from model-readable state as the durable idea.
+
+<SelfRate id="lesson:agents/memory-state/agent-checkpoints" />

@@ -1,0 +1,134 @@
+---
+id: rag-022
+title: Review an ingestion job that skips what it cannot parse
+subtitle: a pull request that makes a nightly batch "resilient"
+track: rag
+module: ingestion
+type: critique
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [ingestion, quality-gates, idempotency, observability, code-review, batch]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: NVIDIA NeMo Curator documentation, About (v1.4.0, 26.09)
+    url: https://docs.nvidia.com/nemo/curator/latest/about/index.html
+    note: "curation as a staged pipeline: download, extraction, language detection, rule-based quality filtering, deduplication, model-based quality filtering. Checked 2026-10-28."
+  - title: pgvector README (v0.8.7 in the install instructions)
+    url: https://github.com/pgvector/pgvector
+    note: "vectors are Postgres rows, so a delete and an insert can share one transaction. Checked 2026-10-28."
+checklist:
+  - Says the job reports success for every outcome that does not raise, so the orchestrator never alerts on skips or emptied documents
+  - Notices that an empty extraction raises nothing, so the old chunks are deleted, nothing is inserted, and the document is counted as ok
+  - Notices that the new hash is saved before the embed and insert, so a failure after that point makes the next run skip the document while its chunks are already gone
+  - Notices that the delete and the insert are separate writes, so readers see the document missing while it re-embeds
+  - Notices that a skipped document is never retried, because nothing re-queues it and the next batch contains only changed files
+  - Notices that the ok counter cannot tell "nothing changed" from "everything failed", because unchanged documents are not counted
+  - Flags the silent truncation at 200,000 characters
+  - Points out that the hash ignores the parser version, so a parser upgrade never reprocesses anything and lineage cannot say which parser produced a chunk
+  - Notes that the retry wraps every embedding error, including ones that will never succeed, with a fixed wait and no budget across the batch
+  - "Judgement call: skipping an unparseable document is acceptable if it goes to quarantine with a reason, its live version stays, it is retried, and the batch fails above a failure rate set from the baseline"
+  - "Judgement call: a size cap is acceptable if it is set above the measured largest documents and every truncation is recorded on the document"
+  - Proposes the batch result as counts per outcome with a gate, and states the cost of failing the batch versus quarantining
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Code review">
+"This pull request went in two months ago. Last week we found a few thousand documents missing from the index and no alert ever fired. Review it as if it had just been opened: list every problem you see, rank them, and say what you would ask the author to change."
+</Callout>
+
+> **Make nightly ingest resilient to bad files.** Previously one corrupt PDF crashed the batch and nothing was indexed that night. Now unparseable files are logged and skipped, so one file cannot block the batch. Adds retries on embedding calls and a size cap to protect worker memory. Tested on last night's batch: 18,412 ok, 37 skipped.
+
+```python
+MAX_CHARS = 200_000
+
+
+def ingest_batch(batch_id: str, paths: list[str]) -> dict:
+    ok, skipped = 0, 0
+    for path in paths:
+        doc_id = doc_id_for(path)
+        try:
+            raw = read_bytes(path)
+            text = extract_text(raw)[:MAX_CHARS]
+        except Exception as e:
+            log.warning("skip %s: %s", path, e)
+            skipped += 1
+            continue
+
+        digest = hashlib.sha256(raw).hexdigest()
+        if state.get(doc_id) == digest:
+            continue
+        state.set(doc_id, digest)
+
+        store.delete_doc(doc_id)
+        chunks = splitter.split(text)
+        vectors = embed_with_retry(chunks)
+        store.insert(doc_id, chunks, vectors)
+        ok += 1
+
+    metrics.gauge("ingest.docs_ok", ok)
+    log.info("batch %s done: %d ok, %d skipped", batch_id, ok, skipped)
+    return {"status": "success", "ok": ok}
+
+
+@retry(stop=stop_after_attempt(8), wait=wait_fixed(2))
+def embed_with_retry(chunks):
+    return embedder.embed(chunks)
+```
+
+The orchestrator marks a run failed only when `status` is not `success` or the function raises. `store` writes to a pgvector table. `paths` holds only files whose modification time changed since the last run.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what <code>extract_text</code> returns for a scanned PDF with no text layer.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask the author what happens on the next run to a document whose embedding call failed all eight times.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the <code>ingest.docs_ok</code> series for the last 60 nights and ask what a value of zero would mean.</p></details>
+
+## Answer
+
+### The flaws, ranked by damage
+
+1. **An empty extraction deletes the document.** A scanned PDF without a text layer does not raise; `extract_text` returns an empty string. The job deletes the old chunks, the splitter returns nothing, nothing is inserted, and `ok` goes up. This is the likely source of the missing thousands: a parser change or a scanner setting can turn every scan into this path in one night, and every signal says success.
+2. **The hash is saved before the work it stands for.** `state.set` runs before delete, embed and insert. When the embed fails eight times the exception aborts the batch after the delete. The orchestrator marks that run failed, someone reruns it, and the rerun sees a matching hash and skips the document forever. The document is gone and nothing will bring it back until its file changes.
+3. **Every outcome that does not raise reports `success`.** The orchestrator's only other failure signal is never sent. 37 skips, 3,700 skips and 18,000 emptied documents all report the same way.
+4. **The counter cannot see failure.** Unchanged documents `continue` without being counted, so `docs_ok = 0` means either "nothing changed" or "everything failed", and a quiet night looks the same as a broken one.
+5. **Skipped documents are never retried.** The next batch holds only files whose modification time changed, so a document skipped once stays at its old version, or absent if it is new, until someone edits it.
+6. **Delete and insert are separate writes.** Between them, while a document re-embeds, it is missing from the index for every reader. pgvector is Postgres: embed first, then delete and insert in one transaction.
+7. **Silent truncation.** Long contracts and manuals lose everything after 200,000 characters with no record, so questions about their last sections fail as "not found".
+8. **The hash ignores the parser.** A parser upgrade changes no file bytes, so nothing is reprocessed, the index holds a mix of parser outputs, and no chunk records which parser produced it.
+9. **The retry.** Eight attempts at a fixed 2 seconds on every exception retries errors that will never pass (an input over the model's limit), costs up to 14 seconds of waiting per failing document, and has no budget across the batch, so a provider outage turns a nightly job into hours of sleeping.
+
+Flaws 1, 2 and 4 are the ones a reviewer passes on first read: nothing in the diff looks like error handling, and each needs a question about data the diff does not show.
+
+### What to ask for
+
+Each document ends in exactly one recorded outcome: `published`, `unchanged`, `quarantined` (with the reason: parse error, empty text, truncated), or `failed` (embed or write). Empty text and truncation are outcomes, not successes. The new hash, together with the parser version, is written in the same transaction as the chunks, after the embed. Quarantined and failed documents keep their live version and are re-queued on the next run regardless of modification time. The function returns the counts per outcome, and the orchestrator gates on them.
+
+### Fail the batch or quarantine: two defensible answers
+
+- **Fail the batch on any parse failure.** Nothing partial is ever published, and a bad parser never reaches the index. The cost is what the pull request was written to fix: one corrupt file holds back every other change that night, including ones someone is waiting for.
+- **Quarantine per document and gate the batch on rates.** Freshness for everything that parsed, and a batch failure only when the rate of quarantines is abnormal for that source. The cost: failures below the threshold publish silently every night, and the threshold has to come from a measured baseline that someone maintains.
+
+The conflict is freshness against completeness. I would take the second, with the threshold per source at a few times its worst normal night (the pull request's own test shows 37 of about 18,450, 0.2 percent), because a single corrupt PDF is a normal event and a parser that empties all scans is not.
+
+### Where that answer fails
+
+A source that fails steadily below the threshold, say one bad template producing 30 empty documents a night, never trips the gate, and those 30 documents sit in quarantine on their old versions for weeks. The gate catches regressions; it does not catch chronic failure. That needs an alert on quarantine age and a weekly review of quarantine reasons with an owner.
+
+## Follow-ups
+
+- *Pushback: the author says re-queuing quarantined documents every night will retry the same corrupt PDFs forever and burn embedding budget. What limit do you set, and what happens to a document that hits it?*
+- *Reversal: what would you need to see in a quarter of outcome counts to switch this source to failing the whole batch on any parse error?*
+- *The thousands of documents are already gone and the hashes say they are current. How do you find them and restore them without a full rebuild?*
+- *The author and the on-call lead disagree on whether truncation should quarantine or publish with a flag. How do you decide without deciding by rank?*
+
+## Common mistakes
+
+- Stopping at "it swallows exceptions" and missing that the most damaging path raises nothing.
+- Fixing the status line but leaving the hash written before the work.
+- Treating "skip and log" as handling; a log line nobody reads is not an outcome.
+- Asking for the batch to fail on any error without saying what that does to the freshness the pull request was written to protect.

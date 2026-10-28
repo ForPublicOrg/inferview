@@ -1,0 +1,118 @@
+---
+id: inf-026
+title: A multi-model gateway for a product with paying tenants
+subtitle: per-tenant budgets, attribution, and fallbacks a customer can see
+track: inference
+module: gateways-finops
+type: design
+difficulty: hard
+seniority: [senior, staff]
+minutes: 45
+core: false
+tags: [gateway, fallbacks, budgets, attribution, multi-tenant, data-residency]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: LiteLLM docs, Routing
+    url: https://docs.litellm.ai/docs/routing
+    note: "vendor docs: simple-shuffle is the default and recommended strategy; cooldown_time defaults to 5 seconds; without allowed_fails, a 429, more than 50% failures in the current minute, or a 401, 404 or 408 puts a deployment in cooldown; the x-litellm-model-id response header names the deployment that served the request; spend logs record the member deployment that served it. Checked 2026-10-28."
+  - title: LiteLLM docs, Fallbacks and reliability
+    url: https://docs.litellm.ai/docs/proxy/reliability
+    note: "vendor docs: fallbacks, content_policy_fallbacks and context_window_fallbacks, tried in order after num_retries; context-window fallbacks need enable_pre_call_checks; spend logs carry attempted_fallbacks and original_model_group; since v1.85.0 the proxy strips mock_testing_fallbacks from requests, so fallbacks are tested with a real provider error in a non-production environment. Checked 2026-10-28."
+  - title: LiteLLM docs, Budget routing
+    url: https://docs.litellm.ai/docs/proxy/provider_budget_routing
+    note: "vendor docs: provider budgets skip providers that have exceeded their budget and raise an error if all have; Redis is required to track spend across instances. Checked 2026-10-28."
+  - title: LiteLLM docs, Budgets and rate limits
+    url: https://docs.litellm.ai/docs/proxy/users
+    note: "vendor docs: budget reservation estimates the request's maximum cost and rejects it before the provider call if the reservation would exceed the budget; customer budgets are global per deployment, tracked against the customer id. Checked 2026-10-28."
+  - title: OpenRouter docs, Provider routing
+    url: https://openrouter.ai/docs/features/provider-routing
+    note: "vendor docs: allow_fallbacks defaults to true; require_parameters defaults to false, so a provider may receive a request and silently ignore parameters it does not support; providers can serve open-weight models at different quantization levels, and quantized models may perform worse on some prompts. Checked 2026-10-28."
+  - title: Claude API docs, Pricing
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: "official: Claude Sonnet 5.5 at $2 input, $2.50 5-minute cache write, $0.10 cache hit and $10 output per million tokens; inference_geo us applies a 1.1x multiplier to all token categories; Bedrock and Google-managed Vertex have independent regional pricing. Checked 2026-10-28."
+  - title: Claude API docs, Prompt caching
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: "official: caches are isolated between organizations, and by workspace on the Claude API; Bedrock uses organization-level isolation; 5-minute default lifetime. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Design round, 45 minutes">
+"Design the model gateway for our product. Tenants have AI budgets on their plans, finance needs cost per tenant, and last month's failover broke customers' automations without anyone knowing which tenants were affected."
+</Callout>
+
+What you learn by asking (scenario):
+
+- A B2B product with 1,200 tenants. Each plan includes a monthly AI allowance in dollars of model cost; enterprise tenants buy more. 140 tenants have contracts that require processing in the EU, and 25 contracts name the model provider.
+- Features call logical models: `chat` (conversational, long cached histories), `extract` (JSON extraction that customers feed into their own automations), `summarise` (overnight, not interactive).
+- Deployments: Claude Sonnet 5.5 on the Anthropic API and the same model on a cloud provider, gpt-6.1-sol on OpenAI, and an open-weight model on the team's own GPUs.
+- Last month the Anthropic deployment returned errors for three hours. The current gateway, configured with a fallback list, sent `extract` to gpt-6.1-sol. The JSON came back with different field names for some documents, customers' automations failed, and nobody could say which tenants had been served by which model.
+- Each tenant has a token rate limit; the largest is 200,000 input and 40,000 output tokens per minute.
+- Three engineers, eight weeks. The product's own p99 latency objective must not move.
+
+Cover budgets and how they are enforced, cost attribution, the fallback policy per logical model, and what a tenant can see. Choose how far a tenant may overshoot its allowance and defend it. State what you give up, and write the fallback policy as you would publish it to the team.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which customer automations broke last month and what each one checks in the JSON it receives.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask finance whether an overage of a few dollars on a tenant's allowance is a billing problem or a contract breach.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what share of `chat` input is served from the prompt cache today, by deployment.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Fallbacks are a policy per logical model, not a list per deployment. <code>extract</code> fails over only to the same model on another provider, inside the tenant's region and provider constraints, and otherwise fails loudly; <code>chat</code> may fail over to a different model that passed its eval set, and the response says so; <code>summarise</code> waits. Every response carries the served deployment and any fallback reason, and every usage record carries tenant, feature, logical and served model, attempt, token counts by type and a dated price per deployment. Budgets are metered asynchronously with an overshoot bounded by the tenant's rate limit and the metering lag; I choose a 60-second lag, which bounds the largest tenant's overshoot at $0.80, rather than a synchronous reservation on every call. I give up availability of <code>extract</code> in a single-model outage, exact enforcement at the cap, and some money on cache-cold failover.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Fallbacks change behaviour; the policy says where that is allowed.</strong> Last month's incident is a gateway that treated "another model answered" as success. Two policies are defensible for a feature like <code>extract</code>:</p>
+<ul>
+<li><em>Same model, other provider, or fail loudly.</em> Sonnet 5.5 on the cloud provider is the only fallback. If it is down too, the request fails with an error that names the outage. The cost: during a model-wide outage <code>extract</code> is down, and the customer's automation sees errors instead of data. Errors are what an automation can handle; wrong field names are not.</li>
+<li><em>An eval-qualified equivalence class.</em> A different model can be a fallback for a logical model only after it passes that model's eval set, including a schema check on every field customers consume, and requests to it require every parameter the caller sent: no silent dropping of a schema, which OpenRouter's documentation says can happen when <code>require_parameters</code> is off. The cost: an eval set per logical model, kept current, and a re-qualification every time either model changes; and a passing eval is a sample, so a fallback can still differ on documents the set does not cover.</li>
+</ul>
+<p>I would take the first for <code>extract</code> and the second for <code>chat</code>, where a different model's tone is acceptable to customers and an outage is not. <code>summarise</code> does not fail over at all; it retries for hours, since it is overnight work. Constraints that override every policy: never route an EU-contract tenant outside the EU, never route a tenant whose contract names a provider to another provider, whatever the outage. The gateway checks these before routing, from the tenant record, not from the feature's config. Budget routing is in scope too: LiteLLM's provider budgets skip a provider that has exceeded its budget, which is a fallback triggered by finance configuration; any such rule goes through the same policy.</p>
+<p><strong>What a tenant can see.</strong> Every response carries the served deployment and model and, when one happened, the fallback reason, the way LiteLLM returns <code>x-litellm-model-id</code> and records <code>attempted_fallbacks</code> and <code>original_model_group</code>. The product shows it in the tenant's audit log, so last month's question, "which tenants got which model", is one query.</p>
+<p><strong>Attribution.</strong> One usage record per attempt, not per request: tenant, feature, logical model, served deployment and model, attempt number, fallback reason, input, cache-write, cache-read and output tokens, and cost from a price table versioned per deployment, because the same model is priced independently on a cloud provider and US-only processing on Anthropic's API costs 1.1x. A tenant pays for the attempt that served it. Failed attempts and the cost of failover are the platform's, recorded against the platform's own budget; otherwise an outage raises customers' bills.</p>
+<p><strong>Budgets: reservation or metering.</strong> Both are defensible.</p>
+<ul>
+<li><em>Reserve on every call</em>, as LiteLLM's budget reservation does: estimate the maximum cost, reserve it in a shared store, settle after. Never over the cap. The cost: a store round trip on every request, and the store becomes part of the product's availability, with a fail-open or fail-closed choice to make.</li>
+<li><em>Meter asynchronously and bound the overshoot.</em> Usage records stream to a counter; when a tenant crosses its allowance, a block flag reaches the gateways within the metering lag. The overshoot is at most the tenant's maximum spend rate times the lag. For the largest tenant on Sonnet 5.5, 200,000 input tokens × $2 / 1M + 40,000 output × $10 / 1M = $0.80 a minute, so a 60-second lag bounds it at $0.80, a 5-minute lag at $4, and 15 minutes at $12.</li>
+</ul>
+<p>The overshoot you accept is your number to defend. Finance's answer on overage decides it: if overage is a billing line, minutes of lag and a few dollars are fine; if the contract says "never more than the allowance", reservation is the answer for those tenants. I would meter with a 60-second lag, since $0.80 is below anything worth a dispute, and reserve only for tenants whose contract forbids any overage. The constraint conflict is exact enforcement against latency and availability on every call.</p>
+<p><strong>The fallback policy, as published.</strong></p>
+<ul>
+<li><code>extract</code>: Sonnet 5.5 on the Anthropic API, then Sonnet 5.5 on the cloud provider in the tenant's region. No other model. If both fail, return 503 with the reason. Customers are told this in the API docs.</li>
+<li><code>chat</code>: as above, then gpt-6.1-sol if the tenant's contract does not name a provider and the tenant is not EU-only, only while it passes the <code>chat</code> eval set at the last qualification. The response and the audit log say which model answered.</li>
+<li><code>summarise</code>: no fallback; retry with backoff until the morning deadline, then report the tenants affected.</li>
+<li>Rollout: shadow the policy for two weeks, logging what the gateway would have done; fault-inject a provider error in staging for each logical model, since LiteLLM's proxy no longer honours mock fallback flags from requests; then enforce.</li>
+<li>Roll back to the current configuration if the gateway's added p99 latency moves the product objective, or if any request is served outside a tenant's region or provider constraint.</li>
+</ul>
+<p><strong>What I give up.</strong> <code>extract</code> availability during a Sonnet-wide outage; exact enforcement at the cap for most tenants; and money during failover.</p>
+<p><strong>Where this design fails.</strong> The same-model failover is cache-cold. Prompt caches are kept by each provider and organisation, so a <code>chat</code> conversation with 30,000 tokens of cached history that moves to the cloud provider rewrites it: 30,000 × $2.50 / 1M = $0.075 instead of a $0.003 read, and the request costs about $0.084 instead of $0.012 for a 2,000-token new turn and a 500-token answer. During a three-hour failover every active conversation pays that once, the platform's failover budget absorbs it, and if it is not separated from tenant budgets, tenants hit their caps in the middle of an outage they did not cause. The second failure: the cloud provider's version of the same model may not support the same features and parameters on the same date, so "same model" has to be checked parameter by parameter, not assumed from the name.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Pushback: sales says enterprise customers were promised "no downtime" and refuses a policy where <code>extract</code> fails loudly. Which promise do you change in writing, and who signs it?</em></li>
+<li><em>Reversal: what would you need to see to allow a different model as an <code>extract</code> fallback?</em> A schema-checked eval on a sample of every tenant's real documents, passing on both models, and customers' automations tolerating the measured differences, confirmed with the tenants who consume the output.</li>
+<li><em>Two senior engineers disagree: one wants reservation for every tenant because "budgets are budgets", the other says the store becomes a single point of failure. How do you decide without deciding by rank?</em> Count the contracts that forbid any overage; reserve for those and meter the rest, and measure what a store outage would have cost each way.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *A tenant disputes a charge from the outage week. What record do you produce, and what does it show for each attempt?*
+- *The cloud provider deprecates the Sonnet 5.5 version you fail over to six weeks before Anthropic does. What happens to the `extract` policy, and who decides?*
+- *Your metering lag grows to 20 minutes during a log-pipeline incident. What happens to the overshoot bound, and what does the gateway do about it?* The bound grows with the lag, to $16 for the largest tenant; the gateway should switch those tenants to reservation, or to a lower rate limit, until the lag recovers.
+
+## Common mistakes
+
+- A fallback list per deployment with no idea of which features can tolerate which models.
+- Falling back to a model or provider that drops a parameter the caller depended on, and reporting success.
+- Routing across a residency or named-provider contract during an outage.
+- Charging tenants for failed attempts and failover cost.
+- One price per model instead of per deployment and region.
+- Enforcing budgets synchronously everywhere without stating what happens when the budget store is down.

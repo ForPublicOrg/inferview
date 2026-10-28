@@ -1,0 +1,116 @@
+---
+title: Building SFT data
+track: training
+module: post-training
+order: 1
+kind: lesson
+level: senior
+minutes: 10
+summary: How DeepSeek-V3, DeepSeek-R1 and Llama 3 built their supervised fine-tuning sets from expert generators, rejection sampling, cleaning and packing, and how to design that pipeline for one capability.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: "section 5.1: 1.5M instruction-tuning instances; reasoning data from an internal DeepSeek-R1 model via per-domain expert models trained with SFT and RL; two sample types per instance (original response, and R1 response with a reflection-and-verification system prompt); high-temperature sampling and rejection sampling; R1 data suffered overthinking, poor formatting and excessive length; non-reasoning data from DeepSeek-V2.5 verified by annotators; two epochs, cosine decay from 5e-6 to 1e-6, packed samples isolated by a mask. Section 5.4.1, Table 9: R1 distillation on DeepSeek-V2.5 took LiveCodeBench-CoT pass@1 from 31.1 to 37.4 (length 718 to 783) and MATH-500 from 74.6 to 83.2 (length 769 to 1,510). Checked 2026-10-28."
+  - title: DeepSeek-AI, DeepSeek-R1 (v1)
+    url: https://arxiv.org/html/2501.12948v1
+    note: "rejection sampling and SFT: about 600k reasoning samples and about 200k non-reasoning samples, two epochs on DeepSeek-V3-Base over about 800k samples; chains of thought with mixed languages, long paragraphs and code blocks filtered out. Checked 2026-10-28."
+  - title: Llama Team, The Llama 3 Herd of Models
+    url: https://arxiv.org/html/2407.21783
+    note: "section 4: six rounds of reward modelling, rejection sampling, SFT and DPO; K typically 10 to 30 samples per prompt with the reward model choosing the best; PagedAttention raised rejection-sampling throughput by over 2x; SFT at learning rate 1e-5 for 8.5K to 9K steps on the largest models; removal of overused phrases such as \"I'm sorry\" and \"I apologize\"; topic classification with a fine-tuned Llama 3 8B; quality from reward-model scores (top quartile) and Llama-based ratings; difficulty from Instag with Llama 3 70B; semantic deduplication with RoBERTa clusters sorted by quality times difficulty; model averaging across data versions. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+Supervised fine-tuning sets the format, behaviours and response style that the preference and RL stages start from. The data decision has three parts: where each response comes from (people, a stronger model, or the model being trained), what is thrown away before training, and how samples are laid out in a batch. DeepSeek and Meta answer all three differently in their reports, and both treat the data pipeline as the work, with the training run as a short final step.
+
+## Where responses come from
+
+**Expert generators.** DeepSeek-V3 did not write its reasoning SFT data by hand. For each domain (code, maths, general reasoning) it trained an expert model with its own SFT and RL pipeline and used that expert as the data generator. Each prompt produced two kinds of sample: the problem with its original response, and the problem with a response from an internal DeepSeek-R1 model plus a system prompt asking for reflection and verification. During the expert's RL phase, high-temperature sampling let it blend the two styles, and rejection sampling chose what went into the final set. Non-reasoning data (writing, role-play, simple QA) came from DeepSeek-V2.5, with human annotators checking accuracy. The final set was 1.5M instances.
+
+The reason for the expert step is in the same section: raw R1 output "suffers from issues such as overthinking, poor formatting, and excessive length." Table 9 of the V3 report shows the cost of distilling it directly. Adding R1 data to DeepSeek-V2.5 took MATH-500 pass@1 from 74.6 to 83.2 and average response length from 769 to 1,510 tokens: 8.6 points of accuracy for 1,510 / 769 = 1.96 times the tokens. Whether that trade is acceptable depends on what the product pays per token, which is why DeepSeek put a generator between R1 and the training set rather than copying R1's outputs.
+
+**Rejection sampling from the model in training.** Llama 3 ran six rounds. In each round it trained a reward model on the latest preference data, sampled K responses per prompt from the best current checkpoint (K typically 10 to 30), kept the response the reward model scored highest, trained SFT on the result, and then ran DPO. The SFT data therefore drifts towards responses the reward model likes. That is the purpose, and also the risk: a reward model that likes length or hedging selects for length and hedging, round after round. The next lesson covers what reward models reward.
+
+**Filters before the model sees anything.** DeepSeek-R1's SFT set (about 600k reasoning samples and about 200k non-reasoning samples, two epochs on DeepSeek-V3-Base) dropped chains of thought that mixed languages, ran to long paragraphs or contained code blocks. These are format filters, cheap to run and easy to audit. Llama 3's cleaning went further. It removed overused phrases such as "I'm sorry" and "I apologize", classified every example by topic with a fine-tuned Llama 3 8B, scored quality with the reward model (top quartile counted as high quality) and a Llama-based rater, scored difficulty with Instag tags from Llama 3 70B, and ran semantic deduplication: cluster with RoBERTa embeddings, sort each cluster by quality times difficulty, and keep an example only if its cosine similarity to everything already kept is below a threshold.
+
+## The cost of rejection sampling, worked
+
+Rejection sampling is an inference job, and it is usually the largest compute line in an SFT pipeline. As a scenario: 200,000 prompts, K = 20, and an average of 800 generated tokens per sample. That is 200,000 × 20 × 800 = 3.2 billion generated tokens to produce 200,000 kept samples of about 160 million tokens. Nineteen of every twenty generated tokens are discarded by design. Llama 3 reports that PagedAttention raised its rejection-sampling throughput by over 2 times, which is why the serving stack matters to a data pipeline. Halving K halves the cost and lowers the expected quality of the best sample; the measurement to make before the full run is the reward score of the kept sample as a function of K on a few hundred prompts, and the K where that curve flattens.
+
+## Packing and isolation
+
+Short samples waste a fixed-length batch if each sits in its own padded row, so trainers pack several samples into one row. Without an attention mask, the third sample in a row attends to the first two, which teaches the model to condition on unrelated text and leaks one example's answer into another's context. DeepSeek-V3 packs and uses "a sample masking strategy" so that packed examples stay "isolated and mutually invisible": the causal mask becomes block-diagonal. The loss mask is a separate decision. Prompt tokens are usually excluded from the loss so the model is trained on responses only.
+
+<Predict id="trn-sft-pack-mask" question="A 4,096-token row packs eight 512-token samples with a block-diagonal causal mask. What percentage of the causal attention score pairs of an unpacked 4,096-token sequence does the mask keep? (Count i attending to j for j at or before i.)" answer={12.5} tolerance={0.3} unit="%">
+<p>Causal pairs in one 512-token block: 512 × 513 / 2 = 131,328. Eight blocks: 1,050,624. Causal pairs over 4,096 tokens: 4,096 × 4,097 / 2 = 8,390,656. The mask keeps 1,050,624 / 8,390,656 = <b>12.5%</b>. A kernel that takes the sequence boundaries (variable-length attention) computes only those pairs; one that applies the mask after computing the full score matrix pays for all of them.</p>
+</Predict>
+
+## The training run is short
+
+The published settings are small next to the data work. DeepSeek-V3: two epochs, with the learning rate on a cosine decay from 5 × 10⁻⁶ to 1 × 10⁻⁶. DeepSeek-R1: two epochs over about 800k samples. Llama 3: learning rate 10⁻⁵ for 8.5K to 9K steps on the largest models, repeated each round, with models from different data versions and hyperparameters averaged at each stage. Two epochs means every example is seen twice, so a duplicated or wrong example is seen four times or more; deduplication and verification pay off directly in what the model memorises.
+
+## A pipeline for one capability
+
+As an example, a team adds structured extraction from invoices to a general assistant. A pipeline in the shape of the published recipes:
+
+```python
+def build_sft(prompts, generate, score, verify, k=8, keep_top=1):
+    """Rejection-sample k responses per prompt and keep the best verified ones; dedupe afterwards."""
+    kept, gaps = [], []
+    for p in prompts:
+        cands = [generate(p, temperature=0.8) for _ in range(k)]
+        ok = [c for c in cands if verify(p, c)]
+        if not ok:
+            gaps.append(p)          # no sample passed: send to annotators
+            continue
+        ok.sort(key=lambda c: score(p, c), reverse=True)
+        kept.extend((p, c) for c in ok[:keep_top])
+    return kept, gaps
+```
+
+The parts that carry the risk sit outside the loop. The prompt set needs the layouts and languages the product sees, sampled from logs with personal data removed. The verifier is a rule: the output parses against the schema and every extracted value appears in the source document. A rule cannot be talked into a higher score. The scorer, a reward model or a judge, ranks verified candidates for completeness and style and never overrides the verifier. The prompts in `gaps` are the examples worth paying annotators for, because they are where the current model fails. A held-out set built before any of this, from different documents, measures whether the capability improved and whether general behaviour regressed.
+
+The mixing ratio is the decision no published recipe makes for you. Too little extraction data and the capability does not take; too much and the assistant answers ordinary questions in JSON. Train two or three ratios on a small model, measure the extraction set and a general regression set, and pick the ratio where extraction stops improving faster than the regression set degrades.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+You have six weeks and an annotation budget of about 5,000 human-written responses. The product team wants a coding assistant to stop wrapping short fixes in long explanations, and the research lead wants to distil a stronger reasoning model into it. Design the SFT data.
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Generate rather than write: rejection-sample from the stronger model and from the current one, verify by running tests, and keep the shortest passing response among the top-scored ones. Spend the human budget on prompts where no sample passes and on a held-out set, not on bulk data. Track pass rate and length together, because distilling a reasoning model lengthens answers (R1 distillation took DeepSeek-V2.5's MATH-500 responses from 769 to 1,510 tokens) and the product goal points the other way.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Sources.</strong> Prompts from logs, deduplicated semantically. For each prompt, K samples from the stronger model with a system prompt asking for a minimal fix, and K from the current model. Executing the code against tests is the verifier; a judge ranks the passing candidates.</p>
+<p><strong>Selection.</strong> Among passing candidates, keep the shortest one within a small score margin of the best, so that length is a tiebreak rather than a target the judge can be gamed on. Filter chains of thought with mixed languages or long prose blocks, as R1 did.</p>
+<p><strong>Human budget.</strong> Prompts where nothing passes are the coverage gaps, and annotators write those. A slice goes into a held-out set nobody trains on.</p>
+<p><strong>Conflict.</strong> Distillation raises pass rate and length together. Measure both on the held-out set at two mixing ratios before the full run. What you give up: some of the stronger model's accuracy on hard problems, in exchange for answers the product team will ship. The failure mode of this design is that the length tiebreak quietly favours responses that skip the explanation a user needed on hard fixes; the held-out set needs hard prompts graded by a person, not only by tests.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Your test-based verifier covers only the prompts that come with tests, which is under half of them. Do you write tests for the rest, drop them, or let the judge decide alone, and what risk do you accept in writing?</li>
+<li>After SFT, pass rate rises and the product team says answers are still too long. What would you need to see to move length control into the preference stage instead of SFT?</li>
+<li>The research lead wants every sample the strong model produces; you want a filtered set a tenth of the size. How do you decide without deciding by rank?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+These recipes come from labs with strong generators. If no model better than yours exists for the capability, rejection sampling from your own model selects the best of what it already does and cannot teach behaviour it never produces; human-written data or a verifier-driven RL stage is then the only source of new behaviour.
+
+Reward-model selection makes the SFT data inherit the reward model's biases. If the reward model prefers length, six rounds of best-of-K make each round longer, and the drift does not show in a loss curve. Track length, refusal rate and phrase frequencies per round.
+
+Packing isolation is a correctness property. A training stack that ignores the sample boundaries trains on cross-example attention without any error. Test it by packing two samples and checking that the loss on the second is unchanged when the first is replaced.
+
+The DeepSeek and Llama numbers are the labs' own, measured on their benchmarks and settings, and neither lab publishes its full data mix.
+
+<SelfRate id="lesson:training/post-training/sft-data" />

@@ -1,0 +1,786 @@
+---
+title: Repository bug squash
+track: rounds
+module: codebase-rounds
+kind: lab
+minutes: 90
+summary: Load a multi-file client library into the filesystem, reproduce and fix three bugs in three of its modules through patches, then review a retry PR whose tests pass by writing the tests that fail on it.
+updated: 2026-10-28
+sources:
+  - title: PracHub, Stripe new grad software engineer interview experience (published 2026-10-17)
+    url: https://prachub.com/interview-experiences/stripe-new-grad-software-engineer-interview-experience-rejected-after-ai-coding-and-integration-plus-bug-squash-onsite
+    note: "candidate report of a Bug Squash round on open-source Python libraries, including a Requests bug on a resent request; the package in this lab is original. Checked 2026-10-28."
+  - title: PracHub, Netflix machine learning engineer interview experience (published 2026-10-10)
+    url: https://prachub.com/interview-experiences/netflix-machine-learning-engineer-interview-experience-ml-fundamentals-plus-a-production-pr-review-rejected
+    note: "candidate report of a PR review where the PR's tests all passed and the question was what it would break in production; the model for step 5. Checked 2026-10-28."
+  - title: Python docs, the import system
+    url: https://docs.python.org/3/reference/import.html
+    note: "sys.modules is the first place checked during import search, and a module found there completes the import; deleting the key makes Python search again on the next import. Checked 2026-10-28."
+  - title: Stripe API reference, idempotent requests
+    url: https://docs.stripe.com/api/idempotent_requests
+    note: "a client-generated key lets a request be repeated after a connection error without creating a second object; retries with the same key return the saved response. The model for FakeBatchAPI in step 4. Checked 2026-10-28."
+  - title: RFC 9110, section 10.2.3, Retry-After
+    url: https://www.rfc-editor.org/rfc/rfc9110
+    note: "Retry-After = HTTP-date / delay-seconds, where delay-seconds is a non-negative decimal integer; examples are an HTTP date and 120. Checked 2026-10-28."
+steps:
+  - title: Load the package from files
+    brief: |
+      batchkit, a small client for a batch embeddings API, arrives as FILES: one entry per file, path to source. load(files, package) writes them into a fresh temporary directory, puts that directory at the front of sys.path and imports the package. Import checks sys.modules first, so a second load of the same package returns the first load's modules unless you remove every entry for the package and its submodules before importing; remove the previous load's directory from sys.path as well, or the path grows with every run. patch(files, path, old, new) returns a copy with one edit and raises ValueError unless old occurs exactly once in that file, because an edit that silently applies nowhere is how a fix ships without the fix. The rest of the lab edits the package only through patch.
+    starter: |
+      import importlib
+      import os
+      import shutil
+      import sys
+      import tempfile
+
+      # batchkit, a client for a batch embeddings API, as it ships today. Each entry is one file of the package.
+      FILES = {
+          "batchkit/__init__.py": """from batchkit import cache, client, fakes, pages
+      """,
+          "batchkit/pages.py": """# Listing endpoints return {"items": [...], "next": cursor or None}.
+
+
+      def iter_items(fetch, page_size=100):
+          # Yield every item of a listing. fetch(cursor, limit) returns one page; cursor None asks for the first page.
+          cursor = None
+          while True:
+              page = fetch(cursor, page_size)
+              yield from page["items"]
+              if len(page["items"]) < page_size:
+                  return
+              cursor = page["next"]
+      """,
+          "batchkit/cache.py": """from collections import OrderedDict
+
+
+      class EmbeddingCache:
+          # Memoises embed(texts, model, dimensions) per text, least recently used out first.
+
+          def __init__(self, embed, max_entries=1024):
+              self._embed = embed
+              self._data = OrderedDict()
+              self.max_entries = max_entries
+
+          def _key(self, model, dimensions, text):
+              return (model, text)
+
+          def get(self, texts, model, dimensions=None):
+              out, missing = {}, []
+              for text in dict.fromkeys(texts):
+                  key = self._key(model, dimensions, text)
+                  if key in self._data:
+                      self._data.move_to_end(key)
+                      out[text] = self._data[key]
+                  else:
+                      missing.append(text)
+              if missing:
+                  for text, vector in zip(missing, self._embed(missing, model, dimensions)):
+                      out[text] = vector
+                      self._data[self._key(model, dimensions, text)] = list(vector)
+                      if len(self._data) > self.max_entries:
+                          self._data.popitem(last=False)
+              return [list(out[text]) for text in texts]
+      """,
+          "batchkit/client.py": """import time
+      import uuid
+
+
+      class Transient(Exception):
+          # The request may or may not have reached the server: a reset connection, a 502, 503 or 504.
+          pass
+
+
+      class RateLimited(Exception):
+          # A 429. retry_after is the Retry-After header exactly as the server sent it.
+          def __init__(self, retry_after):
+              super().__init__(retry_after)
+              self.retry_after = retry_after
+
+
+      class BatchClient:
+          def __init__(self, transport, attempts=3, sleep=time.sleep, clock=time.time, max_wait=60):
+              self.transport = transport
+              self.attempts = attempts
+              self.sleep = sleep
+              self.clock = clock
+              self.max_wait = max_wait
+
+          def submit(self, requests):
+              # Create one batch job and return it. The provider deduplicates on the Idempotency-Key header.
+              for attempt in range(self.attempts):
+                  headers = {"Idempotency-Key": str(uuid.uuid4())}
+                  try:
+                      return self.transport.post("/v1/batches", {"requests": requests}, headers)
+                  except Transient:
+                      if attempt == self.attempts - 1:
+                          raise
+                      self.sleep(min(2 ** attempt, self.max_wait))
+      """,
+          "batchkit/fakes.py": """from batchkit.client import RateLimited, Transient
+
+
+      class FakeListing:
+          # A listing of items. The server caps a page at max_page items whatever limit the client asks for, and a
+          # page also ends at a shard boundary, so a short page is not always the last one.
+
+          def __init__(self, items, max_page=100, shard=None):
+              self.items = list(items)
+              self.max_page = max_page
+              self.shard = shard
+              self.calls = []
+
+          def __call__(self, cursor, limit):
+              if cursor is None and self.calls:
+                  raise AssertionError("the listing was restarted from the first page")
+              self.calls.append((cursor, limit))
+              start = 0 if cursor is None else int(cursor)
+              end = min(start + min(limit, self.max_page), len(self.items))
+              if self.shard:
+                  end = min(end, (start // self.shard + 1) * self.shard)
+              return {"items": self.items[start:end], "next": str(end) if end < len(self.items) else None}
+
+
+      class FakeBatchAPI:
+          # Batch creation with idempotency keys. script lists what each POST does, in order, then every POST succeeds:
+          # "ok"; "lose" creates the job and loses the response; "fail" fails before the job is created;
+          # ("429", value) is refused with Retry-After: value.
+
+          def __init__(self, script=()):
+              self.script = list(script)
+              self.jobs = []
+              self.by_key = {}
+              self.keys = []
+
+          def post(self, path, body, headers):
+              key = headers.get("Idempotency-Key")
+              self.keys.append(key)
+              step = self.script.pop(0) if self.script else "ok"
+              if isinstance(step, tuple) and step[0] == "429":
+                  raise RateLimited(step[1])
+              if step == "fail":
+                  raise Transient("connection reset before the request was read")
+              if key not in self.by_key:
+                  job = {"id": f"batch_{len(self.jobs) + 1}", "count": len(body["requests"])}
+                  self.jobs.append(job)
+                  self.by_key[key] = job
+              if step == "lose":
+                  raise Transient("connection reset after the job was created")
+              return self.by_key[key]
+      """,
+      }
+
+
+      def load(files, package):
+          """Write files into a fresh directory, make it importable and return the freshly imported package.
+          Modules from an earlier load of the same package must not leak into this one."""
+          raise NotImplementedError
+
+
+      def patch(files, path, old, new):
+          """A copy of files with old replaced by new in files[path]. Raise ValueError unless old occurs exactly once."""
+          raise NotImplementedError
+    tests: |
+      pkg = load(FILES, "batchkit")
+      assert pkg.pages.iter_items is not None and pkg.client.BatchClient is not None
+      assert os.path.isfile(pkg.__file__) and pkg.__file__.endswith(os.path.join("batchkit", "__init__.py"))
+
+      v1 = load({"demo/__init__.py": "VALUE = 1\n"}, "demo")
+      v2 = load({"demo/__init__.py": "VALUE = 2\n"}, "demo")
+      assert (v1.VALUE, v2.VALUE) == (1, 2), "the second load must import the new files, not the cached module"
+
+      changed = patch(FILES, "batchkit/pages.py", "cursor = None", "cursor = None  # start")
+      assert "# start" in changed["batchkit/pages.py"] and "# start" not in FILES["batchkit/pages.py"]
+    hidden: |
+      def _raises(exc, fn, *args):
+          try:
+              fn(*args)
+          except exc:
+              return True
+          return False
+
+      _a = load({"nest/__init__.py": "from nest.sub import leaf\n", "nest/sub/__init__.py": "", "nest/sub/leaf.py": "X = 'a'\n"}, "nest")
+      _b = load({"nest/__init__.py": "from nest.sub import leaf\n", "nest/sub/__init__.py": "", "nest/sub/leaf.py": "X = 'b'\n"}, "nest")
+      assert (_a.leaf.X, _b.leaf.X) == ("a", "b")
+      assert sys.modules["nest.sub.leaf"] is _b.leaf
+
+      _before = len(sys.path)
+      for _i in range(5):
+          load({"demo/__init__.py": f"VALUE = {_i}\n"}, "demo")
+      assert len(sys.path) == _before, "repeated loads must not keep adding directories to sys.path"
+      assert load({"demo/__init__.py": "VALUE = 9\n"}, "demo").VALUE == 9
+
+      assert _raises(ValueError, patch, FILES, "batchkit/pages.py", "no such text", "x")
+      assert _raises(ValueError, patch, FILES, "batchkit/pages.py", "page", "x")
+      assert _raises(ValueError, patch, FILES, "batchkit/missing.py", "a", "b")
+      _copy = dict(FILES)
+      patch(FILES, "batchkit/pages.py", "cursor = None", "cursor = None  # x")
+      assert FILES == _copy
+    solution: |
+      import importlib
+      import os
+      import shutil
+      import sys
+      import tempfile
+
+      # batchkit, a client for a batch embeddings API, as it ships today. Each entry is one file of the package.
+      FILES = {
+          "batchkit/__init__.py": """from batchkit import cache, client, fakes, pages
+      """,
+          "batchkit/pages.py": """# Listing endpoints return {"items": [...], "next": cursor or None}.
+
+
+      def iter_items(fetch, page_size=100):
+          # Yield every item of a listing. fetch(cursor, limit) returns one page; cursor None asks for the first page.
+          cursor = None
+          while True:
+              page = fetch(cursor, page_size)
+              yield from page["items"]
+              if len(page["items"]) < page_size:
+                  return
+              cursor = page["next"]
+      """,
+          "batchkit/cache.py": """from collections import OrderedDict
+
+
+      class EmbeddingCache:
+          # Memoises embed(texts, model, dimensions) per text, least recently used out first.
+
+          def __init__(self, embed, max_entries=1024):
+              self._embed = embed
+              self._data = OrderedDict()
+              self.max_entries = max_entries
+
+          def _key(self, model, dimensions, text):
+              return (model, text)
+
+          def get(self, texts, model, dimensions=None):
+              out, missing = {}, []
+              for text in dict.fromkeys(texts):
+                  key = self._key(model, dimensions, text)
+                  if key in self._data:
+                      self._data.move_to_end(key)
+                      out[text] = self._data[key]
+                  else:
+                      missing.append(text)
+              if missing:
+                  for text, vector in zip(missing, self._embed(missing, model, dimensions)):
+                      out[text] = vector
+                      self._data[self._key(model, dimensions, text)] = list(vector)
+                      if len(self._data) > self.max_entries:
+                          self._data.popitem(last=False)
+              return [list(out[text]) for text in texts]
+      """,
+          "batchkit/client.py": """import time
+      import uuid
+
+
+      class Transient(Exception):
+          # The request may or may not have reached the server: a reset connection, a 502, 503 or 504.
+          pass
+
+
+      class RateLimited(Exception):
+          # A 429. retry_after is the Retry-After header exactly as the server sent it.
+          def __init__(self, retry_after):
+              super().__init__(retry_after)
+              self.retry_after = retry_after
+
+
+      class BatchClient:
+          def __init__(self, transport, attempts=3, sleep=time.sleep, clock=time.time, max_wait=60):
+              self.transport = transport
+              self.attempts = attempts
+              self.sleep = sleep
+              self.clock = clock
+              self.max_wait = max_wait
+
+          def submit(self, requests):
+              # Create one batch job and return it. The provider deduplicates on the Idempotency-Key header.
+              for attempt in range(self.attempts):
+                  headers = {"Idempotency-Key": str(uuid.uuid4())}
+                  try:
+                      return self.transport.post("/v1/batches", {"requests": requests}, headers)
+                  except Transient:
+                      if attempt == self.attempts - 1:
+                          raise
+                      self.sleep(min(2 ** attempt, self.max_wait))
+      """,
+          "batchkit/fakes.py": """from batchkit.client import RateLimited, Transient
+
+
+      class FakeListing:
+          # A listing of items. The server caps a page at max_page items whatever limit the client asks for, and a
+          # page also ends at a shard boundary, so a short page is not always the last one.
+
+          def __init__(self, items, max_page=100, shard=None):
+              self.items = list(items)
+              self.max_page = max_page
+              self.shard = shard
+              self.calls = []
+
+          def __call__(self, cursor, limit):
+              if cursor is None and self.calls:
+                  raise AssertionError("the listing was restarted from the first page")
+              self.calls.append((cursor, limit))
+              start = 0 if cursor is None else int(cursor)
+              end = min(start + min(limit, self.max_page), len(self.items))
+              if self.shard:
+                  end = min(end, (start // self.shard + 1) * self.shard)
+              return {"items": self.items[start:end], "next": str(end) if end < len(self.items) else None}
+
+
+      class FakeBatchAPI:
+          # Batch creation with idempotency keys. script lists what each POST does, in order, then every POST succeeds:
+          # "ok"; "lose" creates the job and loses the response; "fail" fails before the job is created;
+          # ("429", value) is refused with Retry-After: value.
+
+          def __init__(self, script=()):
+              self.script = list(script)
+              self.jobs = []
+              self.by_key = {}
+              self.keys = []
+
+          def post(self, path, body, headers):
+              key = headers.get("Idempotency-Key")
+              self.keys.append(key)
+              step = self.script.pop(0) if self.script else "ok"
+              if isinstance(step, tuple) and step[0] == "429":
+                  raise RateLimited(step[1])
+              if step == "fail":
+                  raise Transient("connection reset before the request was read")
+              if key not in self.by_key:
+                  job = {"id": f"batch_{len(self.jobs) + 1}", "count": len(body["requests"])}
+                  self.jobs.append(job)
+                  self.by_key[key] = job
+              if step == "lose":
+                  raise Transient("connection reset after the job was created")
+              return self.by_key[key]
+      """,
+      }
+
+
+      _LOADED = {}
+
+
+      def load(files, package):
+          """Write files into a fresh directory, make it importable and return the freshly imported package.
+          Modules from an earlier load of the same package must not leak into this one."""
+          old = _LOADED.pop(package, None)
+          if old:
+              if old in sys.path:
+                  sys.path.remove(old)
+              shutil.rmtree(old, ignore_errors=True)
+          for name in list(sys.modules):
+              if name == package or name.startswith(package + "."):
+                  del sys.modules[name]
+          root = tempfile.mkdtemp(prefix="lab-repo-")
+          for path, text in files.items():
+              full = os.path.join(root, *path.split("/"))
+              os.makedirs(os.path.dirname(full), exist_ok=True)
+              with open(full, "w", encoding="utf-8") as f:
+                  f.write(text)
+          sys.path.insert(0, root)
+          _LOADED[package] = root
+          importlib.invalidate_caches()
+          return importlib.import_module(package)
+
+
+      def patch(files, path, old, new):
+          """A copy of files with old replaced by new in files[path]. Raise ValueError unless old occurs exactly once."""
+          if path not in files:
+              raise ValueError(f"{path} is not in the package")
+          count = files[path].count(old)
+          if count != 1:
+              raise ValueError(f"expected the old text once in {path}, found it {count} times")
+          out = dict(files)
+          out[path] = files[path].replace(old, new)
+          return out
+  - title: Reproduce bug one with a failing test
+    brief: |
+      Support reports that exports of large accounts stop early, with no error. Read pages.py and the listing server in fakes.py before touching anything. Write test_bug_one(pkg): it takes a loaded package, fails on the package as shipped and passes once pages.py is fixed. Then build FIXED with patch, changing pages.py only. The tests run your test against both versions, so a test that fails for an unrelated reason (a typo, a wrong argument) fails the second check. The hidden tests run the fixed iterator against listings with short pages, shard boundaries, an empty listing and a last page that is exactly full.
+    starter: |
+      def test_bug_one(pkg):
+          """A test that fails on the package as shipped and passes once pages.py is fixed. pkg is a loaded batchkit;
+          pkg.fakes.FakeListing is the listing server the package ships for tests."""
+          raise NotImplementedError
+
+
+      # Build the fix with patch(FILES, "batchkit/pages.py", old, new).
+      FIXED = dict(FILES)
+    tests: |
+      def fails(test, pkg):
+          try:
+              test(pkg)
+          except Exception:
+              return True
+          return False
+
+      assert fails(test_bug_one, load(FILES, "batchkit")), "test_bug_one must fail on the package as shipped"
+      assert not fails(test_bug_one, load(FIXED, "batchkit")), "test_bug_one must pass on FIXED"
+      assert all(FIXED[p] == FILES[p] for p in FILES if p != "batchkit/pages.py"), "change pages.py only"
+    hidden: |
+      _pk = load(FIXED, "batchkit")
+
+      def _list(items, **kw):
+          fake = _pk.fakes.FakeListing(items, **{k: v for k, v in kw.items() if k != "page_size"})
+          return list(_pk.pages.iter_items(fake, page_size=kw.get("page_size", 100))), fake
+
+      assert _list([])[0] == []
+      _got, _fake = _list(range(200), page_size=100)
+      assert _got == list(range(200)) and len(_fake.calls) == 2, "a full last page with next None ends the listing"
+      _got, _fake = _list(range(1000), max_page=100, shard=130, page_size=100)
+      assert _got == list(range(1000)) and [c for c, _ in _fake.calls][1:] == sorted([c for c, _ in _fake.calls][1:], key=int)
+      assert _list(range(7), max_page=3, page_size=5)[0] == list(range(7))
+      assert _list(range(5), page_size=5)[0] == list(range(5))
+    solution: |
+      def test_bug_one(pkg):
+          """A test that fails on the package as shipped and passes once pages.py is fixed. pkg is a loaded batchkit;
+          pkg.fakes.FakeListing is the listing server the package ships for tests."""
+          listing = pkg.fakes.FakeListing(range(250), max_page=40)
+          assert list(pkg.pages.iter_items(listing, page_size=100)) == list(range(250))
+
+
+      FIXED = patch(FILES, "batchkit/pages.py", """        yield from page["items"]
+              if len(page["items"]) < page_size:
+                  return
+              cursor = page["next"]""", """        yield from page["items"]
+              cursor = page["next"]
+              if cursor is None:
+                  return""")
+  - title: Fix bug two in another module
+    brief: |
+      A team that asks for 256-dimension embeddings sometimes gets vectors of a different size, but only for texts another team embedded first. The cause is in cache.py. Build FIXED2 from FIXED with patch, so the pages.py fix stays. The hidden tests check that the cache still does its job after your change: repeated texts in one call are embedded once, a returned vector can be changed by the caller without changing the cache, and max_entries still bounds it.
+    starter: |
+      # Build on FIXED, so the pages.py fix stays in.
+      FIXED2 = dict(FIXED)
+    tests: |
+      pkg = load(FIXED2, "batchkit")
+      calls = []
+
+      def embed(texts, model, dimensions):
+          calls.append((tuple(texts), model, dimensions))
+          return [[0.5] * (dimensions or 8) for _ in texts]
+
+      cache = pkg.cache.EmbeddingCache(embed)
+      assert len(cache.get(["hello"], "embed-1", 4)[0]) == 4
+      assert len(cache.get(["hello"], "embed-1", 16)[0]) == 16, "a vector of the wrong size came back"
+      assert len(cache.get(["hello"], "embed-1", 4)[0]) == 4 and len(calls) == 2, "the third call should be a cache hit"
+      assert FIXED2["batchkit/pages.py"] == FIXED["batchkit/pages.py"], "keep the pages.py fix"
+    hidden: |
+      _pk = load(FIXED2, "batchkit")
+      _calls = []
+
+      def _embed(texts, model, dimensions):
+          _calls.append(list(texts))
+          return [[float(len(t)), float(dimensions or 0), float(len(model))] for t in texts]
+
+      _c = _pk.cache.EmbeddingCache(_embed, max_entries=3)
+      _out = _c.get(["a", "bb", "a"], "m1")
+      assert _out == [[1.0, 0.0, 2.0], [2.0, 0.0, 2.0], [1.0, 0.0, 2.0]] and _calls == [["a", "bb"]]
+      _out[0].append(99.0)
+      assert _c.get(["a"], "m1") == [[1.0, 0.0, 2.0]] and len(_calls) == 1
+      assert _c.get(["a"], "m1", 256) == [[1.0, 256.0, 2.0]] and _c.get(["a"], "m22") == [[1.0, 0.0, 3.0]]
+      _c.get(["x", "y", "z"], "m1")
+      _n = len(_calls)
+      assert _c.get(["a"], "m1") == [[1.0, 0.0, 2.0]] and len(_calls) == _n + 1, "max_entries bounds the cache"
+      assert list(_pk.pages.iter_items(_pk.fakes.FakeListing(range(90), max_page=7), page_size=50)) == list(range(90))
+    solution: |
+      FIXED2 = patch(FIXED, "batchkit/cache.py", "        return (model, text)", "        return (model, dimensions, text)")
+  - title: Fix bug three that only shows on a resent request
+    brief: |
+      Finance sees two batch jobs, and two bills, for one submission on nights when the network is unreliable. The provider deduplicates on the Idempotency-Key header: a request repeated with the same key returns the job the first one created, the pattern Stripe documents for its API. FakeBatchAPI in fakes.py behaves that way, and its "lose" step creates the job and then loses the response, which is what a reset after the server committed looks like to the client. Build FIXED3 from FIXED2 with one patch to client.py. Two separate submits must still create two jobs.
+    starter: |
+      # Build on FIXED2.
+      FIXED3 = dict(FIXED2)
+    tests: |
+      pkg = load(FIXED3, "batchkit")
+      api = pkg.fakes.FakeBatchAPI(script=["lose"])
+      client = pkg.client.BatchClient(api, sleep=lambda seconds: None)
+      job = client.submit([{"input": "a"}, {"input": "b"}])
+      assert len(api.jobs) == 1, "a lost response created a second batch"
+      assert job == api.jobs[0] and len(api.keys) == 2
+    hidden: |
+      _pk = load(FIXED3, "batchkit")
+      _slept = []
+      _api = _pk.fakes.FakeBatchAPI(script=["fail", "lose"])
+      _cl = _pk.client.BatchClient(_api, sleep=_slept.append)
+      assert _cl.submit([{"input": "x"}]) == _api.jobs[0] and len(_api.jobs) == 1 and len(set(_api.keys)) == 1
+      _cl.submit([{"input": "y"}])
+      assert len(_api.jobs) == 2 and len(set(_api.keys)) == 2, "two submits are two batches"
+      assert all(isinstance(k, str) and 0 < len(k) <= 255 for k in _api.keys)
+
+      _api = _pk.fakes.FakeBatchAPI(script=["lose", "lose", "lose"])
+      try:
+          _pk.client.BatchClient(_api, attempts=3, sleep=_slept.append).submit([{"input": "z"}])
+          _raised = False
+      except _pk.client.Transient:
+          _raised = True
+      assert _raised and len(_api.jobs) == 1 and len(_api.keys) == 3
+      assert FIXED3["batchkit/cache.py"] == FIXED2["batchkit/cache.py"] and FIXED3["batchkit/pages.py"] == FIXED["batchkit/pages.py"]
+    solution: |
+      FIXED3 = patch(FIXED2, "batchkit/client.py", """        for attempt in range(self.attempts):
+                  headers = {"Idempotency-Key": str(uuid.uuid4())}
+      """, """        headers = {"Idempotency-Key": str(uuid.uuid4())}
+              for attempt in range(self.attempts):
+      """)
+  - title: Review a PR whose tests pass and list what breaks
+    brief: |
+      A colleague's PR teaches submit to retry 429 responses. Its description is in the comment above PR_CLIENT, and its own tests, pr_tests, pass. Review it against the description and against the fix you made in step 4. For each thing that breaks, write a test function that takes a loaded package and fails on the PR, and add it to BREAKS. Each function must also pass on a version that does what the description says, and the hidden tests check that your functions, between them, catch every break the PR introduces. Pass sleep and clock into BatchClient in every test: the client must never sleep for real. RFC 9110 allows a Retry-After value to be a number of seconds or an HTTP date.
+    starter: |
+      # A colleague's PR, "Retry rate-limited batch submissions". Its description: on a 429, wait for the Retry-After
+      # the server sent and try again; the total time slept inside one submit never exceeds max_wait, and when a
+      # Retry-After would take it past that, raise RateLimited at once without sleeping. It also says: "after a 429 we
+      # send a fresh Idempotency-Key, because the provider caches the 429 under the old key."
+      PR_CLIENT = """import time
+      import uuid
+
+
+      class Transient(Exception):
+          # The request may or may not have reached the server: a reset connection, a 502, 503 or 504.
+          pass
+
+
+      class RateLimited(Exception):
+          # A 429. retry_after is the Retry-After header exactly as the server sent it.
+          def __init__(self, retry_after):
+              super().__init__(retry_after)
+              self.retry_after = retry_after
+
+
+      class BatchClient:
+          def __init__(self, transport, attempts=3, sleep=time.sleep, clock=time.time, max_wait=60):
+              self.transport = transport
+              self.attempts = attempts
+              self.sleep = sleep
+              self.clock = clock
+              self.max_wait = max_wait
+
+          def submit(self, requests):
+              # Create one batch job and return it. The provider deduplicates on the Idempotency-Key header.
+              headers = {"Idempotency-Key": str(uuid.uuid4())}
+              for attempt in range(self.attempts):
+                  try:
+                      return self.transport.post("/v1/batches", {"requests": requests}, headers)
+                  except Transient:
+                      if attempt == self.attempts - 1:
+                          raise
+                      self.sleep(min(2 ** attempt, self.max_wait))
+                  except RateLimited as e:
+                      if attempt == self.attempts - 1:
+                          raise
+                      self.sleep(min(int(e.retry_after), self.max_wait))
+                      headers = {"Idempotency-Key": str(uuid.uuid4())}
+      """
+      PR_FILES = dict(FIXED3)
+      PR_FILES["batchkit/client.py"] = PR_CLIENT
+
+
+      def pr_tests(pkg):
+          # The tests that came with the PR. They pass.
+          slept = []
+          api = pkg.fakes.FakeBatchAPI(script=[("429", "2")])
+          job = pkg.client.BatchClient(api, sleep=slept.append).submit([{"input": "a"}])
+          assert job == api.jobs[0] and len(api.jobs) == 1 and slept == [2]
+          api = pkg.fakes.FakeBatchAPI(script=[("429", "1"), ("429", "1"), ("429", "1")])
+          try:
+              pkg.client.BatchClient(api, sleep=slept.append).submit([{"input": "a"}])
+              assert False, "three 429s in three attempts should raise"
+          except pkg.client.RateLimited:
+              pass
+
+
+      # Each entry is a test function taking a loaded package: it must fail on PR_FILES and pass once the PR does what
+      # its description says. One function per thing that breaks.
+      BREAKS = []
+    tests: |
+      def fails(check, pkg):
+          try:
+              check(pkg)
+          except Exception:
+              return True
+          return False
+
+      pr = load(PR_FILES, "batchkit")
+      assert not fails(pr_tests, pr), "the PR's own tests pass"
+      assert len(BREAKS) >= 1, "add a test function to BREAKS for each thing that breaks"
+      assert all(fails(check, pr) for check in BREAKS), "every function in BREAKS must fail on the PR"
+    hidden: |
+      _GOOD = """import time
+      import uuid
+      from email.utils import parsedate_to_datetime
+
+
+      class Transient(Exception):
+          # The request may or may not have reached the server: a reset connection, a 502, 503 or 504.
+          pass
+
+
+      class RateLimited(Exception):
+          # A 429. retry_after is the Retry-After header exactly as the server sent it.
+          def __init__(self, retry_after):
+              super().__init__(retry_after)
+              self.retry_after = retry_after
+
+
+      class BatchClient:
+          def __init__(self, transport, attempts=3, sleep=time.sleep, clock=time.time, max_wait=60):
+              self.transport = transport
+              self.attempts = attempts
+              self.sleep = sleep
+              self.clock = clock
+              self.max_wait = max_wait
+
+          def submit(self, requests):
+              # Create one batch job and return it. The provider deduplicates on the Idempotency-Key header.
+              headers = {"Idempotency-Key": str(uuid.uuid4())}
+              waited = 0
+              for attempt in range(self.attempts):
+                  try:
+                      return self.transport.post("/v1/batches", {"requests": requests}, headers)
+                  except Transient:
+                      if attempt == self.attempts - 1:
+                          raise
+                      pause = min(2 ** attempt, self.max_wait - waited)
+                      waited += pause
+                      self.sleep(pause)
+                  except RateLimited as e:
+                      if attempt == self.attempts - 1:
+                          raise
+                      delay = self.delay(e.retry_after)
+                      if waited + delay > self.max_wait:
+                          raise
+                      waited += delay
+                      self.sleep(delay)
+
+          def delay(self, value):
+              value = value.strip()
+              if value.isdigit():
+                  return int(value)
+              return max(0.0, parsedate_to_datetime(value).timestamp() - self.clock())
+      """
+      _variants = {
+          "Retry-After as an HTTP-date": _GOOD.replace("""        if value.isdigit():
+                  return int(value)
+              return max(0.0, parsedate_to_datetime(value).timestamp() - self.clock())""", "        return int(value)"),
+          "the max_wait budget": _GOOD.replace("""                if waited + delay > self.max_wait:
+                          raise
+                      waited += delay
+                      self.sleep(delay)""", "                self.sleep(min(delay, self.max_wait))"),
+          "the key after a 429": _GOOD.replace("""                waited += delay
+                      self.sleep(delay)""", """                waited += delay
+                      self.sleep(delay)
+                      headers = {"Idempotency-Key": str(uuid.uuid4())}"""),
+      }
+      assert all(v != _GOOD for v in _variants.values())
+
+      def _with(client):
+          files = dict(PR_FILES)
+          files["batchkit/client.py"] = client
+          return load(files, "batchkit")
+
+      _good = _with(_GOOD)
+      assert not fails(pr_tests, _good) and not any(fails(check, _good) for check in BREAKS)
+      assert any(fails(check, _with(_variants["Retry-After as an HTTP-date"])) for check in BREAKS)
+      assert any(fails(check, _with(_variants["the max_wait budget"])) for check in BREAKS)
+      assert any(fails(check, _with(_variants["the key after a 429"])) for check in BREAKS)
+    solution: |
+      PR_CLIENT = """import time
+      import uuid
+
+
+      class Transient(Exception):
+          # The request may or may not have reached the server: a reset connection, a 502, 503 or 504.
+          pass
+
+
+      class RateLimited(Exception):
+          # A 429. retry_after is the Retry-After header exactly as the server sent it.
+          def __init__(self, retry_after):
+              super().__init__(retry_after)
+              self.retry_after = retry_after
+
+
+      class BatchClient:
+          def __init__(self, transport, attempts=3, sleep=time.sleep, clock=time.time, max_wait=60):
+              self.transport = transport
+              self.attempts = attempts
+              self.sleep = sleep
+              self.clock = clock
+              self.max_wait = max_wait
+
+          def submit(self, requests):
+              # Create one batch job and return it. The provider deduplicates on the Idempotency-Key header.
+              headers = {"Idempotency-Key": str(uuid.uuid4())}
+              for attempt in range(self.attempts):
+                  try:
+                      return self.transport.post("/v1/batches", {"requests": requests}, headers)
+                  except Transient:
+                      if attempt == self.attempts - 1:
+                          raise
+                      self.sleep(min(2 ** attempt, self.max_wait))
+                  except RateLimited as e:
+                      if attempt == self.attempts - 1:
+                          raise
+                      self.sleep(min(int(e.retry_after), self.max_wait))
+                      headers = {"Idempotency-Key": str(uuid.uuid4())}
+      """
+      PR_FILES = dict(FIXED3)
+      PR_FILES["batchkit/client.py"] = PR_CLIENT
+
+
+      def pr_tests(pkg):
+          # The tests that came with the PR. They pass.
+          slept = []
+          api = pkg.fakes.FakeBatchAPI(script=[("429", "2")])
+          job = pkg.client.BatchClient(api, sleep=slept.append).submit([{"input": "a"}])
+          assert job == api.jobs[0] and len(api.jobs) == 1 and slept == [2]
+          api = pkg.fakes.FakeBatchAPI(script=[("429", "1"), ("429", "1"), ("429", "1")])
+          try:
+              pkg.client.BatchClient(api, sleep=slept.append).submit([{"input": "a"}])
+              assert False, "three 429s in three attempts should raise"
+          except pkg.client.RateLimited:
+              pass
+
+
+      def retry_after_as_http_date(pkg):
+          # RFC 9110 allows Retry-After to be an HTTP-date as well as a number of seconds.
+          now = 1793188800  # 2026-10-28 12:00:00 UTC
+          slept = []
+          api = pkg.fakes.FakeBatchAPI(script=[("429", "Wed, 28 Oct 2026 12:00:30 GMT")])
+          pkg.client.BatchClient(api, sleep=slept.append, clock=lambda: now).submit([{"input": "a"}])
+          assert len(api.jobs) == 1 and sum(slept) <= 30
+
+
+      def total_wait_stays_inside_max_wait(pkg):
+          slept = []
+          api = pkg.fakes.FakeBatchAPI(script=[("429", "120")])
+          try:
+              pkg.client.BatchClient(api, sleep=slept.append, max_wait=60).submit([{"input": "a"}])
+              raised = False
+          except pkg.client.RateLimited:
+              raised = True
+          assert raised and slept == [], "a Retry-After past the budget raises without sleeping"
+          api = pkg.fakes.FakeBatchAPI(script=[("429", "40"), ("429", "40")])
+          try:
+              pkg.client.BatchClient(api, sleep=slept.append, max_wait=60).submit([{"input": "a"}])
+          except pkg.client.RateLimited:
+              pass
+          assert sum(slept) <= 60
+
+
+      def lost_response_then_429_is_one_batch(pkg):
+          api = pkg.fakes.FakeBatchAPI(script=["lose", ("429", "1")])
+          pkg.client.BatchClient(api, sleep=lambda seconds: None).submit([{"input": "a"}])
+          assert len(api.jobs) == 1, "a new key after the 429 created a second batch"
+
+
+      BREAKS = [retry_after_as_http_date, total_wait_stays_inside_max_wait, lost_response_then_429_is_one_batch]
+---
+
+This lab practises the bug-squash round on one small library. `batchkit` is a client for a batch embeddings API in four modules: paginated listing, an embedding cache, batch submission with retries, and the fakes its tests use. It arrives as a dictionary of files, and step 1 makes it importable the way a repo round's runner does: write the files into a fresh directory, import them, and make sure a second import sees the new code rather than the modules Python cached the first time.
+
+Steps 2 to 4 each start from a user report, not from the cause. Each bug sits in a different module, and each fix is a `patch` on top of the previous one, so a fix that breaks an earlier one fails the later steps. Step 2 asks for the reproduction as a test before the fix: a test that fails on the shipped code and passes on the fixed code is the evidence the round asks for, and it is also what stops the bug coming back. Step 4's bug only shows when a request is sent twice.
+
+Step 5 turns to review. A colleague's PR adds retries for rate-limited requests; its tests pass. You answer the review in code: one test per thing that breaks, each failing on the PR and passing on a version that does what the PR description promises.
+
+All the servers are fakes with scripted behaviour, so every test is deterministic and asserts behaviour (jobs created, keys sent, seconds slept), never timing. Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

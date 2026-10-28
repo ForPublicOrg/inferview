@@ -1,0 +1,131 @@
+---
+id: sec-016
+title: Your agent can execute arbitrary Python
+subtitle: make it safe in a multi-tenant product
+track: security
+module: sandboxing-secrets
+type: design
+difficulty: hard
+seniority: [senior, staff]
+minutes: 45
+core: false
+tags: [code-execution, gvisor, landlock, multi-tenant, egress, resource-limits, agents]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: ombharatiya, AI system design interview question bank (Q65)
+    url: https://github.com/ombharatiya/ai-system-design-guide/blob/main/00-interview-prep/01-question-bank.md
+    note: "a synthesised question bank; Q65 asks how to make it safe for an agent to execute arbitrary Python code; no company named. The exercise below is original material."
+  - title: Claude Code docs, Securely deploying AI agents (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/agent-sdk/secure-deployment
+    note: "isolation options with stated trade-offs (sandbox runtime, containers, gVisor, VMs); a hardened container profile with --cap-drop ALL, no-new-privileges, a seccomp profile, a read-only root, tmpfs, --network none, memory, CPU and pids limits and a non-root user; a proxy outside the boundary for credentials; vendor-reported gVisor overhead about 0% CPU-bound, about 2x simple system calls, up to 10 to 200x for heavy open and close"
+  - title: gVisor documentation (checked 2026-10-28)
+    url: https://gvisor.dev/docs/
+    note: "an application kernel in user space; the Sentry does not pass system calls through to the host kernel; reduced compatibility and higher per-system-call overhead"
+  - title: Linux kernel documentation, Landlock (checked 2026-10-28)
+    url: https://docs.kernel.org/userspace-api/landlock.html
+    note: "lets any process, including unprivileged ones, restrict itself; filesystem rights from ABI 1, TCP bind and connect from ABI 4; restrictions are inherited by children and cannot be removed"
+  - title: Linux kernel documentation, Seccomp BPF (checked 2026-10-28)
+    url: https://docs.kernel.org/userspace-api/seccomp_filter.html
+    note: "system call filtering is not a sandbox on its own; it minimises the kernel surface a sandbox exposes"
+  - title: Anthropic Engineering, How we contain Claude across products (2026-05-25)
+    url: https://www.anthropic.com/engineering/how-we-contain-claude
+    note: "claude.ai runs code in gVisor containers on isolated infrastructure with ephemeral per-session filesystems; any probabilistic defence has a non-zero miss rate, so the environment is the layer that holds"
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"Our analytics assistant can run Python. The model writes the code, we execute it, and the result goes back to the model. Customers upload spreadsheets and the assistant analyses them. Make code execution safe for a product where every customer is a different company."
+</Callout>
+
+The constraints are a scenario, given by the interviewer:
+
+- The product runs on a managed Kubernetes cluster that the platform team will not replace this year; node pools are general-purpose cloud VMs.
+- Three engineers, eight weeks.
+- The model reads the uploaded files and any web page a user pastes, so the code it writes can be steered by whoever wrote those.
+- Product wants a tool call, including execution, back in 3 seconds at p95 for typical pandas work. An enterprise customer's security review asks how their data is kept away from other customers and from the internet.
+
+Design the execution path and the limits, choose the numbers, and write the risk note you would send to the enterprise customer's reviewer.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask whether variables and files from one tool call must still be there on the next call in the same conversation, and how often the model relies on that today.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request a sample of executed code from the current prototype, with its runtime, peak memory and output size.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask the reviewer what they mean by "away from the internet": no outbound connections at all, or none they have not approved.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Treat every line the model writes as attacker code, because anyone who wrote a file or page the model read can steer it. Run it in a gVisor sandbox per conversation through a runsc RuntimeClass on the existing cluster, with no network, no credentials, the conversation's files mounted read-only and an output directory the host collects. Cap wall time, CPU, memory, processes and the bytes of output that go back into the model's context. Inside the sandbox, the launcher runs as an unprivileged user and, where the runtime supports it, restricts itself with Landlock before it runs the model's code. Sandboxes are never shared across tenants or conversations and are destroyed at the end. I give up outbound access, which some analyses want, and some start-up time.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>The boundary.</strong> A container shares the host kernel with every other tenant's code on the node, and seccomp alone is not a sandbox, by the kernel's own documentation. gVisor's Sentry handles the workload's system calls in user space, and it runs as a RuntimeClass on the existing nodes, which a microVM would not without KVM. Numeric pandas work is mostly CPU-bound, the case where Anthropic's deployment guide reports gVisor's overhead near zero (vendor-reported); importing pandas is open-heavy and pays the most, so the image preloads it.</p>
+<p><strong>Inside the sandbox.</strong> The pod spec follows the hardened profile in that guide: all capabilities dropped, no new privileges, a read-only root, tmpfs for scratch, a non-root user, and limits on memory, CPU and process count. The launcher applies a Landlock ruleset that allows reads of the image and /data and writes only to /work and /out, and denies TCP connect. Landlock restrictions are inherited by every child and cannot be removed, so a subprocess the model spawns is held to them too. This layer is cheap and catches mistakes in the image or pod spec; gVisor remains the boundary. gVisor does not implement every system call, so check that the Landlock calls are available in the runtime version you deploy; where they are not, the read-only root and mounts carry the same intent with less precision.</p>
+<p><strong>Data in and out.</strong> No credentials enter the sandbox. A host-side service fetches the conversation's uploads from storage and mounts them read-only at /data. Files the code writes to /out are collected by the host after the call, scanned for size and type, and stored under the conversation. stdout and stderr go back to the model, capped, with the rest saved as a file the model can page through.</p>
+<p><strong>Network.</strong> None: no network device and no proxy. If a customer later needs outbound access, it goes through an egress proxy outside the sandbox with a per-tenant allowlist, as a separate decision with its own review.</p>
+<p><strong>Lifecycle.</strong> One sandbox per conversation, created on the first tool call, destroyed after an idle timeout or at the end of the conversation. Never pooled across tenants; a warm pool holds only empty sandboxes that know nothing about any tenant until claimed.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The per-conversation sandbox costs more in memory than the feature earns on the free tier. Which tier loses state between calls, and what risk or quality cost do you accept in writing?</em></li>
+<li><em>What would you need to see in production to give one enterprise tenant outbound access to their own data warehouse?</em></li>
+<li><em>The model's code is correct but slow, and 8% of calls hit the wall-time cap in your logs. Do you raise the cap, give the model a progress signal, or move long jobs to a batch path, and who decides?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+### The decision with two defensible answers: state across calls
+
+- **A fresh sandbox per tool call.** Every call starts from the same clean image with the uploads mounted. Nothing one call does can affect the next, so code planted by an injection in call 3 is gone by call 4. The cost: the model reloads and re-parses the spreadsheet on every call, which adds the parse time to each call and pushes heavier analyses past the 3-second p95; and the model loses variables between calls, so it writes longer code that redoes earlier steps.
+- **One sandbox per conversation.** Variables, dataframes and intermediate files persist across calls, as users of notebooks expect. The cost: the sandbox lives as long as the conversation, and anything planted in it persists. An injected instruction in an uploaded file can make an early call patch a library function or start a background thread, and every later call in that conversation, including on a file the user uploads afterwards, runs with it.
+
+The conflict is answer quality and latency against how long a compromise lasts. I choose one sandbox per conversation, because the prototype's sample (Hint 2) is where the model's multi-step analyses get their value, and I bound the persistence: no network, so a planted thread has nowhere to send what it reads; the interpreter restarts when a new file is uploaded, which clears in-memory state while keeping /work; and the conversation's sandbox dies on idle.
+
+### The numbers to choose
+
+Each comes from the prototype sample, and the defaults are mine to defend:
+
+- **Wall time per call: 30 seconds.** Long enough for a groupby over a large spreadsheet in the sample, short enough that a runaway loop costs one user a wait, not a node its CPU. Two seconds is unreasonable: it fails ordinary work. Ten minutes is unreasonable for an interactive tool: the user has left, and the model is still waiting.
+- **Memory: 2 GiB per sandbox,** set from the sample's peak and the largest upload the product accepts. The cap applies to the sandbox, so an out-of-memory kill takes down only that conversation's state, which the user hears about as an error from the tool.
+- **Output back to the model: 16 KB,** the rest saved to /out. A dataframe printed in full is the common way a tool result fills the context window and the bill, and a capped result can still be paged.
+- **Processes: 64,** enough for a pool of workers, too few for a fork bomb to matter.
+
+### Risk note for the reviewer
+
+**What is isolated.** Each conversation's code runs in its own gVisor sandbox with no network and no credentials. Another customer's code never runs in the same sandbox, and the sandbox is destroyed when the conversation ends.
+
+**What remains.** Code runs on nodes shared with other customers' sandboxes; a vulnerability in gVisor that also reaches the host kernel would cross that line, and we track gVisor and kernel advisories with a patch window we state in the contract. Within one conversation, a file you upload can steer the model into running code that alters later results in that conversation. Results are as trustworthy as the files they come from.
+
+**What we will not do without your approval.** Outbound network access from code execution.
+
+### Rollout plan and rollback triggers
+
+Weeks 1 to 3: RuntimeClass, image, launcher with Landlock, limits, collection of /out. Weeks 4 to 5: prototype traffic shadowed into the new path, comparing results and latency. Weeks 6 to 8: switch tenants over, enterprise first behind a flag.
+
+Roll back any tenant, or the whole path, when:
+
+- Any sandbox makes an outbound connection attempt that reaches the node network, from node flow logs.
+- p95 tool-call time is above 3 seconds for typical calls for a full day.
+- Any file from one conversation appears in another conversation's /data or /out, from the collection service's audit log.
+
+### What you give up and where it fails
+
+Outbound access is gone, so analyses that would fetch an exchange rate or a public dataset cannot. gVisor adds latency to file-heavy steps, and package installs at run time are not allowed: the image decides what is available. The design fails where it trusts the output channel. stdout goes back to the model, so a file crafted to print instructions when parsed becomes a second injection, one step removed. Capping and labelling tool output as data does not stop the model reading it.
+
+## Follow-ups
+
+- *Security wants a model-based classifier on every piece of code before it runs. Where does that sit relative to the sandbox, and what does it buy you that the sandbox does not?*
+- *A customer uploads a 3 GB file. Which of your numbers breaks first, and do you raise it, stream the file, or refuse it?*
+- *Two senior engineers disagree: one wants a fresh sandbox per call for security, the other per conversation for quality. How do you settle it with data instead of seniority?*
+
+## Common mistakes
+
+- Running the model's code with exec in the application process, or in a container on a shared kernel, and calling the container the boundary.
+- Mounting a storage credential inside the sandbox so the code can read uploads.
+- Giving the sandbox outbound access "for pip install", which is also a way out for every file it can read.
+- Returning unbounded stdout to the model.
+- Pooling sandboxes across tenants to save start-up time.

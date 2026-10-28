@@ -1,0 +1,141 @@
+---
+// Per-sequence cache for open-weight layer layouts: KV that grows with context, windowed or chunked KV that stops
+// growing, and recurrent state that never grows. Values come from each model's published config.json (see the
+// teardown's sources). Props: title, id (unique on the page).
+interface Props {
+  title?: string;
+  id?: string;
+}
+const { title = 'Cache per sequence by layer layout', id = 'malk' } = Astro.props;
+const f = (k: string) => `${id}-${k}`;
+---
+<div class="widget malk" data-malk>
+  <header><h4>{title}</h4><span class="tiny">computed from published configs, cache and state only</span></header>
+  <div class="malk-grid">
+    <label for={f('ctx')}>Context per sequence
+      <select id={f('ctx')} data-k="ctx">
+        <option value="8192">8,192 tokens</option>
+        <option value="32768">32,768 tokens</option>
+        <option value="131072" selected>131,072 tokens</option>
+        <option value="262144">262,144 tokens</option>
+      </select>
+    </label>
+    <label for={f('kv')}>KV precision
+      <select id={f('kv')} data-k="kv">
+        <option value="2" selected>16-bit, 2 bytes</option>
+        <option value="1">8-bit, 1 byte</option>
+      </select>
+    </label>
+    <label for={f('st')}>Recurrent state precision
+      <select id={f('st')} data-k="st">
+        <option value="2" selected>16-bit, 2 bytes</option>
+        <option value="4">32-bit, 4 bytes</option>
+      </select>
+    </label>
+    <label class="malk-check"><input type="checkbox" data-k="full" /> engine allocates windowed and chunked layers at full context</label>
+  </div>
+  <div class="tablewrap">
+    <table class="malk-table">
+      <thead>
+        <tr><th scope="col">model</th><th scope="col">layout</th><th scope="col">growing bytes per token</th><th scope="col">bounded part</th><th scope="col">per sequence</th></tr>
+      </thead>
+      <tbody data-rows></tbody>
+    </table>
+  </div>
+  <p class="tiny malk-note" data-note></p>
+  <p class="sr-only" aria-live="polite" data-summary></p>
+</div>
+
+<style>
+  .malk-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px 14px; margin-bottom: 12px; }
+  .malk-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 13.5px; }
+  .malk-grid select { min-height: 36px; max-width: 100%; }
+  .malk-grid .malk-check { flex-direction: row; align-items: center; gap: 6px; min-height: 36px; }
+  .malk-table td, .malk-table th { padding: 6px 8px; font-size: 13px; }
+  .malk-table td { font-family: var(--mono); white-space: nowrap; }
+  .malk-table td.lay { font-family: inherit; white-space: normal; min-width: 140px; }
+  .malk-note { margin-top: 8px; }
+</style>
+
+<script>
+  type Layout = {
+    name: string;
+    layout: string;
+    perLayer: number; // KV values cached per attention layer per token
+    full: number; // layers whose cache grows with context
+    win: number; // windowed or chunked layers
+    window: number; // tokens kept by each windowed layer
+    state: number; // recurrent state values per sequence
+    fixedBytesPerToken: number; // per-token bytes stored at a fixed precision (FP8 indexer keys)
+  };
+  const MODELS: Layout[] = [
+    { name: 'gpt-oss-120b', layout: '18 full, 18 banded at 128, sinks', perLayer: 2 * 8 * 64, full: 18, win: 18, window: 128, state: 0, fixedBytesPerToken: 0 },
+    { name: 'Gemma 3 27B', layout: '10 global, 52 local at 1,024', perLayer: 2 * 16 * 128, full: 10, win: 52, window: 1024, state: 0, fixedBytesPerToken: 0 },
+    { name: 'Jamba-v0.1', layout: '4 attention, 28 Mamba', perLayer: 2 * 8 * 128, full: 4, win: 0, window: 0, state: 28 * (8192 * 16 + 8192 * 3), fixedBytesPerToken: 0 },
+    { name: 'Kimi Linear 48B', layout: '7 MLA, 20 KDA', perLayer: 512 + 64, full: 7, win: 0, window: 0, state: 20 * 32 * 128 * 128, fixedBytesPerToken: 0 },
+    { name: 'MiniMax-Text-01', layout: '10 softmax, 70 lightning', perLayer: 2 * 8 * 128, full: 10, win: 0, window: 0, state: 70 * 64 * 128 * 128, fixedBytesPerToken: 0 },
+    { name: 'Llama 4 Scout', layout: '12 global NoPE, 36 chunked at 8,192', perLayer: 2 * 8 * 128, full: 12, win: 36, window: 8192, state: 0, fixedBytesPerToken: 0 },
+    { name: 'DeepSeek-V3.2', layout: '61 MLA, FP8 indexer keys', perLayer: 512 + 64, full: 61, win: 0, window: 0, state: 0, fixedBytesPerToken: 61 * 128 },
+  ];
+  const GIB = 2 ** 30;
+  const MIB = 2 ** 20;
+
+  function fmtBytes(b: number): string {
+    if (b >= GIB) return `${(b / GIB).toFixed(2)} GiB`;
+    if (b >= MIB) return `${(b / MIB).toFixed(1)} MiB`;
+    if (b > 0) return `${(b / 1024).toFixed(1)} KiB`;
+    return '0';
+  }
+
+  function compute(m: Layout, ctx: number, kv: number, st: number, allocFull: boolean) {
+    const growingLayers = allocFull ? m.full + m.win : m.full;
+    const perToken = kv * m.perLayer * growingLayers + m.fixedBytesPerToken;
+    const windowed = allocFull ? 0 : kv * m.perLayer * m.win * Math.min(ctx, m.window);
+    const bounded = windowed + st * m.state;
+    return { perToken, bounded, total: perToken * ctx + bounded };
+  }
+
+  function cell(text: string, cls = ''): HTMLTableCellElement {
+    const c = document.createElement('td');
+    c.textContent = text;
+    if (cls) c.className = cls;
+    return c;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-malk]').forEach((root) => {
+    const ctxEl = root.querySelector<HTMLSelectElement>('[data-k="ctx"]')!;
+    const kvEl = root.querySelector<HTMLSelectElement>('[data-k="kv"]')!;
+    const stEl = root.querySelector<HTMLSelectElement>('[data-k="st"]')!;
+    const fullEl = root.querySelector<HTMLInputElement>('[data-k="full"]')!;
+    const rows = root.querySelector<HTMLElement>('[data-rows]')!;
+    const note = root.querySelector<HTMLElement>('[data-note]')!;
+    const summary = root.querySelector<HTMLElement>('[data-summary]')!;
+
+    const render = () => {
+      const ctx = Number(ctxEl.value);
+      const kv = Number(kvEl.value);
+      const st = Number(stEl.value);
+      const allocFull = fullEl.checked;
+      const results = MODELS.map((m) => ({ m, ...compute(m, ctx, kv, st, allocFull) }));
+      rows.replaceChildren(
+        ...results.map(({ m, perToken, bounded, total }) => {
+          const tr = document.createElement('tr');
+          const th = document.createElement('th');
+          th.scope = 'row';
+          th.textContent = m.name;
+          tr.append(th, cell(m.layout, 'lay'), cell(perToken.toLocaleString('en-US')), cell(fmtBytes(bounded)), cell(fmtBytes(total)));
+          return tr;
+        }),
+      );
+      note.textContent = allocFull
+        ? 'Windowed and chunked layers are charged for every token, as an engine without per-layer allocation would charge them. DeepSeek-V3.2 indexer keys stay at 1 byte.'
+        : 'Bounded part: windowed or chunked KV at its cap plus recurrent state. DeepSeek-V3.2 indexer keys are counted at 1 byte (FP8) whatever the KV precision.';
+      const best = results.reduce((a, b) => (a.total < b.total ? a : b));
+      const worst = results.reduce((a, b) => (a.total > b.total ? a : b));
+      summary.textContent = `At ${ctx.toLocaleString('en-US')} tokens, ${best.m.name} needs the least, ${fmtBytes(best.total)}, and ${worst.m.name} the most, ${fmtBytes(worst.total)}.`;
+    };
+
+    [ctxEl, kvEl, stEl, fullEl].forEach((el) => el.addEventListener('change', render));
+    render();
+  });
+</script>

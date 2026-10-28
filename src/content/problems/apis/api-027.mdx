@@ -1,0 +1,152 @@
+---
+id: api-027
+title: Review a refund tool before it ships
+subtitle: definition, handler and the approval rule
+track: apis
+module: structured-outputs
+type: critique
+difficulty: hard
+seniority: [senior, staff]
+minutes: 35
+core: false
+tags: [tool-design, tool-calling, authorisation, idempotency, approvals]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: KORE1, AI agent engineer interview questions (23 September 2026)
+    url: https://www.kore1.com/ai-agent-engineer-interview-questions/
+    note: "vendor (IT staffing firm) guide describing a 30-minute exercise at an unnamed insurer: rewrite an issue_refund tool that returned OK or error and would not execute above $500. The exercise here is original material on the same theme. Checked 2026-10-28."
+  - title: Anthropic, Writing effective tools for agents (11 September 2025)
+    url: https://www.anthropic.com/engineering/writing-tools-for-agents
+    note: "unambiguous parameter names (user_id, not user); return meaningful names rather than opaque identifiers; errors that state specific, actionable improvements rather than opaque codes. Checked 2026-10-28."
+  - title: Claude docs, handle tool calls
+    url: https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls
+    note: "is_error results; write instructive errors that say what went wrong and what to try next; Claude retries an invalid call 2 to 3 times before apologising. Checked 2026-10-28."
+  - title: Claude docs, structured outputs
+    url: https://platform.claude.com/docs/en/build-with-claude/structured-outputs
+    note: "Claude may change the capitalisation of enum values with no error, so avoid values that differ only in case; strict schemas require additionalProperties false; at most 24 optional parameters across strict schemas in a request. Checked 2026-10-28."
+checklist:
+  - Moves the approval threshold from the description into the executor, where the model cannot talk past it
+  - Caps refunds per order cumulatively, so two calls under the threshold cannot add up to one above it
+  - Checks the amount against the order's refundable balance (captured minus already refunded)
+  - Takes the customer from the authenticated session, not from a model argument, and checks the order belongs to them
+  - Replaces the order-number-or-email lookup with an order id, because the email path can pick the wrong order
+  - Uses integer minor units plus a currency code instead of a float with no currency
+  - Adds an idempotency key derived from the business action so a retried call cannot refund twice
+  - Replaces OK and error with results that state the outcome, the remaining balance and the next allowed step
+  - Removes enum values that differ only in case and turns reason into codes the model cannot mis-capitalise
+  - Gives approval a real state (a pending refund a person approves) instead of an instruction to ask a manager
+  - "Judgement call: a single refund tool that returns pending_approval above the limit is acceptable if the executor, not the model, creates the approval request and the model has no tool that completes it"
+  - Names the threshold it would choose and the evidence (refund size distribution, fraud losses, approver capacity) that sets it
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"This refund tool passed code review last week and goes to the support agent on Monday. Review it. List every problem you would block on, then rewrite the definition."
+</Callout>
+
+```json
+{
+  "name": "refund",
+  "description": "Refunds a customer. Only refund eligible orders. Refunds over $500 need manager approval, so ask a manager first. Returns OK or error.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "customer": {"type": "string", "description": "The customer"},
+      "order":    {"type": "string", "description": "Order number or the customer's email"},
+      "amount":   {"type": "number", "description": "Amount to refund"},
+      "reason":   {"type": "string", "enum": ["Damaged item", "damaged item", "Late delivery", "Other"]},
+      "notify":   {"type": "boolean", "description": "Email the customer"}
+    },
+    "required": ["order", "amount"]
+  }
+}
+```
+
+```python
+def refund(order, amount, customer=None, reason="Other", notify=True):
+    o = orders.by_number(order) or orders.latest_for_email(order)
+    if o is None:
+        return "error"
+    if amount > 500:
+        return "error"
+    payments.refund(o.payment_id, amount)
+    if notify:
+        mail.send(o.email, f"We refunded {amount} for order {o.number}.")
+    return "OK"
+```
+
+The agent serves logged-in customers in chat. The store sells in three currencies. There is no tool for contacting a manager.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what the agent does today when a customer asks for a $900 refund, step by step, given the tools it has.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for last quarter's refunds by size and how many a person could approve per day.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what happens if the payment call times out and the model calls the tool again.</p></details>
+
+## Answer
+
+The flaws fall into three groups.
+
+**The policy lives in the prompt.** "Ask a manager first" is an instruction with no mechanism behind it: there is no manager tool, so the model asks the customer, or reports that approval was given. The handler's `amount > 500` check is per call, so two calls of $400 refund $800 with no approval, and nothing checks the amount against what was paid or already refunded. None of these depend on the model behaving badly; they are reachable by a customer who asks twice.
+
+**The arguments are ambiguous.** `order` takes a number or an email, and the email path picks the latest order, which is the wrong order whenever the customer means an earlier one. `amount` is a float with no currency in a three-currency store. `customer` is a free string the handler ignores, so authorisation is absent: the order is never checked against the logged-in user, and a customer who pastes someone else's order number gets their refund processed. The reason enum has two values that differ only in case; Claude's structured outputs documentation says enum capitalisation can change with no error, so the value stored is not reliable.
+
+**The results teach the model nothing.** "OK" and "error" cannot be acted on. The model cannot tell "order not found" from "over the limit" from "already refunded", so it retries or apologises at random. There is no idempotency: a payment timeout followed by a retry refunds twice. The email states an amount without a currency.
+
+The rewrite:
+
+```json
+{
+  "name": "orders_refund",
+  "description": "Refund part or all of one order for the signed-in customer. Use the order_id from orders_list. Amounts are integer minor units in the order's currency. Up to the auto-approve limit per order, the refund runs immediately. Above it, the tool creates an approval request and returns status pending_approval; tell the customer it is pending and do not call this tool again for the same order.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "order_id":     {"type": "string", "pattern": "^ORD-[0-9]{10}$"},
+      "amount_minor": {"type": "integer", "description": "Integer minor units, for example 1250 for 12.50"},
+      "reason_code":  {"type": "string", "enum": ["damaged", "late", "not_received", "other"]},
+      "note":         {"type": ["string", "null"], "description": "One sentence from the customer's own words"}
+    },
+    "required": ["order_id", "amount_minor", "reason_code", "note"],
+    "additionalProperties": false
+  },
+  "strict": true
+}
+```
+
+The executor takes the customer from the session, loads the order, rejects it if it belongs to someone else, computes the refundable balance and the cumulative refunded amount for the order, derives an idempotency key from the conversation id, order id and amount (a retry in the same conversation cannot refund twice, while a request in a later conversation is new), and returns structured results: `{"status": "refunded", "amount_minor": 1250, "currency": "EUR", "refundable_remaining_minor": 3000}`, or an error such as "amount 90000 exceeds the refundable balance of 45000 EUR for ORD-0000012345; offer up to 45000". The customer email comes from the executor, with the currency.
+
+<Depth>
+<Fragment slot="short">
+<p>Two defensible designs for approval. One tool that returns <code>pending_approval</code> and files the request itself keeps the model's tool set small and the approval out of its reach; the cost is that the model must explain a state it cannot change, and customers wait. A separate <code>orders_request_refund_approval</code> tool makes the escalation explicit in the transcript and lets the model attach context for the approver; the cost is one more tool to choose wrongly and an approval request the model can file for anything. I would ship the single tool, with a per-order cumulative auto-approve limit I would set from the refund distribution, and I would watch the pending queue.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>The threshold is a number to choose.</strong> The old $500 per call came from nowhere. I would ask for the last quarter's refunds by size, the fraud losses on refunds, and the approvers' daily capacity, then set the per-order cumulative limit so that the pending queue fits that capacity with headroom. A limit that sends most refunds to a person defeats the agent; one that auto-approves the long tail moves the fraud risk to the model. Both directions are reasonable starting points if the number is written down with its evidence and reviewed after a month.</p>
+<p><strong>The constraint conflict</strong> is autonomy against safety: every refund the agent completes alone is a customer served in one turn, and every one above the line is money a person did not look at.</p>
+<p><strong>The failure mode of this design.</strong> A cumulative per-order cap blocks a legitimate second refund on the same order (a second damaged item) and sends it to the queue even when it is small. If the queue backs up, the agent tells more customers "pending", and the support load moves from chat to email. The mitigation is a queue-age alert and a written rule for who raises the limit, not a prompt change.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Your executor checks ownership, balance, cumulative cap and idempotency, and the handler is now four times the size of the refund logic. Which check would you drop for launch, and what risk do you accept in writing?</em></li>
+<li><em>What would you need to see in the pending queue after a month to raise the limit, or to remove auto-approval entirely?</em></li>
+<li><em>The fraud team wants every refund to need approval; the support lead wants none to. How do you decide without deciding by rank?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *The model tells a customer "I've requested manager approval" when the tool returned an ownership error. What changes, in the result format or the prompt?*
+- *A second channel, email support, wants to call the same tool from a different agent. What in this design assumes chat?*
+- *How do you test the cumulative cap without real payments?*
+
+## Common mistakes
+
+- Rewriting the description and leaving the handler unchanged.
+- Raising or lowering the $500 without asking where it came from.
+- Keeping `customer` as an argument and checking it, which still trusts the model for identity.
+- An idempotency key from `tool_use_id`, which is new on every proposal, including a retry.

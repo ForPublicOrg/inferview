@@ -1,0 +1,109 @@
+---
+id: trn-018
+title: Review a parallel layout for a 140B dense run
+subtitle: a one-page proposal that a busy reviewer could approve
+track: training
+module: distributed
+type: critique
+difficulty: hard
+seniority: [staff]
+minutes: 30
+core: false
+tags: [parallelism, tensor-parallelism, pipeline-parallelism, zero, design-review]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "TP kept under the GPUs per node, TP at most 8; significant drops from TP 8 to TP 16; PP across nodes lost 14% from one node to two against around 43% for TP; PP with ZeRO-3 not often done because it needs a much larger global batch to amortise communication; bubble (p - 1)/m; 4 to 60 million tokens per batch; full recomputation adds up to 30-40% compute; sequence parallelism lowers activation size to b x s x h / tp. Checked 2026-10-28."
+  - title: Meta, The Llama 3 Herd of Models (arXiv 2407.21783), section 3.3.2 and table 4
+    url: https://arxiv.org/html/2407.21783
+    note: "405B pretraining at 8,192 GPUs with TP 8, CP 1, PP 16, DP 64, 16M tokens per batch, 430 TFLOPs per GPU, 43% BF16 MFU; parallelism order [TP, CP, PP, DP] chosen for network communication. Checked 2026-10-28."
+  - title: Austin et al., How to Scale Your Model, GPUs chapter (JAX scaling book)
+    url: https://jax-ml.github.io/scaling-book/gpus/
+    note: "a GPU node is typically 8 GPUs, up to 72 for GB200; H100 NVLink 450 GB/s per direction per GPU and InfiniBand 50 GB/s per GPU. Checked 2026-10-28."
+  - title: Korthikanti et al., Reducing Activation Recomputation in Large Transformer Models (arXiv 2205.05198)
+    url: https://ar5iv.labs.arxiv.org/html/2205.05198
+    note: "sequence parallelism replaces each tensor-parallel all-reduce with a reduce-scatter and an all-gather; selective recomputation reaches 54.2% MFU on a 530B model against 42.1% with full recomputation, the paper reports. Checked 2026-10-28."
+checklist:
+  - Finds that rank order [dp, pp, tp] makes data parallelism innermost, so each tensor-parallel group of 16 spans 16 nodes rather than 2
+  - Finds that TP 16 cannot fit an 8-GPU node in any order, and cites the cost of tensor-parallel collectives on InfiniBand
+  - Rejects the claim that a layer does not fit at TP 8, computing about 0.36 GB of BF16 weights per layer per GPU
+  - Computes the bubble at p = 8 and m = 8 as 7/8 of useful time, nearly half the step
+  - Connects the bubble to the 524,288-token batch, which is below the playbook's 4 to 60 million range and leaves 512 tokens per GPU per step
+  - Flags PP with ZeRO-3 as a rare combination that re-gathers parameters for every micro-batch or gives up the memory saving
+  - Rejects "sequence parallelism adds collectives", since it replaces each all-reduce with a reduce-scatter and an all-gather of the same total volume
+  - Flags full recomputation as up to 30 to 40% extra compute bought with memory the layout does not need
+  - Flags the consolidated rank-0 checkpoint, about 2.24 TB of state through one process, and asks for a sharded format that reshards on load
+  - Rejects the 45% MFU expectation as borrowed from Llama 3's TP 8 layout at a 16M-token batch
+  - Judges TP 16 acceptable if the NVLink domain spans at least 16 GPUs, as in larger-domain systems
+  - Proposes a layout with numbers, such as TP 8, PP 8, ZeRO-1 over DP 16, sequence parallelism, selective recomputation and a batch of at least 4M tokens, and states its bubble
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"This layout proposal goes to the cluster committee on Friday. Two people have approved it. Review it."
+</Callout>
+
+> **Run D-140: parallel layout**
+>
+> **Model.** Dense decoder, 140B parameters, 96 layers, hidden 12,288, sequence length 8,192.
+>
+> **Cluster.** 128 nodes of 8 H100 80GB, NVLink inside each node, 8 x 400 Gbps InfiniBand per node.
+>
+> **Layout.** TP 16, PP 8, DP 8 with ZeRO-3, 1,024 GPUs. Rank order `[dp, pp, tp]`, so gradient reductions stay on NVLink. TP 16 is required: one layer does not fit at TP 8.
+>
+> **Memory.** ZeRO-3 shards all model state across the 1,024 GPUs: 140B x 16 bytes / 1,024 = 2.2 GB per GPU, leaving most of the 80 GB for activations.
+>
+> **Schedule.** 1F1B, 8 micro-batches of one sequence per data-parallel rank per step: 64 sequences, 524,288 tokens per step.
+>
+> **Activations.** Full recomputation on every layer, for safety. Sequence parallelism off, since it adds collectives.
+>
+> **Checkpointing.** Every 500 steps, consolidated on rank 0 into one file, so restarts can change the layout freely.
+>
+> **Expected MFU.** 45%, in line with Llama 3's 43% on 8,192 GPUs.
+
+List every problem you would raise, rank them, and say what you would send back. Then open the checklist.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which global ranks form rank 0's tensor-parallel group, and which nodes they are on.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask how the 524,288-token batch was chosen, and whether research has a convergence reason for it.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask how long the current consolidated checkpoint of a smaller run takes to write and to load.</p></details>
+
+## Answer
+
+**1. Placement, the flaw both approvers missed.** The proposal puts data parallelism innermost to keep gradient reductions on NVLink. With `[dp, pp, tp]`, consecutive ranks differ in their DP index, so ranks 0 to 7 on node 0 are eight DP replicas, and rank 0's tensor-parallel group is ranks 0, 64, 128 and so on to 960: sixteen GPUs on sixteen nodes. Tensor parallelism puts collectives in every layer, forward and backward; data parallelism has one gradient reduction per step, which overlaps with the backward pass. The order is backwards: Llama 3 uses `[TP, CP, PP, DP]` so the most frequent collectives get the fastest links.
+
+**2. TP 16 on 8-GPU nodes.** Even with the order fixed, a group of 16 spans two nodes, and every tensor-parallel all-reduce has an InfiniBand hop: 50 GB/s against 450 GB/s on NVLink in the scaling book's H100 figures. The playbook measured significant drops from TP 8 to TP 16. The justification, that a layer does not fit at TP 8, is wrong: 140B over 96 layers is about 1.46B parameters per layer, 182M per GPU at TP 8, 0.36 GB in BF16.
+
+**3. The bubble and the batch.** With p = 8 and m = 8, the bubble is (p - 1)/m = 7/8 of the useful time, 7/15 = 47% of the step. The cause is the 524,288-token batch: 64 sequences over 8 data-parallel ranks leaves 8 micro-batches each, and 512 tokens per GPU per step. That batch is far below the playbook's 4 to 60 million tokens for recent pretraining runs, so unless research has a convergence reason for it, it is an accident of the layout.
+
+**4. PP with ZeRO-3.** ZeRO-3 gathers each layer's parameters before using them. With 8 micro-batches per stage, either the gathers run for every micro-batch, multiplying the all-gather traffic by 8, or the parameters stay gathered across micro-batches and the memory saving is gone. The playbook calls the combination rare for this reason. Nothing in this proposal needs it: TP 8 and PP 8 split the model 64 ways, 2.19B parameters per GPU, and ZeRO-1 over 16 data-parallel ranks gives 4 x 2.19B = 8.75 GB of weights and gradients plus 12 x 2.19B / 16 = 1.64 GB of optimizer state, about 10.4 GB.
+
+**5. Recomputation and sequence parallelism.** Sequence parallelism does not add traffic: it replaces each all-reduce with a reduce-scatter and an all-gather that together move the same bytes, and it shards the activations in the norm and dropout regions. Full recomputation costs up to 30 to 40% more compute, and with about 10 GB of model state per GPU this run has memory for selective recomputation. Korthikanti et al. report 54.2% MFU with selective recomputation against 42.1% with full recomputation on a 530B model.
+
+**6. Checkpointing.** Full state is 140B x 16 bytes = 2.24 TB. Consolidating it on rank 0 sends all of it through one process and one NIC, every 500 steps, and loading it means one process reading 2.24 TB before anyone can start. A sharded checkpoint that stores logical tensors gives the same freedom to change layout, because it can reshard on load.
+
+**7. The MFU forecast.** Llama 3's 43% came from TP 8, PP 16 and a 16M-token batch. Borrowing it for a layout with cross-node tensor parallelism and a 47% bubble is a forecast nobody can defend in the committee.
+
+**Acceptable if.** TP 16 is acceptable if the NVLink domain spans at least 16 GPUs; the scaling book notes nodes of up to 72 GPUs on GB200 systems, and the proposal's cluster is not one. PP 8 across nodes is acceptable as proposed: the playbook measured much smaller cross-node losses for pipeline than for tensor parallelism. Full recomputation is acceptable if a memory snapshot at 8,192 tokens shows selective recomputation does not fit, which the arithmetic says it will.
+
+**What to send back.** TP 8 inside the node, PP 8, DP 16 with ZeRO-1, rank order `[tp, pp, dp]`, sequence parallelism on, selective recomputation, sharded checkpoints, and a batch of at least 4M tokens unless research objects in writing. At 4,194,304 tokens that is 512 sequences, 32 micro-batches per data-parallel rank, a bubble of 7/32 of useful time, and 7/64 if the engine interleaves two stages per device.
+
+**How the counter-proposal fails.** If research holds the batch at 524,288 tokens for convergence, DP 16 leaves 4 micro-batches per rank and a bubble of 7/4, worse than the original. The fallback then is fewer pipeline stages and more data parallelism, PP 4 with DP 32, which doubles parameters per GPU to about 19 GB of state and still leaves a large bubble at that batch. A small batch on 1,024 GPUs has no good layout; the committee should hear that as a choice between the batch and the cluster size.
+
+## Follow-ups
+
+- *Research insists on the 524,288-token batch for the first 50B tokens. Do you run those tokens on fewer GPUs, accept the bubble, or ramp the batch, and what do you put in the committee note?*
+- *One approver argues DP innermost was deliberate, because gradient all-reduce at this size dominates. What number would settle it, and what would make you agree?*
+- *The committee approves your layout and measured MFU is 33%. What would you need to see to go back to the cluster for more GPUs rather than to the engine team for more overlap?*
+
+## Common mistakes
+
+- Accepting the 2.2 GB memory arithmetic because it is correct, without asking whether the sharding is needed.
+- Fixing TP 16 and missing the rank order, which is the larger of the two placement errors.
+- Treating the bubble as a schedule problem rather than a consequence of the batch size.
+- Believing sequence parallelism adds communication volume.

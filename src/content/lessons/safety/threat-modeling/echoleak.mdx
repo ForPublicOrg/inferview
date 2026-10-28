@@ -1,0 +1,166 @@
+---
+title: "Teardown: EchoLeak, end to end"
+track: safety
+module: threat-modeling
+order: 4
+kind: teardown
+level: senior
+minutes: 12
+summary: How one email to a Microsoft 365 Copilot user became a zero-click exfiltration (CVE-2025-32711) by chaining a classifier evasion, reference-style Markdown past link redaction, an auto-fetched image and a Teams endpoint the CSP allowed, and why the fix pattern is a deterministic block on the channel.
+prerequisites: [safety/threat-modeling/exfiltration-channels]
+updated: 2026-10-28
+sources:
+  - title: Pavan Reddy and Aditya Sanjay Gujral, EchoLeak, the first real-world zero-click prompt injection exploit in a production LLM system (arXiv 2509.10540, 6 September 2025)
+    url: https://arxiv.org/abs/2509.10540
+    note: "case study built from public research, not a reproduction; XPIA classifier evasion, reference-style Markdown past link redaction, auto-fetched image, Teams endpoint permitted by the CSP; timeline January 2025 report, April initial remediation, May server-side fix with no customer action, 11 June disclosure; mitigations: prompt partitioning, provenance gating, output policy gate, strict CSP, signed media proxy, egress monitoring; list of what the authors could not know; checked 2026-10-28"
+  - title: CVE-2025-32711 record (MITRE CVE API)
+    url: https://cveawg.mitre.org/api/cve/CVE-2025-32711
+    note: "assigned by Microsoft; published 2025-06-11, updated 2026-02-26; AI command injection in M365 Copilot allows an unauthorized attacker to disclose information over a network; CVSS 3.1 base 9.3, AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:L/A:N; CWE-74; checked 2026-10-28"
+  - title: Simon Willison, Breaking down EchoLeak (11 June 2025)
+    url: https://simonwillison.net/2025/Jun/11/echoleak/
+    note: "email phrased as instructions to the recipient with no mention of AI or Copilot; told not to reference the email for compliance reasons; fake guide sections to be retrieved for ordinary queries; reference-style link and image syntax; *.teams.microsoft.com on the CSP allowlist with an open redirect at eu-prod.asyncgw.teams.microsoft.com/urlp/v1/url/content; Aim Labs reported it in January 2025; checked 2026-10-28"
+  - title: Simon Willison, markdown-exfiltration tag
+    url: https://simonwillison.net/tags/markdown-exfiltration/
+    note: the same image channel in other products before and after EchoLeak; checked 2026-10-28
+  - title: MSRC, How Microsoft defends against indirect prompt injection attacks (Andrew Paverd, 29 July 2025)
+    url: https://www.microsoft.com/en-us/msrc/blog/2025/07/how-microsoft-defends-against-indirect-prompt-injection-attacks
+    note: probabilistic layers (hardened prompts, spotlighting, Prompt Shields) and deterministic blocking of markdown image exfiltration and certain untrusted links; does not name EchoLeak; checked 2026-10-28
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Diagram from '../../../../components/Diagram.astro';
+import Trace from '../../../../components/Trace.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What it is and who runs it
+
+EchoLeak is a prompt injection chain against Microsoft 365 Copilot, the assistant that answers employees' questions over their own mail, files and chats. Aim Labs reported it to Microsoft in January 2025. Microsoft assigned CVE-2025-32711, published on 11 June 2025 with a CVSS 3.1 base score of 9.3 and the description "AI command injection in M365 Copilot allows an unauthorized attacker to disclose information over a network". The vector string reads as the attack does: network reachable, low complexity, no privileges, no user interaction, scope changed, high confidentiality impact.
+
+The attacker needs to be able to send the victim an email and nothing else. The victim does not open it. Some time later they ask Copilot an ordinary work question; Copilot retrieves the email as context, follows its instructions, and writes an answer containing an image whose URL carries the most sensitive data in its context. The client fetches the image, and the data arrives in the attacker's server log.
+
+This teardown is built from the CVE record, the arXiv case study by Reddy and Gujral, and Simon Willison's breakdown of Aim Labs' disclosure. The case study is reconstructed from public research; its authors did not reproduce the attack against Microsoft's production system.
+
+## The system
+
+<Diagram
+  title="The EchoLeak chain through Microsoft 365 Copilot, from public sources"
+  nodes={[
+    { id: 'email', label: 'Attacker email', note: 'instructions phrased to the recipient' },
+    { id: 'xpia', label: 'Classifier evasion', note: 'XPIA classifier did not flag it' },
+    { id: 'mail', label: "Victim's mailbox and files" },
+    { id: 'ask', label: "Victim's question" },
+    { id: 'rag', label: 'Retrieval into Copilot context' },
+    { id: 'llm', label: 'Copilot model' },
+    { id: 'md', label: 'Reference-style Markdown', note: 'redaction covered inline links only' },
+    { id: 'img', label: 'Auto-fetched image', note: 'client renders without a click' },
+    { id: 'csp', label: 'CSP img-src allowlist' },
+    { id: 'proxy', label: 'Allowed proxy', note: 'Teams URL endpoint' },
+    { id: 'srv', label: 'Attacker server', note: 'logs the request' },
+  ]}
+  edges={[
+    { from: 'email', to: 'xpia', label: 'inbound' },
+    { from: 'xpia', to: 'mail', label: 'delivered' },
+    { from: 'mail', to: 'rag' },
+    { from: 'ask', to: 'rag', label: 'query' },
+    { from: 'rag', to: 'llm', label: 'context' },
+    { from: 'llm', to: 'md', label: 'answer' },
+    { from: 'md', to: 'img', label: 'not redacted' },
+    { from: 'img', to: 'csp', label: 'GET' },
+    { from: 'csp', to: 'proxy', label: 'allowed host' },
+    { from: 'proxy', to: 'srv', label: 'URL with data' },
+  ]}
+  rows={[['email'], ['xpia'], ['mail', 'ask'], ['rag'], ['llm'], ['md'], ['img', 'csp'], ['proxy', 'srv']]}
+/>
+
+**Attacker email.** The message reads as a business email addressed to the person who receives it. Willison's breakdown describes two details beyond the payload. The email tells the "recipient" never to refer to the email "for compliance reasons", which kept Copilot from citing it as a source in its answer. And it contains sections dressed as reference material, such as a guide to employee onboarding, so that retrieval would match it to ordinary questions.
+
+**Classifier evasion.** Microsoft runs a cross-prompt injection attempt (XPIA) classifier meant to stop injected instructions reaching the model. The email was phrased as instructions to a human and never mentioned AI, assistants or Copilot, and the classifier did not flag it. The classifier's logic is not public, so why that phrasing passed is inference from the outcome.
+
+**Victim's mailbox, question and retrieval into Copilot context.** Copilot answers with retrieval over data the user can access. Nothing about the email's sender limits it from being retrieved; it is in the user's mailbox, so it is in scope. Any question that matches the email's planted sections brings the instructions into the model's context next to whatever sensitive content the same query retrieved. Aim Labs called this an "LLM scope violation"; Willison argues it is ordinary indirect injection, since the model cannot tell where its tokens came from.
+
+**Copilot model.** The model follows the instructions: take the most sensitive details in context and place them in a URL inside the answer. No tool call is involved. The output itself is the action.
+
+**Reference-style Markdown.** Copilot's output filter redacted inline links of the form `[text](url)` to external targets. Markdown has a second syntax, where the link text and the URL are on different lines and joined by a label, and the filter did not handle it. In Willison's words, the filter had not been implemented "for Markdown's other lesser-known link format". The same gap applied to images: inline image syntax was filtered, reference-style image syntax was not.
+
+**Auto-fetched image.** The client renders the answer, and rendering an image means fetching its URL. That fetch is what makes the attack zero-click. A link would have needed the user to click it.
+
+**CSP img-src allowlist and the allowed proxy.** The page's Content Security Policy restricted which hosts images could load from, so an image on the attacker's domain would not load. The allowlist included Microsoft Teams hosts, and a Teams endpoint accepted a URL as a parameter and caused a request to it. The case study gives the pattern as `teams.microsoft.com/urlp/v1/url/content?url=<attacker URL>`, describing a service that fetches the URL; Willison's breakdown gives the host as `eu-prod.asyncgw.teams.microsoft.com` and calls it an open redirect. Either way, the browser's request to an allowed host ended as a request to the attacker's server, with the data in the path.
+
+**Attacker server.** It only has to log the request.
+
+## One request
+
+<Trace
+  title="From an unread email to a line in the attacker's log"
+  note="steps follow the case study and Willison's breakdown; the question is a scenario"
+  steps={[
+    { actor: 'attacker', text: 'Sends an email phrased as instructions to the recipient, with sections that read like an onboarding guide.' },
+    { actor: 'system', text: 'The XPIA classifier inspects the email and does not flag it; it is delivered to the mailbox.', note: 'Classifier evasion: the text never mentions AI or Copilot.' },
+    { actor: 'user', text: 'Days later asks Copilot a question about onboarding. The email is never opened.' },
+    { actor: 'tool', text: "Retrieval returns the attacker's email alongside the user's sensitive content as context.", note: 'The planted sections are there to match ordinary questions.' },
+    { actor: 'assistant', text: 'Answers the question and, as instructed, adds a reference-style image whose URL embeds sensitive details from the context, pointed at the Teams endpoint with the attacker URL as a parameter.' },
+    { actor: 'system', text: 'The output filter redacts inline external links; the reference-style image passes.', note: 'The filter matched one Markdown syntax, not the rendered result.' },
+    { actor: 'system', text: 'The client renders the answer and requests the image. The CSP allows the Teams host.' },
+    { actor: 'system', text: "The Teams endpoint causes a request to the attacker's URL, carrying the data in the path." },
+    { actor: 'attacker', text: 'Reads the data from the server log. The answer cites no source, as the email instructed.' },
+    { actor: 'system', text: 'Fix pattern: block the channel deterministically, so the image never resolves to a host that will forward a model-written URL, whatever the model writes.' },
+  ]}
+/>
+
+## Context strategy
+
+Copilot's value is that one question can draw on everything the user can access, and that is the condition the attack needs. Retrieval ranks by relevance to the question, not by the trustworthiness of the source, so an external sender's email and an internal financial document are equal candidates for the same context window. The attacker does not need to guess the question; they plant text that matches many questions and wait.
+
+The case study's first two mitigations address this layer. Prompt partitioning tags external content as non-authoritative, which lowers a rate. Provenance gating defaults to internal sources and includes external content only on explicit request, which removes [A] from most sessions in Rule of Two terms, at the cost of answers that cannot use external mail unless asked.
+
+## Tools and permission model
+
+The exploit used no tools. Copilot acts with the user's access to Microsoft 365 data, so the private-data leg is the product, and the untrusted-content leg is every inbound email. The way out was not a capability anyone granted; it was the client's rendering of model output, governed by the output filter and the CSP. That is why a capability review of Copilot's tools would have found nothing: the exfiltration path was in the presentation layer.
+
+## Cost and latency
+
+For the attacker, the cost is one email per target and a web server. The CVSS vector records the conditions: no privileges and no user interaction. Neither Microsoft nor the researchers published how long the retrieval-to-exfiltration step takes, how often the email is retrieved for a given volume of questions, or how much data a single answer carried; the case study says only that the leaked content was the most sensitive details in the user's context. The [exfiltration lesson](/learn/safety/threat-modeling/exfiltration-channels) works the channel's width from a scenario.
+
+## Failure modes
+
+Every layer existed and had a gap the next layer did not cover. The classifier lowered a rate and an attacker wrote to its blind spot. Retrieval had no provenance policy, so external text reached the context by design. The output filter matched one syntax rather than the rendered result. The CSP allowed a host by name without asking what that host would fetch on request. None of these is a bug in isolation. The chain is the finding.
+
+Microsoft's MSRC post on indirect injection, published in July 2025, describes the general fix shape without naming EchoLeak: probabilistic layers (hardened system prompts, spotlighting, Prompt Shields) plus deterministic blocks on exfiltration techniques, with Markdown image injection and certain untrusted links as its examples. The case study reports that the server-side fix for EchoLeak was deployed in May 2025 with no customer action, and that the patches "reportedly introduced options" to restrict external communication in some contexts. Its recommended output controls are an output policy gate that strips disallowed links and images, `img-src` and `connect-src` restricted by CSP, and permitted fetches brokered through a signed, time-limited media proxy. Its own comparison table, which the authors present as analysis rather than test results, rates output gates as less effective against image auto-fetch.
+
+The same channel recurs across products in Willison's tag, before and after EchoLeak: Mistral LeChat in October 2024, GitLab Duo in May 2025, an expired allowlisted domain in Salesforce Agentforce in September 2025. The allowlisted-host variant is the one that survives a CSP.
+
+## What is not public
+
+Microsoft has not published its internal detection or fix timeline beyond the advisory; the dates for initial remediation in April and the server-side fix in May come from the case study, not from Microsoft. The XPIA classifier's logic, the redaction rules, and the exact CSP directives before and after the fix are not public, so this teardown says what passed, not why. The exact behaviour of the Teams endpoint is described differently by the two sources (a server-side fetch in the case study, an open redirect in Willison's breakdown), and Microsoft has not said which. The data exfiltrated in the original proof of concept, the share of questions that retrieve a planted email, and whether the case study's account matches the production system in every step are not public; the authors list these limits themselves. The case study cites follow-up analyses reporting no known exploitation in the wild, and no Microsoft statement on that is part of the record used here.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You run an internal assistant over mail and documents, built the same way as Copilot. After EchoLeak, security wants external email excluded from retrieval entirely. Sales says half their questions are about customer emails. You have one sprint before the quarterly security review. What changes?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Block the channel first, because it holds whatever the retrieval policy is: the renderer resolves images only from our own host, the CSP allows only that host, and links to external hosts render as plain text with the host shown. Then make external mail opt-in per question rather than excluded, so sales keeps the use case with an explicit step and the default session has no untrusted input. Both fit in a sprint; a better classifier does not change the risk statement.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The two requests are about different legs. Excluding external mail removes [A] for everyone, at the cost of the sales use case. Blocking the rendering channel removes the way out for everyone, at the cost of inline external images and clickable external links in answers. The channel block is cheaper and holds against injections we have not thought of, so it goes first.</p>
+<p>Concretely: the renderer drops any image that does not resolve to an asset ID served from our domain; the CSP sets <code>img-src</code> and <code>connect-src</code> to our hosts only, and I audit every allowed host for endpoints that fetch or redirect to a URL parameter, because that is the EchoLeak step. Links to external hosts are shown as text the user can copy. The filter runs on the rendered HTML, not on Markdown, so syntax variants do not matter.</p>
+<p>For retrieval, external mail is excluded by default and included when the user asks for it, with the answer marked as using external content. That keeps sales' workflow with one extra step and keeps most sessions free of untrusted input. What I give up: answers that silently combine external and internal sources, and some convenience for sales. The failure mode is that users opt in on every question out of habit, which I would measure; if the opt-in rate is near total, the default is not doing its job and the channel block is carrying the whole risk.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>An auditor finds a Microsoft-hosted domain on your CSP allowlist that serves user content. It is needed for embedded Office previews. Do you remove it and break previews, or keep it with what compensating control?</em></li>
+<li><em>Security still wants external mail excluded entirely. What evidence from the first month of opt-in usage would settle the disagreement without deciding by rank?</em></li>
+<li><em>The assistant gains a tool that drafts and sends replies. Which leg did you just add back, and what does the send path have to show the user?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+This account rests on one academic case study, one detailed secondary write-up and the CVE record. Where they differ, as on the Teams endpoint, this teardown says so rather than choosing. If Microsoft publishes a postmortem, its account replaces these sources on every point it covers.
+
+The lesson generalises the chain into a pattern, and the pattern is stronger than the case: a different product with a different filter and CSP would have different gaps. What carries over is the method of checking each layer for what the next one assumes it covers.
+
+<SelfRate id="lesson:safety/threat-modeling/echoleak" />

@@ -1,0 +1,158 @@
+---
+title: "Chunked prefill, token budgets and fairness"
+track: inference
+module: batching
+order: 3
+kind: lesson
+level: staff
+minutes: 17
+summary: Chunked prefill bounds every engine step with a token budget so a long prompt cannot stall the decodes sharing its step, and the budget is a choice between inter-token latency for running requests and time to first token for new ones that also decides how preemption and tenant fairness behave.
+prerequisites: [inference/batching/continuous-batching, inference/batching/paged-attention]
+updated: 2026-10-28
+sources:
+  - title: "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve (Agrawal et al., arXiv 2403.02310 v3, 2024-06-17)"
+    url: https://arxiv.org/abs/2403.02310
+    note: "Generation stalls under prefill-prioritising schedulers, one lasting several seconds in vLLM (Yi-34B, two A100s); naive hybrid batching raises TBT up to 28.3x over a decode-only batch; linear-layer time flat while weight reads dominate, then linear; prefill throughput saturates near 512 tokens; chunk attention re-reads earlier chunks' KV; tile quantisation, chunk 257 up to 32% slower than 256; chunking overhead at most 25% at chunk 512 and almost negligible at 2048 (Yi-34B); budgets 512 (strict) and 2048 (relaxed); P99 TBT SLOs 0.1 s and 0.5 s for Mistral-7B, 0.2 s and 1 s for Yi-34B; 2.6x capacity for Mistral-7B on one A100 and up to 3.7x for Yi-34B on two over vLLM; 3.5x at a 100 ms SLO with budget 512 and 1.65x at 1 s with budget 2048; Table 4 TTFT and TBT for hybrid batching, chunking and both. Checked 2026-10-28."
+  - title: vLLM docs, Optimization and tuning
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: "V1 enables chunked prefill whenever possible, batches pending decodes before prefills and chunks a prefill that does not fit; smaller max_num_batched_tokens (for example 2048) gives better ITL, larger gives better TTFT, above 8192 recommended for throughput especially for smaller models on large GPUs; setting it to max_model_len is almost the V0 default policy. Checked 2026-10-28."
+  - title: vLLM V1 alpha release blog (2025-01-27)
+    url: https://vllm.ai/blog/2025-01-27-v1-alpha-release
+    note: "With a fixed token budget the V1 scheduler decides how many tokens each request gets per step. Checked 2026-10-28."
+  - title: vllm/engine/arg_utils.py at v0.32.0 (commit 5df63a7)
+    url: https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/engine/arg_utils.py
+    note: "Default max_num_batched_tokens for the OpenAI-compatible server: 16384 on GPUs with at least 160 GiB, 8192 on GPUs with at least 70 GiB that are not A100, 2048 otherwise; offline LLM class 16384, 16384 and 8192; max_num_seqs 1024, 1024 and 256; comment that large budgets reduce A100 throughput (PR 17885)."
+  - title: vllm/config/scheduler.py at v0.32.0 (commit 5df63a7)
+    url: https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/scheduler.py
+    note: "policy fcfs or priority (lower value first, arrival time breaks ties); long_prefill_token_threshold caps a long prompt's tokens per step, 0 by default, not applied when it is the only request; long_prefill_token_threshold_adaptive floors the cap at the budget divided by queued and running requests; scheduler_reserve_full_isl (default True) checks that the full input fits in KV before admission; watermark of free blocks, off by default."
+  - title: vllm/v1/core/sched/scheduler.py and request_queue.py at v0.32.0 (commit 5df63a7)
+    url: https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py
+    note: "FCFS preempts running[-1]; priority preempts the max of (priority, arrival_time); preempted requests return to the front of the FCFS waiting queue; no admission in a step that preempted; the priority queue orders by (priority, arrival_time) with no aging."
+  - title: vllm/v1/metrics/loggers.py at v0.32.0 (commit 5df63a7)
+    url: https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/metrics/loggers.py
+    note: "vllm:request_num_preemptions is a histogram of how many times each request was preempted."
+  - title: vLLM docs, Metrics design
+    url: https://docs.vllm.ai/en/latest/design/metrics.html
+    note: "A preemption during prefill lands in TTFT and the prefill interval; during decode, in inter-token latency. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import InferenceBatchingBudget from '../../../../components/widgets/InferenceBatchingBudget.astro';
+
+## A mixed step runs at the speed of its prefill
+
+Continuous batching lets a new request's prompt join the same forward pass as everyone else's decode token. Every request in a step waits for the step, so a 30,000-token prompt processed in one pass holds up every streaming response on that replica for as long as its prefill takes. Sarathi-Serve calls this a generation stall and attributes it to prefill-prioritising schedulers, which is what Orca and vLLM were in early 2024: admit and prefill new work as soon as memory allows, because larger decode batches afterwards mean more throughput. Its Figure 1 shows a single stall in vLLM lasting several seconds on Yi-34B across two A100s. Measured per step, naive hybrid batching raised time between tokens by up to 28.3 times over a decode-only batch.
+
+This is head-of-line blocking inside one kernel launch, and the fix is the familiar one: bound the size of the unit of work. The interesting part is what bounding it costs, and who pays.
+
+## Why chunking costs little up to a point
+
+A step's cost is not proportional to its token count. Sarathi-Serve's profile of LLaMA2-70B's linear layers shows execution time roughly flat across small token counts, where reading the weights dominates, then growing linearly once the step becomes compute-bound. A decode-only step sits on the flat part: it pays for a full weight read and uses a fraction of the compute. Prefill tokens added to that step use compute the step was already paying for, until the step crosses the knee.
+
+So the scheduler can piggyback a slice of a prompt onto every decode step at little cost to the decodes, as long as the slice keeps the step near the knee. The paper reports prefill throughput saturating around 512 tokens per pass in its setup, so a chunk of a few hundred tokens already runs the prompt efficiently.
+
+Chunking is not free. Each chunk's attention must read the KV of every earlier chunk of the same prompt, so with N chunks the first chunk's KV is read N − 1 times. Kernel launch and other fixed costs repeat per chunk. And GPU matrix multiplies run in tiles: the paper measured a chunk of 257 tokens taking up to 32% longer than one of 256. On Yi-34B the total prefill overhead of chunking was at most 25% at chunk size 512 and almost negligible at 2,048. The long prompt itself always finishes later than it would alone; chunking moves latency from the many to the one.
+
+## Stall-free batching and the token budget
+
+Sarathi-Serve's scheduler builds each step in a fixed order: every running decode first, then the next chunk of any partially processed prompt, then new requests, each prompt chunk sized to whatever budget remains. The budget is the maximum number of tokens in a step, chosen as the largest batch that stays under the time-between-tokens objective in a one-time profile of the deployment. The authors used 512 tokens under strict objectives and 2,048 under relaxed ones (1,536 for LLaMA2-70B relaxed, to limit pipeline bubbles). The objectives were P99 time between tokens of 0.1 s strict and 0.5 s relaxed for Mistral-7B, and 0.2 s and 1 s for Yi-34B.
+
+The paper reports 2.6 times the serving capacity of vLLM for Mistral-7B on one A100 and up to 3.7 times for Yi-34B on two A100s, under those objectives. The trade shows most clearly in its Table 4, for Yi-34B with a budget of 1,024 on the openchat_sharegpt4 trace:
+
+| Scheduler | P50 TTFT | P99 TBT |
+|---|---|---|
+| Hybrid batching only | 0.53 s | 0.68 s |
+| Chunked prefill only | 1.04 s | 0.17 s |
+| Both (Sarathi-Serve) | 0.76 s | 0.14 s |
+
+Chunking alone cut tail time between tokens by a factor of four and doubled median TTFT. Combining it with hybrid batching (decodes riding in the same step) recovered part of the TTFT. The baseline here is the prefill-prioritising vLLM of early 2024, not today's vLLM, which adopted the same approach.
+
+## The knob in vLLM
+
+V1 has one token budget per step, `max_num_batched_tokens`, and the optimization docs state the policy: chunked prefill is on whenever possible, pending decodes are batched first, and a prefill that does not fit in the remaining budget is chunked. Smaller budgets (the docs give 2,048 as an example) improve inter-token latency because fewer prefill tokens slow each decode step; larger budgets improve TTFT; above 8,192 is recommended for throughput, especially for smaller models on large GPUs. Setting the budget to `max_model_len` is almost the V0 policy.
+
+The default depends on the hardware the engine detects. In `arg_utils.py` at v0.32.0, the OpenAI-compatible server uses 16,384 on GPUs with at least 160 GiB, 8,192 on GPUs with at least 70 GiB that are not A100s, and 2,048 otherwise; the offline `LLM` class uses larger values. A comment explains the A100 exception: large budgets reduced its throughput. Two engines on different GPU types therefore run different latency policies unless the budget is pinned in configuration, which it should be for any service with an ITL objective.
+
+Three newer scheduler settings shape the same trade:
+
+- `long_prefill_token_threshold` caps how many tokens one long prompt may take in a step, leaving the rest of the budget for other prompts. It is off by default and not applied when the prompt is the only request. The adaptive variant floors the cap at the budget divided by the number of queued and running requests.
+- `scheduler_reserve_full_isl`, on by default, checks that a new request's entire input fits in the KV cache before admitting it, not only its first chunk. Without it, chunking lets the engine admit prompts it cannot finish, which then preempt each other.
+- `watermark` keeps a fraction of KV blocks free when admitting, trading peak concurrency for fewer preemptions. It is off by default.
+
+<Predict id="inf-chunk-steps" question="Budget 2,048 tokens per step. 128 requests are decoding, one token each, and are scheduled first. A 16,384-token prompt arrives. How many steps until it produces its first token?" answer={9} tolerance={0} unit="steps">
+<p>The decodes take 128 tokens per step, leaving 2,048 − 128 = 1,920 for the prompt. 16,384 / 1,920 = 8.53, so the prompt needs <b>9 steps</b>, and samples its first token at the end of the ninth. If 512 requests were decoding, the prompt would get 1,536 per step and need 11; with a budget of 512 it would get nothing at all.</p>
+</Predict>
+
+## Picking a budget for a mixed workload
+
+The widget uses a stated cost model: a step costs 30 ms up to 512 tokens and grows linearly beyond that. The shape follows Sarathi-Serve's profile; the constants are invented for the widget, so read the relationships, not the milliseconds. It reports the decode gap while a long prompt prefills, the prompt's own prefill time, and the p99 and maximum decode gap over a minute in which long prompts arrive at a steady rate.
+
+<InferenceBatchingBudget />
+
+With 128 decodes and six 16,384-token prompts a minute, no chunking gives a p99 gap of 30 ms and a maximum of 968 ms: each prompt stalls every stream for almost a second, but those steps are 0.3% of all steps, below the 1% that p99 sees. A budget of 2,048 caps the stall at 120 ms but stretches 2.9% of steps, so p99 rises to 120 ms, and the prompt's prefill takes 1,028 ms instead of 968. A budget of 512 holds every step at the 30 ms floor and costs the prompt 1,290 ms. Raise the rate to twenty prompts a minute and no chunking puts p99 at 968 ms.
+
+The lesson in those numbers is that chunking converts rare large stalls into frequent small ones, and whether that helps depends on the percentile in the objective and the arrival rate of long prompts. A p99 objective can look healthy over a replica with multi-second stalls; a p99.9 or maximum objective cannot. Set the budget from the full distribution of decode gaps under production's mix of decode count and prompt lengths, not from the median prompt. Sarathi-Serve's procedure is the practical version: profile step time against token count at the production decode count, then take the largest budget whose step time leaves headroom under the objective.
+
+```python
+# Scenario profile: measured step time (ms) at each token count, at production's decode count.
+profile = {256: 28, 512: 31, 1024: 52, 2048: 97, 4096: 190, 8192: 380}
+
+def pick_budget(profile, itl_slo_ms, headroom=0.8):
+    """Largest profiled token count whose step stays under the objective with headroom."""
+    ok = [n for n, ms in sorted(profile.items()) if ms <= itl_slo_ms * headroom]
+    if not ok:
+        raise ValueError("no budget meets the objective: cap concurrent decodes or add capacity")
+    return ok[-1]
+
+print(pick_budget(profile, itl_slo_ms=100))   # 1024: a 2048-token step at 97 ms leaves no headroom
+print(pick_budget(profile, itl_slo_ms=150))   # 2048
+```
+
+The profiled sizes are powers of two on purpose, given the tile effect above.
+
+## Preemption order and fairness
+
+The budget decides how tokens are shared within a step; preemption and admission decide who is in the step at all. In v0.32.0 the scheduler supports two policies. Under first-come-first-served, the victim when blocks run out is the last request in the running list, the most recently admitted, and it goes back to the front of the waiting queue so it is readmitted first. Under the priority policy, the victim is the running request with the largest (priority, arrival time), and the waiting queue is a heap on the same key. No new request is admitted in a step that preempted.
+
+Two consequences matter in a shared deployment. FCFS is fair per request, not per tenant: a tenant that sends a burst of long prompts holds a proportional share of running slots, KV blocks and prefill budget for as long as the burst lasts, and the engine has no notion of who sent what. The priority policy has no aging, so a low-priority request under sustained high-priority load waits indefinitely. Per-tenant fairness has to come from outside the engine: caps on in-flight prompt tokens per tenant at the gateway, priority values assigned by the gateway (including raising a request's priority after it has waited too long), or separate pools.
+
+Under FCFS the newest request usually has the fewest computed tokens, so evicting it wastes the least work, though a long prompt admitted last breaks that. Under the priority policy the victim is chosen by priority alone, so it can be a low-priority request with a long context, which pays for recomputing all of it when readmitted. The metrics design doc assigns preemption time during decode to inter-token latency and during prefill to TTFT, which makes the cost visible per request in `vllm:request_num_preemptions`.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Scenario: one vLLM pool on H100s serves chat, with a p99 inter-token latency objective of 100 ms, and a document-analysis tenant sending 30,000-token prompts. Last week someone raised `max_num_batched_tokens` from 8,192 to 32,768 to cut document TTFT, and chat breached its objective. You have this week and no new GPUs. What do you ship?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Roll the budget back to a value profiled against the chat objective, and stop asking one budget to serve both workloads. Then isolate: either a cap on long-prompt tokens per step and per tenant inside the shared pool, or a separate set of replicas for document traffic with a large budget. Document TTFT gets worse than last week's peak; chat gets its objective back.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The breach is the expected effect of the change: a larger budget lets each document prompt put more prefill tokens into the steps chat decodes share. The first move is the rollback, because it is a configuration change with a known prior state.</p>
+<p>Then the real decision: one pool or two. In one pool, I would profile step time at chat's decode count, set the budget at the largest value that leaves headroom under 100 ms, and set <code>long_prefill_token_threshold</code> so no single document takes the whole budget. Document TTFT is then bounded by how many tokens per step chat leaves it, and it rises with chat load. Pooling keeps utilisation high and costs document latency.</p>
+<p>Two pools, carved out of the existing GPUs, give each workload its own budget: small for chat, large for documents. The cost is stranded capacity, because each pool is sized for its own peak, and a routing layer that must know which tenant goes where. If document traffic is a large, steady share, two pools win; if it is bursty and small, a shared pool with caps wins. Prefill-decode disaggregation is the long-term version of the split and is out of scope for one week.</p>
+<p>In either case, the gateway caps in-flight prompt tokens per tenant, because nothing in vLLM's FCFS or priority policies stops one tenant's burst from filling the KV cache. I would write down the chat objective, the document TTFT the tenant should now expect, and the rollback trigger before changing anything else.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The document tenant pays more than chat and its account owner says their TTFT matters more. How do you decide without deciding by rank?</em></li>
+<li><em>Your profile says 2,048 meets the objective, but production p99 still breaches at that budget. What did the profile miss?</em> Decode count and context length at peak, preemption recomputation, and the arrival rate of long prompts that sets how many steps are stretched.</li>
+<li><em>What would you need to see in production to merge the two pools again?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The widget's cost model has a floor and a slope and nothing else. Real decode steps also grow with the total context of the running requests, chunked prefill pays the overheads above, and step time varies with the attention backend and CUDA graph coverage. Use it to reason about direction and percentiles; get the numbers from a profile.
+
+Sarathi-Serve's multiples compare against the vLLM of early 2024, which prioritised prefills. Current vLLM chunks by default, so those multiples describe the change already made, not headroom available today. The remaining choice is the budget, the caps and the isolation.
+
+Chunking manages interference; it does not remove it. Every step that carries prefill is slower than a decode-only step. Prefill-decode disaggregation runs prompts on separate replicas and ships the KV cache to decode replicas, which removes interference at the cost of a KV transfer per request and prefill replicas whose memory holds no long-lived cache, as Sarathi-Serve's discussion notes. At high long-prompt rates or with strict maximum-latency objectives, that split can beat any budget.
+
+Defaults in this lesson are vLLM v0.32.0's, and several (`long_prefill_token_threshold_adaptive`, `scheduler_reserve_full_isl`, the watermark) are recent additions whose names and defaults may change. Pin the budget and these settings in configuration rather than inheriting them from the hardware the engine happens to start on.
+
+<SelfRate id="lesson:inference/batching/chunked-prefill" />

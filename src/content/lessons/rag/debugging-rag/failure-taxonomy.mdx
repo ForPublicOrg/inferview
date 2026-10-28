@@ -1,0 +1,183 @@
+---
+title: "Locating a RAG failure: chunk, query, rank, context or generation"
+track: rag
+module: debugging-rag
+order: 1
+kind: lesson
+level: senior
+minutes: 14
+summary: Every wrong RAG answer has a first stage where the evidence went missing, and finding it is a bisection over a logged trace of index, query, ranking, assembled context and answer.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Barnett, Kurniawan, Thudumu, Brannelly and Abdelrazek, Seven Failure Points When Engineering a Retrieval Augmented Generation System (arXiv 2401.05856, 2024-01-11)
+    url: https://arxiv.org/abs/2401.05856
+    note: "FP1 Missing Content to FP7 Incomplete; three case studies (Cognitive Reviewer, AI Tutor, BioASQ); BioASQ run used 4,017 open-access documents and 1,000 expert-written questions (the introduction says 15,000 documents, which conflicts with Table 1); authors inspected 40 issues by hand plus every item OpenEvals flagged and found the automated evaluation more pessimistic than a human rater; 8K context beat 4K in the AI Tutor; adding file name and chunk number as metadata helped; validation is only feasible during operation. HTML version checked 2026-10-28"
+  - title: Ragas documentation, Faithfulness (page dated 2025-12-09)
+    url: https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/faithfulness/
+    note: "supported claims divided by total claims, 0 to 1; worked example where one of two claims is supported scores 0.5; FaithfulnesswithHHEM swaps the LLM verifier for Vectara's HHEM-2.1-Open T5 classifier; the legacy metrics API 'will be deprecated in version 0.4 and removed in version 1.0'; checked 2026-10-28"
+  - title: Cohere documentation, Models overview
+    url: https://docs.cohere.com/docs/models
+    note: "rerank context length 32k for rerank-v5.0 and v4.0 (pro and fast), 4k for rerank-v3.5, rerank-english-v3.0 and rerank-multilingual-v3.0; query and document tokens count together, and an over-limit document is chunked and processed in multiple inferences; checked 2026-10-28"
+  - title: Chroma Research, Context Rot (2025-07-14)
+    url: https://www.trychroma.com/research/context-rot
+    note: "18 models tested; a single distractor reduces performance relative to the needle-only baseline and four distractors compound the drop; checked 2026-10-28"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import CodeRunner from '../../../../components/CodeRunner.astro';
+
+export const triageCode = `def triage(gold_ids, index_ids, retrieved_ids, context_ids, answer_correct):
+    """Name the first pipeline stage that lost the gold evidence for one eval question."""
+    gold = set(gold_ids)
+    if not gold & set(index_ids):
+        return "missing from index"
+    if not gold & set(retrieved_ids):
+        return "missed by retrieval"
+    if not gold & set(context_ids):
+        return "not in context"
+    if not answer_correct:
+        return "not extracted"
+    return "ok"
+`;
+
+export const triageTests = `assert triage(["c9"], ["c1", "c2"], [], [], False) == "missing from index", "the gold chunk was never indexed"
+assert triage(["c17"], ["c1", "c17"], ["c1", "c30"], ["c1"], False) == "missed by retrieval", "indexed but not retrieved"
+assert triage(["c17"], ["c1", "c17", "c30"], ["c30", "c17", "c1"], ["c30"], False) == "not in context", "retrieved, then cut before the prompt"
+assert triage(["c17"], ["c17"], ["c17"], ["c17"], False) == "not extracted", "the model had the evidence and still got it wrong"
+assert triage(["c17"], ["c17"], ["c17"], ["c17"], True) == "ok", "every stage passed"
+`;
+
+Attempt [Right documents, wrong answers](/problems/rag-014) before reading this lesson; it is a trace from a pipeline with two real defects, and the lesson is the procedure for ranking them.
+
+## The first stage that lost the evidence
+
+A RAG answer passes through at least five transformations: documents become chunks, the user's turn becomes a query, the query becomes a ranked list, the ranked list becomes a prompt, and the prompt becomes an answer. A wrong answer is evidence that some stage dropped or corrupted the facts the answer needed. The useful question is which stage did it first, because every later stage was working from bad input and any fix applied there treats a symptom.
+
+That is a bisection over the pipeline, the same move as `git bisect` over commits or walking a distributed trace hop by hop. The difference is that RAG stages are not independent. A strong generator can answer correctly from its own weights after retrieval missed, which hides a retrieval defect until a question arrives about a document the model never saw in training. A reranker can recover a chunk that first-stage retrieval ranked at 40, or bury one ranked at 2. So the bisection works on the evidence, the gold chunk ids for the question, and asks at each stage whether they are still present, rather than asking whether the final answer looks right.
+
+## The taxonomy
+
+Barnett et al. (2024) named seven failure points from three systems: a research assistant over uploaded papers, a course tutor over video transcripts, HTML and PDF, and a biomedical question-answering run over 4,017 open-access documents with 1,000 expert-written questions from BioASQ. The names are the closest thing the field has to a shared vocabulary, so use them in design reviews and incident notes.
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Failure point</th><th>What happened</th><th>Stage</th></tr></thead>
+<tbody>
+<tr><td>FP1 Missing Content</td><td>The answer is not in the corpus at all</td><td>Corpus</td></tr>
+<tr><td>FP2 Missed the Top Ranked Documents</td><td>The answer exists but did not rank high enough to be returned</td><td>Retrieval</td></tr>
+<tr><td>FP3 Not in Context</td><td>Retrieved, but dropped when the context was assembled</td><td>Context assembly</td></tr>
+<tr><td>FP4 Not Extracted</td><td>In the prompt, but the model did not pull it out, often because of noise or contradictions</td><td>Generation</td></tr>
+<tr><td>FP5 Wrong Format</td><td>Ignored a requested format such as a table or list</td><td>Generation</td></tr>
+<tr><td>FP6 Incorrect Specificity</td><td>Too general or too specific for what was asked</td><td>Generation</td></tr>
+<tr><td>FP7 Incomplete</td><td>Correct but missing information that was available</td><td>Generation</td></tr>
+</tbody>
+</table>
+</div>
+
+Two stages from this lesson's title are not rows in the table. Chunking failures land in FP1 or FP2 depending on what went wrong: a parser that dropped a table makes the answer missing from the index even though it was in the source, and a chunk boundary that separated a value from its header makes the right chunk unretrievable for any query that names the header. Check the index, not the source documents, before calling something Missing Content. Query failures land in FP2: in a multi-turn assistant the query sent to retrieval is often a rewrite of the user's turn, and a rewrite that dropped the entity name produces a clean, confident miss. Log the query as sent, not the user's text.
+
+Read the paper's evidence base for what it is. The authors inspected 40 issues by hand plus every item their automated evaluator flagged, and they report that the automated evaluation was more pessimistic than a human rater. The introduction gives the BioASQ corpus as 15,000 documents while the case-study table gives 4,017, and the paper does not reconcile them. Its lessons-learned table is experience from three systems, including that an 8K context beat 4K in the tutor and that adding the file name and chunk number to each chunk helped. Its central claim is the operational one: robustness is found at runtime, because the inputs that break a RAG system are the ones nobody wrote a test for.
+
+## What the trace has to hold
+
+Bisection needs a recorded value at every stage boundary. Per request, log:
+
+- the index version or snapshot id, so "was the gold chunk indexed" has an answer for the state the request saw rather than today's index;
+- the query as sent to each retriever, after any rewriting;
+- the ranked ids and scores from each first-stage retriever and from fusion;
+- the ids after reranking, deduplication and any score threshold;
+- the ids actually rendered into the prompt, with their positions and token counts, after the token budget cut;
+- the answer, its citations, and the model and prompt version.
+
+The gap between "retrieved" and "in context" is where most of the hidden defects sit. Rerankers with an input token limit, deduplication keyed on the wrong field, a token budget that truncates the last chunk, and prompt templates that sort chunks by document date all live there. A dashboard that reports recall@k on the retriever's output says nothing about them. Recall measured on the rendered prompt does.
+
+## The triage function
+
+Given gold ids for each eval question and the trace above, the first failing stage is a four-line function. It labels the first upstream loss even when the answer was correct: a correct answer with no gold chunk in the prompt came from the model's weights, and that path fails on private documents.
+
+<CodeRunner id="lesson-rag-triage" title="Run the triage function against the five cases" starter={triageCode} tests={triageTests} gradable={false} />
+
+Run it over every failed question and count the labels, and the counts are a ranked bug list. The "not extracted" bucket then splits further by hand into FP4 to FP7, which is the part a function cannot do. With the trace in place, a reviewer has about three minutes per item to classify twenty failures in an hour (60 / 20 = 3), which is enough to read the question, the gold chunk, the rendered context ids and the answer. Without the trace it is not: reconstructing what the prompt held means rerunning the request, and the index may have changed since. The [RAG pipeline lab](/labs/rag-pipeline) builds a pipeline whose stages log these boundaries and ends with a broken stage that the trace has to name.
+
+<Predict id="rag-generator-ceiling" question="What is the highest accuracy a generator swap alone can reach on this set?" answer={72} tolerance={0} unit="percent">
+<Fragment slot="prompt">
+<p>An eval set of 100 questions over private documents the model has never seen. The pipeline answers 60 correctly. Triage of the 40 failures: 6 missing from index, 14 missed by retrieval, 8 not in context, 12 not extracted. The team proposes swapping to a larger generator and changing nothing else.</p>
+</Fragment>
+<p>A generator can only fix questions whose evidence reached it: the 12 labelled "not extracted". The other 28 never had the gold chunk in the prompt, and on private documents the model cannot know the answer from training. The ceiling is (60 + 12) / 100 = <b>72%</b>, and only if the larger model fixes every extraction failure without breaking any of the 60. The same arithmetic says retrieval and context-assembly fixes are worth up to 14 + 8 = 22 points, and ingestion fixes up to 6.</p>
+</Predict>
+
+## Faithfulness tells you which side of the prompt went wrong
+
+Answer correctness alone cannot separate a generator that invented a claim from a generator that faithfully repeated a wrong chunk. Faithfulness can. Ragas defines it as the number of claims in the answer supported by the retrieved context divided by the total number of claims, from 0 to 1; its documentation works an example in which an answer gives a correct birthplace and a wrong date, one of two claims is supported, and the score is 0.5. Claim extraction and verification are model calls by default, and the `FaithfulnesswithHHEM` variant replaces the verifier with Vectara's HHEM-2.1-Open, a T5 classifier. Crossing correctness with faithfulness gives four cells, each pointing at a different stage:
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th></th><th>Faithful to context</th><th>Not faithful to context</th></tr></thead>
+<tbody>
+<tr><td>Correct</td><td>Working</td><td>Answered from weights; retrieval or assembly lost the evidence and the model covered for it</td></tr>
+<tr><td>Wrong</td><td>The context was wrong: a stale, superseded or conflicting chunk won retrieval; look at ingestion and freshness</td><td>Generation added or distorted claims; FP4 territory</td></tr>
+</tbody>
+</table>
+</div>
+
+The bottom-left cell is the expensive one to miss. A faithful wrong answer looks like a model problem in a review of transcripts and is a data problem: last year's policy is still indexed, and the generator did its job. Raising the faithfulness score cannot fix it. Two cautions apply to the metric itself. The verifier is a model with its own error rate, so hand-label a sample of its verdicts and report agreement beside the score. And pin the library version in the harness: the Ragas page states that the legacy metrics API will be deprecated in 0.4 and removed in 1.0, so an unpinned upgrade changes what the number means.
+
+## A field guide
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Symptom</th><th>First check</th><th>Usual stage</th></tr></thead>
+<tbody>
+<tr><td>Fails on codes, names, SKUs</td><td>Does BM25 alone find the chunk?</td><td>Retrieval: add lexical search</td></tr>
+<tr><td>Cites deleted or outdated content</td><td>Is the old chunk still in the index?</td><td>Ingestion: deletes and versioning</td></tr>
+<tr><td>Right documents retrieved, wrong answer</td><td>Was the gold chunk in the final prompt?</td><td>Context assembly or generation; run oracle context</td></tr>
+<tr><td>Wrong numbers from tables</td><td>Does the chunk hold the row and its header?</td><td>Parsing and chunking</td></tr>
+<tr><td>Fine on one-turn questions, poor in conversation</td><td>What query was actually sent to retrieval?</td><td>Query rewriting</td></tr>
+<tr><td>Worse after raising k</td><td>How many distractors are in the prompt now?</td><td>Context assembly; rerank and cut</td></tr>
+<tr><td>Confident answers to unanswerable questions</td><td>Does the eval set include unanswerable questions?</td><td>Generation: refusal behaviour</td></tr>
+</tbody>
+</table>
+</div>
+
+The "worse after raising k" row has a measurement behind it. Chroma's 2025 context-rot report tested 18 models and found that a single distractor reduced performance relative to the needle-only baseline, and four distractors compounded the drop. Raising k trades FP2 failures for FP4 failures, and only the per-stage counts say whether the trade paid. The "right documents, wrong answer" row is where the [oracle-context ablation](/learn/rag/debugging-rag/oracle-context) starts: replace the context with the gold chunks and see whether generation succeeds at all.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"A release changed the chunker and the reranker together. Accuracy on the 200-question eval fell from 81% to 74%. The product lead wants to keep the new reranker for its latency gain, a full re-index with the old chunker takes two days, and the release window closes in three. What do you do?"** (Scenario numbers.)
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Diff the two runs per question, not in aggregate: 7 points on 200 questions is about 14 questions, and I triage only the ones that flipped from pass to fail. The trace says which change each one blames: gold chunk missing or unretrievable points at the chunker, gold retrieved but cut before the prompt points at the reranker. Then I run the old reranker over the new index, which costs minutes and no re-index, to confirm. I re-index only if the chunker is implicated.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The two constraints conflict: keeping the reranker is worth latency, rolling back the chunker costs two of the three days. So the first hour goes to locating, not fixing. A paired comparison counts flips in both directions; the unpaired standard error at 78% on 200 questions is √(0.78 × 0.22 / 200) ≈ 2.9 points, and a 7-point drop is beyond that, but the flips tell me more than the aggregate.</p>
+<p>For each pass-to-fail question I run the triage function on both traces. "Missing from index" or "missed by retrieval" in the new run with the gold present in the old run blames the chunker; "not in context" with the gold retrieved blames the reranker or its cut. Rerankers count query and document tokens together against a context limit: Cohere lists 4k for rerank-v3.5 and 32k for the v4.0 and v5.0 models, and documents an over-limit document being split and scored in several inferences. A chunker that made chunks longer therefore changes what the reranker scores, and produces a reranker regression that looks like a chunker one; swapping the reranker back on the new index separates them.</p>
+<p>If the reranker is the cause, I widen its candidate cut or raise its truncation limit and measure latency again, because the latency gain may survive. If the chunker is the cause, I start the re-index today and ship the reranker on the old index, which the window allows. Written down: the flip table, the decision, and a rollback trigger on the production faithfulness and correctness samples. What I give up is a release that ships both changes on schedule.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The flips split evenly, seven blamed on each change, and they interact: the reranker loses exactly the chunks the new chunker made longer. You have one re-index left before the window. Which change ships, and what risk do you accept in writing?</em></li>
+<li><em>The product lead says 74% still clears the 70% launch bar and the latency gain matters more. Two of you disagree; how do you decide without deciding by rank?</em></li>
+<li><em>What would you need to see in the first week of production to reverse whichever decision you made?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The model assumes a linear pipeline with one retrieval per answer. Agentic systems retrieve several times, rewrite their own queries and decide when to stop, so the first failing stage can be a planning decision; trace each retrieval call as its own span and triage per call.
+
+It assumes a small gold set exists. Questions whose answer is an aggregation across many documents ("which teams changed on-call policy this year") have no handful of gold chunks, and global questions may have no single right answer. There, coverage and faithfulness carry more weight than recall, and the triage function returns noise.
+
+It assumes the labels are current. Gold chunk ids are tied to a chunking and an index version; change the chunker and every label needs remapping, and documents that changed since labelling turn correct answers into apparent failures. Version the eval set with the index.
+
+It assumes stages fail one at a time. Fixing the first failing stage can expose the next: raising recall puts more distractors in the prompt, and the "not extracted" count rises. Rerun the full triage after each fix rather than tracking one bucket.
+
+And the taxonomy itself comes from three systems and one paper, with a hand inspection of 40 issues. It names failure modes well; it says nothing about how often each occurs in your system, which only your own counts can.
+
+<SelfRate id="lesson:rag/debugging-rag/failure-taxonomy" />

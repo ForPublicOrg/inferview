@@ -1,0 +1,180 @@
+---
+title: "Teardown: Aider"
+track: harness
+module: context-management
+order: 9
+kind: teardown
+level: senior
+minutes: 12
+summary: How Aider, an Apache-2.0 terminal pair-programming tool, builds a ranked repository map into a fixed token budget, separates editable chat files from reference files, asks the model for edits in a chosen format and commits every change to git.
+prerequisites:
+  - harness/context-management/finding-code
+updated: 2026-10-28
+sources:
+  - title: Aider docs, Repository map (checked 2026-10-28)
+    url: https://aider.chat/docs/repomap.html
+    note: "the map lists the most important classes and functions with signatures, keeps only the most referenced identifiers, and is sent with each change request; graph ranking over files and dependencies; --map-tokens defaults to 1k; the map expands when no files are in the chat"
+  - title: "Aider blog, Building a better repository map with tree sitter (2023-10-22)"
+    url: https://aider.chat/2023/10/22/repomap.html
+    note: tree-sitter replaced the ctags-based map; definitions and references taken from the syntax tree; graph of files with dependency edges; most important parts that fit the token budget; users still choose the files to edit, automatic selection described as future work
+  - title: Aider source, aider/repomap.py (main branch, last changed 2026-02-11, checked 2026-10-28)
+    url: https://github.com/Aider-AI/aider/blob/main/aider/repomap.py
+    note: "map_tokens=1024; map_mul_no_files=8, capped at the context window minus 4,096; refresh='auto'; tags cached on disk keyed by file mtime; edge multipliers x10 mentioned, x10 long snake, kebab or camel names, x0.1 leading underscore, x0.1 defined in more than 5 files, x50 from a chat file, times the square root of reference count; personalised networkx pagerank; binary search on tag count accepting a result within 15% of the budget; chat files excluded from the map"
+  - title: Aider repository licence (checked 2026-10-28)
+    url: https://github.com/Aider-AI/aider
+    note: Apache License 2.0
+  - title: Aider docs, In-chat commands (checked 2026-10-28)
+    url: https://aider.chat/docs/usage/commands.html
+    note: "/add files to edit or review in detail; /read-only for reference-only files; /drop to free context; /map and /map-refresh; /tokens; /undo the last aider commit; /architect with two models; /ask without editing"
+  - title: Aider docs, Usage (checked 2026-10-28)
+    url: https://aider.chat/docs/usage.html
+    note: add only the files that need editing; too many files can overwhelm the model and cost more tokens; aider pulls in related context through the repo map
+  - title: Aider docs, Edit formats (checked 2026-10-28)
+    url: https://aider.chat/docs/more/edit-formats.html
+    note: "whole (full file returned), diff (search/replace blocks), diff-fenced (path inside the fence, mainly Gemini models), udiff (simplified unified diff, mainly GPT-4 Turbo), editor-diff and editor-whole for architect mode; aider picks the best format for common models"
+  - title: Aider docs, Git integration (checked 2026-10-28)
+    url: https://aider.chat/docs/git.html
+    note: "every edit committed with a descriptive message; dirty files committed first; the weak model writes commit messages from the diff and chat history; (aider) appended to author and committer names; --no-auto-commits, --no-dirty-commits; /undo, /diff, /commit"
+  - title: Claude API pricing (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: "Claude Opus 5.5: $20 per million output tokens"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Diagram from '../../../../components/Diagram.astro';
+import Trace from '../../../../components/Trace.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What it is and who runs it
+
+Aider is a terminal tool for editing code with a model, released under the Apache License 2.0 and developed in the open on GitHub. Its design differs from the agentic harnesses elsewhere in this track: the user decides which files the model may edit, the harness supplies a compact map of the rest of the repository, the model answers with edits in a fixed text format, and every accepted change becomes a git commit. Because the source is public, the mechanisms below are taken from the documentation and from `aider/repomap.py` as of its last change in February 2026.
+
+## The system
+
+<Diagram
+  title="Aider's request path, from the docs and repomap.py"
+  nodes={[
+    { id: 'user', label: 'Developer in the terminal' },
+    { id: 'chat', label: 'Chat files', note: 'editable, full text' },
+    { id: 'ro', label: 'Read-only files', note: 'reference, full text' },
+    { id: 'tags', label: 'Tree-sitter tags', note: 'cached by mtime' },
+    { id: 'rank', label: 'Personalised PageRank' },
+    { id: 'map', label: 'Repo map', note: '1,024-token budget' },
+    { id: 'model', label: 'Model', note: 'edit format per model' },
+    { id: 'apply', label: 'Edit applier' },
+    { id: 'git', label: 'Git', note: 'commit per change' },
+  ]}
+  edges={[
+    { from: 'user', to: 'chat', label: '/add' },
+    { from: 'user', to: 'ro', label: '/read-only' },
+    { from: 'tags', to: 'rank', label: 'def and ref graph' },
+    { from: 'chat', to: 'rank', label: 'personalise' },
+    { from: 'rank', to: 'map', label: 'fit to budget' },
+    { from: 'chat', to: 'model' },
+    { from: 'ro', to: 'model' },
+    { from: 'map', to: 'model' },
+    { from: 'model', to: 'apply', label: 'edits' },
+    { from: 'apply', to: 'git', label: 'commit' },
+  ]}
+  rows={[['user'], ['chat', 'ro', 'tags'], ['rank'], ['map', 'model'], ['apply', 'git']]}
+/>
+
+**Chat files and read-only files.** The user adds the files the model may edit with `/add` (or on the command line) and reference files with `/read-only`; `/drop` removes files to free context. Both kinds are sent in full. The docs advise adding only the files that need editing, because more files cost tokens and can overwhelm the model.
+
+**Tree-sitter tags.** Since October 2023 the map has been built from tree-sitter syntax trees rather than ctags: for each file, where functions, classes, variables and types are defined and where they are referenced. Tags are cached on disk and reused while a file's modification time is unchanged.
+
+**Personalised PageRank.** Files are nodes; an edge runs from a file that references an identifier to the file that defines it. Edge weights come from hand-set multipliers (×10 for an identifier the user mentioned, ×10 for long snake, kebab or camel case names, ×0.1 for private or widely defined names, ×50 when the referencing file is in the chat, times the square root of the reference count). PageRank runs with extra restart probability on chat files, files the user named and files whose path contains a mentioned identifier. The finding-code lesson works one edge weight through.
+
+**Repo map.** The ranked definitions are rendered as file names with the key lines of each definition, and fitted to the budget by binary search on how many to include, accepting a token count within 15% of the target. The default budget is 1,024 tokens; with no chat files it is multiplied by 8, capped at the model's context window minus 4,096. Chat files are left out of the map because their full text is already present. The map is sent with every change request.
+
+**Model and edit format.** The model returns edits as text in one of several formats, which Aider picks per model: `whole` (the full updated file), `diff` (search and replace blocks), `diff-fenced` (the same with the path inside the fence, mainly for Gemini models), `udiff` (a simplified unified diff, mainly used with GPT-4 Turbo), and streamlined `editor-diff` and `editor-whole` for architect mode, where one model describes the change in plain text and a second model writes the edit.
+
+**Edit applier and git.** Aider applies the edits to the files, then commits. If the files had uncommitted changes, it first commits those with their own message. Commit messages are written by the configured weak model from the diff and the chat history, and Aider appends "(aider)" to the author and committer names unless told otherwise. `/undo` reverts the last commit if Aider made it.
+
+## One request
+
+<Trace
+  title="Change how invoice totals are rounded"
+  note="the file names and request are a scenario; the mechanics follow the docs and repomap.py"
+  steps={[
+    { actor: 'user', text: '/add billing/invoice.py, then asks to round totals with banker\'s rounding in round_invoice_total.' },
+    { actor: 'system', text: 'Tags for changed files are re-parsed; unchanged files come from the mtime-keyed cache.' },
+    { actor: 'system', text: 'PageRank is personalised toward billing/invoice.py and the mentioned identifier round_invoice_total.', note: 'Edges from the chat file are weighted x50; the mentioned long snake-case name x100.' },
+    { actor: 'system', text: 'Binary search picks how many ranked definitions fit 1,024 tokens, within 15%.', note: 'billing/invoice.py itself is left out of the map; its full text is in the chat.' },
+    { actor: 'assistant', text: 'The model receives the edit-format instructions, the map, the chat file and the request, and replies with a search and replace block for invoice.py.', tokens: 1024, note: 'The token tag is the map budget, not the whole request.' },
+    { actor: 'tool', text: 'Aider applies the block. Uncommitted edits by the user were committed first.' },
+    { actor: 'tool', text: 'The change is committed with a message written by the weak model; the author name ends in (aider).' },
+    { actor: 'user', text: 'Reviews the diff; /undo would revert this commit only.' },
+  ]}
+/>
+
+## Context strategy
+
+Aider's context has three parts with different owners. The user owns the chat and read-only files and pays for them in full. The harness owns the map, a fixed-size summary of everything else, recomputed toward whatever the conversation names. The model owns nothing: the docs describe no search loop, so the model sees the map and the files the user added. With no files added, Aider tries to work out from the request which files need editing, and the map is what it has to go on.
+
+This is a push model. A grep-driven agent pulls context with tool calls and pays in turns; Aider pushes a ranked summary on every request and pays in a constant slice of context. The cap on the map's growth depends on the model.
+
+<Predict id="aider-map-budget" question="How many tokens may the repo map use when no files are in the chat?" answer={4096} tolerance={0} unit="tokens">
+<Fragment slot="prompt">
+<p>Scenario: Aider runs against a local model with an 8,192-token context window, the default <code>--map-tokens</code> of 1,024 and the default multiplier of 8 when the chat is empty. From <code>repomap.py</code>: the target is the smaller of budget × multiplier and the context window minus 4,096.</p>
+</Fragment>
+<p>Budget × multiplier: 1,024 × 8 = 8,192. Window minus padding: 8,192 − 4,096 = 4,096. The smaller is <b>4,096 tokens</b>, half the window. On a model with a 200,000-token window the cap does not bind and the empty-chat map gets the full 8,192. The padding protects the rest of the request; on a small model it also means the map takes half the window before any file is added.</p>
+</Predict>
+
+## Tools and permission model
+
+Aider has no tool-calling loop to permission in the sense of the other teardowns. The model's only action is to propose edits in text; Aider applies them to the files the user added. The safety net is git: every change is a commit, the user's own uncommitted work is committed separately before Aider edits, and `/undo` reverts Aider's last commit. `--no-auto-commits` and `--no-dirty-commits` turn those behaviours off.
+
+## Cost and latency
+
+The map costs its budget on every request: 1,024 tokens by default, up to 8,192 with an empty chat on a large-window model. Tag extraction is cached by modification time, so after the first run only changed files are re-parsed.
+
+The edit format is the larger cost lever on output. With `whole`, the model returns every line of every file it changes. A one-line change to a 4,000-token file costs about 4,000 output tokens; as a search and replace block it is a few lines plus markers, about 150 tokens in this scenario. At Claude Opus 5.5's $20 per million output tokens, that is 8 cents against 0.3 cents per edit, and output tokens also set latency. The trade is reliability: a search block that does not match the file exactly fails to apply, while a whole-file reply always applies.
+
+Aider's docs do not publish latency or per-request cost figures.
+
+## Failure modes
+
+- **The map favours what is named.** Personalisation and the ×10 and ×50 multipliers pull the map toward files and identifiers already in the conversation. A file linked to the task by behaviour rather than by name, such as a configuration file that changes what the edited function does, ranks low.
+- **The user picks the files.** The 2023 post describes automatic selection of files to edit as future work. If the user adds the wrong file, the model edits what it was given.
+- **Dirty commits.** By default the user's uncommitted work is committed before Aider edits, with a message written by a model. Teams that review commit history can find work in progress committed under a generated message.
+- **Format mismatch.** A model that drifts from its edit format, or a search block that no longer matches because the file changed, produces a failed edit; which format suits which model is a property of the model, which is why Aider selects it per model.
+- **Small-window models.** On a short context window the empty-chat map can take half the window, as the prediction above shows.
+
+## What is not public
+
+Little is hidden: the ranking, budgets, formats and git behaviour are all in the source and docs. What is not public is how Aider performs on its users' repositories: usage figures, and success rates by edit format or map budget on real projects rather than benchmarks. Anyone choosing a map budget or format for their own repository has to measure it there.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You are adding an Aider-style ranked map to your in-house agent. Product wants it on every request because it cut wrong-file edits in a pilot. Finance points out that the map changes whenever the chat files or mentioned names change, which breaks prompt caching for everything after it. You have a fixed cost target for next quarter. Where does the map go, and how big is it?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>After the stable prefix (system prompt, tools, memory files) and as late in the request as possible, so a map change invalidates only what follows it. Its budget is set from a paired measurement of wrong-file edits against map size, and it is recomputed only when the chat files change, not on every mention, so it stays byte-identical across most turns.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The conflict is real because the map is valuable exactly when it changes: it re-ranks toward what the conversation is about. A prefix cache only helps content that is identical from the start of the request, so anything after a changed map is re-processed at the uncached rate.</p>
+<p>Placement is the first lever. With the system prompt, tool definitions and memory files first, and the map after them but before the conversation, a map change costs the map plus the conversation; putting the map at the very end costs only the map but separates it from the instructions that refer to it. I would measure both with the pilot's tasks.</p>
+<p>Stability is the second. Aider-style personalisation includes mentioned identifiers, so every new message can move the ranking. Recomputing only when the set of chat files changes keeps the map stable for most turns, at the cost of reacting more slowly to new names. The budget comes from the pilot: wrong-file edit rate at, say, 512, 1,024 and 2,048 tokens, paired per task.</p>
+<p>What I give up: a less responsive map. The failure mode is a long session where the user's focus moves without changing the chat files, so the map keeps pointing at the old area; a forced refresh after a set number of turns bounds it.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Finance's target allows half the map budget the pilot used. Which half of the wrong-file reduction do you give up, and how do you state it to product?</em></li>
+<li><em>An engineer proposes replacing the map with a retrieval sub-agent called on demand. What would you measure to decide between them?</em></li>
+<li><em>What would you need to see to turn the map off for large-window models entirely?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+This describes the main branch as of February 2026 and the docs as checked in October 2026. The multipliers, budgets and padding are constants in the source, and any release can change them.
+
+The cost comparison between edit formats uses a scenario file size and a single model's output price. The ratio depends on how large the edited files are and how often a search block fails to apply and has to be retried, which Aider does not publish for its users' work.
+
+<SelfRate id="lesson:harness/context-management/aider" />

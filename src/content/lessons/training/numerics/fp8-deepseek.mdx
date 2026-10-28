@@ -1,0 +1,137 @@
+---
+title: FP8 training as DeepSeek-V3 did it
+track: training
+module: numerics
+order: 2
+kind: paper
+level: staff
+minutes: 14
+summary: How DeepSeek-V3 ran all three Linear GEMMs in FP8 with 1x128 activation tiles, 128x128 weight blocks and FP32 promotion every 128 elements, what it kept in higher precision, and what a claim of FP8 training should make you ask.
+prerequisites: [training/numerics/mixed-precision]
+updated: 2026-10-28
+sources:
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2), section 3.3 and appendix B
+    url: https://arxiv.org/html/2412.19437v2
+    note: "Fprop, Dgrad and Wgrad of Linear operators in FP8; embedding, output head, MoE gating, normalization and attention kept in BF16 or FP32; master weights and gradients FP32, AdamW moments BF16; 1x128 activation tiles (128x1 in backward), 128x128 weight blocks; online max-abs scaling; E4M3 on all tensors where prior work used E4M3 for Fprop and E5M2 for Dgrad and Wgrad; H800 FP8 GEMM accumulation retains around 14 bits, maximum relative error nearly 2% at K = 4096; promotion to FP32 on CUDA cores every N_C = 128 elements (4 WGMMAs); activations cached in FP8 with E5M6 for inputs of the Linear after attention; dispatch in FP8, combine in BF16; validated on models similar to DeepSeek-V2-Lite and DeepSeek-V2 for about 1 trillion tokens with relative loss error below 0.25%; block-wise quantization of activation gradients diverged on a roughly 16B-parameter MoE; 2.788M H800 GPU hours, 14.8T tokens. Checked 2026-10-28."
+  - title: Micikevicius et al., FP8 Formats for Deep Learning (arXiv 2209.05433, 2022-09)
+    url: https://arxiv.org/abs/2209.05433
+    note: "E4M3 and E5M2 encodings; E4M3 extends its range by not representing infinities and has a single mantissa bit pattern for NaN; E5M2 follows IEEE 754 conventions; FP8 training matches 16-bit result quality with unchanged hyperparameters, on language models up to 175B parameters. Checked 2026-10-28."
+  - title: NVIDIA Technical Blog, NVIDIA Hopper Architecture In-Depth (2022-03-22)
+    url: https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/
+    note: "E4M3 for less range and more precision, E5M2 for more range; FP8 halves storage and doubles throughput compared with FP16 or BF16; Transformer Engine scales tensors with factors computed from per-layer statistics; figures described as preliminary. Checked 2026-10-28."
+  - title: Hugging Face, The Ultra-Scale Playbook, mixed precision training
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "FP8 pretraining stability is a significant challenge; instability rises with learning rate at fixed model size; DeepSeek-V3's tile-wise scaling makes normalization less affected by activation outliers. Checked 2026-10-28."
+  - title: Kimi Team, Kimi K2 technical report (arXiv 2507.20534), section 2.4.3
+    url: https://arxiv.org/html/2507.20534
+    note: "Kimi K2 does not apply FP8 in computation; inputs to MoE up-projections and SwiGLU are stored in FP8-E4M3 with 1x128 tiles and FP32 scales to save activation memory. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The problem the paper solves
+
+Hopper tensor cores run FP8 matrix multiplies at twice the throughput of BF16, by NVIDIA's own figures, and FP8 halves the bytes of anything stored in it. The catch is the format. E4M3 has a 4-bit exponent and 3 mantissa bits; E5M2 has 5 and 2. Both of the failure modes from the previous lesson return together: too little range for one scale to cover a tensor, and too little precision for accumulation. The Ultra-Scale Playbook calls FP8 pretraining stability a significant challenge, with instability that grows with the learning rate at a fixed model size.
+
+DeepSeek-V3's report describes a recipe that ran the forward GEMM and both backward GEMMs of every Linear operator in FP8 for a 14.8T-token pretraining run, with a measured gap to BF16 that the report puts below 0.25% in relative loss. The recipe is four decisions: what stays out of FP8, how scales are assigned, how accumulation is kept honest, and which format is used where.
+
+## The formats, derived
+
+The FP8 paper by Micikevicius and co-authors defines both encodings. E5M2 follows IEEE conventions, so with bias 15 its largest finite value is 1.75 × 2^15 = 57,344 and its smallest subnormal is 2^−14 × 2^−2 = 2^−16 ≈ 1.5 × 10^−5. E4M3 gives up infinities and keeps a single NaN pattern to win one more binade: with bias 7, its top exponent is 2^8 and its largest mantissa below the NaN pattern is 1.75, so its maximum is 448, and its smallest subnormal is 2^−6 × 2^−3 = 2^−9 ≈ 0.002.
+
+That is a dynamic range of 448 / 2^−9 ≈ 2.3 × 10^5 for E4M3 against 57,344 / 2^−16 ≈ 3.8 × 10^9 for E5M2. NVIDIA's Hopper post frames the choice the same way: E4M3 where less range and more precision are needed, E5M2 where range matters more. The split the DeepSeek report attributes to prior work follows from it: E4M3 for Fprop, E5M2 for Dgrad and Wgrad, whose gradients span more orders of magnitude.
+
+## Why one scale per tensor is not enough
+
+FP8 training replaces the single loss scale of FP16 with a scale per tensor: divide by the tensor's maximum absolute value, multiply by the format's maximum, cast, and carry the factor alongside. NVIDIA's Transformer Engine computes those factors from per-layer statistics. A scale is chosen for the largest value in its group, and everything else in the group lives or dies by it.
+
+<Predict id="trn-num-fp8-outlier" question="Scenario: an activation tensor has typical values around 0.01 and one outlier channel at 10,000. With one scale for the whole tensor, chosen so that 10,000 maps to E4M3's maximum of 448, what does a typical value of 0.01 become after scaling, before the cast?" answer={0.000448} tolerance={0.00001} unit="">
+<p>The scale is 448 / 10,000 = 0.0448, so 0.01 becomes <b>0.000448</b>. E4M3's smallest subnormal is 2^−9 ≈ 0.00195, and 0.000448 is below half of it, so the cast returns zero. One outlier channel has erased the rest of the tensor. With a separate scale per 128-channel tile of each token, only the tile that contains the outlier pays: the other tiles in that row scale 0.01 up toward 448 and keep all 3 mantissa bits of precision.</p>
+</Predict>
+
+Activation outliers concentrated in a few channels are the case the Playbook names when it says tile-wise scaling makes normalization less affected by outliers. DeepSeek-V3 scales activations per 1×128 tile, one token by 128 channels, and weights per 128×128 block. The scales are computed online from the current tile's maximum, not delayed from a history of past maxima, which removes the case where a new outlier arrives before the history has seen it.
+
+<Predict id="trn-num-fp8-scales" question="Each 1x128 activation tile carries one FP32 scale factor (4 bytes) next to its 128 one-byte FP8 values. What is the scale overhead as a percentage of the FP8 payload?" answer={3.125} tolerance={0.01} unit="%">
+<p>4 bytes per 128 bytes is 4 / 128 = <b>3.125%</b>. For weights in 128×128 blocks it is 4 / 16,384, about 0.02%. Fine-grained scaling is cheap in bytes; its cost is in the kernel, which has to apply a different factor to each tile's partial products.</p>
+</Predict>
+
+The backward pass needed a correction the report documents in its appendix. Activation gradients quantized in 128×128 blocks caused divergence on an MoE model of about 16B parameters, which the authors attribute to outliers correlated with tokens; a block mixes 128 tokens, so one token's outlier sets the scale for 127 others. The working recipe quantizes activations per 1×128 tile in the forward pass and per 128×1 in the backward pass, so the scale group always follows the axis along which outliers line up.
+
+## Accumulation
+
+A GEMM with inner dimension K sums K products into each output. The report measured that FP8 GEMM on the H800's tensor cores retains around 14 bits of accumulation precision, and in a preliminary test with K = 4,096 that produced a maximum relative error of nearly 2%. That is the BF16 accumulator problem from the previous lesson, inside the hardware.
+
+The fix runs part of the accumulation outside the tensor core. Every N_C = 128 elements of K, four WGMMA instructions, the partial result is copied to FP32 registers on the CUDA cores and added there, where the per-tile scale factors are also applied. For K = 4,096 that is 32 promotions per output element, each of which pays a register copy and an FP32 add. The report notes that two WGMMA operations typically run concurrently, so one warpgroup's promotion overlaps the other's MMA and the tensor cores stay busy.
+
+## Format and storage
+
+With fine-grained scales, the report uses E4M3 for every tensor, including gradients, instead of the E4M3 forward and E5M2 backward split. Per-tile scaling gives each group its own range, so the format's bits can go to precision.
+
+The rest of the recipe, from section 3.3:
+
+| Kept in BF16 or FP32 | In FP8 |
+|---|---|
+| Embedding module, output head | Fprop, Dgrad and Wgrad GEMMs of Linear operators |
+| MoE gating modules | Activations cached for the Linear backward pass |
+| Normalization operators, attention operators | Activations before MoE up-projection dispatch |
+| Master weights and gradients (FP32) | |
+| AdamW moments (BF16), MoE combine (BF16) | |
+
+Two storage exceptions show how carefully the boundary was drawn: inputs to the Linear after attention are cached in a custom E5M6 format with round-scaled factors, because the attention operator's backward pass reuses them and the report calls it sensitive to precision, and the combine step of the MoE all-to-all stays in BF16 in both directions.
+
+## The number, and its conditions
+
+The headline figure is the relative loss error against a BF16 baseline, below 0.25%. Its conditions: two model scales similar to DeepSeek-V2-Lite and DeepSeek-V2, about 1 trillion tokens each, with high-precision accumulation and fine-grained quantization in place. It is a loss comparison, not a downstream-benchmark comparison, and the 14.8T-token production run has no BF16 twin to compare against. The report's stability claim for the production run is separate: no irrecoverable loss spikes and no rollbacks.
+
+The speedup is a different question from the precision.
+
+<Predict id="trn-num-fp8-amdahl" question="Scenario: in a BF16 training step, GEMMs take 70% of step time and everything else 30%. FP8 doubles GEMM throughput, NVIDIA's peak ratio, and nothing else changes. What is the speedup of the whole step?" answer={1.54} tolerance={0.02} unit="x">
+<p>New step time is 0.30 + 0.70 / 2 = 0.65 of the old, a speedup of 1 / 0.65 ≈ <b>1.54×</b>. That is an upper bound for this split: quantization kernels, promotion and scale application add time, and the components kept in BF16 (attention, norms, gating) stay on the 30% side. Whatever share of the step is not a Linear GEMM caps what FP8 can buy.</p>
+</Predict>
+
+## What changed in practice
+
+The report moved fine-grained scaling from a research option to a published recipe at frontier scale, and it named the hardware gap: the accumulation precision of FP8 tensor cores, which the authors worked around in software. It also showed a middle path that other teams took. Kimi K2's report says it does not apply FP8 in computation, but stores the inputs to MoE up-projections and SwiGLU in FP8-E4M3 with 1×128 tiles and FP32 scales, purely to save activation memory. FP8 storage and FP8 compute are separate decisions with separate risks, and a team can take the memory without taking the GEMM risk.
+
+## What "we trained in FP8" should make you ask
+
+Each question below maps to one of the decisions above, and each has an answer that changes how much the claim is worth.
+
+- Which GEMMs: forward only, or Dgrad and Wgrad as well? FP8 Wgrad is what lets activations be cached in FP8.
+- What scale granularity: per tensor, per row, per tile, per block? Delayed or online?
+- Where does accumulation happen, and how often is it promoted to FP32?
+- What stayed in higher precision, and which of those components were tried in FP8 and failed?
+- What was the baseline: a BF16 twin at the same scale and token count, or a shorter proxy run? Loss, or downstream evaluations?
+- What happens at inference: is the checkpoint served in the same FP8 layout, or converted?
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your next dense 30B run has a fixed deadline, and FP8 GEMMs would bring it in two weeks early on your measured GEMM share. You have no FP8 baseline at this scale. Do you train in FP8, and on what evidence?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Not across the board on day one. I would take FP8 storage of selected activations, which Kimi K2 shows carries little risk, plus FP8 Fprop with per-tile scales, and keep Dgrad and Wgrad in BF16 until a matched proxy run at reduced scale shows the loss gap stays inside seed noise. Then I move the backward GEMMs over at a checkpoint. That keeps most of the deadline gain and limits the blast radius to a restart.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The two defensible answers have different costs. Full FP8 from the start, DeepSeek-style, takes the whole speedup and bets the run on a recipe validated on a different architecture, an MoE with its own outlier profile; if it fails late, the loss is weeks of compute and the deadline. BF16 throughout gives up the two weeks for certainty.</p>
+<p>The staged plan sits between them. First, a 1/20-scale proxy pair, BF16 and FP8, on the same data order and seed, compared on loss and two downstream evaluations. Second, launch with FP8 Fprop and FP8 activation storage. Third, at a scheduled checkpoint, enable FP8 backward GEMMs if the proxy agreed. Rollback triggers are written down before launch: a relative loss gap above the proxy's seed-to-seed spread, or a rising rate of gradient-norm spikes, sends the run back to the checkpoint in BF16.</p>
+<p>How this fails: a proxy at 1/20 scale may not reach the activation magnitudes that cause FP8 trouble, because outliers grow with scale and training length. I would log per-tile amax distributions in the main run from step one, so the first sign of trouble is a growing tail, not a loss spike.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The proxy shows a 0.4% relative loss gap, and DeepSeek reported under 0.25%. Your deadline needs the speedup. Do you ship it, and who signs off on the gap?</li>
+<li>Halfway through, per-tile amax for one layer's activation gradients starts growing. What would you need to see to move that layer back to BF16 rather than the whole model?</li>
+<li>The serving team wants the checkpoint in FP8 for inference. What does training in FP8 change for them, and what does it not?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The recipe was validated for one family of models on one family of hardware. The 2% accumulation error is an H800 measurement, and the promotion interval is a response to it; hardware with higher accumulation precision changes that trade. The components kept out of FP8 were chosen for an MoE with MLA attention, and a different architecture can have different sensitive operators. And the 0.25% figure was measured over about a trillion tokens: it says nothing about behaviour after 14 trillion beyond the report's own statement that the production run needed no rollbacks.
+
+<SelfRate id="lesson:training/numerics/fp8-deepseek" />

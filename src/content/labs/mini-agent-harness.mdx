@@ -1,0 +1,1037 @@
+---
+title: Build a mini agent harness
+track: harness
+module: harness-anatomy
+kind: lab
+minutes: 150
+summary: Grow one agent harness over eight steps against a scripted mock model, from the loop and its turn cap to output budgets, a shell permission gate, batching, a cache-stable prefix, compaction, a Stop check, a spend cap and skill loading.
+updated: 2026-10-28
+sources:
+  - title: How the agent loop works (Claude Agent SDK docs)
+    url: https://code.claude.com/docs/en/agent-sdk/agent-loop
+    note: "turns, max_turns counting the final text-only response, error_max_turns, max_budget_usd checked after each response, read-only tools concurrent and mutating tools sequential, custom tools sequential by default. Checked 2026-10-28."
+  - title: Rules (OpenAI Codex docs)
+    url: https://learn.chatgpt.com/docs/agent-configuration/rules
+    note: "split only a linear chain of plain words joined by &&, ||, ; or |; scripts with redirection, substitution, variables, wildcards or control flow are one bash -lc invocation; the most restrictive decision wins. Checked 2026-10-28."
+  - title: OpenHands SDK, Condenser
+    url: https://docs.openhands.dev/sdk/arch/condenser
+    note: "keep the first keep_first events (default 4) verbatim, keep recent events, summarise the middle; the trigger is an event count above max_size (default 120)"
+  - title: How Claude Code uses prompt caching (Anthropic docs)
+    url: https://code.claude.com/docs/en/prompt-caching
+    note: "exact prefix matching; plan mode and skill loading appended as messages; CLAUDE.md read at session start and reloaded on /clear, /compact or restart. Checked 2026-10-28."
+  - title: Unrolling the Codex agent loop (OpenAI, Michael Bolin, 2026-01-23)
+    url: https://openai.com/index/unrolling-the-codex-agent-loop/
+    note: "configuration changes appended as new messages; early MCP support listed tools in an inconsistent order and missed the cache. Checked 2026-10-28."
+  - title: Claude Code tools reference, Bash output (Anthropic docs)
+    url: https://code.claude.com/docs/en/tools-reference
+    note: "about 30,000 characters inline by default; past that, a saved file's path plus a preview of up to 2,000 characters. Checked 2026-10-28."
+  - title: Hooks reference, Stop (Anthropic docs)
+    url: https://code.claude.com/docs/en/hooks
+    note: "exit 2 from a Stop hook continues the conversation; after eight consecutive continuations Claude Code ends the turn, and the count resets when Claude calls a tool. Checked 2026-10-28."
+  - title: Build skills (OpenAI Codex docs)
+    url: https://learn.chatgpt.com/docs/build-skills
+    note: "the startup skill list uses at most 2% of the context window, or 8,000 characters when the window is unknown; the full SKILL.md loads when a skill is chosen. Checked 2026-10-28."
+  - title: Agent Skills specification (agentskills.io)
+    url: https://agentskills.io/specification
+    note: "name: 1 to 64 lowercase letters, digits and hyphens, no leading, trailing or doubled hyphen, matching the folder; description: 1 to 1,024 characters; progressive disclosure"
+  - title: CodeCrafters, Build your own Claude Code
+    url: https://app.codecrafters.io/courses/claude-code/overview
+    note: "a staged build of a coding agent from the first API call through the agent loop, read, write and bash tools, and skills; this lab's code is original"
+steps:
+  - title: The loop, its turn cap and the final-turn rule
+    brief: |
+      The starter is the whole skeleton: a scripted MockModel that records every request, helpers for replies, calls and tools, request building, tool execution, and one do-nothing hook for each later step. You write two functions. invoke(state, c) runs one call and returns its output as a string; an unknown tool or an exception comes back as a string starting with "error:". run_agent(model, task, tools, max_turns=8, **opts) is the loop: state = new_state(task, tools, opts); for each turn, call maybe_compact(state) and apply_config(state, turn), and on the last allowed turn first append {"role": "user", "content": FINAL_NOTE}; send build_request(state, final); record state["turns"]; append the reply as {"role": "assistant", "content": text, "tool_calls": calls}; if charge(state, reply) is true, stop with "budget"; a reply with no calls ends the run with whatever on_final returns, unless it returns "continue"; on the final turn calls are not run and the status is "max_turns"; otherwise extend the messages with run_tools(state, calls). Return result(state, status, text). The final-turn rule exists because a capped run that just stops leaves no answer: the Claude Agent SDK counts the final text-only response as a turn, and a run that hits max_turns without room for it ends with no response.
+    starter: |
+      import copy, json
+
+      SYSTEM = "You are a coding agent. Use the tools to do the task, then answer in plain text."
+      FINAL_NOTE = "This is the final turn. Tools are off: answer now in plain text with what you have."
+
+
+      class MockModel:
+          """A deterministic stand-in for a model API. Each scripted reply is a dict, or a function that takes the
+          request and returns one. Every request is deep-copied into .requests so tests can see what was sent."""
+
+          def __init__(self, replies):
+              self.replies = list(replies)
+              self.requests = []
+
+          def __call__(self, request):
+              self.requests.append(copy.deepcopy(request))
+              if not self.replies:
+                  return reply("(script exhausted)")
+              r = self.replies.pop(0)
+              return r(request) if callable(r) else r
+
+
+      def reply(text="", *calls, tokens_in=1000, tokens_out=100):
+          return {"text": text, "tool_calls": list(calls), "usage": {"input_tokens": tokens_in, "output_tokens": tokens_out}}
+
+
+      def call(id, name, /, **args):
+          return {"id": id, "name": name, "args": args}
+
+
+      def tool(fn, description="", read_only=False, shell=False, duration=0.0):
+          return {"fn": fn, "description": description, "read_only": read_only, "shell": shell, "duration": duration}
+
+
+      def new_state(task, tools, opts):
+          state = {"opts": opts, "tools": dict(tools), "store": opts.get("store", {}), "messages": [],
+                   "turns": 0, "calls": 0, "clock": 0.0, "spent": 0.0, "compactions": 0}
+          for setup in (memory_message, skills_setup):
+              m = setup(state)
+              if m:
+                  state["messages"].append(m)
+          state["messages"].append({"role": "user", "content": task})
+          return state
+
+
+      def result(state, status, text):
+          return {"status": status, "text": text, "turns": state["turns"], "messages": state["messages"],
+                  "clock": state["clock"], "spent": state["spent"], "store": state["store"]}
+
+
+      def tool_list(state):
+          return [{"name": n, "description": t.get("description", "")} for n, t in state["tools"].items()]
+
+
+      def build_request(state, final):
+          return {"system": SYSTEM, "tools": tool_list(state), "messages": list(state["messages"]),
+                  "tool_choice": "none" if final else "auto"}
+
+
+      def execute_call(state, c):
+          refusal = check_permission(state, c)
+          if refusal is not None:
+              return refusal
+          return fit_output(state, c["id"], invoke(state, c))
+
+
+      def run_tools(state, calls):
+          out = []
+          for c in calls:
+              state["clock"] += state["tools"].get(c["name"], {}).get("duration", 0.0)
+              out.append({"role": "tool", "id": c["id"], "content": execute_call(state, c)})
+          state["calls"] += len(calls)
+          return out
+
+
+      # Hooks that later steps replace. Each default changes nothing.
+      def memory_message(state): return None
+      def skills_setup(state): return None
+      def maybe_compact(state): pass
+      def apply_config(state, turn): pass
+      def check_permission(state, c): return None
+      def fit_output(state, call_id, text): return text
+      def charge(state, r): return False
+      def on_final(state, r): return "done"
+
+
+      def invoke(state, c):
+          """Run one tool call and return its output as a string. An unknown tool name or an exception raised by the
+          tool comes back as a string starting with "error:", never as an exception."""
+          raise NotImplementedError
+
+
+      def run_agent(model, task, tools, max_turns=8, **opts):
+          """Return result(state, status, text), where status is "done", "max_turns", "budget" or what on_final returned."""
+          raise NotImplementedError
+    tests: |
+      def recorder(log):
+          def fn(**args):
+              log.append(args)
+              return "ok " + json.dumps(args, sort_keys=True)
+          return tool(fn, "records its arguments")
+
+      log = []
+      m = MockModel([reply("", call("c1", "echo", x=1)), reply("finished")])
+      r = run_agent(m, "say hi", {"echo": recorder(log)})
+      assert r["status"] == "done" and r["text"] == "finished" and r["turns"] == 2, r["status"]
+      assert log == [{"x": 1}], "the tool ran once with the model's arguments"
+      assert m.requests[1]["messages"][-1] == {"role": "tool", "id": "c1", "content": 'ok {"x": 1}'}, "the result goes back with its call id"
+      log = []
+      m = MockModel([reply("", call(f"c{i}", "echo", i=i)) for i in range(10)])
+      r = run_agent(m, "loop", {"echo": recorder(log)}, max_turns=3)
+      assert r["status"] == "max_turns" and r["turns"] == 3 and len(m.requests) == 3, r["status"]
+      assert [q["tool_choice"] for q in m.requests] == ["auto", "auto", "none"], "the last allowed turn turns tools off"
+      assert "final turn" in m.requests[-1]["messages"][-1]["content"].lower(), "the final turn tells the model to answer now"
+      assert len(log) == 2, "tool calls returned on the final turn are not run"
+      def boom(**a):
+          raise ValueError("disk full")
+      m = MockModel([reply("", call("a", "nope"), call("b", "boom")), reply("gave up")])
+      r = run_agent(m, "t", {"boom": tool(boom)})
+      results = [x for x in m.requests[1]["messages"] if x["role"] == "tool"]
+      assert [x["id"] for x in results] == ["a", "b"], "one result per call, in call order"
+      assert "unknown tool" in results[0]["content"] and "disk full" in results[1]["content"], "errors go back to the model as text"
+    hidden: |
+      def recorder(log):
+          def fn(**args):
+              log.append(args)
+              return "ok"
+          return tool(fn, "records")
+
+      m = MockModel([reply("answer")])
+      r = run_agent(m, "t", {"echo": recorder([])}, max_turns=1)
+      assert r["status"] == "done" and len(m.requests) == 1 and m.requests[0]["tool_choice"] == "none"
+      m = MockModel([reply("", call("a", "echo")), reply("", call("b", "echo")), reply("late answer")])
+      r = run_agent(m, "t", {"echo": recorder([])}, max_turns=3)
+      assert r["status"] == "done" and r["text"] == "late answer"
+      log = []
+      m = MockModel([reply("", call(f"c{i}", "echo")) for i in range(50)])
+      r = run_agent(m, "t", {"echo": recorder(log)}, max_turns=5)
+      assert len(m.requests) == 5 and r["turns"] == 5 and len(log) == 4
+      assert [t["name"] for t in m.requests[0]["tools"]] == ["echo"]
+      m = MockModel([reply("", call("a", "echo"), call("b", "echo")), reply("ok")])
+      r = run_agent(m, "t", {"echo": recorder([])})
+      assert [x["role"] for x in r["messages"]] == ["user", "assistant", "tool", "tool", "assistant"]
+      assert m.requests[0]["messages"] == [{"role": "user", "content": "t"}]
+      m = MockModel([reply("", call("a", "echo", bad=1)), reply("ok")])
+      r = run_agent(m, "t", {"echo": tool(lambda: "no args")})
+      assert r["status"] == "done" and m.requests[1]["messages"][-1]["content"].startswith("error:")
+    solution: |
+      import copy, json
+
+      SYSTEM = "You are a coding agent. Use the tools to do the task, then answer in plain text."
+      FINAL_NOTE = "This is the final turn. Tools are off: answer now in plain text with what you have."
+
+
+      class MockModel:
+          """A deterministic stand-in for a model API. Each scripted reply is a dict, or a function that takes the
+          request and returns one. Every request is deep-copied into .requests so tests can see what was sent."""
+
+          def __init__(self, replies):
+              self.replies = list(replies)
+              self.requests = []
+
+          def __call__(self, request):
+              self.requests.append(copy.deepcopy(request))
+              if not self.replies:
+                  return reply("(script exhausted)")
+              r = self.replies.pop(0)
+              return r(request) if callable(r) else r
+
+
+      def reply(text="", *calls, tokens_in=1000, tokens_out=100):
+          return {"text": text, "tool_calls": list(calls), "usage": {"input_tokens": tokens_in, "output_tokens": tokens_out}}
+
+
+      def call(id, name, /, **args):
+          return {"id": id, "name": name, "args": args}
+
+
+      def tool(fn, description="", read_only=False, shell=False, duration=0.0):
+          return {"fn": fn, "description": description, "read_only": read_only, "shell": shell, "duration": duration}
+
+
+      def new_state(task, tools, opts):
+          state = {"opts": opts, "tools": dict(tools), "store": opts.get("store", {}), "messages": [],
+                   "turns": 0, "calls": 0, "clock": 0.0, "spent": 0.0, "compactions": 0}
+          for setup in (memory_message, skills_setup):
+              m = setup(state)
+              if m:
+                  state["messages"].append(m)
+          state["messages"].append({"role": "user", "content": task})
+          return state
+
+
+      def result(state, status, text):
+          return {"status": status, "text": text, "turns": state["turns"], "messages": state["messages"],
+                  "clock": state["clock"], "spent": state["spent"], "store": state["store"]}
+
+
+      def tool_list(state):
+          return [{"name": n, "description": t.get("description", "")} for n, t in state["tools"].items()]
+
+
+      def build_request(state, final):
+          return {"system": SYSTEM, "tools": tool_list(state), "messages": list(state["messages"]),
+                  "tool_choice": "none" if final else "auto"}
+
+
+      def execute_call(state, c):
+          refusal = check_permission(state, c)
+          if refusal is not None:
+              return refusal
+          return fit_output(state, c["id"], invoke(state, c))
+
+
+      def run_tools(state, calls):
+          out = []
+          for c in calls:
+              state["clock"] += state["tools"].get(c["name"], {}).get("duration", 0.0)
+              out.append({"role": "tool", "id": c["id"], "content": execute_call(state, c)})
+          state["calls"] += len(calls)
+          return out
+
+
+      # Hooks that later steps replace. Each default changes nothing.
+      def memory_message(state): return None
+      def skills_setup(state): return None
+      def maybe_compact(state): pass
+      def apply_config(state, turn): pass
+      def check_permission(state, c): return None
+      def fit_output(state, call_id, text): return text
+      def charge(state, r): return False
+      def on_final(state, r): return "done"
+
+
+      def invoke(state, c):
+          spec = state["tools"].get(c["name"])
+          if spec is None:
+              return f"error: unknown tool {c['name']}"
+          try:
+              return str(spec["fn"](**c["args"]))
+          except Exception as e:
+              return f"error: {type(e).__name__}: {e}"
+
+
+      def run_agent(model, task, tools, max_turns=8, **opts):
+          state = new_state(task, tools, opts)
+          for turn in range(1, max_turns + 1):
+              maybe_compact(state)
+              apply_config(state, turn)
+              final = turn == max_turns
+              if final:
+                  state["messages"].append({"role": "user", "content": FINAL_NOTE})
+              r = model(build_request(state, final))
+              state["turns"] = turn
+              state["messages"].append({"role": "assistant", "content": r["text"], "tool_calls": r["tool_calls"]})
+              if charge(state, r):
+                  return result(state, "budget", r["text"])
+              if not r["tool_calls"]:
+                  verdict = on_final(state, r)
+                  if verdict != "continue":
+                      return result(state, verdict, r["text"])
+                  continue
+              if final:
+                  return result(state, "max_turns", r["text"])
+              state["messages"].extend(run_tools(state, r["tool_calls"]))
+          return result(state, "max_turns", "")
+  - title: Output budgets with a saved-file fallback
+    brief: |
+      One build log can fill the window and push the task out of it. Write fit_output(state, call_id, text): text within opts["output_budget"] characters (default 30,000) passes through unchanged; anything longer is saved whole in state["store"] under a path no earlier output used, and the model gets the first opts["output_preview"] characters (default 2,000, never more than the budget) and one line with the full length and the path. Those defaults are Claude Code's for Bash output. The model reads the rest through an ordinary tool, so nothing is lost, only deferred. The preview is a choice with a cost: builds tend to print their error last, which a head-only preview hides.
+    starter: |
+      def fit_output(state, call_id, text):
+          """Return text unchanged when it fits in opts["output_budget"] characters (default 30000). Otherwise save the
+          whole text in state["store"] under a path no earlier output used, and return the first opts["output_preview"]
+          characters (default 2000, never more than the budget) followed by one line giving the full length and the path."""
+          raise NotImplementedError
+    tests: |
+      import re
+      store = {}
+      def build_log(**a):
+          return "x" * 50000 + "END"
+      def read(path, offset=0, limit=500):
+          return store[path][offset:offset + limit]
+      def follow_path(request):
+          seen = request["messages"][-1]["content"]
+          path = next(p for p in store if p in seen)
+          return reply("", call("r1", "read", path=path, offset=len(store[path]) - 100))
+      T = {"build_log": tool(build_log), "read": tool(read, read_only=True)}
+      m = MockModel([reply("", call("b1", "build_log")), follow_path, reply("the log ends with END")])
+      r = run_agent(m, "why did the build fail?", T, store=store, output_budget=1000, output_preview=200)
+      shown = m.requests[1]["messages"][-1]["content"]
+      assert len(shown) <= 400, f"the model saw {len(shown)} characters of a 50,003-character output"
+      assert shown.startswith("x" * 200), "the preview is the start of the output"
+      assert "50003" in shown.replace(",", ""), "the note gives the full length"
+      assert len(store) == 1 and list(store.values())[0] == "x" * 50000 + "END", "the full output is saved"
+      assert list(store)[0] in shown, "the note names the saved path"
+      assert m.requests[2]["messages"][-1]["content"].endswith("END"), "the model can read the rest through an ordinary tool"
+    hidden: |
+      store = {}
+      def sized(n):
+          return lambda **a: "y" * n
+      T = {"exact": tool(sized(30000)), "over": tool(sized(30001)), "short": tool(sized(10))}
+      m = MockModel([reply("", call("a", "exact"), call("b", "over"), call("c", "short")), reply("ok")])
+      r = run_agent(m, "t", T, store=store)
+      out = {x["id"]: x["content"] for x in r["messages"] if x["role"] == "tool"}
+      assert out["a"] == "y" * 30000 and out["c"] == "y" * 10
+      assert len(out["b"]) < 2200 and len(store) == 1
+      store2 = {}
+      T2 = {"one": tool(lambda **a: "1" * 5000), "two": tool(lambda **a: "2" * 5000)}
+      for _ in range(2):
+          run_agent(MockModel([reply("", call("c1", "one"), call("c2", "two")), reply("ok")]), "t", T2, store=store2, output_budget=100)
+      assert sorted(store2.values()) == ["1" * 5000, "1" * 5000, "2" * 5000, "2" * 5000], "no saved output overwrites another"
+      store3 = {}
+      r = run_agent(MockModel([reply("", call("e", "boom")), reply("ok")]), "t", {"boom": tool(lambda **a: 1 / 0)}, store=store3, output_budget=5)
+      assert any("error" in x.get("content", "") for x in r["messages"] if x["role"] == "tool")
+      store4 = {}
+      r = run_agent(MockModel([reply("", call("p", "big")), reply("ok")]), "t", {"big": tool(lambda **a: "z" * 900)}, store=store4, output_budget=300, output_preview=5000)
+      shown = [x["content"] for x in r["messages"] if x["role"] == "tool"][0]
+      assert shown.startswith("z" * 300) and not shown.startswith("z" * 301), "the preview never exceeds the budget"
+    solution: |
+      def fit_output(state, call_id, text):
+          opts = state["opts"]
+          budget = opts.get("output_budget", 30000)
+          if len(text) <= budget:
+              return text
+          preview = min(opts.get("output_preview", 2000), budget)
+          path, n = f"tool-output/{call_id}.txt", 1
+          while path in state["store"]:
+              n += 1
+              path = f"tool-output/{call_id}-{n}.txt"
+          state["store"][path] = text
+          return text[:preview] + f"\n[output truncated: {len(text)} characters in total, saved at {path}]"
+  - title: A deny, ask and allow gate for shell commands
+    brief: |
+      Write decide(command, rules) and check_permission(state, c). Rules are token prefixes under "deny", "ask" and "allow"; deny beats ask beats allow, and a command no rule matches is "ask". Split a script only when it is a linear chain of plain words joined by &&, ||, ; or |, and take the most restrictive decision across the parts. Anything else, such as a redirect, $( ), backticks, a variable, a glob, control flow, a newline, a background &, a quoting error or an empty part, is one invocation ["bash", "-lc", script] that a narrow allow rule cannot match. Codex's rules documentation lists the first five of these; the rest follow from splitting only what is provably a plain chain. check_permission gates only tools marked shell=True: allow runs; ask calls opts["approve"](command) and runs only on True; deny never runs, whatever an approver says. A refusal goes back to the model as the tool's result. The hidden tests try bypasses.
+    starter: |
+      def decide(command, rules):
+          """Return "deny", "ask" or "allow" for one shell command string. rules maps "deny", "ask" and "allow" to
+          lists of token prefixes such as ["git", "status"]."""
+          raise NotImplementedError
+
+
+      def check_permission(state, c):
+          """Gate calls to tools marked shell=True, using decide(c["args"]["command"], opts["rules"]). Return None to
+          let the call run, or a refusal string that goes back to the model instead of the output."""
+          raise NotImplementedError
+    tests: |
+      ran = []
+      def sh(command):
+          ran.append(command)
+          return "ran"
+      RULES = {"allow": [["git", "status"], ["git", "diff"], ["ls"]], "ask": [["git", "push"]], "deny": [["rm"]]}
+      def outcome(command, approve=None):
+          ran.clear()
+          opts = {"rules": RULES}
+          if approve is not None:
+              opts["approve"] = approve
+          m = MockModel([reply("", call("s", "bash", command=command)), reply("done")])
+          run_agent(m, "t", {"bash": tool(sh, shell=True)}, **opts)
+          return "ran" if ran else "blocked"
+      assert outcome("git status") == "ran"
+      assert outcome("git status && ls -la") == "ran", "every part of the chain is allowed"
+      assert outcome("git status && rm -rf build") == "blocked", "one denied part blocks the chain"
+      assert outcome("git push origin main") == "blocked", "ask with no approver refuses"
+      asked = []
+      assert outcome("git push origin main", approve=lambda c: asked.append(c) or True) == "ran" and asked == ["git push origin main"]
+      assert outcome("rm -rf build", approve=lambda c: True) == "blocked", "an approver cannot override deny"
+      assert outcome("git status > notes.txt") == "blocked", "a redirect is not split, so no allow rule matches it"
+    hidden: |
+      ran = []
+      def sh(command):
+          ran.append(command)
+          return "ran"
+      RULES = {"allow": [["git", "status"], ["git", "diff"], ["ls"], ["echo"]], "ask": [["git", "push"]], "deny": [["rm"]]}
+      asked = []
+      def outcome(command, approve=None, rules=RULES):
+          ran.clear()
+          opts = {"rules": rules}
+          if approve is not None:
+              opts["approve"] = approve
+          m = MockModel([reply("", call("s", "bash", command=command)), reply("done")])
+          run_agent(m, "t", {"bash": tool(sh, shell=True), "plain": tool(lambda command: "plain ran")}, **opts)
+          return "ran" if ran else "blocked"
+      BYPASSES = ["git status\nrm -rf /", "git status;rm -rf /", "git status || rm -rf /", "git status | sh",
+                  "echo $(rm -rf /)", "echo `rm -rf /`", "git status > ~/.bashrc", "ls < /etc/shadow",
+                  "FOO=1 git status", "ls *", "git status &", "git status & rm -rf /", "git commit -m 'oops",
+                  "npm test &&", "&& git status", "", "gitk", "git statusx", "git -c core.pager=sh status",
+                  'echo "$(rm -rf /)"', "if true; then rm -rf /; fi", "(rm -rf /)", "git status #", "ls\\;rm"]
+      assert [c for c in BYPASSES if outcome(c) == "ran"] == []
+      assert outcome("git diff -- 'a && b'") == "ran", "an operator inside quotes is part of a word"
+      assert outcome("git status | ls") == "ran"
+      assert outcome("rm -rf / && git push", approve=lambda c: True) == "blocked"
+      asked.clear()
+      outcome("git status", approve=lambda c: asked.append(c) or True)
+      outcome("rm -rf x", approve=lambda c: asked.append(c) or True)
+      assert asked == [], "the approver is only asked about commands that need asking"
+      asked.clear()
+      assert outcome("ls > out.txt", approve=lambda c: asked.append(c) or True) == "ran" and asked == ["ls > out.txt"]
+      assert outcome("ls", rules={}) == "blocked", "a command no rule matches is asked about"
+      r = run_agent(MockModel([reply("", call("p", "plain", command="rm -rf /")), reply("ok")]), "t", {"plain": tool(lambda command: "plain ran")}, rules=RULES)
+      assert r["messages"][2]["content"] == "plain ran", "only shell tools go through the gate"
+      m = MockModel([reply("", call("s", "bash", command="rm -rf /")), reply("ok")])
+      run_agent(m, "t", {"bash": tool(sh, shell=True)}, rules=RULES)
+      assert "denied" in m.requests[1]["messages"][-1]["content"], "the model is told the call was refused"
+    solution: |
+      import re
+
+      OPERATORS = ("&&", "||", ";", "|")
+      UNSAFE = set("$`<>()*?[]{}~\\#!\n\r")
+      CONTROL = {"if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+                 "function", "select", "time", "coproc"}
+      RANK = {"allow": 0, "ask": 1, "deny": 2}
+
+
+      def split_chain(script):
+          """Split a linear chain of plain words into commands, or return None when the script is anything else."""
+          commands, words, word, quote, quoted, i = [], [], "", None, False, 0
+          while i < len(script):
+              ch = script[i]
+              if quote == "'":
+                  if ch == "'":
+                      quote = None
+                  else:
+                      word += ch
+              elif quote == '"':
+                  if ch == '"':
+                      quote = None
+                  elif ch in '$`\\':
+                      return None  # substitution and escapes still work inside double quotes
+                  else:
+                      word += ch
+              elif ch in "'\"":
+                  quote, quoted = ch, True
+              elif ch in " \t":
+                  if word or quoted:
+                      words.append(word)
+                  word, quoted = "", False
+              elif script.startswith(("&&", "||"), i) or ch in ";|":
+                  if word or quoted:
+                      words.append(word)
+                  word, quoted = "", False
+                  if not words:
+                      return None  # an operator with no command before it
+                  commands.append(words)
+                  words = []
+                  i += 2 if script.startswith(("&&", "||"), i) else 1
+                  continue
+              elif ch in UNSAFE or ch == "&":
+                  return None  # redirection, substitution, globs, background jobs, newlines and the rest
+              else:
+                  word += ch
+              i += 1
+          if quote:
+              return None
+          if word or quoted:
+              words.append(word)
+          if not words:
+              return None  # empty script, or a trailing operator such as "npm test &&"
+          commands.append(words)
+          for words in commands:
+              if words[0] in CONTROL or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
+                  return None  # control flow, or an environment assignment before the command
+          return commands
+
+
+      def decide_one(words, rules):
+          for verdict in ("deny", "ask", "allow"):
+              for prefix in rules.get(verdict, []):
+                  if prefix and words[:len(prefix)] == list(prefix):
+                      return verdict
+          return "ask"
+
+
+      def decide(command, rules):
+          commands = split_chain(command) or [["bash", "-lc", command]]
+          return max((decide_one(words, rules) for words in commands), key=RANK.get)
+
+
+      def check_permission(state, c):
+          spec = state["tools"].get(c["name"], {})
+          if not spec.get("shell"):
+              return None
+          command = str(c["args"].get("command", ""))
+          verdict = decide(command, state["opts"].get("rules", {}))
+          if verdict == "allow":
+              return None
+          if verdict == "ask":
+              approve = state["opts"].get("approve")
+              if approve is not None and approve(command):
+                  return None
+              return f"denied: {command!r} needs approval and was not approved"
+          return f"denied by policy: {command!r}"
+  - title: Read-only calls together, everything else in order
+    brief: |
+      When one reply carries several calls, reads can run together, but an edit must not race another call. Rewrite run_tools(state, calls): consecutive read-only calls form one batch, every other call runs alone, and results go back in call order. The tools here are simulated, so concurrency shows on a clock: each batch advances state["clock"] by its longest duration. A tool that does not say it is read-only runs alone, as custom tools do by default in the Claude Agent SDK. Keep adding len(calls) to state["calls"]; step 7 relies on it.
+    starter: |
+      def run_tools(state, calls):
+          """Run one reply's calls and return their tool messages in call order. Consecutive read-only calls form one
+          batch that runs together; every other call runs alone. Advance state["clock"] by the longest duration in each
+          batch, and add len(calls) to state["calls"]."""
+          raise NotImplementedError
+    tests: |
+      files = {"a.py": "x = 1"}
+      order = []
+      def read(path):
+          order.append(("read", path))
+          return files.get(path, "missing")
+      def write(path, text):
+          order.append(("write", path))
+          files[path] = text
+          return "written"
+      T = {"read": tool(read, read_only=True, duration=1.0), "write": tool(write, duration=1.0),
+           "grep": tool(lambda pattern: "no matches", read_only=True, duration=2.0)}
+      def clock_for(*calls):
+          order.clear()
+          return run_agent(MockModel([reply("", *calls), reply("ok")]), "t", T)
+      r = clock_for(call("1", "read", path="a.py"), call("2", "grep", pattern="x"), call("3", "read", path="b.py"))
+      assert r["clock"] == 2.0, f"three reads run together and take as long as the slowest: {r['clock']}"
+      r = clock_for(call("1", "write", path="a.py", text="x = 2"), call("2", "write", path="b.py", text="y"))
+      assert r["clock"] == 2.0, "writes run one after another"
+      files["a.py"] = "x = 1"
+      r = clock_for(call("1", "read", path="a.py"), call("2", "write", path="a.py", text="x = 2"), call("3", "read", path="a.py"))
+      assert r["clock"] == 3.0, "a write splits the reads around it into separate batches"
+      assert [x["id"] for x in r["messages"] if x["role"] == "tool"] == ["1", "2", "3"], "results come back in call order"
+      assert [x["content"] for x in r["messages"] if x["role"] == "tool"] == ["x = 1", "written", "x = 2"], "the read after the write sees the write"
+    hidden: |
+      T = {"r": tool(lambda: "r", read_only=True, duration=1.0), "w": tool(lambda: "w", duration=1.0),
+           "mcp": tool(lambda: "m", duration=1.0), "slow": tool(lambda: "s", read_only=True, duration=5.0)}
+      T["mcp"].pop("read_only")
+      def clock(*names):
+          calls = [call(str(i), n) for i, n in enumerate(names)]
+          return run_agent(MockModel([reply("", *calls), reply("ok")]), "t", T)["clock"]
+      assert clock("r", "mcp", "r") == 3.0, "a tool that does not say it is read-only runs alone"
+      assert clock("r", "r", "r", "r", "slow") == 5.0
+      assert clock("w", "w", "w") == 3.0
+      assert clock("r", "w", "r", "w", "r") == 5.0
+      assert clock() == 0.0
+      r = run_agent(MockModel([reply("", call("a", "r"), call("b", "r")), reply("", call("c", "w")), reply("ok")]), "t", T)
+      assert r["clock"] == 2.0, "the clock accumulates across turns"
+      calls = [call(str(i), "r" if i % 3 else "w") for i in range(30)]
+      r = run_agent(MockModel([reply("", *calls), reply("ok")]), "t", T)
+      assert [x["id"] for x in r["messages"] if x["role"] == "tool"] == [str(i) for i in range(30)]
+      assert r["clock"] == 20.0
+    solution: |
+      def plan_batches(state, calls):
+          batches = []
+          for c in calls:
+              read_only = state["tools"].get(c["name"], {}).get("read_only", False)
+              if read_only and batches and batches[-1][0]:
+                  batches[-1][1].append(c)
+              else:
+                  batches.append((read_only, [c]))
+          return [batch for _, batch in batches]
+
+
+      def run_tools(state, calls):
+          out = []
+          for batch in plan_batches(state, calls):
+              state["clock"] += max(state["tools"].get(c["name"], {}).get("duration", 0.0) for c in batch)
+              for c in batch:
+                  out.append({"role": "tool", "id": c["id"], "content": execute_call(state, c)})
+          state["calls"] += len(calls)
+          return out
+  - title: A request prefix that stays put
+    brief: |
+      Prompt caching pays only when each request starts with exactly what the one before it sent. Two things break that here: tools listed in registration order, and settings that change mid-session. Rewrite tool_list(state) to sort the tools and reuse the list sent with the first request for the whole session. Write apply_config(state, turn): it reads opts["config_changes"].get(turn) and appends one user message describing the change; tools announced mid-session under "add_tools" become callable and are described in that message, while the tool list stays as it was. Codex appends a message for a new sandbox mode or working directory for the same reason, and its early MCP support missed the cache by listing tools in an inconsistent order.
+    starter: |
+      def tool_list(state):
+          """The tool definitions sent with every request: [{"name", "description"}]. The same tools give the same list
+          whatever order they were registered in, and the list sent with the first request is reused for the rest of
+          the session (until step 6 rewrites history)."""
+          raise NotImplementedError
+
+
+      def apply_config(state, turn):
+          """opts["config_changes"] maps a turn number to a dict of changes, for example {"cwd": "pkg/api"}, or
+          {"add_tools": {name: tool(...)}} for tools a server announces mid-session. Before that turn's request, append
+          one user message describing the change and register any added tools so they can be called. Never edit the
+          system prompt or an earlier message."""
+          raise NotImplementedError
+    tests: |
+      def ok(**a):
+          return "ok"
+      T = {"zeta": tool(ok, "z"), "alpha": tool(ok, "a"), "mid": tool(ok, "m")}
+      T2 = {"mid": T["mid"], "alpha": T["alpha"], "zeta": T["zeta"]}
+      m1, m2 = MockModel([reply("done")]), MockModel([reply("done")])
+      run_agent(m1, "t", T)
+      run_agent(m2, "t", T2)
+      assert m1.requests[0]["tools"] == m2.requests[0]["tools"], "registration order does not change the tool list"
+      def extends(a, b):
+          return a["system"] == b["system"] and a["tools"] == b["tools"] and b["messages"][:len(a["messages"])] == a["messages"]
+      m = MockModel([reply("", call(f"c{i}", "alpha")) for i in range(5)])
+      r = run_agent(m, "t", T, max_turns=5, config_changes={3: {"cwd": "pkg/api", "sandbox": "read-only"}})
+      assert all(extends(a, b) for a, b in zip(m.requests, m.requests[1:])), "each request extends the one before it"
+      assert "pkg/api" in m.requests[2]["messages"][-1]["content"], "the change arrives as the newest message on its turn"
+      assert not any("pkg/api" in q["system"] for q in m.requests), "the system prompt never changes"
+    hidden: |
+      def ok(**a):
+          return "ok"
+      def extends(a, b):
+          return a["system"] == b["system"] and a["tools"] == b["tools"] and b["messages"][:len(a["messages"])] == a["messages"]
+      T = {"zeta": tool(ok, "z"), "alpha": tool(ok, "a")}
+      lint_runs = []
+      changes = {2: {"cwd": "pkg/api"}, 3: {"add_tools": {"lint": tool(lambda: lint_runs.append(1) or "clean", "runs the linter")}}}
+      m = MockModel([reply("", call("a", "alpha")), reply("", call("b", "alpha")), reply("", call("c", "lint")), reply("", call("d", "zeta")), reply("done")])
+      r = run_agent(m, "t", T, max_turns=6, config_changes=changes)
+      assert r["status"] == "done"
+      assert all(extends(a, b) for a, b in zip(m.requests, m.requests[1:]))
+      assert [t["name"] for t in m.requests[-1]["tools"]] == ["alpha", "zeta"], "a tool announced mid-session does not change the tool list"
+      assert "lint" in m.requests[2]["messages"][-1]["content"] and lint_runs == [1], "the new tool is announced and callable"
+      assert sum("pkg/api" in str(x.get("content")) for x in m.requests[-1]["messages"]) == 1, "each change is appended once"
+      assert len(m.requests[1]["messages"]) == len(m.requests[0]["messages"]) + 3
+      assert len(m.requests[3]["messages"]) == len(m.requests[2]["messages"]) + 2, "turns without a change add nothing"
+      m = MockModel([reply("", call("a", "alpha")), reply("", call("b", "alpha")), reply("", call("c", "alpha"))])
+      run_agent(m, "t", T, max_turns=3)
+      assert all(extends(a, b) for a, b in zip(m.requests, m.requests[1:])), "the final-turn note is appended, not inserted"
+      assert m.requests[0]["system"] == m.requests[-1]["system"]
+    solution: |
+      def tool_list(state):
+          if "sent_tools" not in state:
+              state["sent_tools"] = [{"name": n, "description": state["tools"][n].get("description", "")}
+                                     for n in sorted(state["tools"])]
+          return state["sent_tools"]
+
+
+      def apply_config(state, turn):
+          change = dict(state["opts"].get("config_changes", {}).get(turn) or {})
+          if not change:
+              return
+          added = change.pop("add_tools", {})
+          state["tools"].update(added)
+          lines = [f"{key}: {change[key]}" for key in sorted(change)]
+          lines += [f"new tool {name}: {added[name].get('description', '')}" for name in sorted(added)]
+          state["messages"].append({"role": "user", "content": "<config_change>\n" + "\n".join(lines) + "\n</config_change>"})
+  - title: Compaction that keeps the task and re-reads memory
+    brief: |
+      Write memory_message(state) and maybe_compact(state). Memory files (opts["memory_files"], read from the store) load as the first message at session start and are re-read only when the history is compacted, which is how Claude Code treats CLAUDE.md: an edit made mid-session applies after /compact. Compaction runs when the characters in all message contents pass opts["compact_at"], and rebuilds the history as a fresh memory message, the first keep_first other messages (default 2, which holds the task), one message marked "summary": True, then at least keep_last recent messages (default 4). Use opts["summarize"](dropped) when given. Never keep a tool result without its call or a call without its result, and drop the frozen tool list, since the prefix is new anyway. OpenHands' summarising condenser keeps the first four events by default for the same reason this keeps the task.
+    starter: |
+      def memory_message(state):
+          """One user message, marked "memory": True, holding the current text of every path in opts["memory_files"]
+          as read from state["store"]; None when there are no memory files."""
+          raise NotImplementedError
+
+
+      def maybe_compact(state):
+          """When the characters in all message contents pass opts["compact_at"], rebuild the history as: a fresh
+          memory message, the first opts.get("keep_first", 2) other messages, one user message marked "summary": True
+          with opts["summarize"](dropped) or your own text, then the most recent messages (at least
+          opts.get("keep_last", 4)). Never keep a tool result without the assistant message that called it, or a call
+          without its result. Forget the tool list sent so far, since the prefix is new anyway."""
+          raise NotImplementedError
+    tests: |
+      store = {"AGENTS.md": "Run pytest -q before finishing."}
+      def big(**a):
+          return "y" * 400
+      def remember(text):
+          store["AGENTS.md"] = text
+          return "saved"
+      T = {"big": tool(big, read_only=True), "remember": tool(remember)}
+      script = [reply("", call("r", "remember", text="Use uv run pytest."))] + [reply("", call(f"b{i}", "big")) for i in range(8)] + [reply("done")]
+      m = MockModel(script)
+      r = run_agent(m, "Fix the flaky test in tests/test_io.py", T, max_turns=12, store=store,
+                    memory_files=["AGENTS.md"], compact_at=1500, keep_first=1, keep_last=4)
+      assert r["status"] == "done", r["status"]
+      assert m.requests[0]["messages"][0].get("memory") and "pytest -q" in m.requests[0]["messages"][0]["content"], "memory loads at session start"
+      assert "uv run" not in m.requests[2]["messages"][0]["content"], "an edit to a memory file does not apply mid-session"
+      last = m.requests[-1]["messages"]
+      assert any(x.get("summary") for x in last) and len(last) < 12, "the history was compacted"
+      assert "uv run" in last[0]["content"] and sum(1 for x in last if x.get("memory")) == 1, "compaction re-reads memory files, once"
+      assert any("Fix the flaky test" in str(x.get("content")) for x in last), "the task survives compaction"
+      def paired(msgs):
+          called, answered = set(), set()
+          for x in msgs:
+              if x["role"] == "assistant":
+                  called |= {c["id"] for c in x.get("tool_calls") or []}
+              if x["role"] == "tool":
+                  if x["id"] not in called:
+                      return False
+                  answered.add(x["id"])
+          return called <= answered
+      assert all(paired(q["messages"]) for q in m.requests), "no result without its call, and no call without its result"
+    hidden: |
+      def paired(msgs):
+          called, answered = set(), set()
+          for x in msgs:
+              if x["role"] == "assistant":
+                  called |= {c["id"] for c in x.get("tool_calls") or []}
+              if x["role"] == "tool":
+                  if x["id"] not in called:
+                      return False
+                  answered.add(x["id"])
+          return called <= answered
+      def size(msgs):
+          return sum(len(str(x.get("content", ""))) for x in msgs)
+      store = {"CLAUDE.md": "v1", "notes.md": "n1"}
+      def edit(path, text):
+          store[path] = text
+          return "ok"
+      T = {"read": tool(lambda **a: "z" * 300, read_only=True), "edit": tool(edit)}
+      script = []
+      for i in range(30):
+          if i == 10:
+              script.append(reply("", call("e", "edit", path="CLAUDE.md", text="v2")))
+          else:
+              script.append(reply("", call(f"p{i}a", "read"), call(f"p{i}b", "read"), call(f"p{i}c", "read")))
+      script.append(reply("done"))
+      summaries = []
+      m = MockModel(script)
+      r = run_agent(m, "TASK-MARKER", T, max_turns=40, store=store, memory_files=["CLAUDE.md", "notes.md"],
+                    compact_at=3000, keep_last=5, summarize=lambda dropped: summaries.append(len(dropped)) or f"{len(dropped)} dropped")
+      assert r["status"] == "done" and len(summaries) >= 3
+      assert all(paired(q["messages"]) for q in m.requests)
+      assert all(sum(1 for x in q["messages"] if x.get("memory")) == 1 for q in m.requests)
+      assert all(q["messages"][0].get("memory") for q in m.requests), "memory stays first"
+      assert all("TASK-MARKER" in str([x.get("content") for x in q["messages"]]) for q in m.requests)
+      assert all(size(q["messages"]) < 3000 + 1300 for q in m.requests), "compaction keeps the history near the limit"
+      assert "v2" in m.requests[-1]["messages"][0]["content"] and "n1" in m.requests[-1]["messages"][0]["content"]
+      assert any(" dropped" in str(x.get("content")) for x in m.requests[-1]["messages"]), "the caller's summarizer is used"
+      before = [i for i, q in enumerate(m.requests) if any(x.get("summary") for x in q["messages"])]
+      assert before and before[0] > 0
+      r = run_agent(MockModel([reply("", call("a", "read")), reply("done")]), "short", T, compact_at=10 ** 6)
+      assert not any(x.get("summary") for x in r["messages"]), "no compaction below the limit"
+      grow = {"t": tool(lambda **a: "q" * 50)}
+      m = MockModel([reply("", call(f"g{i}", "t")) for i in range(12)] + [reply("done")])
+      r = run_agent(m, "T", grow, max_turns=20, compact_at=400, keep_first=1, keep_last=1)
+      assert all(paired(q["messages"]) for q in m.requests), "keep_last=1 still keeps the call with its result"
+      added = {"lint": tool(lambda: "clean", "lint")}
+      m = MockModel([reply("", call(f"x{i}", "read")) for i in range(6)] + [reply("done")])
+      run_agent(m, "T", T, max_turns=10, compact_at=1000, config_changes={2: {"add_tools": added}})
+      assert "lint" in [t["name"] for t in m.requests[-1]["tools"]], "after compaction the request lists every current tool"
+    solution: |
+      def memory_message(state):
+          paths = state["opts"].get("memory_files", [])
+          if not paths:
+              return None
+          parts = [f"<memory path=\"{p}\">\n{state['store'].get(p, '')}\n</memory>" for p in paths]
+          return {"role": "user", "content": "\n".join(parts), "memory": True}
+
+
+      def content_size(messages):
+          return sum(len(str(m.get("content", ""))) for m in messages)
+
+
+      def maybe_compact(state):
+          opts = state["opts"]
+          limit = opts.get("compact_at")
+          if not limit or content_size(state["messages"]) <= limit:
+              return
+          msgs = [m for m in state["messages"] if not m.get("memory")]
+          head_end = min(opts.get("keep_first", 2), len(msgs))
+          while head_end < len(msgs) and msgs[head_end]["role"] == "tool":
+              head_end += 1  # results belong with the call that is already in the head
+          start = max(head_end, len(msgs) - opts.get("keep_last", 4))
+          while start > head_end and msgs[start]["role"] == "tool":
+              start -= 1  # never open the tail on a result whose call would be dropped
+          dropped = msgs[head_end:start]
+          if not dropped:
+              return
+          summarize = opts.get("summarize")
+          if summarize:
+              text = summarize(dropped)
+          else:
+              names = sorted({c["name"] for m in dropped for c in m.get("tool_calls") or []})
+              text = f"{len(dropped)} earlier messages were removed; tools used in them: {', '.join(names) or 'none'}."
+          rebuilt = [m for m in [memory_message(state)] if m]
+          rebuilt += msgs[:head_end] + [{"role": "user", "content": "[summary] " + text, "summary": True}] + msgs[start:]
+          state["messages"] = rebuilt
+          state["compactions"] += 1
+          state.pop("sent_tools", None)
+  - title: A Stop check that sends the agent back
+    brief: |
+      "All tests pass" is the model's claim. Write on_final(state, r): with no opts["stop_check"], return "done"; otherwise call it for (passed, output). On a failure, append the output as a user message, passed through fit_output because a test log can be huge, and return "continue" so the agent goes back to work. Cap the loop: more than opts.get("max_stop_blocks", 3) blocks in a row with no tool call between them returns "unverified". Claude Code's Stop hooks behave the same way, with a cap of eight consecutive continuations that resets when Claude calls a tool.
+    starter: |
+      def on_final(state, r):
+          """Called when the model answers without tool calls. With no opts["stop_check"], return "done". Otherwise call
+          it; it returns (passed, output). Passed: "done". Failed: append a user message carrying the output and return
+          "continue", unless that would make more than opts.get("max_stop_blocks", 3) blocks in a row with no tool call
+          in between, in which case return "unverified"."""
+          raise NotImplementedError
+    tests: |
+      fixed = {"done": False}
+      def edit(**a):
+          fixed["done"] = True
+          return "edited"
+      def tests_pass():
+          return (True, "3 passed") if fixed["done"] else (False, "FAILED tests/test_io.py::test_roundtrip - assert 2 == 3")
+      m = MockModel([reply("All tests pass."), reply("", call("e", "edit")), reply("Fixed; 3 passed.")])
+      r = run_agent(m, "fix test_roundtrip", {"edit": tool(edit)}, stop_check=tests_pass)
+      assert r["status"] == "done" and r["turns"] == 3, r["status"]
+      assert "test_roundtrip" in m.requests[1]["messages"][-1]["content"], "the failing output goes back to the model"
+      m = MockModel([reply("Done.")] * 10)
+      r = run_agent(m, "t", {}, stop_check=lambda: (False, "1 failed"), max_stop_blocks=2, max_turns=10)
+      assert r["status"] == "unverified" and len(m.requests) == 3, "three claims in a row without work: two blocks, then stop"
+      r = run_agent(MockModel([reply("Done.")]), "t", {})
+      assert r["status"] == "done", "no stop check means the model's answer ends the run"
+    hidden: |
+      checks = []
+      def never():
+          checks.append(1)
+          return (False, "still failing")
+      script = []
+      for i in range(6):
+          script += [reply("done?"), reply("", call(f"w{i}", "work"))]
+      m = MockModel(script + [reply("done?")] * 5)
+      r = run_agent(m, "t", {"work": tool(lambda: "worked")}, stop_check=never, max_stop_blocks=1, max_turns=12)
+      assert r["status"] == "max_turns", "a tool call between claims resets the streak"
+      m = MockModel([reply("done?")] * 20)
+      r = run_agent(m, "t", {}, stop_check=never, max_turns=20)
+      assert r["status"] == "unverified" and len(m.requests) == 4
+      m = MockModel([reply("", call("w", "work")), reply("done?")])
+      r = run_agent(m, "t", {"work": tool(lambda: "worked")}, stop_check=never, max_turns=2)
+      assert r["status"] != "done", "a failed check on the last turn never reports done"
+      checks.clear()
+      r = run_agent(MockModel([reply("", call("w", "work")), reply("ok")]), "t", {"work": tool(lambda: "worked")}, stop_check=never, max_turns=5)
+      assert len(checks) >= 1 and r["status"] != "done"
+      r = run_agent(MockModel([reply("done?"), reply("done")]), "t", {}, stop_check=lambda: (False, "E" * 50000), output_budget=1000, max_turns=3)
+      assert all(len(str(x.get("content", ""))) < 5000 for x in r["messages"]), "a huge failure log is truncated like any tool output"
+      n = {"k": 0}
+      def flaky():
+          n["k"] += 1
+          return (n["k"] > 2, f"run {n['k']}")
+      r = run_agent(MockModel([reply("a"), reply("b"), reply("c")]), "t", {}, stop_check=flaky, max_turns=5)
+      assert r["status"] == "done" and r["text"] == "c" and r["turns"] == 3
+    solution: |
+      def on_final(state, r):
+          check = state["opts"].get("stop_check")
+          if check is None:
+              return "done"
+          passed, output = check()
+          if passed:
+              return "done"
+          if state.get("calls_at_last_block") != state["calls"]:
+              state["stop_blocks"] = 0  # the model did some work since the last block, so the streak starts again
+          state["stop_blocks"] = state.get("stop_blocks", 0) + 1
+          state["calls_at_last_block"] = state["calls"]
+          if state["stop_blocks"] > state["opts"].get("max_stop_blocks", 3):
+              return "unverified"
+          feedback = fit_output(state, f"stop-check-{state['turns']}", str(output))
+          state["messages"].append({"role": "user", "content": "The stop check failed, so the task is not done yet:\n" + feedback})
+          return "continue"
+  - title: A spend cap and a skill loader
+    brief: |
+      Two last controls. charge(state, r) adds each reply's cost from its token usage and opts["price_in"] and opts["price_out"], and returns True once opts["max_budget"] is reached; the loop then stops without running that reply's calls. The check runs after each response, as in the Claude Agent SDK, so spend can pass the cap by at most one response. skills_setup(state) parses each SKILL.md (frontmatter name and description, then the body), skips skills that break the Agent Skills naming rules or whose name does not match the folder, registers a read-only load_skill tool, and returns one message listing names and descriptions only, within opts.get("skills_index_chars", 8000) characters, the fallback Codex uses when it does not know the window. A body arrives as the result of load_skill, appended like any tool result, so loading a skill never changes the prefix. A body that compaction summarised away can be loaded again.
+    starter: |
+      def charge(state, r):
+          """Add this reply's cost to state["spent"]: usage input_tokens times opts["price_in"] plus output_tokens times
+          opts["price_out"] (dollars per token, default 0). Return True once opts["max_budget"] is set and reached."""
+          raise NotImplementedError
+
+
+      def skills_setup(state):
+          """opts["skills"] maps a skill's directory name to its SKILL.md text: YAML frontmatter with name and
+          description, then the body. Register a read-only tool "load_skill" (argument: name) that returns the body the
+          first time and a short note after that, and return one user message listing each valid skill's name and
+          description, within opts.get("skills_index_chars", 8000) characters. Return None when there are no skills."""
+          raise NotImplementedError
+    tests: |
+      runs = []
+      def work(**a):
+          runs.append(1)
+          return "did work"
+      m = MockModel([reply("", call(f"w{i}", "work"), tokens_in=20000, tokens_out=1000) for i in range(10)])
+      r = run_agent(m, "t", {"work": tool(work)}, max_turns=10, price_in=3e-6, price_out=15e-6, max_budget=0.25)
+      assert r["status"] == "budget", r["status"]
+      per_reply = 20000 * 3e-6 + 1000 * 15e-6
+      assert len(m.requests) == 4 and abs(r["spent"] - 4 * per_reply) < 1e-9, f"{len(m.requests)} calls, spent {r['spent']}"
+      assert len(runs) == 3, "the reply that reaches the cap does not get its tools run"
+      SKILLS = {"release-notes": "---\nname: release-notes\ndescription: Draft release notes from merged PRs. Use when asked for a changelog.\n---\nBODY-MARKER: read the merged PRs, group them by area, write one line each.",
+                "db-migrate": "---\nname: db-migrate\ndescription: Write and check a schema migration.\n---\nMIGRATE-BODY: never edit an applied migration."}
+      m = MockModel([reply("", call("a", "work")), reply("", call("s", "load_skill", name="release-notes")), reply("", call("b", "work")), reply("done")])
+      r = run_agent(m, "write the changelog", {"work": tool(work)}, skills=SKILLS)
+      assert "Draft release notes" in str(m.requests[0]["messages"]) and "db-migrate" in str(m.requests[0]["messages"]), "names and descriptions load at start"
+      assert "BODY-MARKER" not in str(m.requests[0]) and "BODY-MARKER" not in str(m.requests[1]), "a body stays out until the skill is chosen"
+      assert "BODY-MARKER" in m.requests[2]["messages"][-1]["content"], "the body arrives as the result of load_skill"
+      assert m.requests[0]["system"] == m.requests[-1]["system"] and m.requests[0]["tools"] == m.requests[-1]["tools"], "loading a skill keeps the prefix"
+      assert "MIGRATE-BODY" not in str(m.requests[-1])
+    hidden: |
+      runs = []
+      def work(**a):
+          runs.append(1)
+          return "did work"
+      m = MockModel([reply("", call(f"w{i}", "work"), tokens_in=1000, tokens_out=0) for i in range(10)])
+      r = run_agent(m, "t", {"work": tool(work)}, max_turns=10, price_in=0.001, max_budget=3.0)
+      assert r["status"] == "budget" and len(m.requests) == 3, "reaching the cap exactly stops the run"
+      m = MockModel([reply("", call(f"w{i}", "work"), tokens_in=500, tokens_out=0) for i in range(30)])
+      r = run_agent(m, "t", {"work": tool(work)}, max_turns=30, price_in=0.001, max_budget=2.2)
+      assert r["status"] == "budget" and r["spent"] - 2.2 < 0.5 + 1e-9, "spend passes the cap by at most one reply"
+      m = MockModel([reply("", call(f"w{i}", "work")) for i in range(5)])
+      r = run_agent(m, "t", {"work": tool(work)}, max_turns=5)
+      assert r["status"] == "max_turns" and r["spent"] == 0.0, "no prices, no spend"
+      r = run_agent(MockModel([reply("hi", tokens_in=10, tokens_out=10)]), "t", {}, price_in=0.5, price_out=0.25, max_budget=100)
+      assert r["status"] == "done" and abs(r["spent"] - 7.5) < 1e-9
+      SK = {"good": "---\nname: good\ndescription: A valid skill.\n---\nGOOD-BODY",
+            "bad-folder": "---\nname: other\ndescription: Name does not match the folder.\n---\nX",
+            "Upper": "---\nname: Upper\ndescription: Uppercase name.\n---\nX",
+            "no-desc": "---\nname: no-desc\n---\nX",
+            "dash--dash": "---\nname: dash--dash\ndescription: Consecutive hyphens.\n---\nX",
+            "no-front": "just a body"}
+      m = MockModel([reply("", call("1", "load_skill", name="good")), reply("", call("2", "load_skill", name="good")), reply("", call("3", "load_skill", name="other")), reply("ok")])
+      r = run_agent(m, "t", {}, skills=SK)
+      index = str(m.requests[0]["messages"])
+      assert "good" in index and not any(n in index for n in ["Uppercase", "does not match", "Consecutive", "no-desc"]), "invalid skills are not listed"
+      results = [x["content"] for x in r["messages"] if x["role"] == "tool"]
+      assert "GOOD-BODY" in results[0] and "GOOD-BODY" not in results[1], "a second load does not repeat the body"
+      assert "GOOD-BODY" not in results[2] and "other" in results[2]
+      r = run_agent(MockModel([reply("ok")]), "t", {})
+      assert "load_skill" not in str(r["messages"]), "no skills, no index"
+      many = {f"skill-{i:03d}": f"---\nname: skill-{i:03d}\ndescription: {'d' * 900}\n---\nB{i}" for i in range(40)}
+      m = MockModel([reply("", call("x", "load_skill", name="skill-000")), reply("ok")])
+      r = run_agent(m, "t", {}, skills=many, skills_index_chars=4000)
+      idx = [x for x in m.requests[0]["messages"] if "skill-000" in str(x.get("content"))]
+      assert idx and len(idx[0]["content"]) <= 4000, "the index fits its budget"
+      assert "B0" in m.requests[1]["messages"][-1]["content"]
+      big = {"t": tool(lambda **a: "w" * 400, read_only=True)}
+      script = [reply("", call("s1", "load_skill", name="good"))] + [reply("", call(f"t{i}", "t")) for i in range(10)] + [reply("", call("s2", "load_skill", name="good")), reply("ok")]
+      m = MockModel(script)
+      r = run_agent(m, "t", big, skills=SK, max_turns=20, compact_at=2000, keep_last=2)
+      assert "GOOD-BODY" in m.requests[-1]["messages"][-1]["content"], "after compaction drops a skill body, loading it again returns the body"
+    solution: |
+      import re
+
+
+      def charge(state, r):
+          opts, usage = state["opts"], r.get("usage") or {}
+          state["spent"] += usage.get("input_tokens", 0) * opts.get("price_in", 0.0) + usage.get("output_tokens", 0) * opts.get("price_out", 0.0)
+          cap = opts.get("max_budget")
+          return cap is not None and state["spent"] >= cap
+
+
+      SKILL_NAME = re.compile(r"^(?!-)(?!.*--)[a-z0-9-]{1,64}(?<!-)$")
+
+
+      def parse_skill(folder, text):
+          """Return (name, description, body), or None when the frontmatter breaks the Agent Skills rules."""
+          lines = text.split("\n")
+          if not lines or lines[0].strip() != "---" or "---" not in [l.strip() for l in lines[1:]]:
+              return None
+          end = 1 + [l.strip() for l in lines[1:]].index("---")
+          meta = {}
+          for line in lines[1:end]:
+              key, sep, value = line.partition(":")
+              if sep:
+                  meta[key.strip()] = value.strip().strip("\"'")
+          name, description = meta.get("name", ""), meta.get("description", "")
+          if not SKILL_NAME.match(name) or name != folder or not 1 <= len(description) <= 1024:
+              return None
+          return name, description, "\n".join(lines[end + 1:]).strip()
+
+
+      def skills_setup(state):
+          skills = {}
+          for folder, text in (state["opts"].get("skills") or {}).items():
+              parsed = parse_skill(folder, text)
+              if parsed:
+                  skills[parsed[0]] = parsed
+          if not skills:
+              return None
+          sent = {}
+
+          def load_skill(name):
+              if name not in skills:
+                  return f"error: no skill named {name}; available: {', '.join(sorted(skills))}"
+              marker = f"<skill name=\"{name}\">"
+              # Loaded means the body is still in the history: compaction may have summarised it away.
+              if sent.get(name) == state["turns"] or any(marker in str(m.get("content", "")) for m in state["messages"]):
+                  return f"skill {name} is already loaded in this conversation"
+              sent[name] = state["turns"]
+              return f"{marker}\n{skills[name][2]}\n</skill>"
+
+          state["tools"]["load_skill"] = tool(load_skill, "Load a skill's full instructions by name", read_only=True)
+          budget = state["opts"].get("skills_index_chars", 8000)
+          header = "Skills you can load with load_skill (name: description):"
+          names = sorted(skills)
+          room = max(0, (budget - len(header)) // len(names) - 1)
+          entries = []
+          for n in names:
+              entry = f"{n}: {skills[n][1]}"
+              if len(entry) > room:
+                  entry = entry[:max(len(n), room - 3)] + "..."  # shorten descriptions first, keep every name
+              entries.append(entry)
+          text = header + "".join("\n" + e for e in entries)
+          while len(text) > budget and entries:
+              entries.pop()  # still too long: drop skills from the end
+              text = header + "".join("\n" + e for e in entries)
+          return {"role": "user", "content": text}
+---
+
+This lab builds the harness from the harness-anatomy module as one program, the part of a coding agent that sits between the user and the model. Each step replaces one function in the same file, and its tests run against everything you have written so far, so the permission gate from step 3 still guards the runs in step 8.
+
+There is no real model. The starter includes `MockModel`, a scripted stand-in that returns the replies a test gives it, in order, and records a copy of every request it receives. The tests never check the model's prose. They check behaviour: which tools ran, what the model was sent, whether each request extends the one before it, and whether a cap stopped the run where it should.
+
+Steps 1 to 4 are the loop and what it does with tool calls: the turn cap, output budgets, a shell permission gate that the hidden tests try to bypass, and batching. Steps 5 to 8 are what keeps a long run cheap and honest: a stable prefix for the cache, compaction that keeps the task, a Stop check that does not trust "done", a spend cap and skills that load only when chosen. Each brief names the production tool whose documented behaviour the step follows.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

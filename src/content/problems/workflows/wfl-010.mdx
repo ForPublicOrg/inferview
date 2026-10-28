@@ -1,0 +1,134 @@
+---
+id: wfl-010
+title: A pilot replay of failed runs pays twice
+subtitle: find the cause, then decide how the other 2,920 run
+track: workflows
+module: durable-execution
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [inngest, replay, idempotency, payments, recovery]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Inngest docs, Replay
+    url: https://www.inngest.com/docs/platform/replay
+    note: replay by function, time range and status; Replay creates new executions, so check which charges, messages or records could repeat; use a narrow window; availability depends on event retention
+  - title: Inngest docs, how functions are executed
+    url: https://www.inngest.com/docs/learn/how-functions-are-executed
+    note: within one run the handler is replayed and completed steps return saved results; the state key is a hash of the step id
+  - title: Inngest docs, handling idempotency
+    url: https://www.inngest.com/docs/guides/handling-idempotency
+    note: event and function deduplication windows of 24 hours; a step's API call can succeed before its result is recorded; send a stable operation key, not a retry attempt id
+  - title: Stripe API reference, idempotent requests
+    url: https://docs.stripe.com/api/idempotent_requests
+    note: for API v1, keys can be removed once they are at least 24 hours old, and a reused key after pruning makes a new request; keys up to 255 characters
+  - title: OpenAI Agents SDK, human in the loop
+    url: https://openai.github.io/openai-agents-python/human_in_the_loop/
+    note: retry only after authoritative reconciliation establishes that no earlier attempt performed the action
+choices:
+  - text: Replay re-ran classify, and the model approved refunds this time that the original runs had declined
+    correct: false
+    why: That happened to 3 runs, but the 58 duplicated orders were approved and paid in their original runs, so a new approval cannot explain a second payment.
+  - text: The provider prunes idempotency keys after a day, so any replay of a run older than that refunds again
+    correct: false
+    why: Pruning is real and matters for the full replay, but duplicates also appear in the batch that failed two hours ago, well inside the window.
+  - text: The refund key is built from ctx.run_id, and a replayed execution has a new run id, so the key is new
+    correct: true
+    why: Replay creates new executions; each one derives a key the provider has never seen, so every originally approved order is refunded again.
+  - text: The refund step timed out after the provider paid, so its result was lost and the original run paid again
+    correct: false
+    why: The original histories show issue-refund completed and write-summary failed, and the duplicates appear only after the pilot replay.
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"A bad deploy failed 3,000 refund runs over two days. The fix is out. We replayed 80 as a pilot and finance is already on the phone. Why did it happen, and what has to be true before anyone replays the rest?"
+</Callout>
+
+Scenario. An Inngest function handles refund requests from a support assistant. Simplified, using the Python SDK:
+
+```python
+@client.create_function(
+    fn_id="refund-request",
+    trigger=inngest.TriggerEvent(event="support/refund.requested"),
+    retries=4,
+)
+async def refund_request(ctx: inngest.Context) -> dict:
+    req = ctx.event.data
+    decision = await ctx.step.run("classify", classify_with_model, req)
+    if decision["approve"]:
+        await ctx.step.run(
+            "issue-refund", issue_refund,
+            req["order_id"], req["amount_cents"], f"{ctx.run_id}:refund",
+        )
+        await ctx.step.run("email", send_email, req["email"], "refund_approved")
+    await ctx.step.run("write-summary", write_summary, req, decision)
+    return decision
+```
+
+`issue_refund` passes its third argument to the payment provider as the idempotency key. A schema change made `write_summary` raise from Monday 09:00 to Wednesday 09:00, failing 3,000 runs after their earlier steps had completed. The fix shipped Wednesday morning.
+
+The pilot (scenario figures): the on-call engineer used Replay on 40 runs that failed in the last two hours and 40 that failed on Monday. All 80 new executions completed.
+
+- In the original 80 runs, 62 were approved (refund and email done) and 18 were declined.
+- On replay, 58 of the 62 were approved again, 4 were declined, and 3 of the 18 declined runs were approved.
+- Finance reports 58 orders refunded twice, spread across both batches.
+- Support reports 61 customers with a second or first "refund approved" email this morning.
+- You have the provider's refund list for the 80 orders but not the keys sent with each request.
+
+Pick the cause of the 58 duplicate refunds. Then rank the other problems the pilot exposed and say what must change before the remaining 2,920.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the idempotency keys the provider received for one duplicated order. Are they equal?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask whether the duplicates differ between the two-hour batch and the Monday batch. What would differ if a time window were the cause?</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask where the original runs' decisions are stored outside Inngest. If nowhere, what does the replay decide with?</p></details>
+
+## Answer
+
+The key is derived from the run id, and Replay creates new executions. Inside one run the key is stable: a retried step or a re-invoked handler sees the same `ctx.run_id`, which is why the code looked safe. A replayed execution is a new run with a new id, so `issue-refund` sends a key the provider has never seen, and every order that was approved and paid in its original run is paid again. The 58 duplicates are exactly the 58 orders approved in both runs, in both batches, which fits this and nothing else.
+
+Why the other picks are tempting. The re-run of `classify` is real and produced the 3 new refunds and the 4 reversed decisions, but those are different orders from the duplicates. Key pruning is real too: the Stripe v1 API may drop keys once they are at least 24 hours old, so a stable key would still not protect Monday's runs. It cannot explain the two-hour batch. A step that succeeds at the provider before its result is recorded is the failure Inngest's idempotency guide warns about, but the original histories show the refund step completed, and the duplicates appeared only after the pilot.
+
+The other problems, ranked. First, the replay re-ran the model: 7 of 80 decisions changed, so a full replay would reverse decisions customers have already been told about. Second, `send_email` has no deduplication at all, so every approved run emailed again. Third, even a stable key does not cover runs older than the provider's key window, and these failures span two days.
+
+<Depth>
+<Fragment slot="short">
+<p>The refund key is built from the run id, and Replay starts new runs, so the provider sees new keys and pays again. Before the rest: make every external effect check an authoritative record first (has this order been refunded, has this email been sent), derive keys from the request rather than the run, and stop the replay from re-deciding by reading the original decision or treating an existing refund as the decision. Then replay a pilot, or skip Replay and run only the failed step from the recorded inputs. The pilot cannot prove safety at low rates; the reconciliation check has to.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Classify every step by what a repeat does.</strong> <code>classify</code> re-runs a model and can change the decision. <code>issue-refund</code> moves money. <code>email</code> sends a message. <code>write-summary</code> writes your own table and is the only step that needs to run. Replay re-runs all four.</p>
+<p><strong>Two defensible ways to recover.</strong> Option one: make the function safe to replay, then use Replay. Derive the refund key from the request (<code>refund:</code> plus the order id and request id), and before calling the provider, look up refunds for the order in the provider or your ledger and skip if one exists, because keys older than the provider's window will not deduplicate. Record sent emails keyed by request and skip repeats. For the decision, treat an existing refund as an approval and re-run the model only for runs that never reached the refund step. Cost: code changes under pressure, one reconciliation read per run, and model spend for 3,000 classifications. Benefit: one code path, with Inngest's retries and visibility. Option two: do not replay. Write a backfill function that takes each failed run's event data and the decision recorded in the failed run, and runs only <code>write_summary</code>. Cost: a second code path that exists for one incident, and you need a way to export the recorded decisions, which you should confirm before choosing this. Benefit: nothing external can repeat because nothing external is called. I would choose option two when the decisions can be exported cleanly and option one when they cannot, and I would ship option one's reconciliation check either way, because the next replay will not be planned.</p>
+<p><strong>The quantity: how big a pilot.</strong> A pilot with zero duplicates in n runs bounds the duplicate rate at about 3/n with 95 percent confidence. With n = 100, that bound is 3 percent, or up to 88 of 2,920 runs. If finance accepts at most 10 duplicate refunds in the rest, 2,920 × 3/n ≤ 10 needs n ≥ 876, which is a third of the batch. So a pilot catches a broken key, as this one did, but it cannot certify a rare duplicate; the per-run reconciliation check is what makes the full replay safe, and the pilot only checks that the check works.</p>
+<p><strong>The constraint conflict.</strong> Support wants summaries back today, and the fastest path is the button. Correctness needs the reconciliation code and a second pilot. The order is: freeze further replays, work with finance to recover the 58 duplicate refunds, ship the checks, pilot again, then replay in narrow time windows as the Inngest docs advise.</p>
+<p><strong>The written artefact.</strong> A one-page pre-flight for any bulk replay: the steps with external effects and the record each one checks first, the key derivation, the provider's key retention, the pilot size and its stop rule (any duplicate stops the replay), who approves, and how duplicates are reversed.</p>
+<p><strong>Where the recommended answer fails.</strong> The reconciliation read can race a refund still in flight at the provider, and some providers' list endpoints lag behind writes; a refund issued seconds before the check can be missed. Reading the provider by order id also assumes one refund per order is the rule, which is false for partial refunds, so the check needs the request id in the refund's metadata.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Pushback.</em> The reconciliation check adds a provider read to every refund, in the hot path, forever. The payments team asks you to keep it only in replays. What risk do you accept in writing?</li>
+<li><em>Reversal.</em> What would you need to see to stop using Replay for this function entirely and always recover with targeted backfills?</li>
+<li><em>Two senior engineers disagree.</em> One says the 4 reversed decisions should stand because the model is better now; the other says the original decision binds. How do you decide without deciding by rank?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- The function had an `idempotency` expression on `event.data.request_id`. Would it have stopped the duplicates? What would you test to find out, given the docs do not say?
+- How should `send_email` prove it has already sent a message when the email provider has no idempotency key?
+- Which of these protections would also have mattered without any replay, on an ordinary step retry?
+
+## Common mistakes
+
+- Assuming Replay reuses the original run's completed steps the way a retry inside one run does.
+- Deriving keys from run ids, attempt numbers or timestamps instead of from the business operation.
+- Treating a stable key as sufficient for a recovery that spans more than the provider's key retention.
+- Letting the replay re-decide with the model and then honouring both decisions.
+- Reading a clean pilot as proof the full replay is safe.

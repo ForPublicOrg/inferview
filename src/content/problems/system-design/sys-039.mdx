@@ -1,0 +1,94 @@
+---
+id: sys-039
+title: "Critique: an agent platform that passes OAuth tokens to sandboxes"
+track: system-design
+module: case-platforms
+type: critique
+difficulty: hard
+seniority: [staff]
+minutes: 30
+core: false
+tags: [credentials, oauth, sandboxes, egress, multi-tenancy, security-review]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Claude docs, Managed Agents vaults
+    url: https://platform.claude.com/docs/en/managed-agents/vaults
+    note: environment_variable credentials are placeholders substituted at egress; allowed_hosts; injection_location header or body; exchanged tokens arrive unredacted; vaults workspace-scoped; archive purges secrets; refresh handled by the platform for mcp_oauth credentials; checked 2026-10-28
+  - title: Anthropic Engineering, Scaling Managed Agents (2026-04-08)
+    url: https://www.anthropic.com/engineering/managed-agents
+    note: with generated code next to credentials, a prompt injection could expose tokens; tokens never reachable from the sandbox; checked 2026-10-28
+  - title: Anthropic Engineering, how we contain Claude (2026-05-25)
+    url: https://www.anthropic.com/engineering/how-we-contain-claude
+    note: committed hook ran before the trust prompt; upload through allowlisted api.anthropic.com with an attacker's key; checked 2026-10-28
+checklist:
+  - Generated code in the sandbox can read the access tokens from the environment, so any prompt injection in a repository or tool result can exfiltrate them
+  - Refresh tokens and the client secret are also injected, which turns a one-hour exposure into a long-lived one
+  - The egress allowlist includes github.com and an object store that accept writes from any account, so exfiltration needs no blocked host
+  - Repository setup hooks run in the provisioner before the sandbox starts, outside the trust boundary and next to the token store
+  - The warm pool reuses containers across tenants after a filesystem wipe, while tokens persist in the process environment and shell history
+  - Session creation trusts a user id from the request body to choose the vault, so a caller with the workspace key can name another tenant's vault
+  - Session logs capture full tool output, so an agent running env or printing a failed request stores tokens in the log for 90 days
+  - Tokens are requested with broad scopes (repo, admin:org) because one scope set serves every customer
+  - "Judgement call: short-lived, narrowly scoped access tokens in the sandbox are acceptable if they are per session, cannot be refreshed in the sandbox, egress is bound to the issuing provider with this session's identity, and the residual risk is written down"
+  - Proposes the replacement path per tool type (egress substitution for header-authenticated APIs, a broker for signed or exchanged credentials) rather than a single fix
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Here is the design doc for our hosted agent platform's integrations. It passed design review last quarter. You are the new staff engineer on the security review: list what is wrong with it, ranked by what you would fix first."
+</Callout>
+
+> **Integrations design (v3).** Customers connect GitHub, Jira and Google Drive through OAuth. We store each customer's access token, refresh token and our client secret in our secrets manager, encrypted at rest. When a session starts, the provisioner fetches the tenant's credentials and starts a container with `GITHUB_TOKEN`, `GITHUB_REFRESH_TOKEN`, `JIRA_TOKEN`, `GDRIVE_TOKEN` and `OAUTH_CLIENT_SECRET` as environment variables, so the agent's tools and any CLI it runs work without extra plumbing. Tokens refresh inside the container when they expire, using a small helper.
+>
+> Before handing the container to the agent, the provisioner clones the repository and runs the repository's `setup.sh` so dependencies are ready on the first turn.
+>
+> **Isolation.** Each session gets its own container. To keep first-turn latency low we keep a warm pool; containers are returned to the pool after the session and their `/workspace` directory is wiped.
+>
+> **Network.** Egress is deny-by-default with an allowlist: `github.com`, `api.github.com`, our Jira and Google endpoints, `pypi.org`, `registry.npmjs.org`, and our artefact bucket on the cloud provider's object store.
+>
+> **Tenancy.** The web app calls the session API with the workspace API key and a `user_id` field in the body; the session service looks up that user's vault and attaches it.
+>
+> **Scopes.** We request `repo`, `read:org` and `admin:org` on GitHub so the same app works for every customer's setup.
+>
+> **Observability.** Every tool call's input and output is stored in the session log for 90 days to debug customer issues.
+>
+> **Security controls.** The model is instructed never to print or transmit credentials. Tool calls that push code require user approval.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>For each credential in the container, which process needs the value, and which only needs to make a request with it?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Which hosts on the allowlist accept data from any account holder, not only from this customer?</p></details>
+<details class="hint"><summary>Hint 3</summary><p>What survives a wipe of `/workspace` when a container goes back to the pool?</p></details>
+
+## Answer
+
+The first fix is structural: no token should be readable from the sandbox that runs generated code. Anthropic's Managed Agents rebuild started from the same problem (with generated code next to credentials, a prompt injection could expose tokens) and moved to a design where the sandbox never holds them. The repository token is used at clone time and held by the git remote; MCP and API credentials sit in a vault and reach the network through a proxy. For CLIs and SDKs, an environment-variable credential is a placeholder substituted at egress, only for allowed hosts and only in headers if that is all the client needs.
+
+The flaws a first read catches are the environment variables and "the model is instructed never to print credentials", which is a request, not a control. The ones that pass a first read:
+
+- **Refresh tokens and the client secret in the container.** The access token alone is bounded by its lifetime. The refresh token and client secret let an attacker mint new access tokens after the session ends, so the exposure has no end date. Refresh belongs to the platform, as the vault does for `mcp_oauth` credentials.
+- **Write-capable hosts on the allowlist.** `github.com` and the object store accept writes from any account. An injected instruction can push the repository to an attacker's GitHub account or upload to an attacker's bucket using the attacker's own credentials, the same shape as the Cowork upload through allowlisted `api.anthropic.com`. The fix binds writes to identities the platform issued to this session.
+- **`setup.sh` in the provisioner.** The repository is untrusted, and its script runs before the sandbox exists, in a process that just fetched every token. Claude Code had the same class of defect: a committed hook ran before the trust prompt. Setup runs inside the sandbox.
+- **Warm-pool reuse across tenants.** Wiping `/workspace` leaves process environment, shell history, caches in the home directory and any background process the previous session started. Containers are single-use, or pooled per tenant and destroyed after use.
+- **`user_id` in the request body.** Vaults are workspace-scoped, so any caller with the workspace key can attach any vault in it. The session service must derive the user from an authenticated principal, not trust a field.
+- **The session log.** Storing every tool output for 90 days stores every token the agent printed by running `env` or by echoing a failed request. Once tokens leave the sandbox, the log stops being a secret store; until then it needs scrubbing, encryption per tenant and a shorter retention.
+- **`admin:org` for everyone.** One scope set for all customers means every session can administer the customer's organisation. Request scopes per integration and per customer need.
+
+**The judgement call.** Some tools cannot use egress substitution: clients that sign requests, or exchange a secret for a session token, which arrives in the sandbox unredacted. Putting a short-lived, narrowly scoped, per-session access token in the sandbox for those tools is acceptable if it cannot be refreshed there, egress for it is bound to the issuing provider with this session's identity, and the residual risk is in the review. Rejecting it outright usually means the tool is dropped or someone builds a worse workaround.
+
+**Failure mode of the fix.** Egress substitution moves trust into the proxy. A proxy bug that substitutes for the wrong host, or into the request body when only headers were intended, sends the secret to whatever the agent addressed. The proxy needs its own tests and its own review, and body injection stays off unless a client needs it.
+
+## Follow-ups
+
+- *The team says moving refresh out of the container needs a quarter they do not have. What do you accept for the next quarter, and what is the written condition for accepting it?*
+- *What would you need to see to keep the warm pool shared across tenants?*
+- *Product wants the 90-day session log for support. How do you keep the support value without storing secrets?*
+
+## Common mistakes
+
+- Ranking "the model might print the token" first, when the token being readable at all is the defect.
+- Treating a deny-by-default allowlist as exfiltration control without asking which allowed hosts accept writes.
+- Fixing the environment variables and leaving the refresh helper and client secret in the container.

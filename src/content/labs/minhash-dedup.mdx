@@ -1,0 +1,368 @@
+---
+title: MinHash near-dedup
+track: training
+module: pretraining-data
+kind: lab
+minutes: 120
+summary: Grow one near-duplicate filter over six steps, from word shingles to MinHash signatures, LSH bands, a band choice tuned to a threshold, and the line-level boilerplate filter Llama 3 runs after document dedup.
+updated: 2026-10-28
+sources:
+  - title: Lee et al., Deduplicating Training Data Makes Language Models Better (ACL 2022, arXiv 2107.06499)
+    url: https://arxiv.org/abs/2107.06499
+    note: "space-tokenised 5-grams, 9,000 minimums in 450 buckets of 20, duplicates confirmed at Jaccard and edit similarity above 0.8; one 61-word sentence repeated over 60,000 times in C4; models trained on deduplicated data emit memorised text ten times less often. Checked 2026-10-28."
+  - title: Llama Team, The Llama 3 Herd of Models (arXiv 2407.21783)
+    url: https://arxiv.org/html/2407.21783
+    note: "section 3.1: URL-level, global MinHash document-level and line-level dedup, the last removing lines that appear more than 6 times in each bucket of 30M documents. Checked 2026-10-28."
+  - title: Penedo et al., The FineWeb Datasets (arXiv 2406.17557)
+    url: https://arxiv.org/html/2406.17557
+    note: "5-grams, 112 hash functions in 14 buckets of 8; match probabilities 56%, 77%, 92% and 98.8% at similarity 0.7, 0.75, 0.8 and 0.85. Checked 2026-10-28."
+steps:
+  - title: Shingles
+    brief: |
+      A document becomes the set of its word 5-grams, the representation Lee et al. and FineWeb both use, and similarity is the Jaccard index of two such sets. Changing one word changes at most five shingles, so a 100-word page with one edit stays at 0.90 or above, while exact hashing of the whole page treats it as new. Keep case and split on any whitespace; a document shorter than five words is one shingle of all its words, and an empty one has none. Set semantics matter: a page that repeats a paragraph has the same shingle set as one that states it once.
+    starter: |
+      def shingles(text, n=5):
+          """Return the set of word n-grams of text as tuples.
+
+          Words are the whitespace-separated tokens, case kept. Fewer than n words: one shingle of all of them.
+          No words: the empty set.
+          """
+          raise NotImplementedError
+
+
+      def jaccard(a, b):
+          """Return |a & b| / |a | b| for two sets; two empty sets count as identical."""
+          raise NotImplementedError
+    tests: |
+      assert shingles("a b c d e f") == {("a", "b", "c", "d", "e"), ("b", "c", "d", "e", "f")}
+      assert shingles("short doc") == {("short", "doc")}, "fewer than n words: one shingle of all of them"
+      assert shingles("") == set() and shingles("   \n ") == set()
+      assert shingles("A b c d e") != shingles("a b c d e"), "case is kept"
+      assert shingles("a  b\tc\nd e") == {("a", "b", "c", "d", "e")}, "any run of whitespace separates words"
+      assert jaccard({1, 2, 3}, {2, 3, 4}) == 0.5
+      assert jaccard(set(), set()) == 1.0 and jaccard({1}, set()) == 0.0
+    hidden: |
+      import random
+      _g = random.Random(1)
+      _words = ["w%d" % i for i in range(3000)]
+      _docs = [" ".join(_g.choice(_words) for _ in range(_g.randint(0, 60))) for _ in range(200)]
+      assert all(len(shingles(d)) <= max(len(d.split()) - 4, 1 if d.split() else 0) for d in _docs)
+      assert all(jaccard(shingles(a), shingles(b)) == jaccard(shingles(b), shingles(a)) for a, b in zip(_docs, _docs[1:]))
+      assert all(0.0 <= jaccard(shingles(a), shingles(b)) <= 1.0 for a, b in zip(_docs, _docs[1:]))
+      _base = [_g.choice(_words) for _ in range(100)]
+      _edit = list(_base); _edit[50] = "zzz"
+      assert jaccard(shingles(" ".join(_base)), shingles(" ".join(_edit))) >= 91 / 101 - 1e-9, "one changed word changes at most n shingles"
+      assert shingles("x y z w v u", n=3) == {("x", "y", "z"), ("y", "z", "w"), ("z", "w", "v"), ("w", "v", "u")}
+    solution: |
+      def shingles(text, n=5):
+          words = text.split()
+          if len(words) < n:
+              return {tuple(words)} if words else set()
+          return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)}
+
+
+      def jaccard(a, b):
+          inter = len(a & b)
+          union = len(a) + len(b) - inter
+          return inter / union if union else 1.0
+  - title: Hash family
+    brief: |
+      MinHash needs k independent hash functions over shingles. Python's built-in `hash()` on strings is salted per process, so two workers would build different signatures for the same page and never match; the family has to be deterministic for a given seed. The classic family is `(a * x + b) mod p` over one base hash, which costs k Python-level multiplications per shingle. An extendable-output hash such as SHAKE-128 returns as many bytes as you ask for in one call, so 8k bytes give k 64-bit values. Either passes; the tests check determinism, range and spread, not one construction.
+    starter: |
+      def make_hashes(k, seed=0):
+          """Return h where h(shingle) is a list of k ints in [0, 2**64).
+
+          The same seed must give the same values in every process; different seeds give different families.
+          """
+          raise NotImplementedError
+    tests: |
+      h = make_hashes(16, seed=0)
+      v = h(("a", "b", "c", "d", "e"))
+      assert isinstance(v, list) and len(v) == 16
+      assert all(isinstance(x, int) and 0 <= x < 2 ** 64 for x in v)
+      assert h(("a", "b", "c", "d", "e")) == v, "the same shingle hashes the same way every time"
+      assert h(("a", "b", "c", "d", "f")) != v
+      assert make_hashes(16, seed=1)(("a", "b", "c", "d", "e")) != v, "the seed changes the family"
+    hidden: |
+      _h = make_hashes(64, seed=7)
+      _vals = [_h(("s%d" % i, "t")) for i in range(2000)]
+      assert all(len(set(v)) > 60 for v in _vals[:50]), "the k values of one shingle are distinct functions, not copies"
+      _mean = sum(v[0] for v in _vals) / len(_vals)
+      assert abs(_mean / 2 ** 63 - 1) < 0.05, "the first function is spread over the full 64-bit range"
+      _low = sum(1 for v in _vals if v[5] < 2 ** 62)
+      assert 400 < _low < 600, "a quarter of values fall in the lowest quarter of the range"
+      assert make_hashes(8, seed=3)(("q",)) == make_hashes(8, seed=3)(("q",)), "two families built with one seed agree"
+    solution: |
+      import hashlib
+      from array import array
+
+
+      def make_hashes(k, seed=0):
+          prefix = seed.to_bytes(8, "little")
+
+          def h(shingle):
+              # SHAKE-128 is an extendable-output hash: one call yields k independent 64-bit values,
+              # and unlike hash() on str it gives the same values in every process.
+              out = array("Q")
+              out.frombytes(hashlib.shake_128(prefix + " ".join(shingle).encode()).digest(8 * k))
+              return list(out)
+
+          return h
+  - title: Signatures
+    brief: |
+      For one random hash function, the chance that two sets have the same minimum is their Jaccard index, so the fraction of k positions where two signatures agree estimates it with a standard error of sqrt(J(1 − J)/k): about 0.044 at J = 0.5 and k = 128. The signature is the elementwise minimum over the set's shingles, which also makes the signature of a union the elementwise minimum of the two signatures; a distributed pipeline uses that to merge partial results. An empty set has no minimum and must be refused rather than given a sentinel that would match other empty pages.
+    starter: |
+      def signature(shingle_set, h):
+          """Return the k minimums of h over the shingles; raise ValueError for an empty set."""
+          raise NotImplementedError
+
+
+      def estimate(sig_a, sig_b):
+          """Return the fraction of positions where two signatures agree."""
+          raise NotImplementedError
+    tests: |
+      h = make_hashes(128)
+      A = shingles(" ".join("a%d" % i for i in range(60)))
+      B = shingles(" ".join("b%d" % i for i in range(60)))
+      assert signature(A, h) == signature(set(A), h) and len(signature(A, h)) == 128
+      assert estimate(signature(A, h), signature(A, h)) == 1.0
+      assert estimate(signature(A, h), signature(B, h)) < 0.05, "disjoint sets almost never share a minimum"
+    hidden: |
+      import random
+      _g = random.Random(3)
+      _h = make_hashes(128, seed=11)
+      _errs = []
+      for _ in range(30):
+          _pool = ["p%d" % i for i in range(400)]
+          _a = {(x,) for x in _g.sample(_pool, 150)}
+          _b = {(x,) for x in _g.sample(_pool, 150)}
+          _errs.append(abs(estimate(signature(_a, _h), signature(_b, _h)) - jaccard(_a, _b)))
+      assert sum(_errs) / len(_errs) < 0.06, f"mean absolute error {sum(_errs) / len(_errs):.3f} over 30 pairs at k=128"
+      _x = {(str(i),) for i in range(0, 80)}
+      _y = {(str(i),) for i in range(60, 140)}
+      assert signature(_x | _y, _h) == [min(p, q) for p, q in zip(signature(_x, _h), signature(_y, _h))], "the signature of a union is the elementwise minimum"
+      try:
+          signature(set(), _h)
+          assert False, "an empty set has no minimum"
+      except ValueError:
+          pass
+    solution: |
+      def signature(shingle_set, h):
+          if not shingle_set:
+              raise ValueError("an empty document has no signature")
+          return list(map(min, zip(*(h(s) for s in shingle_set))))
+
+
+      def estimate(sig_a, sig_b):
+          return sum(x == y for x, y in zip(sig_a, sig_b)) / len(sig_a)
+  - title: LSH bands
+    brief: |
+      Comparing signatures pairwise is still quadratic. Split each signature into b bands of r rows and bucket documents by each band's exact values; two documents become candidates if they share any bucket, with probability 1 − (1 − s^r)^b at similarity s. Lee et al. used 450 bands of 20 rows, which catches pairs at 0.8 with probability 0.995; FineWeb used 14 bands of 8 and reports 77% at 0.75 and 92% at 0.8. Key buckets by (band index, values) so two different bands with equal values do not collide, and refuse a layout that needs more rows than the signature has.
+    starter: |
+      def match_probability(s, bands, rows):
+          """Probability that two documents with Jaccard s share at least one band."""
+          raise NotImplementedError
+
+
+      def lsh_candidates(signatures, bands, rows):
+          """Return the set of (i, j), i < j, whose signatures agree on every row of at least one band.
+
+          Raise ValueError if bands * rows exceeds the signature length.
+          """
+          raise NotImplementedError
+    tests: |
+      assert abs(match_probability(0.8, 450, 20) - 0.9946) < 1e-3, "Lee et al.: 450 bands of 20 rows at Jaccard 0.8"
+      assert abs(match_probability(0.75, 14, 8) - 0.77) < 0.01, "FineWeb: 14 bands of 8 at 0.75 match 77% of the time"
+      s1, s2, s3 = [1, 2, 3, 4, 5, 6], [1, 2, 3, 9, 9, 9], [7, 7, 7, 7, 7, 7]
+      assert lsh_candidates([s1, s2, s3], bands=2, rows=3) == {(0, 1)}
+      assert lsh_candidates([s1, s1, s1], bands=3, rows=2) == {(0, 1), (0, 2), (1, 2)}
+    hidden: |
+      import random, time
+      _g = random.Random(4)
+      _sigs = [[_g.randrange(3) for _ in range(12)] for _ in range(60)]
+      _brute = {(i, j) for i in range(60) for j in range(i + 1, 60) if any(_sigs[i][b * 3:(b + 1) * 3] == _sigs[j][b * 3:(b + 1) * 3] for b in range(4))}
+      assert lsh_candidates(_sigs, bands=4, rows=3) == _brute, "exactly the pairs that share at least one band"
+      assert all(i < j for i, j in lsh_candidates(_sigs, bands=4, rows=3))
+      try:
+          lsh_candidates([[1, 2, 3]], bands=2, rows=2)
+          assert False, "bands * rows larger than the signature must be refused"
+      except ValueError:
+          pass
+      _many = [[_g.getrandbits(64) for _ in range(128)] for _ in range(4000)]
+      _t = time.perf_counter()
+      assert lsh_candidates(_many, bands=16, rows=8) == set()
+      assert time.perf_counter() - _t < 3.0, "4,000 signatures: bucket by band key instead of comparing pairs"
+    solution: |
+      def match_probability(s, bands, rows):
+          return 1 - (1 - s ** rows) ** bands
+
+
+      def band_keys(sig, bands, rows):
+          if bands * rows > len(sig):
+              raise ValueError("bands * rows exceeds the signature length")
+          return [(b, tuple(sig[b * rows:(b + 1) * rows])) for b in range(bands)]
+
+
+      def lsh_candidates(signatures, bands, rows):
+          buckets = {}
+          for i, sig in enumerate(signatures):
+              for key in band_keys(sig, bands, rows):
+                  buckets.setdefault(key, []).append(i)
+          pairs = set()
+          for members in buckets.values():
+              for x in range(len(members)):
+                  for y in range(x + 1, len(members)):
+                      pairs.add((members[x], members[y]))
+          return pairs
+  - title: Threshold tuning
+    brief: |
+      With k hashes fixed, the split between bands and rows sets where the S-curve rises. More rows make it steeper and push it right: fewer candidates below the threshold, more misses at it. Candidates are verified with exact Jaccard, so a false candidate costs one set comparison while a miss is a duplicate left in the training set. Choose the layout for a threshold and k, then build `dedup`: verify every candidate, drop a document only when a kept document is at or above the threshold, and return the kept indices in order. Which copy of a cluster survives is your policy; the tests check that every drop points at a survivor.
+    starter: |
+      def choose_bands(k, threshold):
+          """Return (bands, rows) with bands * rows <= k for a near-duplicate threshold."""
+          raise NotImplementedError
+
+
+      def dedup(docs, threshold=0.8, k=128):
+          """Return the ascending indices of documents to keep; drop a document only when a kept one is at or above threshold."""
+          raise NotImplementedError
+    tests: |
+      b, r = choose_bands(128, 0.8)
+      assert b * r <= 128
+      assert match_probability(0.8, b, r) >= 0.9, "pairs at the threshold are found at least 90% of the time"
+      assert match_probability(0.5, b, r) <= 0.1, "pairs at 0.5 rarely become candidates"
+      import random
+      _r = random.Random(5)
+      _v = ["v%d" % i for i in range(5000)]
+      base = [_r.choice(_v) for _ in range(120)]
+      near = list(base); near[30] = "changed"
+      other = [_r.choice(_v) for _ in range(120)]
+      kept = dedup([" ".join(base), " ".join(other), " ".join(near)])
+      assert len(kept) == 2 and 1 in kept, kept
+      assert dedup([]) == []
+    hidden: |
+      import random
+      for _k in (128, 256):
+          for _t in (0.7, 0.8, 0.9):
+              _b, _r = choose_bands(_k, _t)
+              assert _b * _r <= _k and match_probability(_t, _b, _r) >= 0.9 and match_probability(_t - 0.3, _b, _r) <= 0.1, (_k, _t, _b, _r)
+      _g = random.Random(55)
+      _V = ["t%d" % i for i in range(30000)]
+      _docs, _cl = [], []
+      for _c in range(80):
+          _base = [_g.choice(_V) for _ in range(150)]
+          _docs.append(" ".join(_base)); _cl.append(_c)
+          for _ in range(_g.randrange(0, 3)):
+              _w = list(_base); _w[_g.randrange(150)] = _g.choice(_V)
+              _docs.append(" ".join(_w)); _cl.append(_c)
+      _kept = dedup(_docs)
+      assert _kept == sorted(set(_kept))
+      _per = {}
+      for _i in _kept:
+          _per[_cl[_i]] = _per.get(_cl[_i], 0) + 1
+      assert len(_per) == 80 and sum(1 for v in _per.values() if v == 1) >= 77, "planted near-duplicates collapse and distinct documents stay"
+      _ks = set(_kept)
+      assert all(any(jaccard(shingles(_docs[i]), shingles(_docs[j])) >= 0.8 for j in _kept) for i in range(len(_docs)) if i not in _ks), "every drop has a kept partner at or above the threshold"
+      _pairs = []
+      for _ in range(30):
+          _w = [_g.choice(_V) for _ in range(150)]
+          _pairs += [" ".join(_w), " ".join(_w[:128] + [_g.choice(_V) for _ in range(22)])]
+      assert dedup(_pairs) == list(range(60)), "pairs at Jaccard 0.74 are verified and kept"
+    solution: |
+      def choose_bands(k, threshold, recall=0.9):
+          # Steeper curves (more rows) cost fewer candidate checks below the threshold, so take the most rows
+          # that still catch pairs at the threshold with probability >= recall.
+          for rows in range(k, 0, -1):
+              bands = k // rows
+              if match_probability(threshold, bands, rows) >= recall:
+                  return bands, rows
+          return k, 1
+
+
+      def dedup(docs, threshold=0.8, k=128):
+          bands, rows = choose_bands(k, threshold)
+          h = make_hashes(k)
+          sets = [shingles(d) for d in docs]
+          tables = {}
+          kept, empty_seen = [], False
+          for i, s in enumerate(sets):
+              if not s:
+                  if not empty_seen:
+                      kept.append(i)
+                      empty_seen = True
+                  continue
+              sig = signature(s, h)
+              keys = [(b, tuple(sig[b * rows:(b + 1) * rows])) for b in range(bands)]
+              candidates = {j for key in keys for j in tables.get(key, ())}
+              # Verify exactly, and compare only against kept documents, so every drop points at a survivor.
+              if any(jaccard(s, sets[j]) >= threshold for j in candidates):
+                  continue
+              kept.append(i)
+              for key in keys:
+                  tables.setdefault(key, []).append(i)
+          return kept
+  - title: Line-level frequency filter
+    brief: |
+      Document-level dedup leaves boilerplate that sits inside otherwise distinct pages: cookie banners, navigation, newsletter prompts. Llama 3 removes lines that appear more than 6 times in each bucket of 30M documents, after URL and MinHash dedup. Counting per bucket rather than globally bounds the memory of the counter and keeps a line that is common across the crawl but rare in any one slice. Compare lines after stripping surrounding whitespace, count every occurrence, keep each document's slot even when nothing is left in it, and leave the order of the surviving lines alone.
+    starter: |
+      def line_filter(docs, max_count=6, bucket_size=30_000_000):
+          """Return docs with every line removed whose stripped text occurs more than max_count times in its bucket.
+
+          Buckets are consecutive slices of bucket_size documents. A document left with no lines becomes "".
+          """
+          raise NotImplementedError
+    tests: |
+      docs = ["intro %d\nSubscribe to our newsletter\nbody %d" % (i, i) for i in range(10)]
+      out = line_filter(docs, max_count=6)
+      assert len(out) == 10
+      assert out[0] == "intro 0\nbody 0", out[0]
+      six = ["page %d\nShared line" % i for i in range(6)]
+      assert line_filter(six, max_count=6) == six, "a line seen exactly max_count times stays"
+      only = ["Cookie banner"] * 8
+      assert line_filter(only, max_count=6) == [""] * 8, "a document of nothing but boilerplate becomes empty and keeps its slot"
+    hidden: |
+      import random
+      _spread = ["doc %d\nFooter line" % i for i in range(8)]
+      assert line_filter(_spread, max_count=6, bucket_size=4) == _spread, "counts are per bucket: 4 and 4 never exceed 6"
+      assert line_filter(_spread, max_count=6, bucket_size=8)[0] == "doc 0"
+      _g = random.Random(6)
+      _lines = ["L%d" % i for i in range(40)]
+      _docs = ["\n".join(_g.choice(_lines) for _ in range(_g.randint(1, 8))) for _ in range(300)]
+      _out = line_filter(_docs, max_count=20, bucket_size=100)
+      assert len(_out) == len(_docs)
+      def _subseq(small, big):
+          it = iter(big)
+          return all(any(x == y for y in it) for x in small)
+      assert all(_subseq([l for l in o.split("\n") if l], d.split("\n")) for o, d in zip(_out, _docs)), "kept lines keep their order"
+      for _s in range(0, 300, 100):
+          _cnt = {}
+          for _d in _docs[_s:_s + 100]:
+              for _l in _d.split("\n"):
+                  _cnt[_l] = _cnt.get(_l, 0) + 1
+          assert all(_cnt[_l] <= 20 for _o in _out[_s:_s + 100] for _l in _o.split("\n") if _l), "no kept line is over the limit in its bucket"
+          assert all((_l in _o.split("\n")) == (_cnt[_l] <= 20) for _o, _d in zip(_out[_s:_s + 100], _docs[_s:_s + 100]) for _l in _d.split("\n")), "a line is removed exactly when its bucket count is over the limit"
+      assert line_filter(["  Padded line  \nx"] * 3 + ["Padded line\ny"] * 4, max_count=6)[0] == "x", "lines compare after stripping surrounding whitespace"
+    solution: |
+      def line_filter(docs, max_count=6, bucket_size=30_000_000):
+          out = []
+          for start in range(0, len(docs), bucket_size):
+              bucket = docs[start:start + bucket_size]
+              counts = {}
+              for doc in bucket:
+                  for line in doc.split("\n"):
+                      key = line.strip()
+                      if key:
+                          counts[key] = counts.get(key, 0) + 1
+              for doc in bucket:
+                  lines = [ln for ln in doc.split("\n") if not ln.strip() or counts[ln.strip()] <= max_count]
+                  out.append("\n".join(lines) if any(ln.strip() for ln in lines) else "")
+          return out
+---
+
+This lab builds the near-duplicate filter from the dedup lesson as one program. Each step adds functions to the same file, and the tests of later steps run against everything written so far: `dedup` in step 5 calls the shingles, hash family and signatures from steps 1 to 3.
+
+Steps 1 to 3 build the estimator: shingles, a deterministic hash family, and signatures whose agreement rate estimates Jaccard. Step 4 turns the estimate into a sub-quadratic index, step 5 tunes it to a threshold and adds the verification that keeps pairs below the threshold, and step 6 adds the line-level pass that removes boilerplate document dedup cannot see.
+
+The visible tests are examples. The hidden tests plant near-duplicates (one word changed in 150) among distinct documents and check that the clusters collapse, that every dropped document has a kept partner at or above the threshold, and that pairs at Jaccard 0.74 survive at threshold 0.8. Which copy survives, and how you choose bands and rows, are yours.
+
+The program holds every kept document's shingle set in memory and processes documents in one order on one machine. At crawl scale the signatures are a map step, the band keys a shuffle, and verification either reads documents back by id or is replaced by an edit-similarity check on the candidate pairs only, as Lee et al. do; those are the differences between this program and a production pipeline.

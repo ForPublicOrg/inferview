@@ -1,0 +1,511 @@
+---
+title: Build an eval harness
+track: evals
+module: llm-judge
+kind: lab
+minutes: 150
+summary: Grow one program over seven steps that loads a versioned golden set, runs a binary judge against a scripted mock, measures the judge's TPR and TNR, corrects its pass rate with an interval, scores pass^k, gates a release with a paired test, and reports what the gate did not check.
+updated: 2026-10-28
+sources:
+  - title: ai-evals-course/judgy on GitHub
+    url: https://github.com/ai-evals-course/judgy
+    note: the corrected pass rate (p_obs + TNR - 1) / (TPR + TNR - 1) with pass as 1, a bootstrap interval (20,000 iterations and 0.95 by default) and the precondition TPR + TNR > 1, used in step 4 with failure as the positive class; checked 2026-10-28
+  - title: Hamel Husain and Shreya Shankar, AI Evals FAQ
+    url: https://hamel.dev/blog/posts/evals-faq/
+    note: positive means an error is present; binary pass or fail judgements; 30 to 50 examples of each label in dev and test, the reason for step 7's thresholds; checked 2026-10-28
+  - title: Hamel Husain, Using LLM-as-a-Judge (published 2024-10-29, modified 2026-09-01)
+    url: https://hamel.dev/blog/posts/llm-judge/
+    note: critique before verdict, raw agreement misleads on imbalanced classes, and re-validation when the model changes; steps 2, 3 and 7; checked 2026-10-28
+  - title: Evan Miller, Adding Error Bars to Evals (arXiv 2411.00640, 2024-11-01)
+    url: https://arxiv.org/abs/2411.00640
+    note: inference on question-level paired differences when two models answer the same questions, and the paired standard error, used in step 6; checked 2026-10-28
+  - title: Yao, Shinn, Razavi and Narasimhan, tau-bench (arXiv 2406.12045, 2024-06-17)
+    url: https://arxiv.org/abs/2406.12045
+    note: pass^k as a measure of reliability over repeated trials; the paper reports pass^8 below 25% in its retail domain for the agents it tested; step 5; checked 2026-10-28
+  - title: Anthropic Engineering, Demystifying evals for AI agents (2026-01-09)
+    url: https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents
+    note: pass^k is the chance all k trials succeed, about 42% for a 75% per-trial rate over 3 trials; model graders need calibration against human graders; checked 2026-10-28
+steps:
+  - title: Load a versioned golden set
+    brief: |
+      Every number this harness produces is about a particular set of labelled outputs, so the set needs an identity that changes exactly when its content does. Write load_golden, which reads JSON Lines with id, output, label ("pass" or "fail") and optional tags, and returns {"version", "items"} with the items sorted by id. The version is a hash of the content, so reordering rows, reformatting the JSON or reordering tags leaves it unchanged, and changing any output or label changes it. Raise ValueError on a duplicate id, a missing id or output, or any other label. Real golden sets reach tens of thousands of rows, and the tests load one.
+    starter: |
+      import hashlib
+      import json
+
+
+      def load_golden(text):
+          """text is JSON Lines: one {"id", "output", "label", "tags"?} object per line; blank lines are skipped.
+          Return {"version": str, "items": [ {"id", "output", "label", "tags"} sorted by id ]}.
+          The version changes when any id, output, label or tag changes, and only then.
+          Raise ValueError on a duplicate id, a missing id or output, or a label other than "pass" or "fail"."""
+          raise NotImplementedError
+    tests: |
+      G = "\n".join([
+          '{"id": "t1", "output": "Your refund goes back to the original card.", "label": "pass", "tags": ["refunds"]}',
+          '{"id": "t2", "output": "The card ending 4471 was charged twice.", "label": "fail", "tags": ["pii"]}',
+          "",
+          '{"id": "t3", "output": "I cannot help with refunds.", "label": "fail", "tags": ["refusal", "refunds"]}',
+      ])
+      g = load_golden(G)
+      assert [r["id"] for r in g["items"]] == ["t1", "t2", "t3"]
+      assert isinstance(g["version"], str) and len(g["version"]) >= 8
+      assert load_golden("\n".join(reversed(G.splitlines())))["version"] == g["version"], "row order is not part of the version"
+      assert load_golden(G.replace('"label": "pass"', '"label": "fail"'))["version"] != g["version"], "a relabel is a new version"
+      try:
+          load_golden(G + "\n" + G.splitlines()[0])
+          raise AssertionError("a duplicate id must raise ValueError")
+      except ValueError:
+          pass
+    hidden: |
+      _hx_a = load_golden('{"id":"a","output":"x","label":"pass","tags":["p","q"]}\n{"id":"b","output":"y","label":"fail"}')
+      _hx_b = load_golden('{"id": "b", "output": "y", "label": "fail", "tags": []}\n\n{"id": "a", "label": "pass", "output": "x", "tags": ["q", "p"]}')
+      assert _hx_a["version"] == _hx_b["version"]
+      assert load_golden('{"id":"a","output":"x!","label":"pass","tags":["p","q"]}\n{"id":"b","output":"y","label":"fail"}')["version"] != _hx_a["version"]
+      for _hx_bad in ('{"id":"a","output":"x","label":"PASSED"}', '{"output":"x","label":"pass"}', '{"id":"a","label":"pass"}'):
+          try:
+              load_golden(_hx_bad)
+              raise AssertionError("invalid row accepted")
+          except ValueError:
+              pass
+      assert len(load_golden("\n".join('{"id":"i%05d","output":"o","label":"pass"}' % i for i in range(20000)))["items"]) == 20000
+    solution: |
+      import hashlib
+      import json
+
+
+      def load_golden(text):
+          items, seen = [], set()
+          for n, line in enumerate(text.splitlines(), 1):
+              if not line.strip():
+                  continue
+              row = json.loads(line)
+              if not isinstance(row.get("id"), str) or not isinstance(row.get("output"), str):
+                  raise ValueError(f"line {n}: id and output are required strings")
+              if row.get("label") not in ("pass", "fail"):
+                  raise ValueError(f"line {n}: label must be 'pass' or 'fail'")
+              if row["id"] in seen:
+                  raise ValueError(f"line {n}: duplicate id {row['id']}")
+              seen.add(row["id"])
+              items.append({"id": row["id"], "output": row["output"], "label": row["label"], "tags": sorted(row.get("tags", []))})
+          items.sort(key=lambda r: r["id"])
+          canonical = json.dumps(items, sort_keys=True, separators=(",", ":"))
+          return {"version": hashlib.sha256(canonical.encode()).hexdigest()[:12], "items": items}
+  - title: A binary judge against a scripted mock
+    brief: |
+      ScriptedJudgeModel stands in for the judge model: it returns scripted replies to prompts that contain a given substring, in order, and records every prompt in calls. Write judge(model, criterion, output), which asks for a short critique followed by a final line "Verdict: PASS" or "Verdict: FAIL" and returns "pass", "fail" or None. The verdict is read from the last line that starts with "Verdict:", in any case and with trailing punctuation, never from a pass or fail word inside the critique. A reply with no readable verdict gets one retry with the same prompt; after a second unreadable reply the judge abstains with None. There is never a third call for one output, because a judge that retries until it gets an answer turns a parsing failure into a hidden cost.
+    starter: |
+      class ScriptedJudgeModel:
+          """A deterministic stand-in for the judge model. replies maps a substring of the prompt
+          to the replies returned, in order, to prompts that contain it; the last reply repeats.
+          Prompts that match no key get default. Every prompt is appended to calls."""
+
+          def __init__(self, replies, default="Critique: meets the criterion.\nVerdict: PASS"):
+              self.replies = {k: list(v) for k, v in replies.items()}
+              self.default = default
+              self.calls = []
+
+          def complete(self, prompt):
+              self.calls.append(prompt)
+              for key, queue in self.replies.items():
+                  if key in prompt:
+                      return queue.pop(0) if len(queue) > 1 else queue[0]
+              return self.default
+
+
+      def judge(model, criterion, output):
+          """Ask model for a critique and a final "Verdict: PASS" or "Verdict: FAIL" line.
+          Return "pass", "fail", or None after two replies without a readable verdict.
+          Never call the model more than twice for one output."""
+          raise NotImplementedError
+    tests: |
+      m = ScriptedJudgeModel({"card ending": ["Critique: a strict reader could call the tone a FAIL, but no card data is shown.\nVerdict: PASS"]})
+      assert judge(m, "The reply shows no payment card data", "The card ending 4471 was charged twice.") == "pass", "the verdict line decides, not a word in the critique"
+      assert len(m.calls) == 1 and "card ending 4471" in m.calls[0] and "no payment card data" in m.calls[0]
+      m = ScriptedJudgeModel({"X1": ["Looks fine to me.", "Critique: leaks a card number.\nVerdict: FAIL"]})
+      assert judge(m, "c", "X1") == "fail" and len(m.calls) == 2, "one retry after a reply with no verdict"
+      m = ScriptedJudgeModel({"X2": ["No verdict in this reply."]})
+      assert judge(m, "c", "X2") is None and len(m.calls) == 2, "two replies without a verdict: abstain, and no third call"
+    hidden: |
+      _hx_m = ScriptedJudgeModel({"ITEM-A": ["Critique: fine.\nverdict: fail."], "ITEM-B": ["Verdict: FAIL\nOn reflection the refund is correct.\nVerdict: PASS"], "ITEM-C": ["Verdict: MAYBE"], "ITEM-D": ["Critique: ok.\nVerdict:  Pass "]})
+      assert judge(_hx_m, "c", "ITEM-A") == "fail"
+      assert judge(_hx_m, "c", "ITEM-B") == "pass"
+      assert judge(_hx_m, "c", "ITEM-C") is None
+      assert judge(_hx_m, "c", "ITEM-D") == "pass"
+      _hx_m2 = ScriptedJudgeModel({}, default="nothing")
+      for _hx_i in range(25):
+          judge(_hx_m2, "c", f"item {_hx_i}")
+      assert len(_hx_m2.calls) == 50
+      assert all(f"item {i}" in _hx_m2.calls[2 * i] for i in range(25))
+    solution: |
+      class ScriptedJudgeModel:
+          """A deterministic stand-in for the judge model. replies maps a substring of the prompt
+          to the replies returned, in order, to prompts that contain it; the last reply repeats.
+          Prompts that match no key get default. Every prompt is appended to calls."""
+
+          def __init__(self, replies, default="Critique: meets the criterion.\nVerdict: PASS"):
+              self.replies = {k: list(v) for k, v in replies.items()}
+              self.default = default
+              self.calls = []
+
+          def complete(self, prompt):
+              self.calls.append(prompt)
+              for key, queue in self.replies.items():
+                  if key in prompt:
+                      return queue.pop(0) if len(queue) > 1 else queue[0]
+              return self.default
+
+
+      def parse_verdict(reply):
+          for line in reversed(reply.strip().splitlines()):
+              head, sep, value = line.partition(":")
+              if sep and head.strip().lower() == "verdict":
+                  word = value.strip().strip(".!*").lower()
+                  return word if word in ("pass", "fail") else None
+          return None
+
+
+      def judge(model, criterion, output):
+          prompt = (
+              f"Criterion: {criterion}\n\nOutput to grade:\n{output}\n\n"
+              "Write a short critique first. End with one line: Verdict: PASS or Verdict: FAIL."
+          )
+          for _ in range(2):
+              verdict = parse_verdict(model.complete(prompt))
+              if verdict:
+                  return verdict
+          return None
+  - title: TPR and TNR on labelled data
+    brief: |
+      The judge is a classifier, so it is measured as one. Write rates(golden, verdicts), where verdicts maps every golden id to "pass", "fail" or None. Failure is the positive class: tpr is the share of human-labelled failures the judge failed, tnr the share of human-labelled passes it passed. An abstention is never a correct verdict, so None counts against whichever rate its item belongs to. Return the golden set's version with the rates, the two label counts and the number of abstentions, because step 7 needs all of them. Raise ValueError when a golden id has no verdict or the set lacks either label.
+    starter: |
+      def rates(golden, verdicts):
+          """verdicts maps every golden id to "pass", "fail" or None. Failure is the positive class.
+          Return {"version", "tpr", "tnr", "failures", "passes", "abstained"}.
+          None is never a correct verdict. Raise ValueError on a missing verdict or a set without both labels."""
+          raise NotImplementedError
+    tests: |
+      import json as _json
+      rows = [{"id": f"f{i:02d}", "output": "o", "label": "fail"} for i in range(10)] + [{"id": f"p{i:02d}", "output": "o", "label": "pass"} for i in range(90)]
+      gold = load_golden("\n".join(_json.dumps(r) for r in rows))
+      verdicts = {f"f{i:02d}": ("fail" if i < 8 else "pass") for i in range(10)}
+      verdicts.update({f"p{i:02d}": ("fail" if i < 6 else "pass") for i in range(90)})
+      r = rates(gold, verdicts)
+      assert r["tpr"] == 0.8 and abs(r["tnr"] - 84 / 90) < 1e-12, "failure is the positive class"
+      assert r["failures"] == 10 and r["passes"] == 90 and r["abstained"] == 0 and r["version"] == gold["version"]
+      verdicts["f00"] = None
+      verdicts["p89"] = None
+      r = rates(gold, verdicts)
+      assert r["tpr"] == 0.7 and abs(r["tnr"] - 83 / 90) < 1e-12 and r["abstained"] == 2, "an abstention is never a correct verdict"
+    hidden: |
+      import json as _hx_json, random as _hx_random
+      _hx_r = _hx_random.Random(5)
+      _hx_checked = 0
+      for _ in range(20):
+          _hx_rows = [{"id": f"i{i}", "output": "o", "label": _hx_r.choice(["pass", "fail"])} for i in range(60)]
+          _hx_rows[0]["label"], _hx_rows[1]["label"] = "pass", "fail"
+          _hx_g = load_golden("\n".join(_hx_json.dumps(x) for x in _hx_rows))
+          _hx_v = {x["id"]: _hx_r.choice(["pass", "fail", None]) for x in _hx_rows}
+          _hx_out = rates(_hx_g, _hx_v)
+          _hx_f = [x for x in _hx_rows if x["label"] == "fail"]
+          _hx_p = [x for x in _hx_rows if x["label"] == "pass"]
+          assert abs(_hx_out["tpr"] - sum(_hx_v[x["id"]] == "fail" for x in _hx_f) / len(_hx_f)) < 1e-12
+          assert abs(_hx_out["tnr"] - sum(_hx_v[x["id"]] == "pass" for x in _hx_p) / len(_hx_p)) < 1e-12
+          assert _hx_out["abstained"] == sum(v is None for v in _hx_v.values())
+          _hx_checked += 1
+      assert _hx_checked == 20
+      try:
+          rates(load_golden('{"id":"a","output":"x","label":"pass"}\n{"id":"b","output":"y","label":"fail"}'), {"a": "pass"})
+          raise AssertionError("a missing verdict must raise")
+      except ValueError:
+          pass
+      try:
+          rates(load_golden('{"id":"a","output":"x","label":"pass"}'), {"a": "pass"})
+          raise AssertionError("no failures in the golden set must raise")
+      except ValueError:
+          pass
+    solution: |
+      def rates(golden, verdicts):
+          tp = fn = tn = fp = abstained = 0
+          for item in golden["items"]:
+              if item["id"] not in verdicts:
+                  raise ValueError(f"no verdict for {item['id']}")
+              v = verdicts[item["id"]]
+              abstained += v is None
+              if item["label"] == "fail":
+                  tp += v == "fail"
+                  fn += v != "fail"
+              else:
+                  tn += v == "pass"
+                  fp += v != "pass"
+          if tp + fn == 0 or tn + fp == 0:
+              raise ValueError("the golden set needs at least one pass and one fail")
+          return {"version": golden["version"], "tpr": tp / (tp + fn), "tnr": tn / (tn + fp),
+                  "failures": tp + fn, "passes": tn + fp, "abstained": abstained}
+  - title: Correct the observed pass rate with an interval
+    brief: |
+      The judge's pass rate on unlabelled production replies is biased by its errors. Write corrected(r, production, confidence=0.95, iterations=2000, seed=0), which takes step 3's rates and a list of production verdicts, drops abstentions, and returns the estimated true pass rate (p_obs + tpr - 1) / (tpr + tnr - 1) clamped to 0 to 1, with an interval that carries the uncertainty of tpr, tnr and the production sample, plus the observed rate, the number of verdicts used and the number dropped. Raise ValueError when tpr + tnr is at most 1, because the judge then carries no information, or when no verdicts remain. The result must be the same for the same inputs and seed. Fewer labelled failures must give a wider interval: that is the property the hidden tests check across base rates.
+    starter: |
+      import random
+
+
+      def corrected(r, production, confidence=0.95, iterations=2000, seed=0):
+          """r comes from rates(); production is a list of "pass", "fail" or None.
+          Return {"estimate", "low", "high", "observed", "n", "dropped"} with 0 <= low <= estimate <= high <= 1.
+          Raise ValueError when tpr + tnr <= 1 or no verdicts remain after dropping None."""
+          raise NotImplementedError
+    tests: |
+      R = {"version": "v1", "tpr": 0.6, "tnr": 0.95, "failures": 50, "passes": 100, "abstained": 0}
+      c = corrected(R, ["pass"] * 785 + ["fail"] * 215)
+      assert abs(c["estimate"] - 0.7) < 1e-9 and abs(c["observed"] - 0.785) < 1e-12, "the judge passes 78.5%; the estimate of the truth is 70%"
+      assert 0 <= c["low"] <= c["estimate"] <= c["high"] <= 1
+      assert c == corrected(R, ["pass"] * 785 + ["fail"] * 215), "same inputs and seed, same interval"
+      assert corrected(R, ["pass"] * 785 + ["fail"] * 215 + [None] * 40)["dropped"] == 40
+      try:
+          corrected({**R, "tpr": 0.6, "tnr": 0.4}, ["pass"] * 10)
+          raise AssertionError("a judge with tpr + tnr = 1 is no better than chance")
+      except ValueError:
+          pass
+    hidden: |
+      _hx_R = {"version": "v", "tpr": 0.9, "tnr": 0.9, "failures": 80, "passes": 200, "abstained": 0}
+      assert corrected(_hx_R, ["pass"] * 99 + ["fail"])["estimate"] == 1.0
+      assert corrected(_hx_R, ["pass"] * 5 + ["fail"] * 95)["estimate"] == 0.0
+      _hx_P = ["pass"] * 800 + ["fail"] * 200
+      _hx_small = corrected({**_hx_R, "failures": 20, "passes": 50}, _hx_P)
+      _hx_big = corrected({**_hx_R, "failures": 320, "passes": 800}, _hx_P)
+      assert _hx_big["high"] - _hx_big["low"] < _hx_small["high"] - _hx_small["low"]
+      _hx_rare = corrected({**_hx_R, "failures": 8, "passes": 400}, _hx_P)
+      _hx_even = corrected({**_hx_R, "failures": 200, "passes": 208}, _hx_P)
+      assert _hx_rare["high"] - _hx_rare["low"] > _hx_even["high"] - _hx_even["low"]
+      for _hx_c in (_hx_small, _hx_big, _hx_rare, _hx_even):
+          assert 0 <= _hx_c["low"] <= _hx_c["estimate"] <= _hx_c["high"] <= 1
+      try:
+          corrected(_hx_R, [None, None])
+          raise AssertionError("no usable verdicts must raise")
+      except ValueError:
+          pass
+    solution: |
+      import random
+
+
+      def _theta(p, tpr, tnr):
+          return min(1.0, max(0.0, (p + tpr - 1) / (tpr + tnr - 1)))
+
+
+      def corrected(r, production, confidence=0.95, iterations=2000, seed=0):
+          if r["tpr"] + r["tnr"] <= 1:
+              raise ValueError("the judge is no better than chance")
+          kept = [v for v in production if v is not None]
+          if not kept:
+              raise ValueError("no usable production verdicts")
+          n, k = len(kept), kept.count("pass")
+          p = k / n
+          est = _theta(p, r["tpr"], r["tnr"])
+          rng, nf, np_ = random.Random(seed), r["failures"], r["passes"]
+          draws, undefined = [], 0
+          for _ in range(iterations):
+              t = rng.binomialvariate(nf, r["tpr"]) / nf
+              s = rng.binomialvariate(np_, r["tnr"]) / np_
+              if t + s <= 1:
+                  undefined += 1
+                  continue
+              draws.append(_theta(rng.binomialvariate(n, p) / n, t, s))
+          alpha = 1 - confidence
+          if undefined > alpha / 2 * iterations:
+              lo, hi = 0.0, 1.0
+          else:
+              draws.sort()
+              lo = min(est, draws[int(alpha / 2 * (len(draws) - 1))])
+              hi = max(est, draws[int((1 - alpha / 2) * (len(draws) - 1))])
+          return {"estimate": est, "low": lo, "high": hi, "observed": p, "n": n, "dropped": len(production) - n}
+  - title: pass^k from repeated trials
+    brief: |
+      A system that passes an item on one run may fail it on the next, and a user who asks twice meets both. Write pass_hat_k(trials, k), where trials maps an item id to its judged verdicts over n repeated runs. For each item, estimate the chance that k runs drawn without replacement from its n all pass, as the share of k-subsets of the runs that are all passes; average over items. Raise ValueError when k is below 1, there are no items, or an item has fewer than k runs. The tests include an item with 4,000 runs and k = 2,000, so the arithmetic must not go through floating-point factorials.
+    starter: |
+      from math import comb
+
+
+      def pass_hat_k(trials, k):
+          """trials maps item id to its verdicts over n runs. Return the mean over items of the chance
+          that k runs drawn without replacement all pass. Raise ValueError when k < 1, there are
+          no items, or an item has fewer than k runs."""
+          raise NotImplementedError
+    tests: |
+      T = {"a": ["pass"] * 4, "b": ["pass", "pass", "fail", "fail"]}
+      assert abs(pass_hat_k(T, 1) - 0.75) < 1e-12
+      assert abs(pass_hat_k(T, 2) - (1 + 1 / 6) / 2) < 1e-12
+      assert abs(pass_hat_k(T, 3) - 0.5) < 1e-12, "item b cannot pass three of three"
+      try:
+          pass_hat_k(T, 5)
+          raise AssertionError("four trials cannot estimate pass^5")
+      except ValueError:
+          pass
+    hidden: |
+      import itertools as _hx_it, random as _hx_rnd
+      _hx_r = _hx_rnd.Random(3)
+      for _ in range(25):
+          _hx_T = {}
+          for _hx_i in range(_hx_r.randint(1, 4)):
+              _hx_n = _hx_r.randint(1, 7)
+              _hx_T[f"i{_hx_i}"] = [_hx_r.choice(["pass", "fail"]) for _ in range(_hx_n)]
+          for _hx_k in range(1, min(len(v) for v in _hx_T.values()) + 1):
+              _hx_exp = 0.0
+              for _hx_v in _hx_T.values():
+                  _hx_subs = list(_hx_it.combinations(_hx_v, _hx_k))
+                  _hx_exp += sum(all(x == "pass" for x in s) for s in _hx_subs) / len(_hx_subs)
+              assert abs(pass_hat_k(_hx_T, _hx_k) - _hx_exp / len(_hx_T)) < 1e-9
+      assert 0 < pass_hat_k({"big": ["pass"] * 3990 + ["fail"] * 10}, 2000) < 0.01
+      assert pass_hat_k({"x": ["pass", "fail"] * 3}, 1) == 0.5
+    solution: |
+      from math import comb
+
+
+      def pass_hat_k(trials, k):
+          if k < 1 or not trials:
+              raise ValueError("k must be at least 1 and there must be at least one item")
+          total = 0.0
+          for item, verdicts in trials.items():
+              n, c = len(verdicts), verdicts.count("pass")
+              if n < k:
+                  raise ValueError(f"{item} has {n} trials, fewer than k = {k}")
+              total += comb(c, k) / comb(n, k)
+          return total / len(trials)
+  - title: A regression gate with a paired test
+    brief: |
+      Baseline and candidate were judged on the same golden items, so compare them item by item. Write gate(baseline, candidate, margin=0.02, z=1.96), where each run is {"version", "results"} and results maps item id to "pass" or "fail". Compute the per-item difference (candidate pass minus baseline pass), its mean, and the standard error of the mean with the sample variance (n - 1 in the denominator). Ship when the lower bound, mean - z * se, is at least -margin; otherwise block. Refuse runs on different golden versions or different item sets, because a paired test on unpaired data is wrong silently. The visible tests include a candidate that an unpaired comparison of two pass rates would block and the paired test ships.
+    starter: |
+      from math import sqrt
+
+
+      def gate(baseline, candidate, margin=0.02, z=1.96):
+          """Each run is {"version", "results": {item id: "pass" or "fail"}}.
+          Return {"version", "diff", "se", "lower", "decision"}, decision "ship" or "block".
+          Raise ValueError on different versions or different item sets."""
+          raise NotImplementedError
+    tests: |
+      def run(version, outcomes):
+          return {"version": version, "results": {f"i{n}": o for n, o in enumerate(outcomes)}}
+
+      same = ["pass"] * 80 + ["fail"] * 20
+      g = gate(run("v1", same), run("v1", same))
+      assert g["decision"] == "ship" and g["diff"] == 0 and g["se"] == 0
+      two_worse = ["pass"] * 78 + ["fail"] * 22
+      assert gate(run("v1", same), run("v1", two_worse), margin=0.05)["decision"] == "ship"
+      assert gate(run("v1", same), run("v1", two_worse), margin=0.045)["decision"] == "block"
+      base = ["pass"] * 160 + ["fail"] * 40
+      cand = ["pass"] * 158 + ["fail"] * 42
+      assert gate(run("v1", base), run("v1", cand), margin=0.03)["decision"] == "ship", "paired: 198 of 200 items did not change"
+      try:
+          gate(run("v1", same), run("v2", same))
+          raise AssertionError("runs on different golden versions must raise")
+      except ValueError:
+          pass
+    hidden: |
+      def _hx_run(v, outs):
+          return {"version": v, "results": {f"i{n}": o for n, o in enumerate(outs)}}
+      import random as _hx_rnd
+      _hx_r = _hx_rnd.Random(9)
+      for _ in range(30):
+          _hx_n = _hx_r.randint(20, 300)
+          _hx_b = [_hx_r.choice(["pass", "fail"]) for _ in range(_hx_n)]
+          _hx_c = [x if _hx_r.random() < 0.9 else _hx_r.choice(["pass", "fail"]) for x in _hx_b]
+          _hx_g = gate(_hx_run("v", _hx_b), _hx_run("v", _hx_c), margin=0.03)
+          _hx_d = [(c == "pass") - (b == "pass") for b, c in zip(_hx_b, _hx_c)]
+          _hx_m = sum(_hx_d) / _hx_n
+          assert abs(_hx_g["diff"] - _hx_m) < 1e-12
+          _hx_se = (sum((x - _hx_m) ** 2 for x in _hx_d) / (_hx_n - 1) / _hx_n) ** 0.5
+          assert abs(_hx_g["se"] - _hx_se) < 1e-9
+          assert _hx_g["decision"] == ("ship" if _hx_m - 1.96 * _hx_se >= -0.03 else "block")
+      assert gate(_hx_run("v", ["fail"] * 50), _hx_run("v", ["pass"] * 50), margin=0)["decision"] == "ship"
+      assert gate(_hx_run("v", ["pass"] * 50), _hx_run("v", ["fail"] * 50), margin=0.5)["decision"] == "block"
+      try:
+          gate(_hx_run("v", ["pass"] * 3), {"version": "v", "results": {"i0": "pass", "i1": "pass", "x": "pass"}})
+          raise AssertionError("different items must raise")
+      except ValueError:
+          pass
+    solution: |
+      from math import sqrt
+
+
+      def gate(baseline, candidate, margin=0.02, z=1.96):
+          if baseline["version"] != candidate["version"]:
+              raise ValueError("the runs used different golden set versions")
+          if set(baseline["results"]) != set(candidate["results"]) or not baseline["results"]:
+              raise ValueError("the runs must cover the same, non-empty set of items")
+          d = [(candidate["results"][i] == "pass") - (baseline["results"][i] == "pass") for i in baseline["results"]]
+          n = len(d)
+          mean = sum(d) / n
+          var = sum((x - mean) ** 2 for x in d) / (n - 1) if n > 1 else 0.0
+          se = sqrt(var / n)
+          lower = mean - z * se
+          return {"version": baseline["version"], "diff": mean, "se": se, "lower": lower,
+                  "decision": "ship" if lower >= -margin else "block"}
+  - title: A report with what the gate did not check
+    brief: |
+      A gate decision without its blind spots is the number that gets misread later. Write report(golden, r, corr, g, min_failures=30, min_per_tag=5, max_width=0.10), returning the golden version, the decision, the corrected pass rate as (estimate, low, high), the judge's tpr, tnr and label counts, and not_checked: a list of {"kind", "detail"} entries. Add "judge_version" when the judge was validated on a different golden version from the one the gate ran on, and then report the decision as "hold" whatever the gate said; "few_failures" when the judge's rates rest on fewer than min_failures labelled failures; "abstentions" when any golden item got no verdict; "wide_interval" when the corrected interval is wider than max_width; and one "thin_tag" entry, with a "tag" key, for each tag with fewer than min_per_tag labelled failures. The tests check the kinds and the tags, never the wording of detail.
+    starter: |
+      def report(golden, r, corr, g, min_failures=30, min_per_tag=5, max_width=0.10):
+          """Return {"version", "decision", "pass_rate", "judge", "not_checked"}.
+          not_checked holds {"kind", "detail"} entries of kind judge_version, few_failures,
+          abstentions, wide_interval, and thin_tag (with a "tag" key)."""
+          raise NotImplementedError
+    tests: |
+      import json as _json
+      rows = [{"id": f"f{i:02d}", "output": "o", "label": "fail", "tags": ["refunds"] if i < 12 else ["pii"]} for i in range(14)]
+      rows += [{"id": f"p{i:03d}", "output": "o", "label": "pass", "tags": ["refunds"]} for i in range(120)]
+      gold = load_golden("\n".join(_json.dumps(r) for r in rows))
+      verdicts = {r["id"]: r["label"] for r in rows}
+      verdicts["f00"] = "pass"
+      verdicts["p000"] = None
+      r = rates(gold, verdicts)
+      c = corrected(r, ["pass"] * 900 + ["fail"] * 100)
+      g = {"version": gold["version"], "diff": 0.0, "se": 0.0, "lower": 0.0, "decision": "ship"}
+      rep = report(gold, r, c, g)
+      kinds = [x["kind"] for x in rep["not_checked"]]
+      assert rep["decision"] == "ship" and rep["version"] == gold["version"]
+      assert "few_failures" in kinds and "abstentions" in kinds, "14 labelled failures and one abstention"
+      assert [x["tag"] for x in rep["not_checked"] if x["kind"] == "thin_tag"] == ["pii"], "2 labelled pii failures, 12 refunds failures"
+      assert report(gold, r, c, {**g, "version": "other"})["decision"] == "hold", "the judge was validated on another golden version"
+    hidden: |
+      _hx_rep = report(gold, r, c, g, min_failures=10, min_per_tag=1)
+      _hx_k = [x["kind"] for x in _hx_rep["not_checked"]]
+      assert "few_failures" not in _hx_k and "thin_tag" not in _hx_k and "abstentions" in _hx_k
+      assert "judge_version" in [x["kind"] for x in report(gold, r, c, {**g, "version": "other"})["not_checked"]]
+      assert report(gold, r, c, {**g, "decision": "block"})["decision"] == "block"
+      _hx_w = report(gold, r, {**c, "low": 0.5, "high": 0.9}, g)
+      assert "wide_interval" in [x["kind"] for x in _hx_w["not_checked"]]
+      assert "wide_interval" not in [x["kind"] for x in report(gold, r, {**c, "low": 0.80, "high": 0.85}, g)["not_checked"]]
+      assert _hx_rep["pass_rate"] == (c["estimate"], c["low"], c["high"])
+      assert _hx_rep["judge"]["failures"] == 14 and _hx_rep["judge"]["passes"] == 120
+    solution: |
+      def report(golden, r, corr, g, min_failures=30, min_per_tag=5, max_width=0.10):
+          gaps = []
+          if r["version"] != g["version"]:
+              gaps.append({"kind": "judge_version", "detail": f"judge validated on {r['version']}, gate ran on {g['version']}"})
+          if r["failures"] < min_failures:
+              gaps.append({"kind": "few_failures", "detail": f"TPR rests on {r['failures']} labelled failures"})
+          if r["abstained"]:
+              gaps.append({"kind": "abstentions", "detail": f"{r['abstained']} golden items got no verdict"})
+          if corr["high"] - corr["low"] > max_width:
+              gaps.append({"kind": "wide_interval", "detail": f"pass rate between {corr['low']:.3f} and {corr['high']:.3f}"})
+          fails_by_tag = {}
+          for item in golden["items"]:
+              for tag in item["tags"]:
+                  fails_by_tag.setdefault(tag, 0)
+                  fails_by_tag[tag] += item["label"] == "fail"
+          for tag, count in sorted(fails_by_tag.items()):
+              if count < min_per_tag:
+                  gaps.append({"kind": "thin_tag", "tag": tag, "detail": f"{count} labelled failures tagged {tag}"})
+          decision = "hold" if r["version"] != g["version"] else g["decision"]
+          return {"version": golden["version"], "decision": decision,
+                  "pass_rate": (corr["estimate"], corr["low"], corr["high"]),
+                  "judge": {k: r[k] for k in ("tpr", "tnr", "failures", "passes")}, "not_checked": gaps}
+---
+
+This lab builds the measurement chain the lessons in this module argue for, as one program. Each step adds functions to the same file and runs its tests against everything written so far, so step 7's report reads the golden set from step 1, the rates from step 3 and the interval from step 4.
+
+There is no model in the lab. `ScriptedJudgeModel` returns scripted replies to prompts that contain a given substring, so the tests can feed the judge a critique that mentions the wrong word, a reply with no verdict, or a verdict that changes on the last line, and then check what the judge did: which verdict it returned and how many calls it made. Labels and production verdicts in the tests come from seeded generators, and the tests check properties (rates that match their definitions, intervals that widen when failures are scarce, decisions at the gate's boundary) rather than a particular output.
+
+Steps 1 to 4 are validation: a golden set with an identity, a judge with a strict output contract, its error rates with failure as the positive class, and the corrected pass rate. Steps 5 and 6 are release decisions: reliability over repeated runs and a paired gate. Step 7 writes down what none of it measured.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

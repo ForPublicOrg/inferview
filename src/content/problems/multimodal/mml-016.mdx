@@ -1,0 +1,137 @@
+---
+id: mml-016
+title: The claims assistant describes the form, not the photo
+subtitle: rank the causes from a diff and three conversations
+track: multimodal
+module: vision-language
+type: debug
+difficulty: hard
+seniority: [senior]
+minutes: 25
+core: false
+tags: [vlm, debugging, image-input, context-trimming, prompt-order]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Amit Shekhar, AI engineering interview questions (GitHub repository, checked 2026-10-28)
+    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
+    note: "a synthesised question bank that lists 'Your multimodal LLM ignores the image and generates descriptions from text alone. How do you fix it?'; names no interviewing company, so no company tag. Checked 2026-10-28."
+  - title: Claude docs, vision
+    url: https://platform.claude.com/docs/en/build-with-claude/vision
+    note: "ceil(w/28) x ceil(h/28) visual tokens; standard tier (models before Claude 4.7) resizes to at most 1,568 px and 1,568 tokens; Claude works best with images before text, while images after or interleaved with text still perform well; heavy JPEG compression can introduce artifacts that hurt performance, especially text; accuracy may suffer on images under 200 px. Checked 2026-10-28."
+choices:
+  - text: The photo now sits one message before the question, and the trimming keeps images only in the last user message, so it is stripped
+    correct: true
+    why: Every request built by the new code has the question as its last user message, so the photo's message is always the second-newest and loses its image block before the call.
+  - text: The claim form text now comes before the photo, so the model anchors on the form's description and answers from it instead of the image
+    correct: false
+    why: The order did flip and image-first is the documented preference, but the same documentation says text-first still performs well; it cannot turn every answer into a restatement of the form.
+  - text: Re-encoding at JPEG quality 55 smears dents and scratches, so the model sees no clear damage and falls back on the claim form text
+    correct: false
+    why: It is a real regression worth measuring, but a degraded photo produces vaguer or wrong damage, not answers that track the form even when the photo plainly contradicts it.
+  - text: The 1092 px cap puts the photo under the model's minimum size, so the image block is discarded and the request carries text only
+    correct: false
+    why: There is no such minimum near 1092 px; a 1092 by 819 photo is 39 by 30 = 1,170 visual tokens and is accepted unresized, and only images under about 200 px are called out as a quality risk.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Debugging round">
+"Our multimodal assistant ignores the photo and answers from the text. Find out why and fix it."
+</Callout>
+
+The product, as a scenario: adjusters upload a phone photo of a damaged car with a claim, and the assistant lists the damaged parts. It runs on Claude Haiku 4.5. Since Tuesday's release, adjusters have flagged 40 claims where the assistant's list repeats the policyholder's description from the claim form, including three where the photo shows the front of the car and the form says "rear bumper". You have Tuesday's diff and the text of three flagged conversations. There are no request payload logs, and nobody has compared answers before and after the release on the same claims.
+
+```diff
+ def build_request(claim, photo_bytes, history):
+-    photo = encode(photo_bytes, max_side=1568, quality=85)
++    photo = encode(photo_bytes, max_side=1092, quality=55)
+     msgs = list(history)
+-    msgs.append({"role": "user", "content": [
+-        {"type": "image", "source": photo},
+-        {"type": "text", "text": render_claim(claim) + "\n\nWhich parts are damaged?"},
+-    ]})
++    msgs.append({"role": "user", "content": [
++        {"type": "text", "text": render_claim(claim)},
++        {"type": "image", "source": photo},
++    ]})
++    msgs.append({"role": "user", "content": [
++        {"type": "text", "text": "Which parts are damaged? Answer from the photo."},
++    ]})
+-    return msgs
++    return drop_old_images(msgs, keep=1)
+```
+
+The helper was added in the same release:
+
+```python
+# Older turns resend their images on every call; keep only the newest ones.
+def drop_old_images(msgs, keep):
+    out, seen = [], 0
+    for m in reversed(msgs):
+        if m["role"] == "user":
+            seen += 1
+            if seen > keep:
+                m = {**m, "content": [b for b in m["content"] if b["type"] != "image"]}
+        out.append(m)
+    return out[::-1]
+```
+
+Pick the cause of the symptom. Then rank the other three by how much each would matter once the cause is fixed, and say what you would collect before shipping a fix and what you would ship without it.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the input token count of one flagged request and of one request from before Tuesday with a photo of the same size.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the exact payload of one request as it left the client, after every helper ran.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the assistant says when a flagged claim is rerun with another claim's photo.</p></details>
+
+## Answer
+
+The cause is the interaction between the new message layout and the new helper. The question moved into its own user message after the photo's message, and `drop_old_images(msgs, keep=1)` counts user messages from the end and strips image blocks from all but the newest. The newest user message is now always the text-only question, so the photo is removed from every request. The model receives the claim form and a question that says "answer from the photo" with no photo, and the form is the only evidence it has. Neither the helper nor the call site is wrong in isolation; the helper's notion of "newest" was written for the old one-message layout.
+
+The evidence that would confirm it in minutes: a Haiku 4.5 request with a 1092 × 819 photo should carry ⌈1092 / 28⌉ × ⌈819 / 28⌉ = 39 × 30 = 1,170 visual tokens on top of the text. If a flagged request's `input_tokens` is roughly the text alone, the photo never arrived.
+
+**The rest, ranked for after the fix.**
+
+1. *JPEG quality 55* is the most likely to matter next. Anthropic's guide warns that heavy compression introduces artifacts that hurt performance; fine scratches and panel gaps are the detail at risk. Measure damage-list accuracy at 55 and 85 on the same claims before keeping it.
+2. *Text before image* is real but minor. The guide prefers image-then-text and says the other orders still perform well. Restore image-first because it is free, not because it explains anything.
+3. *The 1092 px cap* is a smaller change than it looks. On a standard-tier model a 4:3 photo is resized server-side to fit 1,568 tokens anyway, so the old 1568 px setting was mostly undone by the provider; 1,170 tokens against at most 1,568 is a modest loss of detail, and nothing is discarded.
+
+**What to collect, and what to ship without it.** Collect the usage `input_tokens` for flagged requests, one full payload after `drop_old_images`, and a rerun of the 40 flagged claims with photos swapped between claims: if answers do not change with the photo, the model is not using it. Without any of that, ship the helper fix and a test today, because a request that should carry a photo and carries none is wrong regardless of the other evidence:
+
+```python
+def drop_old_images(msgs, keep):
+    # keep images in the newest `keep` user messages that contain any
+    out, kept = [], 0
+    for m in reversed(msgs):
+        has_image = m["role"] == "user" and any(b["type"] == "image" for b in m["content"])
+        if has_image:
+            kept += 1
+            if kept > keep:
+                m = {**m, "content": [b for b in m["content"] if b["type"] != "image"]}
+        out.append(m)
+    return out[::-1]
+
+def test_current_photo_survives():
+    msgs = build_request(claim, photo_bytes, history=[])
+    assert sum(b["type"] == "image" for m in msgs for b in m["content"]) == 1
+```
+
+Revert quality to 85 until the paired comparison says otherwise, and put the image before the claim text.
+
+**How this fix fails.** "Newest message with images" is still a recency rule. An adjuster who uploads a second photo of the same claim later in the conversation now loses the first one, and the assistant lists only the damage in the latest photo, with no error. The rule should key on the claim: keep every photo attached to the current claim, and drop images only from earlier claims. That costs tokens: each extra photo on Haiku 4.5 adds up to 1,568 per request for the rest of the conversation.
+
+## Follow-ups
+
+- *Your fix keeps every photo of the current claim, and long conversations now cost three times as much. Which photos do you drop, and what failure do you accept in writing?*
+- *What would you need to see before deciding quality 55 is safe to keep?*
+- *How do you make sure the next helper that edits messages cannot silently remove the image again?* A contract test on the final payload, run in CI, that asserts every claim request with a photo contains at least one image block, plus an alert on requests whose input tokens fall below the computed image cost.
+
+## Common mistakes
+
+- Picking the prompt order because it is the most visible change in the diff and matches advice from the vendor's guide.
+- Adding "look carefully at the photo" to the prompt; the photo is not in the request.
+- Reading `drop_old_images` alone and concluding it is correct, which it is for the old message layout.
+- Fixing the helper without a test on the final payload, so the next layout change breaks it again.
+- Reverting the whole release, which also discards the token savings the helper was written for, without learning which change caused the symptom.

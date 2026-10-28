@@ -1,0 +1,87 @@
+---
+id: trn-053
+title: Pipeline parallelism under GRPO
+subtitle: groups, micro-batches, policy versions and where the throughput goes
+track: training
+module: rl
+type: concept
+difficulty: hard
+seniority: [staff]
+minutes: 30
+core: false
+tags: [grpo, pipeline-parallelism, micro-batches, staleness, rl-infrastructure]
+companies:
+  - name: Google
+    url: https://prachub.com/interview-questions/explain-pipeline-parallelism-in-grpo-training
+updated: 2026-10-28
+sources:
+  - title: PracHub, Explain Pipeline Parallelism in GRPO Training (dated 2026-08-14)
+    url: https://prachub.com/interview-questions/explain-pipeline-parallelism-in-grpo-training
+    note: "candidate report: attributed to a Google machine learning engineer interview; asks how pipeline stages and micro-batches interact with GRPO rollouts, relative advantages, policy versions, throughput and staleness. The scenario and answer here are original. Checked 2026-10-28."
+  - title: Shao et al., DeepSeekMath (v3, 2024-04-27)
+    url: https://arxiv.org/abs/2402.03300
+    note: "GRPO's baseline is the mean reward of a group of outputs for the same question, normalised by the group std; the ratio is against the policy that sampled. Checked 2026-10-28."
+  - title: Hu et al., OpenRLHF (v6, 2025-10-09)
+    url: https://arxiv.org/html/2405.11143
+    note: "the authors write that inference often accounts for over 90% of RLHF or RLVR runtime and that in synchronous frameworks the slowest chain-of-thought generation can bottleneck the pipeline. Checked 2026-10-28."
+  - title: Kimi Team, Kimi K2 (2025)
+    url: https://arxiv.org/html/2507.20534
+    note: "colocated training and inference engines; partial rollout pauses unfinished long-tail trajectories and resumes them in the next RL iteration; vendor's own figure of under 30 seconds for a full parameter update of the 1T-parameter model. Checked 2026-10-28."
+  - title: Hugging Face TRL, GRPO Trainer (main branch docs)
+    url: https://huggingface.co/docs/trl/main/en/grpo_trainer
+    note: "on main as of 2026-10-28: the effective batch size must be divisible by num_generations; 'dapo' loss normalises by the total token count; importance sampling correction for the vLLM-trainer gap is on by default."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The round">
+"Explain how pipeline parallelism interacts with GRPO. Where do the groups and their advantages live when a batch is split into micro-batches across pipeline stages, which policy version is each sample from, and what limits throughput?"
+</Callout>
+
+As a scenario: the policy is trained with 8 pipeline stages and 4 data-parallel replicas; each step is 64 prompts with G = 8, so 512 sequences, 128 per replica. Rollouts come from a separate inference engine. The loss is a token mean. The team wants to overlap the next step's rollouts with the current step's training. Explain the interactions and choose the micro-batch size and the overlap policy.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how long the longest response in a step is compared with the median.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the loss divides by when gradient accumulation runs over micro-batches.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask how much activation memory one micro-batch of the longest sequences needs per stage.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>The group is a rollout-time unit, not a training-time one. All G responses must be generated and scored before any advantage exists, so the slowest sample gates its group and the slowest group gates a synchronous step. Once advantages are computed they are per-sequence constants, and a group can be split across micro-batches, stages and replicas freely. What cannot be split locally is the loss normaliser: a token mean must divide by the token count of the whole batch, or micro-batches with short responses get more weight per token than ones with long responses. Within one optimiser step a flushed pipeline sees one set of weights, so every micro-batch's ratio is against the same old policy. Throughput is dominated by generation, not by the training pipeline's bubble, so the bigger lever is overlapping rollouts with training, which makes the data one policy version stale and needs the behaviour log-probs and an importance correction.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Groups and advantages.</strong> GRPO's baseline is the group's mean reward and its scale is the group's std, so the advantage of any one sample depends on all G rewards. Compute them on the driver after scoring, attach one scalar per sequence, and from then on the training side needs no group structure. TRL's requirement that the effective batch be divisible by the group size is about keeping whole groups in a generation batch, not about the backward pass.</p>
+<p><strong>The normaliser, computed.</strong> With gradient accumulation over micro-batches, take two micro-batches of four sequences, one with 200-token responses (800 tokens) and one with 2,000-token responses (8,000 tokens). Averaging per micro-batch and then over the two gives each short-response token a weight of 1 / (2 × 800) = 1/1,600 and each long-response token 1 / (2 × 8,000) = 1/16,000, a factor of 10. The batch token mean gives every token 1/8,800. Count the tokens of the whole step across replicas first, and scale every micro-batch's summed loss by that one count.</p>
+<p><strong>Policy versions.</strong> A 1F1B or GPipe schedule flushes the pipeline at the optimiser step, so all micro-batches of a step run forward and backward on the same weights and the ratio is against one old policy. If the step is split into several minibatches with an optimiser step each, later minibatches are off-policy by the number of updates before them; that is what the clip is for. Asynchronous pipeline schedules that update weights without flushing would put different versions on different stages inside one forward pass; do not use them for RL.</p>
+<p><strong>The bubble, computed.</strong> For p stages and m micro-batches per replica, the idle fraction of a flushed schedule is (p - 1) / (m + p - 1). With 128 sequences per replica and p = 8: micro-batches of 4 give m = 32 and 7/39 = 18% idle; micro-batches of 16 give m = 8 and 7/15 = 47%; micro-batches of 2 give m = 64 and 7/71 = 10%. Smaller micro-batches cut the bubble but run each stage's matmuls at lower utilisation and add per-micro-batch overhead.</p>
+<p><strong>Where the time goes.</strong> The OpenRLHF authors put inference at over 90% of RLHF runtime, and long reasoning responses have a long tail. Shrinking the training bubble from 18% to 10% saves a few percent of a step that is mostly waiting for the last responses. The larger lever is to overlap: generate step t + 1's rollouts while step t trains. That makes every sample one policy version stale. Kimi K2 goes further with partial rollouts, pausing unfinished long trajectories and resuming them in the next iteration, which means one trajectory's tokens can come from two policy versions. Both need per-token behaviour log-probs from the engine, so that the ratio or an importance weight is computed against the policy that actually produced each token.</p>
+<p><strong>The decision.</strong> Two defensible designs. <em>Synchronous</em>: generate, score, train, sync weights, repeat. Exactly on-policy apart from engine numerics, simple to reason about, but the training GPUs idle during generation and vice versa. <em>One-step overlap</em>: staleness bounded at one version, near-full use of both fleets, at the cost of an importance correction, a staleness metric to watch, and harder debugging when the run diverges. The constraint conflict is hardware utilisation against how on-policy the data is. My choice here is micro-batches of 4 (18% bubble, within the activation budget for the longest sequences if the hint's answer allows it) and one-step overlap with token-level behaviour log-probs and a truncated importance weight. A staleness bound of one is reasonable; bounds of several versions are defensible for very long agentic rollouts only with the correction and a measured gap; unbounded staleness is not.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Your overlap doubles throughput, but the run's reward curve per step is worse than the synchronous run's. Per step or per GPU-hour: which do you compare, and who decides?</li>
+<li>What would you need to see to go back to synchronous training?</li>
+<li>Partial rollouts make some trajectories span three policy versions. Do you cap that, drop them, or reweight them, and what does each cost?</li>
+</ul>
+</Fragment>
+</Depth>
+
+The recommended overlap has a failure mode that is easy to miss: the weight sync itself. If pushing new weights to the engine takes a large share of a step (Kimi K2 report under 30 seconds for a 1T-parameter model with a purpose-built checkpoint engine; measure yours), the overlap hides less than planned, and if the sync is skipped to save time, staleness silently grows past one. Log the policy version of every sampled token and alert when any exceeds the bound.
+
+## Follow-ups
+
+- The pipeline team proposes 16 stages to fit a larger policy, which doubles the bubble at the same micro-batch size. Do you take it, cut the micro-batch size, or move to more tensor parallelism, and what does each cost?
+- Two senior engineers disagree: one wants per-micro-batch token means because they are simpler to implement, the other wants the global count. How do you settle it with a measurement?
+- The inference engine runs with pipeline parallelism too. Where does that bubble come from during decoding, and does it matter as much as the training one?
+
+## Common mistakes
+
+- Thinking the group must stay on one micro-batch or one replica for the advantage to be right.
+- Normalising the loss per micro-batch under gradient accumulation.
+- Optimising the training bubble while generation takes most of the step.
+- Overlapping rollouts with training and still computing the ratio against the trainer's current weights instead of the behaviour policy.

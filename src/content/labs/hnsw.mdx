@@ -1,0 +1,611 @@
+---
+title: HNSW by hand
+track: rag
+module: vector-systems
+kind: lab
+minutes: 150
+summary: Build an HNSW index in standard-library Python, measure its recall against brute force, then add a filter, watch filtered recall collapse and fix it.
+updated: 2026-10-28
+sources:
+  - title: Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs (Malkov and Yashunin, arXiv 1603.09320, v4 2018-08-14)
+    url: https://arxiv.org/abs/1603.09320
+    note: "levels drawn from an exponentially decaying distribution, greedy search from the top layer down, and the neighbour-selection heuristic that the paper says significantly increases performance at high recall and on highly clustered data; steps 1 to 3. Checked 2026-10-28."
+  - title: pgvector README (v0.8.7 in the install instructions)
+    url: https://github.com/pgvector/pgvector
+    note: "with approximate indexes, filtering is applied after the index is scanned, and at hnsw.ef_search 40 a filter matching 10% of rows leaves about 4 rows on average; iterative scans from 0.8.0 keep scanning up to hnsw.max_scan_tuples, 20,000 by default; steps 5 and 6. Checked 2026-10-28."
+  - title: "ACORN: Performant and Predicate-Agnostic Search Over Vector Embeddings and Structured Data (Patel et al., arXiv 2403.04871, 2024)"
+    url: https://arxiv.org/abs/2403.04871
+    note: "predicate subgraph traversal over an HNSW-based index, reported by the paper at 2 to 1,000 times higher throughput at a fixed recall than prior methods; the filter-aware traversal in step 6 is a simpler relative. Checked 2026-10-28."
+  - title: Qdrant documentation, indexing
+    url: https://qdrant.tech/documentation/concepts/indexing/
+    note: "the query planner switches to the payload index and a full rescore when the filtered set is under full_scan_threshold, and uses filter-aware graph edges otherwise; step 6's exact path for small allowed sets. Checked 2026-10-28."
+steps:
+  - title: Level assignment
+    brief: |
+      A node lives on layers 0 to its level, and the level comes from an exponentially decaying distribution: int(-ln(1 - U) x mL) with mL = 1 / ln(M) and U uniform in [0, 1), so about one node in M reaches layer 1 and one in M squared reaches layer 2. Using 1 - U keeps the logarithm defined when U is 0. add_node registers a node on every layer up to its level with no links yet, and moves the entry point when the node reaches a layer above the current top. Every draw comes from the seeded generator, so two builds with the same seed and the same insert order produce the same graph, which later steps rely on when they compare recall.
+    starter: |
+      import math
+      import random
+
+
+      def distance(a, b):
+          """Euclidean distance. Call it by this name everywhere: later tests count the calls."""
+          return math.dist(a, b)
+
+
+      class HNSW:
+          def __init__(self, M=8, ef_construction=64, seed=0):
+              self.M = M                          # links per node above layer 0; layer 0 allows 2 * M
+              self.ef_construction = ef_construction
+              self.rng = random.Random(seed)      # every random draw comes from here
+              self.vectors = {}                   # key -> tuple of floats
+              self.levels = {}                    # key -> the node's top layer
+              self.layers = []                    # layers[l]: dict of key -> list of neighbour keys
+              self.entry = None                   # a node on the top layer
+
+          def random_level(self):
+              """Draw a node's top layer from an exponentially decaying distribution set by M."""
+              raise NotImplementedError
+
+          def add_node(self, key, vector):
+              """Put the node on layers 0 to its level with no links, move the entry point if the node is the new top,
+              and return the level. A key that is already present raises ValueError."""
+              raise NotImplementedError
+    tests: |
+      h = HNSW(M=8, seed=1)
+      draws = [h.random_level() for _ in range(20000)]
+      above1 = sum(d >= 1 for d in draws) / len(draws)
+      above2 = sum(d >= 2 for d in draws) / len(draws)
+      assert min(draws) == 0
+      assert 0.10 <= above1 <= 0.15, f"with M = 8 about 1 node in 8 should reach layer 1; got {above1:.3f}"
+      assert 0.010 <= above2 <= 0.022, f"and about 1 in 64 layer 2; got {above2:.4f}"
+      wide = HNSW(M=16, seed=1)
+      above1_wide = sum(wide.random_level() >= 1 for _ in range(20000)) / 20000
+      assert 0.05 <= above1_wide <= 0.075, f"the decay follows M: with M = 16 about 1 in 16 reach layer 1; got {above1_wide:.3f}"
+      a, b = HNSW(seed=7), HNSW(seed=7)
+      assert [a.random_level() for _ in range(200)] == [b.random_level() for _ in range(200)], "the same seed draws the same levels"
+      g = HNSW(M=8, seed=2)
+      for i in range(500):
+          g.add_node(i, (float(i), 0.0))
+      assert all(set(g.layers[l]) == {k for k, lv in g.levels.items() if lv >= l} for l in range(len(g.layers))), "layer l holds exactly the nodes whose level is l or more"
+      assert g.levels[g.entry] == max(g.levels.values()) == len(g.layers) - 1, "the entry point sits on the top layer"
+      try:
+          g.add_node(3, (0.0, 0.0))
+          raise AssertionError("adding key 3 twice should raise ValueError")
+      except ValueError:
+          pass
+    hidden: |
+      _hx_h = HNSW(M=4, seed=11)
+      _hx_f = sum(_hx_h.random_level() >= 1 for _ in range(20000)) / 20000
+      assert 0.22 <= _hx_f <= 0.28
+      _hx_g = HNSW(M=8, seed=3)
+      _hx_lv = _hx_g.add_node("first", (0.0,))
+      assert _hx_g.entry == "first" and all(_hx_g.layers[l]["first"] == [] for l in range(_hx_lv + 1))
+      for _hx_i in range(300):
+          _hx_g.add_node(_hx_i, (float(_hx_i),))
+      assert all(lst == [] for layer in _hx_g.layers for lst in layer.values())
+      assert _hx_g.levels[_hx_g.entry] == max(_hx_g.levels.values())
+      _hx_draws = [HNSW(M=8, seed=s).random_level() for s in range(2000)]
+      assert all(isinstance(d, int) and d >= 0 for d in _hx_draws)
+    solution: |
+      import math
+      import random
+
+
+      def distance(a, b):
+          return math.dist(a, b)
+
+
+      class HNSW:
+          def __init__(self, M=8, ef_construction=64, seed=0):
+              self.M = M
+              self.ef_construction = ef_construction
+              self.rng = random.Random(seed)
+              self.vectors = {}
+              self.levels = {}
+              self.layers = []
+              self.entry = None
+              self.mL = 1.0 / math.log(M)
+
+          def random_level(self):
+              # 1 - random() is in (0, 1], so the log is always defined.
+              return int(-math.log(1.0 - self.rng.random()) * self.mL)
+
+          def add_node(self, key, vector):
+              if key in self.vectors:
+                  raise ValueError(f"key {key!r} is already in the index")
+              level = self.random_level()
+              self.vectors[key] = tuple(vector)
+              self.levels[key] = level
+              while len(self.layers) <= level:
+                  self.layers.append({})
+              for layer in range(level + 1):
+                  self.layers[layer][key] = []
+              if self.entry is None or level > self.levels[self.entry]:
+                  self.entry = key
+              return level
+  - title: Greedy search from the top layer
+    brief: |
+      search_layer is best-first search over one layer: a min-heap of candidates to expand and a max-heap of the ef best found so far. It stops when the nearest unexpanded candidate is farther than the worst of the ef best, and that stopping rule is what keeps a search from visiting the whole layer. search descends from the entry point with ef 1 on every layer above 0, then searches layer 0 with max(ef, k). insert is given: it runs your search_layer on each layer, links the new node both ways, and prunes any list that passes its cap (2M on layer 0, M above). The tests build 1,500 random vectors of 16 dimensions, require recall@10 of 0.95 at ef 64 against brute force, and count distance calls: a search may compute at most 40% of the index's distances, so scoring everything fails.
+    starter: |
+      import heapq
+
+
+      class HNSW(HNSW):
+          def search_layer(self, q, entry_points, ef, layer):
+              """Best-first search of one layer from entry_points.
+              Return up to ef (distance, key) pairs for the nearest nodes found, nearest first."""
+              raise NotImplementedError
+
+          def search(self, q, k, ef):
+              """The k nearest keys to q, nearest first. Return [] for an empty index."""
+              raise NotImplementedError
+
+          # Given: the rule step 3 replaces, and insertion built on your search_layer.
+          def select_neighbours(self, q, candidates, m):
+              """candidates are (distance to q, key) pairs, nearest first. Keep the m nearest."""
+              return [key for _, key in candidates[:m]]
+
+          def insert(self, key, vector):
+              old_entry = self.entry
+              level = self.add_node(key, vector)
+              if old_entry is None:
+                  return
+              q = self.vectors[key]
+              entry = [old_entry]
+              top = self.levels[old_entry]
+              for layer in range(top, level, -1):
+                  entry = [self.search_layer(q, entry, 1, layer)[0][1]]
+              for layer in range(min(top, level), -1, -1):
+                  found = self.search_layer(q, entry, self.ef_construction, layer)
+                  cap = 2 * self.M if layer == 0 else self.M
+                  links = self.select_neighbours(q, found, self.M)
+                  self.layers[layer][key] = list(links)
+                  for other in links:
+                      theirs = self.layers[layer][other]
+                      theirs.append(key)
+                      if len(theirs) > cap:
+                          v = self.vectors[other]
+                          ranked = sorted((distance(v, self.vectors[n]), n) for n in theirs)
+                          self.layers[layer][other] = self.select_neighbours(v, ranked, cap)
+                  entry = [k for _, k in found]
+    tests: |
+      import random as _random
+
+      _rng = _random.Random(21)
+      data = {i: tuple(_rng.random() for _ in range(16)) for i in range(1500)}
+      index = HNSW(M=8, ef_construction=64, seed=0)
+      for key, vec in data.items():
+          index.insert(key, vec)
+      queries = [tuple(x + _rng.gauss(0, 0.02) for x in data[_rng.randrange(1500)]) for _ in range(50)]
+
+
+      def exact(q, k):
+          return [key for _, key in sorted((math.dist(q, v), key) for key, v in data.items())[:k]]
+
+
+      calls = [0]
+      _plain_distance = distance
+
+
+      def distance(a, b):
+          calls[0] += 1
+          return _plain_distance(a, b)
+
+
+      got = index.search(queries[0], 10, 64)
+      assert len(got) == len(set(got)) == 10, f"ten distinct keys, got {got}"
+      gaps = [math.dist(queries[0], data[key]) for key in got]
+      assert gaps == sorted(gaps), "nearest first"
+      calls[0] = 0
+      recall = sum(len(set(index.search(q, 10, 64)) & set(exact(q, 10))) for q in queries) / (10 * len(queries))
+      assert recall >= 0.95, f"recall@10 at ef = 64 should be at least 0.95; got {recall:.3f}"
+      per_query = calls[0] / len(queries)
+      assert per_query < 0.4 * len(data), f"a search may compute at most {0.4 * len(data):.0f} distances; this one averaged {per_query:.0f}"
+      assert HNSW().search((0.0,) * 16, 5, 10) == [], "an empty index returns no results"
+      small = HNSW(seed=4)
+      for i in range(6):
+          small.insert(i, (float(i), 0.0))
+      assert sorted(small.search((2.2, 0.0), 10, 10)) == list(range(6)), "k larger than the index returns every node"
+    hidden: |
+      _hx_one = HNSW(seed=9)
+      _hx_one.insert("only", (1.0, 2.0))
+      assert _hx_one.search((0.0, 0.0), 3, 5) == ["only"]
+      _hx_r = _random.Random(5)
+      _hx_pts = {i: (_hx_r.random(), _hx_r.random()) for i in range(40)}
+      _hx_ix = HNSW(M=4, ef_construction=40, seed=1)
+      for _hx_k, _hx_v in _hx_pts.items():
+          _hx_ix.insert(_hx_k, _hx_v)
+      _hx_q = (0.5, 0.5)
+      _hx_exact = [k for _, k in sorted((math.dist(_hx_q, v), k) for k, v in _hx_pts.items())]
+      assert _hx_ix.search(_hx_q, 40, 40) == _hx_exact
+      assert len(index.search(queries[1], 10, 3)) == 10
+      assert all(len(set(index.search(q, 5, 32))) == 5 for q in queries[:10])
+      assert all(all(math.dist(q, data[a]) <= math.dist(q, data[b]) for a, b in zip(r, r[1:])) for q in queries[:10] for r in [index.search(q, 10, 20)])
+    solution: |
+      import heapq
+
+
+      class HNSW(HNSW):
+          def search_layer(self, q, entry_points, ef, layer):
+              visited = set(entry_points)
+              candidates = [(distance(q, self.vectors[e]), e) for e in visited]
+              heapq.heapify(candidates)
+              best = [(-d, e) for d, e in candidates]       # max-heap of the ef nearest so far
+              heapq.heapify(best)
+              while len(best) > ef:
+                  heapq.heappop(best)
+              links = self.layers[layer]
+              while candidates:
+                  d, node = heapq.heappop(candidates)
+                  if len(best) >= ef and d > -best[0][0]:
+                      break                                  # nothing left can improve the result
+                  for n in links[node]:
+                      if n in visited:
+                          continue
+                      visited.add(n)
+                      dn = distance(q, self.vectors[n])
+                      if len(best) < ef or dn < -best[0][0]:
+                          heapq.heappush(candidates, (dn, n))
+                          heapq.heappush(best, (-dn, n))
+                          if len(best) > ef:
+                              heapq.heappop(best)
+              return sorted((-d, e) for d, e in best)
+
+          def search(self, q, k, ef):
+              if self.entry is None:
+                  return []
+              entry = [self.entry]
+              for layer in range(self.levels[self.entry], 0, -1):
+                  entry = [self.search_layer(q, entry, 1, layer)[0][1]]
+              return [key for _, key in self.search_layer(q, entry, max(ef, k), 0)[:k]]
+
+          # Given: the rule step 3 replaces, and insertion built on your search_layer.
+          def select_neighbours(self, q, candidates, m):
+              """candidates are (distance to q, key) pairs, nearest first. Keep the m nearest."""
+              return [key for _, key in candidates[:m]]
+
+          def insert(self, key, vector):
+              old_entry = self.entry
+              level = self.add_node(key, vector)
+              if old_entry is None:
+                  return
+              q = self.vectors[key]
+              entry = [old_entry]
+              top = self.levels[old_entry]
+              for layer in range(top, level, -1):
+                  entry = [self.search_layer(q, entry, 1, layer)[0][1]]
+              for layer in range(min(top, level), -1, -1):
+                  found = self.search_layer(q, entry, self.ef_construction, layer)
+                  cap = 2 * self.M if layer == 0 else self.M
+                  links = self.select_neighbours(q, found, self.M)
+                  self.layers[layer][key] = list(links)
+                  for other in links:
+                      theirs = self.layers[layer][other]
+                      theirs.append(key)
+                      if len(theirs) > cap:
+                          v = self.vectors[other]
+                          ranked = sorted((distance(v, self.vectors[n]), n) for n in theirs)
+                          self.layers[layer][other] = self.select_neighbours(v, ranked, cap)
+                  entry = [k for _, k in found]
+  - title: Neighbour-selection heuristic
+    brief: |
+      Keeping a node's M nearest candidates links it only into its own neighbourhood. On clustered data, whole clusters end up with no inbound link from the rest of the graph, and no ef reaches them. The paper's heuristic keeps a candidate only if it is closer to the base node than to every neighbour already kept, so each new link points somewhere the others do not. Whether you fill free slots with the nearest pruned candidates is your call; the tests accept either. insert calls select_neighbours both to link a new node and to prune a full list, so this one method changes both. The tests build 2,000 vectors in 30 tight clusters and require every node to be reachable from the entry point on layer 0 and recall@10 of 0.95 at ef 64. With the step 2 rule, the same build left more than half of the 2,000 nodes unreachable when we ran it.
+    starter: |
+      class HNSW(HNSW):
+          def select_neighbours(self, q, candidates, m):
+              """candidates are (distance to q, key) pairs, nearest first; every key is in self.vectors.
+              Return at most m keys. insert uses this both to link a new node and to prune a full neighbour list."""
+              raise NotImplementedError
+    tests: |
+      import random as _random
+
+      pick = HNSW(seed=0)
+      pick.vectors.update({"a": (1.0, 0.0), "b": (1.1, 0.1), "c": (-1.2, 0.0)})
+      q = (0.0, 0.0)
+      ranked = sorted((math.dist(q, pick.vectors[k]), k) for k in "abc")
+      assert pick.select_neighbours(q, ranked, 2) == ["a", "c"], "b sits next to a; the second link should point the other way"
+      assert len(pick.select_neighbours(q, ranked, 1)) == 1
+
+      _rng = _random.Random(8)
+      centres = [tuple(_rng.random() for _ in range(8)) for _ in range(30)]
+      clustered = {i: tuple(x + _rng.gauss(0, 0.01) for x in centres[i % 30]) for i in range(2000)}
+      index = HNSW(M=8, ef_construction=48, seed=0)
+      for key, vec in clustered.items():
+          index.insert(key, vec)
+      queries = [tuple(x + _rng.gauss(0, 0.01) for x in clustered[_rng.randrange(2000)]) for _ in range(60)]
+
+
+      def exact(q, k):
+          return [key for _, key in sorted((math.dist(q, v), key) for key, v in clustered.items())[:k]]
+
+
+      recall = sum(len(set(index.search(q, 10, 64)) & set(exact(q, 10))) for q in queries) / (10 * len(queries))
+      assert recall >= 0.95, f"recall@10 at ef = 64 on 30 tight clusters should be at least 0.95; got {recall:.3f}"
+      reached, stack = {index.entry}, [index.entry]
+      while stack:
+          for n in index.layers[0][stack.pop()]:
+              if n not in reached:
+                  reached.add(n)
+                  stack.append(n)
+      assert len(reached) == len(clustered), f"every node should be reachable from the entry point on layer 0; {len(clustered) - len(reached)} are not"
+    hidden: |
+      assert all(len(links) <= (2 * index.M if layer == 0 else index.M) for layer, nodes in enumerate(index.layers) for links in nodes.values())
+      assert all(key not in links and len(links) == len(set(links)) for nodes in index.layers for key, links in nodes.items())
+      assert all(n in nodes for nodes in index.layers for links in nodes.values() for n in links)
+      _hx_r = _random.Random(31)
+      _hx_c = [tuple(_hx_r.random() for _ in range(8)) for _ in range(100)]
+      _hx_d = {i: tuple(x + _hx_r.gauss(0, 0.01) for x in _hx_c[i % 100]) for i in range(2000)}
+      _hx_ix = HNSW(M=8, ef_construction=48, seed=3)
+      for _hx_k, _hx_v in _hx_d.items():
+          _hx_ix.insert(_hx_k, _hx_v)
+      _hx_qs = [tuple(x + _hx_r.gauss(0, 0.01) for x in _hx_d[_hx_r.randrange(2000)]) for _ in range(40)]
+      _hx_rec = sum(len(set(_hx_ix.search(q, 10, 64)) & {k for _, k in sorted((math.dist(q, v), k) for k, v in _hx_d.items())[:10]}) for q in _hx_qs) / 400
+      assert _hx_rec >= 0.95
+      _hx_pick = HNSW(seed=0)
+      _hx_pick.vectors.update({i: (float(i), 0.0) for i in range(1, 6)})
+      _hx_ranked = [(float(i), i) for i in range(1, 6)]
+      assert _hx_pick.select_neighbours((0.0, 0.0), _hx_ranked, 3)[0] == 1 and len(_hx_pick.select_neighbours((0.0, 0.0), _hx_ranked, 3)) <= 3
+    solution: |
+      class HNSW(HNSW):
+          def select_neighbours(self, q, candidates, m):
+              chosen = []
+              for d, key in candidates:
+                  if len(chosen) == m:
+                      break
+                  v = self.vectors[key]
+                  # Keep a candidate only if it is closer to q than to every neighbour already kept.
+                  if all(d < distance(v, self.vectors[c]) for c in chosen):
+                      chosen.append(key)
+              # Fill any free slots with the nearest pruned candidates, so sparse regions keep their links.
+              for d, key in candidates:
+                  if len(chosen) == m:
+                      break
+                  if key not in chosen:
+                      chosen.append(key)
+              return chosen
+  - title: Recall against brute force at several efSearch values
+    brief: |
+      A recall number means something only against exact search on the same queries. brute_force scores every vector; recall_sweep runs the index at each ef and reports mean recall@k against it; smallest_ef returns the cheapest ef in a list that reaches a target, or None. The tests use 32-dimension data, where recall at ef 10 sits visibly below recall at ef 160, so the curve has a shape. In a running system this sweep runs on logged queries on a schedule, because the curve moves as inserts and deletes change the graph.
+    starter: |
+      def brute_force(vectors, q, k):
+          """The exact k nearest keys of the dict vectors, nearest first."""
+          raise NotImplementedError
+
+
+      def recall_sweep(index, queries, k, efs):
+          """{ef: mean recall@k over queries} for each ef in efs, against brute_force on index.vectors."""
+          raise NotImplementedError
+
+
+      def smallest_ef(index, queries, k, target, efs):
+          """The smallest ef in efs whose mean recall@k reaches target, or None if none does."""
+          raise NotImplementedError
+    tests: |
+      import random as _random
+
+      _rng = _random.Random(13)
+      data = {i: tuple(_rng.random() for _ in range(32)) for i in range(2000)}
+      index = HNSW(M=8, ef_construction=64, seed=0)
+      for key, vec in data.items():
+          index.insert(key, vec)
+      queries = [tuple(x + _rng.gauss(0, 0.02) for x in data[_rng.randrange(2000)]) for _ in range(40)]
+      assert brute_force({1: (0.0,), 2: (3.0,), 3: (1.0,)}, (0.9,), 2) == [3, 1]
+      curve = recall_sweep(index, queries, 10, [10, 20, 40, 80, 160])
+      assert set(curve) == {10, 20, 40, 80, 160}
+      assert all(0.0 <= r <= 1.0 for r in curve.values())
+      assert curve[160] >= 0.98, f"at ef = 160 recall@10 should reach 0.98; got {curve[160]:.3f}"
+      assert curve[10] < curve[160], f"recall should rise with ef on 32-dimensional data; got {curve}"
+      best = smallest_ef(index, queries, 10, 0.95, [10, 20, 40, 80, 160])
+      assert best is not None and curve[best] >= 0.95, f"smallest_ef returned {best} for the curve {curve}"
+      assert all(curve[ef] < 0.95 for ef in curve if ef < best), "no smaller ef in the list reaches the target"
+      assert smallest_ef(index, queries, 10, 1.01, [10, 40]) is None
+    hidden: |
+      _hx_curve = recall_sweep(index, queries[:20], 5, [5, 300])
+      assert _hx_curve[300] >= _hx_curve[5] and _hx_curve[300] >= 0.99
+      assert smallest_ef(index, queries[:20], 5, 0.0, [300, 7, 50]) == 7
+      assert brute_force(data, queries[0], 3) == [k for _, k in sorted((math.dist(queries[0], v), k) for k, v in data.items())[:3]]
+      _hx_tiny = HNSW(seed=1)
+      for _hx_i in range(3):
+          _hx_tiny.insert(_hx_i, (float(_hx_i),))
+      assert abs(recall_sweep(_hx_tiny, [(0.2,), (1.7,)], 2, [2])[2] - 1.0) < 1e-9
+    solution: |
+      def brute_force(vectors, q, k):
+          return [key for _, key in sorted((distance(q, v), key) for key, v in vectors.items())[:k]]
+
+
+      def recall_sweep(index, queries, k, efs):
+          truth = [set(brute_force(index.vectors, q, k)) for q in queries]
+          out = {}
+          for ef in efs:
+              hits = sum(len(set(index.search(q, k, ef)) & t) / len(t) for q, t in zip(queries, truth))
+              out[ef] = hits / len(queries)
+          return out
+
+
+      def smallest_ef(index, queries, k, target, efs):
+          curve = recall_sweep(index, queries, k, sorted(efs))
+          for ef in sorted(efs):
+              if curve[ef] >= target:
+                  return ef
+          return None
+  - title: Add a filter and measure recall
+    brief: |
+      Many vector stores filter after the graph search: take the ef candidates, drop the ones the filter rejects, return what is left. Add that as search(q, k, ef, allowed), where allowed is a set of keys or None, and measure it with filtered_recall against the exact k nearest allowed keys. With 5% of keys allowed and ef 40, about 40 x 0.05 = 2 candidates survive on average. The tests check that your measurement shows the collapse: fewer than 5 results returned on average and filtered recall under 0.5, while the same index without a filter stays at 0.95 or better. pgvector's README describes the same behaviour for approximate indexes when iterative scans are off.
+    starter: |
+      class HNSW(HNSW):
+          def search(self, q, k, ef, allowed=None):
+              """allowed: None, or a set of keys a result must belong to.
+              Post-filtering: take the ef candidates the unfiltered search finds, keep the allowed ones, return up to k."""
+              raise NotImplementedError
+
+
+      def filtered_recall(index, queries, k, ef, allowed):
+          """(mean recall@k, mean number of results returned) for index.search(q, k, ef, allowed) over queries.
+          Recall is measured against the exact k nearest allowed keys; when fewer than k keys are allowed, against all of them."""
+          raise NotImplementedError
+    tests: |
+      import random as _random
+
+      _rng = _random.Random(17)
+      data = {i: tuple(_rng.random() for _ in range(16)) for i in range(2000)}
+      index = HNSW(M=8, ef_construction=64, seed=0)
+      for key, vec in data.items():
+          index.insert(key, vec)
+      queries = [tuple(x + _rng.gauss(0, 0.02) for x in data[_rng.randrange(2000)]) for _ in range(40)]
+      in_stock = {key for key in data if key % 20 == 0}
+      got = index.search(queries[0], 10, 40, in_stock)
+      assert set(got) <= in_stock and len(got) <= 10
+      gaps = [math.dist(queries[0], data[key]) for key in got]
+      assert gaps == sorted(gaps), "filtered results stay nearest first"
+      assert index.search(queries[0], 10, 40) == index.search(queries[0], 10, 40, None), "no filter, same results as before"
+      plain_recall, plain_returned = filtered_recall(index, queries, 10, 40, set(data))
+      assert plain_recall >= 0.95 and plain_returned == 10
+      f_recall, f_returned = filtered_recall(index, queries, 10, 40, in_stock)
+      assert f_returned < 5, f"5% of rows pass the filter; post-filtering 40 candidates should leave about 2, got {f_returned:.1f}"
+      assert f_recall < 0.5, f"and filtered recall@10 should collapse; got {f_recall:.2f}"
+      exp_recall = sum(len(set(index.search(q, 10, 40, in_stock)) & set(k for _, k in sorted((math.dist(q, data[k]), k) for k in in_stock)[:10])) / 10 for q in queries) / len(queries)
+      assert abs(f_recall - exp_recall) < 1e-9, f"filtered_recall measures against the exact allowed top 10: expected {exp_recall:.3f}, got {f_recall:.3f}"
+    hidden: |
+      _hx_three = {3, 500, 1999}
+      _hx_r, _hx_n = filtered_recall(index, queries[:10], 10, 40, _hx_three)
+      _hx_exp = sum(len(set(index.search(q, 10, 40, _hx_three)) & _hx_three) / 3 for q in queries[:10]) / 10
+      assert abs(_hx_r - _hx_exp) < 1e-9 and _hx_n <= 3
+      assert index.search(queries[2], 10, 40, set()) == []
+      assert all(set(index.search(q, 10, 200, in_stock)) <= in_stock for q in queries[:5])
+      assert len(index.search(queries[3], 10, 2000, in_stock)) == 10
+    solution: |
+      class HNSW(HNSW):
+          def search(self, q, k, ef, allowed=None):
+              if allowed is None:
+                  return super().search(q, k, ef)
+              if self.entry is None:
+                  return []
+              entry = [self.entry]
+              for layer in range(self.levels[self.entry], 0, -1):
+                  entry = [self.search_layer(q, entry, 1, layer)[0][1]]
+              found = self.search_layer(q, entry, max(ef, k), 0)
+              return [key for _, key in found if key in allowed][:k]
+
+
+      def filtered_recall(index, queries, k, ef, allowed):
+          pool = {key: v for key, v in index.vectors.items() if key in allowed}
+          recall = returned = 0.0
+          for q in queries:
+              truth = set(brute_force(pool, q, k))
+              got = index.search(q, k, ef, allowed)
+              returned += len(got)
+              recall += len(set(got) & truth) / len(truth) if truth else 1.0
+          return recall / len(queries), returned / len(queries)
+  - title: Fix with iterative scan or filter-aware traversal
+    brief: |
+      Make a filtered search return min(k, allowed keys in the index) results at recall 0.9 or better. Two approaches pass. An iterative scan keeps expanding layer 0 until enough allowed keys are found. Filter-aware traversal walks through rejected nodes to reach allowed ones but admits only allowed nodes to the result set. Either way, a small allowed set is cheaper to score exactly than to hunt for in the graph; where that threshold sits is your decision, the same one Qdrant's planner makes with its full-scan threshold. The tests check filters of 5%, 0.5% and three keys for recall and count, and a 50% filter for cost: fewer distance calls per query than half the index, which rules out scoring every allowed key. A hidden test puts the allowed keys in clusters far from the query.
+    starter: |
+      class HNSW(HNSW):
+          def search(self, q, k, ef, allowed=None):
+              """With a filter, return the min(k, number of allowed keys in the index) nearest allowed keys, nearest first,
+              at the recall and cost the tests set. Without one, behave as before."""
+              raise NotImplementedError
+    tests: |
+      import random as _random
+
+      _rng = _random.Random(17)
+      data = {i: tuple(_rng.random() for _ in range(16)) for i in range(2000)}
+      index = HNSW(M=8, ef_construction=64, seed=0)
+      for key, vec in data.items():
+          index.insert(key, vec)
+      queries = [tuple(x + _rng.gauss(0, 0.02) for x in data[_rng.randrange(2000)]) for _ in range(40)]
+      in_stock = {key for key in data if key % 20 == 0}
+      f_recall, f_returned = filtered_recall(index, queries, 10, 40, in_stock)
+      assert f_returned == 10, f"a 5% filter must still fill k = 10; got {f_returned:.1f} on average"
+      assert f_recall >= 0.9, f"filtered recall@10 at ef = 40 should be at least 0.9; got {f_recall:.3f}"
+      rare = {key for key in data if key % 200 == 7}
+      assert filtered_recall(index, queries, 10, 40, rare) == (1.0, 10.0), "ten allowed keys: return all ten"
+      assert sorted(index.search(queries[0], 10, 40, {4, 1500, 77})) == [4, 77, 1500]
+      calls = [0]
+      _plain_distance = distance
+
+
+      def distance(a, b):
+          calls[0] += 1
+          return _plain_distance(a, b)
+
+
+      half = {key for key in data if key % 2 == 0}
+      h_recall, _ = filtered_recall(index, queries, 10, 40, half)
+      assert h_recall >= 0.9, f"half the rows allowed: recall@10 should be at least 0.9; got {h_recall:.3f}"
+      calls[0] = 0
+      for q in queries:
+          index.search(q, 10, 40, half)
+      per_query = calls[0] / len(queries)
+      assert per_query < 0.5 * len(data), f"a 50% filter should cost less than scoring every allowed row: {per_query:.0f} distances per query"
+    hidden: |
+      assert index.search(queries[1], 10, 40, {99999, 3}) == [3]
+      assert index.search(queries[1], 10, 40, set()) == []
+      assert index.search(queries[1], 10, 40) == index.search(queries[1], 10, 40, None)
+      _hx_r = _random.Random(23)
+      _hx_c = [tuple(_hx_r.random() for _ in range(8)) for _ in range(20)]
+      _hx_d = {i: tuple(x + _hx_r.gauss(0, 0.01) for x in _hx_c[i % 20]) for i in range(2000)}
+      _hx_ix = HNSW(M=8, ef_construction=48, seed=2)
+      for _hx_k, _hx_v in _hx_d.items():
+          _hx_ix.insert(_hx_k, _hx_v)
+      _hx_far = {k for k in _hx_d if k % 20 in (5, 6, 7, 8, 9)}
+      _hx_qs = [tuple(x + _hx_r.gauss(0, 0.01) for x in _hx_c[0]) for _ in range(20)]
+      _hx_rec, _hx_ret = filtered_recall(_hx_ix, _hx_qs, 10, 40, _hx_far)
+      assert _hx_rec >= 0.9 and _hx_ret == 10
+      _hx_mid = {k for k in data if k % 10 == 3}
+      _hx_rec2, _hx_ret2 = filtered_recall(index, queries[:20], 10, 40, _hx_mid)
+      assert _hx_rec2 >= 0.9 and _hx_ret2 == 10
+    solution: |
+      class HNSW(HNSW):
+          exact_below = 400          # allowed sets this small are scored exactly; tune it against your latency budget
+          max_scan = 20000           # nodes a filtered traversal may visit before it returns what it has
+
+          def search(self, q, k, ef, allowed=None):
+              if allowed is None:
+                  return super().search(q, k, ef)
+              live = [key for key in allowed if key in self.vectors]
+              if not live:
+                  return []
+              if len(live) <= self.exact_below:
+                  return [key for _, key in sorted((distance(q, self.vectors[key]), key) for key in live)[:k]]
+              entry = [self.entry]
+              for layer in range(self.levels[self.entry], 0, -1):
+                  entry = [self.search_layer(q, entry, 1, layer)[0][1]]
+              return [key for _, key in self._filtered_layer0(q, entry, max(ef, k), allowed)[:k]]
+
+          def _filtered_layer0(self, q, entry_points, ef, allowed):
+              # Traverse through every node, but only allowed nodes enter the result set; stop when the result set is
+              # full and no candidate can improve it, or when the scan budget runs out.
+              visited = set(entry_points)
+              candidates = [(distance(q, self.vectors[e]), e) for e in visited]
+              heapq.heapify(candidates)
+              best = [(-d, e) for d, e in candidates if e in allowed]
+              heapq.heapify(best)
+              links = self.layers[0]
+              while candidates and len(visited) < self.max_scan:
+                  d, node = heapq.heappop(candidates)
+                  if len(best) >= ef and d > -best[0][0]:
+                      break
+                  for n in links[node]:
+                      if n in visited:
+                          continue
+                      visited.add(n)
+                      dn = distance(q, self.vectors[n])
+                      if len(best) < ef or dn < -best[0][0]:
+                          heapq.heappush(candidates, (dn, n))
+                          if n in allowed:
+                              heapq.heappush(best, (-dn, n))
+                              if len(best) > ef:
+                                  heapq.heappop(best)
+              return sorted((-d, e) for d, e in best)
+---
+This lab builds an HNSW index in standard-library Python and then breaks it the way production filters break it. The six steps follow the paper's construction, then the measurement and the filter.
+
+Steps 1 to 3 build the graph: levels, the search that descends from the top layer, and the neighbour-selection rule. Step 3 is where the paper's heuristic stops being a footnote. On clustered data, the simple rule of linking each node to its nearest neighbours leaves whole clusters with no way in, and recall stays low at any ef.
+
+Step 4 measures recall against brute force across several values of ef, the measurement every later decision depends on. Step 5 adds the filter most vector stores apply after the graph search and measures what it does at 5% selectivity. Step 6 fixes it, and leaves the choice between an exact path for small allowed sets and a traversal that respects the filter to you.
+
+Every distance goes through one function, `distance()`, called by that name. The tests replace it with a counter, so cost limits are checked as distance calls, not wall-clock time, and give the same answer in the browser and on a laptop. The data is random vectors from seeded generators, so every run of a step sees the same points.
+
+Each step subclasses the last (`class HNSW(HNSW)`), so a later step can call what an earlier one wrote through `super()`. Your code is saved with your progress as you type, and passing a step's tests unlocks the next one. Python runs in your browser, with the standard library only.

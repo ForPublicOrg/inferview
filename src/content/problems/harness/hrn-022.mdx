@@ -1,0 +1,165 @@
+---
+id: hrn-022
+title: The upgrade that emptied the cache
+subtitle: rank the causes
+track: harness
+module: cache-cost-latency
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 25
+core: true
+tags: [prompt-caching, mcp, tool-definitions, notifications, coding-agents]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: OpenAI, Unrolling the Codex agent loop, by Michael Bolin (2026-01-23)
+    url: https://openai.com/index/unrolling-the-codex-agent-loop/
+    note: "vendor engineering post: cache hits need exact prefix matches, and tools must be identical between requests; changing tools mid-conversation, the model, the sandbox configuration, the approval mode or the working directory causes a miss; Codex's first MCP support enumerated tools in an inconsistent order and caused misses; honouring notifications/tools/list_changed in the middle of a long conversation can cause an expensive cache miss; mid-conversation configuration changes are appended as new messages instead of editing earlier ones"
+  - title: Model Context Protocol specification 2025-11-25, Tools
+    url: https://modelcontextprotocol.io/specification/2025-11-25/server/tools
+    note: "servers that declare listChanged SHOULD send notifications/tools/list_changed when the list of available tools changes; the client then calls tools/list again"
+  - title: Model Context Protocol specification 2026-07-28, Key changes
+    url: https://modelcontextprotocol.io/specification/2026-07-28/changelog
+    note: "servers SHOULD return tools from tools/list in a deterministic order to improve prompt cache hit rates; clients opt in to toolsListChanged notifications through subscriptions/listen; list results carry ttlMs and cacheScope"
+  - title: Claude API docs, Prompt caching (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: "the cache hierarchy is tools, then system, then messages; changing tool definitions invalidates all three; Opus 5.5 five-minute write $5 and read $0.20 per million tokens; the five-minute lifetime is refreshed by each hit"
+  - title: Claude Code docs, How Claude Code uses prompt caching (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/prompt-caching
+    note: "with MCP tools deferred, Claude Code keeps the tool list from the conversation's first request, and a server that connects later supplies deferred definitions; with tools loaded upfront, a dynamic tool update that adds tools invalidates the cache"
+choices:
+  - text: Servers are listed in the order they finished connecting, which differs from one session to the next
+    correct: false
+    why: "A real defect: two sessions rarely share a tool block. But reassigning a key keeps its position in the dict, so the order is fixed for the life of a session and cannot explain misses on requests 7 to 10."
+  - text: The five-minute cache lifetime runs out while long pipeline tool calls hold up the next request
+    correct: false
+    why: "The requests are 26 to 47 seconds apart, and every hit refreshes the lifetime; nothing in the log comes near five minutes."
+  - text: Each refreshed tool list is written into the next request's tools, the head of the cached prefix
+    correct: true
+    why: "The tools block comes first in the cache hierarchy, so replacing it after every notification invalidates the system prompt and the whole conversation behind it on the next request."
+  - text: The server returns its tools in an unstable order, so every refresh reorders the same tool set
+    correct: false
+    why: "That was Codex's early MCP bug, and it would cause this symptom, but the diff shows the same 14 tools in the same order with one description changed."
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Debug round">
+Your team's coding agent is an in-house harness on the Claude API. On Tuesday the CI team upgraded its <code>ci-tools</code> MCP server from 2.3.2 to 2.4.0. Since then the daily prompt-cache hit rate for agent sessions has fallen from 0.93 to 0.04, and input spend per session has gone up about ninefold. Which defect explains why nearly every request now misses? Rank the others.
+</Callout>
+
+From the ci-tools 2.4.0 changelog:
+
+```text
+- run_pipeline's description now lists the pipelines running on the repository, so agents
+  stop starting duplicate runs.
+- The server sends notifications/tools/list_changed whenever that list changes.
+```
+
+One session's request log (constructed for this problem). `cache_read` and `cache_creation` are the API's `cache_read_input_tokens` and `cache_creation_input_tokens`; `total_input` adds them to the API's `input_tokens`, the uncached tokens after the breakpoint:
+
+```text
+req  sent       total_input  cache_read  cache_creation  tools_sha256[:4]
+  5  10:02:11        61,240      59,804           1,436  a91e
+  6  10:02:39        63,020      61,240           1,780  a91e
+     10:02:50  ci-tools: notifications/tools/list_changed
+  7  10:03:05        64,410           0          64,410  c07d
+     10:03:31  ci-tools: notifications/tools/list_changed
+  8  10:03:52        66,950           0          66,950  5b22
+     10:04:20  ci-tools: notifications/tools/list_changed
+  9  10:04:30        68,100           0          68,100  e4f9
+     10:04:48  ci-tools: notifications/tools/list_changed
+ 10  10:05:02        69,880           0          69,880  71d0
+```
+
+The tool definitions sent with request 6 and request 7, diffed (14 tools, same order in both):
+
+```diff
+   {"name": "ci__run_pipeline",
+-   "description": "Start a CI pipeline for a branch. Running now: api-build #4411, web-lint #4412.",
++   "description": "Start a CI pipeline for a branch. Running now: api-build #4411.",
+    "input_schema": {...}},
+```
+
+The harness code that touches tools:
+
+```python
+# harness/mcp_hub.py
+class McpHub:
+    def __init__(self, servers):
+        self.servers = servers
+        self.tools = {}                                  # server name -> tool definitions
+
+    async def start(self):
+        for pending in asyncio.as_completed([s.connect() for s in self.servers]):
+            srv = await pending
+            self.tools[srv.name] = await srv.list_tools()
+            srv.on("notifications/tools/list_changed", self._refresh(srv))
+
+    def _refresh(self, srv):
+        async def handler(_msg):
+            self.tools[srv.name] = await srv.list_tools()
+        return handler
+
+    def tool_defs(self):
+        return [to_api_tool(name, t) for name, ts in self.tools.items() for t in ts]
+```
+
+```python
+# harness/loop.py
+def build_request(session):
+    return {
+        "model": "claude-opus-5-5",
+        "max_tokens": 16_000,
+        "tools": BUILTIN_TOOLS + session.hub.tool_defs(),
+        "system": session.system_prompt,
+        "messages": with_cache_breakpoint(session.messages),   # cache_control on the last block
+    }
+```
+
+What you do not have: the hashes of the system prompt and the messages per request (the log stores only the tools hash), and hit rates for sessions that never connect `ci-tools`.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Request a hash of the tools, the system prompt and the messages for requests 6 and 7. Which of the three would you expect to differ?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>For each candidate, check it against the timestamps and the diff: which ones does the evidence you have rule out?</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the hit rate for sessions that never connect ci-tools over the same days. What would each answer tell you?</p></details>
+
+## Answer
+
+The cache misses because the harness treats the tool list as live state and writes it into every request. Each `notifications/tools/list_changed` makes `_refresh` fetch the list again, `tool_defs()` returns the new list, and the next request's `tools` block differs from the last one. Tools are the first level of the cache hierarchy, so a change there invalidates the system prompt and the whole conversation behind it. Before 2.4.0 the server never announced a change, so the bug was latent; with a description that tracks running pipelines, a busy repository announces a change every minute or so, and every request after one is a full write. On Opus 5.5 a miss writes the reused tokens at $5 per million instead of reading them at $0.20, 25 times the price, and request 10 alone costs $0.35 of input instead of about $0.02. Averaged over a session, a 0.93 hit rate prices input at 0.93 × $0.20 + 0.07 × $5 = $0.54 per million tokens and a 0.04 hit rate at $4.81, which is the ninefold rise.
+
+The ranking.
+
+- **Second, a real defect on the server side: live state in a tool description.** It is the trigger, not the cause. Moving the running-pipeline list into a tool result (a `ci__list_running` tool, or a refusal from `run_pipeline` when the branch already has a run) fixes this server and leaves the harness waiting for the next server that changes a description.
+- **Third, a real harness defect with a different symptom: connection order.** `asyncio.as_completed` fills the dict in whichever order the servers answer, so two sessions rarely send the same tool block and never share a cached prefix. Within a session the order is fixed, because reassigning an existing key keeps its position. Fix it by sorting servers and tools by name.
+- **Ruled out: unstable order from the server.** It would produce this symptom, and it is the bug Codex hit in its first MCP support, but the diff shows the same 14 tools in the same order.
+- **Ruled out: TTL expiry.** Requests are under a minute apart and each hit refreshes the entry.
+
+The evidence is incomplete. The log hashes only the tools block, so a second change in the system prompt (a timestamp, a pipeline count) would look the same from here; log a hash per level for a day. Ask for the hit rate of sessions that never connect `ci-tools`: if it also fell on Tuesday, something else shipped that day. Without either, the timestamps are enough to act: every miss in the log follows a notification, and every hit precedes one.
+
+The fix is a decision with more than one defensible answer.
+
+- **Freeze the tool list for the conversation.** Keep the list from the first request; when a server announces a change, diff the new list against it. Append a short message to the conversation naming tools added or removed, the pattern Codex uses for mid-conversation configuration changes, and return an error that names the removal when the model calls a tool that is gone. Cost: new tools cannot be called until the next compaction or session, and descriptions go stale.
+- **Apply a change only when names or schemas change, and only at a natural rebuild.** Description-only changes are dropped; real changes wait for the next compaction, or for the first request after the cache has expired anyway. Cost: one full write per real change, and a delay before the model can use a new tool.
+- **Defer MCP tools behind a tool search tool.** The prefix holds only the search tool; definitions are appended inline when found, which is how Claude Code keeps its cache when a server connects mid-session. Cost: a tool search to build and own, and a new failure mode where the right tool is not found.
+
+The constraint conflict is freshness against cost: the CI team added the live list for a real reason, duplicate pipeline runs, and the harness needs its prefix stable. My recommendation is the first fix with the second's rule for schemas, plus a request to the CI team to move the running-pipeline list into a tool result, which serves their goal better than a description the model may have read twenty minutes ago.
+
+Failure mode of the recommendation. A server can change a tool's behaviour while keeping its name and schema, with the change stated only in the description ("now requires an approval token"). A frozen list leaves the model working from the old contract until the next rebuild, and the first sign is a run of tool errors. Count tool errors per tool per session after the change; a spike on one tool means its description carried meaning you dropped.
+
+## Follow-ups
+
+- *The CI team refuses to move the live list out of the description: duplicate runs cost them more than your cache misses cost you. What number would you put in front of both teams, and who decides?*
+- *After freezing the list, a security reviewer points out that freezing also blocks a server from changing a tool's description mid-session to inject instructions. Do you now freeze even across compactions, and what do you give up?*
+- *Your clients move to MCP 2026-07-28, where they opt in to tool-list notifications through `subscriptions/listen`. Do you subscribe at all during a conversation, and what would you need to see in production to start?*
+- *Two senior engineers disagree: one wants tool search for every MCP server, the other wants a frozen list and nothing else. How do you decide without deciding by rank?*
+
+## Common mistakes
+
+- Sorting the tools and calling it fixed. The order was never the problem; the content changes with every notification.
+- Moving the tools after the system prompt. The API orders the hierarchy as tools, system, messages regardless of where the fields appear in the request body.
+- Ignoring `list_changed` entirely without handling removed tools, so the model keeps calling a tool that no longer exists and receives an unexplained protocol error.
+- Blaming the CI team's upgrade and stopping there. The next server that updates a description will cause the same incident.

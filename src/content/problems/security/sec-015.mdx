@@ -1,0 +1,590 @@
+---
+id: sec-015
+title: An egress policy for the agent's fetch tool
+subtitle: allowlists, one lookup per hop, and addresses in every spelling
+track: security
+module: sandboxing-secrets
+type: code
+difficulty: hard
+seniority: [senior, staff]
+minutes: 45
+core: true
+tags: [ssrf, egress, dns-rebinding, redirects, ipaddress, mcp, fetch-tool]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Model Context Protocol, Security Best Practices (specification revision 2026-07-28)
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/security_best_practices
+    note: "SSRF section: direct internal IPs, cloud metadata at 169.254.169.254, localhost services, DNS rebinding and redirect chains; require HTTPS except loopback in development; block 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, ::1, 169.254.0.0/16, fc00::/7 and fe80::/10; avoid manual IP validation because of octal, hex and IPv4-mapped IPv6 tricks; validate each redirect hop; pin DNS between check and use; egress proxies such as Smokescreen"
+  - title: Python documentation, ipaddress (checked 2026-10-28)
+    url: https://docs.python.org/3/library/ipaddress.html
+    note: "is_private and is_global follow the IANA special-purpose registries; for IPv4-mapped addresses they follow the embedded IPv4 address; 100.64.0.0/10 is neither; 3.13 changed the classification of 192.0.0.0/24, 64:ff9b:1::/48 and 2002::/16; ipv4_mapped, sixtofour and teredo report embedded addresses; since 3.9.5 leading zeros are an error"
+  - title: Codex docs, Agent approvals and security (checked 2026-10-28)
+    url: https://learn.chatgpt.com/docs/agent-approvals-security
+    note: "Codex's own documentation says its DNS check reduces DNS rebinding risk but does not eliminate it, and to enforce egress controls at a lower layer if hostile DNS is in scope"
+  - title: Claude Code docs, Sandboxing (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/sandboxing
+    note: "allowedDomains does not limit the WebFetch tool, which follows permission rules instead; the sandbox proxy decides from the client-supplied hostname"
+code:
+  starter: |
+    class Policy:
+        """An egress policy for the agent's fetch tool, built once and used for every call.
+
+        schemes: the URL schemes the tool may use, such as {"https"}.
+        hosts:   entries of three kinds. An exact name ("docs.python.org"); "*.suffix", which matches any
+                 name ending in "." + suffix at any depth but not suffix itself; and "*", which matches any
+                 name (an open-web tool whose only protection is the address check). Names compare without
+                 case and without a trailing dot. An IP-literal host matches only "*".
+                 A policy can hold hundreds of thousands of entries.
+        """
+
+        def __init__(self, schemes, hosts):
+            raise NotImplementedError
+
+
+    def fetch(url, policy, resolve, send, max_hops=5):
+        """Fetch url for the agent, or refuse. Return ("ok", final_url, body) or ("deny", reason).
+
+        resolve(name) -> list of address strings, as getaddrinfo returns them; raises LookupError for
+            a name that does not exist. Treat it as the attacker's DNS server: it can answer differently
+            on every call and, like getaddrinfo, it accepts numeric spellings of addresses.
+        send(address, host, url) -> (status, headers, body) makes one request to address, with host for
+            the Host header and TLS name. Header names arrive lowercase. send never follows redirects.
+
+        The request may go only to a global unicast address: no private, loopback, link-local, shared,
+        reserved or multicast address, including one carried inside an IPv6 address. Refuse a URL with
+        userinfo or a backslash; clients disagree about where such a URL points. Follow at most
+        max_hops redirects (301, 302, 303, 307, 308), checking every hop as if the agent had asked for it.
+        """
+        raise NotImplementedError
+  tests: |
+    DNS = {
+        "docs.python.org": ["151.101.0.223"],
+        "api.github.com": ["140.82.112.6"],
+        "raw.githubusercontent.com": ["185.199.108.133"],
+        "evilgithubusercontent.com": ["93.184.215.14"],
+        "githubusercontent.com": ["185.199.108.133"],
+    }
+
+    def resolver(table):
+        def resolve(name):
+            if name not in table:
+                raise LookupError(name)
+            return list(table[name])
+        return resolve
+
+    def server(routes):
+        sent = []
+        def send(address, host, url):
+            sent.append((address, host, url))
+            return routes.get(url, (200, {}, b"page"))
+        send.sent = sent
+        return send
+
+    P = Policy({"https"}, ["docs.python.org", "api.github.com", "*.githubusercontent.com"])
+    s = server({})
+    assert fetch("https://docs.python.org/3/", P, resolver(DNS), s) == ("ok", "https://docs.python.org/3/", b"page")
+    assert s.sent == [("151.101.0.223", "docs.python.org", "https://docs.python.org/3/")], "the request goes to the checked address"
+    assert fetch("http://docs.python.org/3/", P, resolver(DNS), server({}))[0] == "deny", "only https"
+    assert fetch("https://raw.githubusercontent.com/a/b/main/x.py", P, resolver(DNS), server({}))[0] == "ok"
+    assert fetch("https://githubusercontent.com/", P, resolver(DNS), server({}))[0] == "deny", "a wildcard does not match its apex"
+    assert fetch("https://evilgithubusercontent.com/", P, resolver(DNS), server({}))[0] == "deny", "a suffix match starts at a dot"
+    assert fetch("https://docs.python.org/", P, resolver({"docs.python.org": ["169.254.169.254"]}), server({}))[0] == "deny", "an allowed name that resolves to the metadata address is refused"
+    s = server({"https://docs.python.org/old": (302, {"location": "http://169.254.169.254/latest/meta-data/"}, b"")})
+    assert fetch("https://docs.python.org/old", P, resolver(DNS), s)[0] == "deny" and len(s.sent) == 1, "every redirect hop is checked"
+    s = server({"https://docs.python.org/old": (301, {"location": "/3/"}, b"")})
+    assert fetch("https://docs.python.org/old", P, resolver(DNS), s) == ("ok", "https://docs.python.org/3/", b"page"), "a relative redirect resolves against the current URL"
+    assert fetch("https://evil.example\\@api.github.com/", P, resolver(DNS), server({}))[0] == "deny", "a backslash is refused"
+  hidden: |
+    import ipaddress as _ip
+    import random as _random
+    import time as _time
+    from urllib.parse import urlsplit as _urlsplit
+
+
+    def _aton(name):
+        # getaddrinfo's view of a numeric name: 1 to 4 parts, each decimal, 0x hex or 0-led octal.
+        parts = name.split(".")
+        if not 1 <= len(parts) <= 4:
+            return None
+        vals = []
+        for p in parts:
+            try:
+                if p.lower().startswith("0x"):
+                    v = int(p[2:] or "0", 16)
+                elif len(p) > 1 and p.startswith("0"):
+                    v = int(p, 8)
+                else:
+                    v = int(p, 10)
+            except ValueError:
+                return None
+            vals.append(v)
+        *head, last = vals
+        if any(v > 255 for v in head) or last >= 256 ** (4 - len(head)):
+            return None
+        n = 0
+        for v in head:
+            n = n * 256 + v
+        n = (n << (8 * (4 - len(head)))) | last
+        return str(_ip.IPv4Address(n))
+
+
+    def _blocked(text):
+        try:
+            a = _ip.ip_address(text)
+        except ValueError:
+            return True
+        xs = [a]
+        if a.version == 6:
+            if getattr(a, "scope_id", None):
+                return True
+            for e in (a.ipv4_mapped, a.sixtofour):
+                if e is not None:
+                    xs.append(e)
+            if a.teredo:
+                xs.extend(a.teredo)
+            if a in _ip.ip_network("64:ff9b::/96") or a in _ip.ip_network("::/96"):
+                xs.append(_ip.IPv4Address(int(a) & 0xFFFFFFFF))
+        return not all(x.is_global and not x.is_multicast for x in xs)
+
+
+    class _DNS:
+        """Like getaddrinfo: a table, then numeric spellings, then IPv6 literals. Records every answer."""
+
+        def __init__(self, table):
+            self.table = table
+            self.answers = []
+
+        def __call__(self, name):
+            n = name.lower().rstrip(".")
+            if n in self.table:
+                v = self.table[n]
+                ans = list(v(len(self.answers)) if callable(v) else v)
+            else:
+                a = _aton(n)
+                if a is None:
+                    try:
+                        a = str(_ip.ip_address(n))
+                    except ValueError:
+                        raise LookupError(name)
+                ans = [a]
+            self.answers.append((n, ans))
+            return list(ans)
+
+
+    class _Net:
+        def __init__(self, routes=None):
+            self.routes = routes or {}
+            self.sent = []
+
+        def __call__(self, address, host, url):
+            self.sent.append((address, host, url))
+            r = self.routes.get(url)
+            return r(len(self.sent)) if callable(r) else (r or (200, {}, b"body"))
+
+
+    def _safe_sends(net, dns):
+        # Every request went to an allowed address that DNS returned for that host, or to the literal in the URL.
+        for address, host, url in net.sent:
+            if _blocked(address):
+                return False
+            h = str(host).lower().rstrip(".")
+            if not any(n == h and address in ans for n, ans in dns.answers):
+                try:
+                    if _ip.ip_address(address) != _ip.ip_address(h):
+                        return False
+                except ValueError:
+                    return False
+        return True
+
+
+    _OPEN = Policy({"https"}, ["*"])
+    _LOCAL = {"localhost": ["127.0.0.1"], "metadata.google.internal": ["169.254.169.254"],
+              "example.com": ["93.184.215.14"], "v6.example.com": ["2606:4700::1111"],
+              "corp.example.com": ["10.0.0.7"]}
+
+    _BAD = [
+        "https://localhost/", "https://LOCALHOST./", "https://metadata.google.internal/computeMetadata/v1/",
+        "https://corp.example.com/", "https://127.0.0.1/", "https://2130706433/", "https://0x7f.0.0.1/",
+        "https://0177.0.0.1/", "https://127.1/", "https://0x7f000001/", "https://017700000001/",
+        "https://169.254.169.254.:443/latest/", "https://0251.0376.0251.0376/", "https://0xa9fea9fe/",
+        "https://[::1]/", "https://[::]/", "https://0.0.0.0/", "https://100.64.0.1/", "https://224.0.0.251/",
+        "https://[::ffff:127.0.0.1]/", "https://[::ffff:7f00:1]/", "https://[::ffff:a9fe:a9fe]/",
+        "https://[0:0:0:0:0:ffff:169.254.169.254]/", "https://[::127.0.0.1]/", "https://[64:ff9b::a9fe:a9fe]/",
+        "https://[2002:a9fe:a9fe::1]/", "https://[fe80::1%25eth0]/", "https://[fd00::1]/", "https://[ff02::1]/",
+        "https://10.1.2.3/", "https://172.16.0.1/", "https://192.168.1.1/admin", "https://198.18.0.1/",
+        "https://user:pw@example.com/", "https://example.com@localhost/", "https://example.com\\@localhost/",
+        "https://example.com:99999/", "https:///no-host", "", "file:///etc/passwd", "gopher://example.com/",
+        "javascript:alert(1)", "data:text/plain,hi", "http://example.com/",
+    ]
+
+
+    def _all_bad_denied():
+        out = []
+        for u in _BAD:
+            dns, net = _DNS(_LOCAL), _Net()
+            r = fetch(u, _OPEN, dns, net)
+            if r[0] != "deny" or net.sent:
+                out.append(u)
+        return out
+
+
+    assert _all_bad_denied() == []
+
+    _GOOD = ["https://example.com/", "https://EXAMPLE.com./a?b=c", "https://8.8.8.8/", "https://[2606:4700::1111]/",
+             "https://v6.example.com/x", "https://example.com:8443/"]
+
+
+    def _good_ok():
+        out = []
+        for u in _GOOD:
+            dns, net = _DNS(_LOCAL), _Net()
+            if fetch(u, _OPEN, dns, net)[0] != "ok" or not _safe_sends(net, dns):
+                out.append(u)
+        return out
+
+
+    assert _good_ok() == []
+
+
+    def _rebind(public, private):
+        return lambda k: [public] if k == 0 else [private]
+
+
+    def _rebinding_holds():
+        dns = _DNS({"example.com": _rebind("93.184.215.14", "169.254.169.254")})
+        net = _Net()
+        fetch("https://example.com/a", _OPEN, dns, net)
+        one = len(net.sent) == 1 and _safe_sends(net, dns) and len(dns.answers) == 1
+        dns = _DNS({"example.com": _rebind("93.184.215.14", "127.0.0.1")})
+        net = _Net({"https://example.com/a": (307, {"location": "/b"}, b"")})
+        r = fetch("https://example.com/a", _OPEN, dns, net)
+        two = _safe_sends(net, dns) and r[0] == "deny"
+        return one and two
+
+
+    assert _rebinding_holds()
+
+
+    def _mixed_never_private():
+        dns = _DNS({"example.com": ["93.184.215.14", "10.0.0.5"], "x.example.com": ["10.0.0.5", "93.184.215.14"]})
+        net = _Net()
+        fetch("https://example.com/", _OPEN, dns, net)
+        fetch("https://x.example.com/", _OPEN, dns, net)
+        return _safe_sends(net, dns)
+
+
+    assert _mixed_never_private()
+
+
+    def _redirects():
+        dns = _DNS({"a.example.com": ["93.184.215.14"], "b.example.com": ["93.184.215.15"]})
+        chain = {"https://a.example.com/%d" % i: (302, {"location": "/%d" % (i + 1)}, b"") for i in range(5)}
+        net = _Net(chain)
+        ok5 = fetch("https://a.example.com/0", _OPEN, dns, net, max_hops=5) == ("ok", "https://a.example.com/5", b"body")
+        net = _Net(chain)
+        deny4 = fetch("https://a.example.com/0", _OPEN, dns, net, max_hops=4)[0] == "deny" and len(net.sent) <= 5
+        loop = {"https://a.example.com/x": (301, {"location": "https://b.example.com/y"}, b""),
+                "https://b.example.com/y": (308, {"location": "https://a.example.com/x"}, b"")}
+        net = _Net(loop)
+        looped = fetch("https://a.example.com/x", _OPEN, dns, net, max_hops=5)[0] == "deny" and len(net.sent) <= 6
+        net = _Net({"https://a.example.com/d": (302, {"location": "http://b.example.com/"}, b"")})
+        downgrade = fetch("https://a.example.com/d", _OPEN, dns, net)[0] == "deny" and len(net.sent) == 1
+        net = _Net({"https://a.example.com/n": (303, {}, b"")})
+        nowhere = fetch("https://a.example.com/n", _OPEN, dns, net)[0] == "deny"
+        return ok5 and deny4 and looped and downgrade and nowhere
+
+
+    assert _redirects()
+
+
+    def _bad_redirect_targets():
+        out = []
+        for target in _BAD:
+            if not target or target.startswith(("javascript", "data", "file", "gopher", "https:///")):
+                continue
+            dns = _DNS(dict(_LOCAL, **{"start.example.com": ["93.184.215.14"]}))
+            net = _Net({"https://start.example.com/": (302, {"location": target}, b"")})
+            r = fetch("https://start.example.com/", _OPEN, dns, net)
+            if r[0] != "deny" or len(net.sent) != 1 or not _safe_sends(net, dns):
+                out.append(target)
+        return out
+
+
+    assert _bad_redirect_targets() == []
+
+
+    def _host_rule(policy_hosts, host):
+        host = host.lower().rstrip(".")
+        for e in policy_hosts:
+            e = e.lower().rstrip(".")
+            if e == "*" or e == host or (e.startswith("*.") and host.endswith("." + e[2:])):
+                return True
+        return False
+
+
+    def _property(seed, n):
+        rng = _random.Random(seed)
+        names = ["docs.python.org", "pypi.org", "files.pythonhosted.org", "a.b.githubusercontent.com",
+                 "githubusercontent.com", "evil.example", "pythonhosted.org", "x.pypi.org", "localhost"]
+        hosts = ["docs.python.org", "pypi.org", "*.pythonhosted.org", "*.githubusercontent.com"]
+        pol = Policy({"https"}, hosts)
+        addrs = ["93.184.215.14", "151.101.0.223", "10.0.0.1", "127.0.0.1", "169.254.169.254", "::ffff:10.0.0.1",
+                 "2606:4700::1111", "100.64.1.1"]
+        for _ in range(n):
+            table = {nm: rng.sample(addrs, rng.randint(1, 2)) for nm in names}
+            dns = _DNS(table)
+            routes = {}
+            for _ in range(rng.randint(0, 6)):
+                src = "https://%s/%d" % (rng.choice(names), rng.randint(0, 3))
+                dst = "%s://%s/%d" % (rng.choice(["https", "https", "http"]), rng.choice(names), rng.randint(0, 3))
+                routes[src] = (rng.choice([301, 302, 307, 308]), {"location": dst}, b"")
+            net = _Net(routes)
+            start = "https://%s/%d" % (rng.choice(names), rng.randint(0, 3))
+            r = fetch(start, pol, dns, net, max_hops=3)
+            if r[0] not in ("ok", "deny") or len(net.sent) > 4 or not _safe_sends(net, dns):
+                return False
+            for address, host, url in net.sent:
+                if not _host_rule(hosts, host) or _urlsplit(url).scheme != "https":
+                    return False
+        return True
+
+
+    assert _property(7, 400)
+
+
+    def _perf():
+        rng = _random.Random(3)
+        entries = ["svc%d.internal-mirror.example.org" % i for i in range(100000)]
+        entries += ["*.tenant%d.example.net" % i for i in range(100000)]
+        t = _time.perf_counter()
+        pol = Policy({"https"}, entries)
+        build = _time.perf_counter() - t
+        table = {}
+        urls = []
+        for i in range(200):
+            if i % 2:
+                h = "a.b.c.tenant%d.example.net" % rng.randrange(100000)
+            else:
+                h = "nope%d.example.com" % i
+            table[h] = ["93.184.215.14"]
+            urls.append("https://%s/p" % h)
+        dns, net = _DNS(table), _Net()
+        t = _time.perf_counter()
+        results = [fetch(u, pol, dns, net)[0] for u in urls]
+        run = _time.perf_counter() - t
+        return results.count("ok") == 100 and build < 2.0 and run < 0.5
+
+
+    assert _perf()
+  solution: |
+    import ipaddress
+    import re
+    from urllib.parse import urljoin, urlsplit
+
+    REDIRECTS = {301, 302, 303, 307, 308}
+    _NAT64 = ipaddress.ip_network("64:ff9b::/96")
+    _V4COMPAT = ipaddress.ip_network("::/96")
+    _NUMERIC_LABEL = re.compile(r"^(0x[0-9a-f]*|[0-9]+)$")
+    _NAME = re.compile(r"^[a-z0-9_-]+(\.[a-z0-9_-]+)*$")
+
+
+    class Denied(Exception):
+        pass
+
+
+    class Policy:
+        def __init__(self, schemes, hosts):
+            self.schemes = {s.lower() for s in schemes}
+            self.any_host = False
+            self.exact = set()
+            self.suffixes = set()
+            # Sets keyed by name, so a lookup costs one probe per label of the host, not one pass over every entry.
+            for entry in hosts:
+                e = entry.strip().lower().rstrip(".")
+                if e == "*":
+                    self.any_host = True
+                elif e.startswith("*."):
+                    self.suffixes.add(e[2:])
+                elif e:
+                    self.exact.add(e)
+
+        def allows_name(self, host):
+            if self.any_host or host in self.exact:
+                return True
+            i = host.find(".")
+            while i != -1:
+                if host[i + 1:] in self.suffixes:
+                    return True
+                i = host.find(".", i + 1)
+            return False
+
+
+    def _embedded_v4(a):
+        """IPv4 addresses an IPv6 address can carry to a translator or tunnel."""
+        if a.version == 4:
+            return []
+        out = []
+        if a.ipv4_mapped is not None:
+            out.append(a.ipv4_mapped)
+        if a.sixtofour is not None:
+            out.append(a.sixtofour)
+        if a.teredo is not None:
+            out.extend(a.teredo)
+        if a in _NAT64 or a in _V4COMPAT:
+            out.append(ipaddress.IPv4Address(int(a) & 0xFFFFFFFF))
+        return out
+
+
+    def permitted(text):
+        try:
+            a = ipaddress.ip_address(text)
+        except ValueError:
+            return False
+        if getattr(a, "scope_id", None):
+            return False
+        # is_global alone is not enough: 224.0.0.1, ::127.0.0.1 and 64:ff9b::a9fe:a9fe all report global.
+        return all(x.is_global and not x.is_multicast for x in [a] + _embedded_v4(a))
+
+
+    def _parse(url, policy):
+        if not isinstance(url, str) or "\\" in url or any(c in url for c in " \t\r\n"):
+            raise Denied("malformed URL")
+        parts = urlsplit(url)
+        if parts.scheme.lower() not in policy.schemes:
+            raise Denied("scheme not allowed: " + parts.scheme)
+        if "@" in parts.netloc:
+            raise Denied("userinfo in URL")
+        host = parts.hostname
+        try:
+            parts.port
+        except ValueError:
+            raise Denied("bad port")
+        if not host:
+            raise Denied("no host")
+        host = host.rstrip(".")
+        try:
+            literal = ipaddress.ip_address(host)
+        except ValueError:
+            literal = None
+        if literal is not None:
+            if not policy.any_host:
+                raise Denied("IP literal not allowed by this policy")
+            return host, literal
+        if "%" in host or not _NAME.match(host):
+            raise Denied("host is not a plain name")
+        if _NUMERIC_LABEL.match(host.rsplit(".", 1)[-1]):
+            # 0x7f.1, 2130706433 and 0177.0.0.1 are names to a strict parser and addresses to getaddrinfo.
+            raise Denied("non-canonical numeric host")
+        if not policy.allows_name(host):
+            raise Denied("host not allowed: " + host)
+        return host, None
+
+
+    def _pin(host, literal, resolve):
+        if literal is not None:
+            if not permitted(str(literal)):
+                raise Denied("address not allowed")
+            return str(literal)
+        try:
+            answer = list(resolve(host))
+        except Exception:
+            raise Denied("does not resolve: " + host)
+        if not answer:
+            raise Denied("empty answer: " + host)
+        # Policy choice: a mixed answer is refused outright rather than filtered, because it is what a rebinding attack looks like.
+        if not all(permitted(a) for a in answer):
+            raise Denied("answer contains a blocked address")
+        return answer[0]
+
+
+    def fetch(url, policy, resolve, send, max_hops=5):
+        current = url
+        for _ in range(max_hops + 1):
+            try:
+                host, literal = _parse(current, policy)
+                address = _pin(host, literal, resolve)
+            except Denied as e:
+                return ("deny", str(e))
+            # The connection uses the address that was checked; nothing resolves the name again.
+            status, headers, body = send(address, host, current)
+            if status not in REDIRECTS:
+                return ("ok", current, body)
+            location = (headers or {}).get("location")
+            if not location:
+                return ("deny", "redirect without a location")
+            current = urljoin(current, location)
+        return ("deny", "too many redirects")
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Coding, 45 minutes">
+Your agent has a fetch tool: the model passes a URL, the tool returns the body. The URLs come from the model, which reads pages an attacker can write. Write <code>Policy</code> and <code>fetch</code> to the contract in the starter, so that the tool reaches only hosts the policy allows and never an internal address, however the URL, the DNS answer or a redirect is shaped.
+</Callout>
+
+The tool runs on a server inside your cloud network, so it can reach the metadata service at 169.254.169.254, the cluster's internal services and anything on loopback. The MCP specification's security page (revision 2026-07-28) lists, for MCP clients that fetch URLs a server supplies, the same attacks this tool faces: internal IPs written directly, the metadata endpoint, localhost services, DNS rebinding and redirect chains. It also warns against hand-written IP validation, because octal, hex and IPv4-mapped IPv6 spellings slip past custom parsers.
+
+`resolve` stands in for getaddrinfo with an attacker's DNS server behind it: it can answer differently on each call, and it resolves `0x7f.1` the way getaddrinfo does, to 127.0.0.1. `send` makes one request to an address and never follows redirects, so the loop that follows them is yours.
+
+Part of the policy is yours to decide. When one DNS answer holds a public and a private address, you can refuse the request or connect to the public one. When a host is a numeric name that is not a canonical address, you can refuse it before any lookup or let the address check catch what it resolves to. The tests check invariants: every request goes to an address that the policy permits and that DNS returned for that host in that hop, every host sent to is on the allowlist, and a list of internal targets in many spellings is never reached, directly or by redirect.
+
+One constraint is not in the visible tests. In this scenario the allowlist is generated from every tenant's configured integrations and holds 200,000 entries, half of them wildcards, and the tool runs on every fetch of every agent. Checking a host has to cost a handful of operations, not a pass over the list.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how many times the hostname is resolved between the moment your check passes and the moment a socket connects, and by whom.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request a list of every address form your HTTP client and the system resolver will accept for 127.0.0.1, and check each against the parser your policy uses.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask for the size of the largest tenant allowlist and the fetch rate at peak, then work out what one check costs if it walks every entry.</p></details>
+
+## Answer
+
+The reference solution has four parts: an index built once, a parser that refuses ambiguous URLs, an address rule that looks inside IPv6, and a loop that resolves once per hop and connects to what it checked.
+
+**The index.** `Policy` splits entries into a set of exact names and a set of wildcard suffixes. Checking `a.b.tenant7.example.net` probes the exact set once and the suffix set once per dot: `b.tenant7.example.net`, `tenant7.example.net`, `example.net`, `net`. Starting each candidate after a dot is what keeps `evilgithubusercontent.com` from matching `*.githubusercontent.com`, and starting after the first dot is what keeps the apex out. Walking the list instead costs 200 × 200,000 = 4 × 10<sup>7</sup> comparisons for the hidden test's 200 fetches, which takes seconds in CPython and longer in Pyodide.
+
+**The parser.** A URL with a backslash or userinfo is refused, because clients disagree on where it points: `urlsplit` reads `https://evil.example\@api.github.com/` as a request to api.github.com, and a WHATWG parser treats the backslash as a slash and goes to evil.example. A bad port, a missing host or a scheme off the list is refused rather than raised. An IP literal passes only a `*` policy. A host whose last label is numeric but which `ipaddress` will not parse (`2130706433`, `0x7f.1`, `0177.0.0.1`, `127.1`) is refused before any lookup. Since Python 3.9.5 `ipaddress` rejects leading zeros, so the strict parser calls these names, while getaddrinfo calls them addresses.
+
+**The address rule.** `ipaddress` does most of the work, and its flags alone are not enough. Measured on CPython 3.12.6, `is_global` is true for `224.0.0.1` (multicast), for `::127.0.0.1` (IPv4-compatible) and for `64:ff9b::a9fe:a9fe` (NAT64 to the metadata address). The documentation also records that 3.13 changed how it classifies `2002::/16` and parts of `192.0.0.0/24`, so the answer depends on the Python version. The reference therefore extracts every IPv4 address an IPv6 address can carry and requires each to be global and not multicast:
+
+```python
+def permitted(text):
+    a = ipaddress.ip_address(text)                      # ValueError: not permitted
+    if getattr(a, "scope_id", None):                    # fe80::1%eth0
+        return False
+    carried = []
+    if a.version == 6:
+        carried = [x for x in (a.ipv4_mapped, a.sixtofour) if x]
+        carried += list(a.teredo or ())
+        if a in NAT64 or a in V4COMPAT:                 # 64:ff9b::/96, ::/96
+            carried.append(ipaddress.IPv4Address(int(a) & 0xFFFFFFFF))
+    return all(x.is_global and not x.is_multicast for x in [a] + carried)
+```
+
+**One lookup per hop, and the connection uses its answer.** For each hop the reference parses the URL, resolves the host once, checks every address in the answer, and calls `send` with the first address and the name. The check and the connection see the same answer because there is only one. A rebinding server that answers 93.184.215.14 and then 169.254.169.254 gets one question per hop. A redirect is a new hop and gets the whole check again, so a 302 to `http://169.254.169.254/` fails on the scheme and a 302 to an allowed name that now resolves to loopback fails on the address.
+
+**The decision with two defensible answers: a mixed DNS answer.**
+
+- **Refuse the whole answer** (the reference). A public and a private address for one name is what a rebinding setup looks like, and refusing it gives the attacker nothing to time. The cost is legitimate failures: split-horizon DNS for a name your tenants use internally and externally, or a resolver that returns a private address first for a public service, breaks the fetch, and the agent gets a refusal it cannot fix.
+- **Drop the blocked addresses and connect to a permitted one.** Fetches to misconfigured but legitimate hosts keep working. The cost is that the policy now depends on every later step choosing from the filtered list. A client that falls back to the next address after a timeout, or a library that re-resolves on retry, reaches the private address the filter dropped.
+
+The conflict is availability against an attack surface you cannot see. I would refuse, log the name and the answer, and revisit when the logs show which tenants hit it. The redirect limit is the number to defend. The reference uses 5. Every followed hop is a full request to a host the attacker may choose, so a high limit buys nothing for legitimate pages. Below 2, ordinary chains such as a bare domain to its www host and then to a trailing slash start to fail. Anything from 3 to 10 is reasonable; 20 or more is a budget given to the attacker.
+
+**Where this fails.** The gate only holds if every packet passes through it. If the agent can run code in the same network namespace, `curl http://169.254.169.254/` never calls `fetch`; the gate belongs outside the sandbox, as an egress proxy with the agent's network limited to that proxy. Pinning also gives up what the resolver does for availability: connecting to the first address, with no fallback, turns one dead address into a failed fetch. And a policy keyed on names cannot see what a request carries: an allowed host that accepts uploads (a Git host, an object store, a model API) is still a way out for data.
+
+## Follow-ups
+
+- *What changes to run this in a real client?* Open the socket to the pinned address and pass the name separately for the Host header, SNI and certificate verification, so TLS still checks the name. Most HTTP libraries resolve internally, so this means a custom connection class or an egress proxy such as Smokescreen, which the MCP page names. Set connect and read timeouts, cap the response size, and decide whether the pinned address may change on a retry.
+- *Your refusal of mixed answers breaks fetches to a partner's API whose DNS returns a 10.x address first. Which do you relax, the rule or the partner's entry, and what do you write down?*
+- *What would you need to see in a month of fetch logs to drop the IP-literal ban for one tenant?*
+- *Security wants the same gate to protect the MCP client's OAuth metadata discovery. Which parts carry over unchanged, and which policy differs?*
+
+## Common mistakes
+
+- Validating the hostname, then letting the HTTP client resolve it again, which is the rebinding window.
+- Checking only the first address in the answer.
+- Trusting `is_private` or `is_global` alone, and missing multicast, IPv4-compatible and NAT64 forms.
+- Following redirects with the client's default, so only the first URL is checked.
+- Matching wildcards with `endswith(suffix)`, which lets `evilexample.org` through `*.example.org`.
+- Scanning the allowlist on every call; it passes the examples and stalls on a generated list.

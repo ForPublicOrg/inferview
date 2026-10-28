@@ -1,0 +1,177 @@
+---
+title: "Rerankers: choosing and training"
+track: rag
+module: hybrid-search
+order: 2
+kind: lesson
+level: senior
+minutes: 14
+summary: A reranker's candidate count comes from a latency fit and a billing rule, a cross-encoder fine-tuned on mined hard negatives can beat general rerankers ten times its size on its own domain, and distillation or an LLM listwise reranker pays only under conditions you can check before committing.
+prerequisites: [rag/hybrid-search/fusion]
+updated: 2026-10-28
+sources:
+  - title: "Tom Aarsen, Training and Finetuning Reranker Models with Sentence Transformers (Hugging Face blog, 2025-03-26, checked 2026-10-28)"
+    url: https://huggingface.co/blog/train-reranker
+    note: "ModernBERT-base (150M) and ModernBERT-large (396M) cross-encoders on GooAQ; 99k query-answer pairs mined into 578k labelled pairs (99k positive, 479k negative); mine_hard_negatives with num_negatives 5, range_max 100, sampling top (walkthrough: range_min 10, max_score 0.8, margin 0.1); BinaryCrossEntropyLoss with pos_weight 5; 1 epoch, batch 16, lr 2e-5, about 30 minutes on an RTX 3090; eval reranks the top 30 of static-retrieval-mrl-en-v1 on 1k GooAQ dev queries; NDCG@10 retriever 59.12, fine-tuned base 77.14, large 79.42, mxbai-rerank-large-v2 (1.54B) 75.40, gte-reranker-modernbert-base (150M) 73.18, bge-reranker-v2-m3 (568M) 73.56; with all positives inserted 83.51 and 85.81; hard negatives only can hurt easier tasks; rerankers overfit quickly"
+  - title: "Xu, Huang, Zhuang and Srikumar, Distillation versus Contrastive Learning: How to Train Your Rerankers (arXiv 2507.08336, v3 2025-11-06, IJCNLP-AACL 2025 Findings, checked 2026-10-28)"
+    url: https://arxiv.org/abs/2507.08336
+    note: "students of 0.5B to 7B, Transformer and recurrent; distilling from a more performant teacher beats contrastive learning in and out of domain; a same-capacity teacher does not give the same advantage, especially out of domain; without a stronger teacher, contrastive learning is a robust baseline"
+  - title: "Sun et al., Is ChatGPT Good at Search? Investigating Large Language Models as Re-Ranking Agents (arXiv 2304.09542, EMNLP 2023, v3 2024-12-28, checked 2026-10-28)"
+    url: https://arxiv.org/abs/2304.09542
+    note: "reranks BM25 top 100 with a sliding window of 20, step 10; Table 1 nDCG@10 DL19: BM25 50.58, monoT5 3B 71.83, gpt-3.5-turbo 65.80, gpt-4 75.59; BEIR average: monoT5 3B 51.36, gpt-3.5-turbo 49.37, gpt-4 53.68 (gpt-4 on the top 30 of gpt-3.5); Table 7: DeBERTa-large distilled from ChatGPT permutations on 10k MS MARCO queries x 20 BM25 passages, BEIR average 53.03; labelling cost about $40; Table 11 per query on TREC: gpt-4 19,890 tokens, 10 requests, $0.596; gpt-4 on top 30 3,271 tokens, 1 request, $0.098; gpt-3.5-turbo $0.040; results highly sensitive to the initial passage order"
+  - title: Cohere documentation, models (checked 2026-10-28)
+    url: https://docs.cohere.com/docs/models
+    note: "rerank-v5.0-pro and rerank-v5.0-fast 32k context with Context Focus and calibrated scores; rerank-v4.0-pro and -fast 32k, previous generation; rerank-v3.5 4k; query and document tokens together count toward the per-document limit, longer documents are chunked across several inferences"
+  - title: Cohere, Introducing Rerank 5 (blog, 2026-10-21, checked 2026-10-28)
+    url: https://cohere.com/blog/rerank-5
+    note: "vendor claims: relevance_score as a calibrated probability, threshold 0.50 (Pro) and 0.45 (Fast), expected calibration error about 0.06; Fast about 187 documents of 1,000 tokens per second on one A100 at 96 documents per request and concurrency 8, 2.9 times Pro's throughput; $0.05 (Pro) and $0.02 (Fast) per million tokens"
+  - title: Cohere pricing (checked 2026-10-28)
+    url: https://cohere.com/pricing
+    note: "FAQ: a search unit is one query with up to 100 documents; documents over 500 tokens including the query are split and each chunk counts as a document; the page lists Model Vault per-instance rates for Rerank 5 Fast and Pro ($4.00 an hour, $2,500 a month, medium tier)"
+  - title: "Khattab and Zaharia, ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT (SIGIR 2020, checked 2026-10-28)"
+    url: https://arxiv.org/abs/2004.12832
+    note: "the paper reports two orders of magnitude faster and four orders of magnitude fewer FLOPs per query than BERT-based rankers"
+  - title: Qdrant documentation, hybrid and multi-stage queries (checked 2026-10-28)
+    url: https://qdrant.tech/documentation/concepts/hybrid-queries/
+    note: "multi-stage example: prefetch 100 dense candidates, rescore with a ColBERT multivector, return 10"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Two decisions behind one API call
+
+A reranker reads each (query, candidate) pair and outputs a score, so its cost grows with the candidate count and with the tokens per candidate, and nothing about the candidate side is precomputed. Two decisions follow. The first is how many fused candidates to rerank, which is a latency and billing calculation with a quality check on the cut. The second is whose model: a hosted reranker, an open checkpoint, one you fine-tune on your domain, or a general LLM ordering the list. The published numbers below are enough to say when each of the last three is worth the work.
+
+## Where the compute goes
+
+Three architectures sit at different points between precomputation and accuracy.
+
+A cross-encoder concatenates query and candidate and runs the full model on the pair. Every hosted reranker in this lesson is one. Cost per query is linear in candidates times pair length, and a long document that exceeds the model's context is split: Cohere's documentation says query and document tokens together count toward the per-document limit (4k for rerank-v3.5, 32k for the v4.0 and v5.0 models) and longer documents are chunked across several inferences.
+
+Late interaction (ColBERT) precomputes one vector per document token and scores a query by summing, over query tokens, the best match among document tokens. The ColBERT paper reports two orders of magnitude lower latency and four orders of magnitude fewer FLOPs per query than BERT-based rankers, paid for in index storage. Qdrant's documented pattern uses it as a middle stage: prefetch 100 dense candidates, rescore with a ColBERT multivector, return 10. The advanced RAG module covers its storage cost.
+
+An LLM listwise reranker puts the query and a window of candidates in a prompt and asks for an ordering. It reads instructions ("prefer documents after the 2025 policy change") that a cross-encoder cannot, at the price of several sequential model calls per query.
+
+## The candidate count is a fit, not a preference
+
+Measure the reranker's p95 at several candidate counts under production concurrency and fit a line: a fixed cost plus a cost per candidate. Subtract every other stage's p95 share from the target and solve. Then check that the cut costs no quality, by counting on the eval set how often the first relevant document sits below the cut in the fused list. That count is the recall you give up, and it is usually the cheapest number in the design to obtain.
+
+<Predict id="rag-rerank-candidates" question="How many candidates fit, rounded down to a multiple of 5?" answer={80} tolerance={0} unit="candidates">
+<Fragment slot="prompt">
+<p>Scenario measurements: the reranker's p95 is 31 ms plus 2.04 ms per candidate. The end-to-end p95 target is 900 ms and the other stages (embedding, both retrieval legs, fusion, generation to first token) take 700 ms of it.</p>
+</Fragment>
+<p>The reranker gets 900 - 700 = 200 ms. Subtract the fixed 31 ms: 169 ms. Divide by 2.04 ms: 82.8, so <b>80</b> at a batch size of 5. The fixed cost is the term people forget; on a hosted API it includes the network round trip, so the same model self-hosted next to the retriever can afford more candidates at the same p95.</p>
+</Predict>
+
+The same fit, plus the billing rule for one vendor, in code:
+
+```python
+import math
+
+def fit_line(points):
+    """Least-squares fit of p95 latency (ms) = fixed + per_candidate * n."""
+    n = len(points)
+    xs, ys = zip(*points)
+    mx, my = sum(xs) / n, sum(ys) / n
+    slope = sum((x - mx) * (y - my) for x, y in points) / sum((x - mx) ** 2 for x in xs)
+    return my - slope * mx, slope
+
+def max_candidates(points, slo_ms, other_stages_ms, step=5):
+    fixed, per = fit_line(points)
+    room = slo_ms - other_stages_ms - fixed
+    n = math.floor(room / per) if room > 0 else 0
+    return fixed, per, n - n % step  # round down to a batch size you will actually deploy
+
+def search_units(n_docs, doc_tokens, query_tokens, chunk_limit=500, docs_per_unit=100):
+    """Cohere's FAQ rule: documents over 500 tokens, query included, are split; each chunk counts as a document."""
+    chunks_per_doc = math.ceil((doc_tokens + query_tokens) / chunk_limit)
+    return math.ceil(n_docs * chunks_per_doc / docs_per_unit)
+
+# Scenario measurements: p95 of the rerank call at four candidate counts, under production concurrency.
+p95 = [(10, 52), (25, 83), (50, 131), (100, 236)]
+fixed, per, n = max_candidates(p95, slo_ms=900, other_stages_ms=700)
+print(f"fixed {fixed:.0f} ms, {per:.2f} ms per candidate, rerank at most {n}")
+print("search units per query at 60 x 450-token chunks:", search_units(60, 450, 30))
+print("search units per query at 60 x 480-token chunks:", search_units(60, 480, 30))
+# fixed 31 ms, 2.04 ms per candidate, rerank at most 80
+# search units per query at 60 x 450-token chunks: 1
+# search units per query at 60 x 480-token chunks: 2
+```
+
+The last two lines are the billing trap. Cohere's pricing FAQ defines a search unit as one query with up to 100 documents and splits any document over 500 tokens, query included, into chunks that each count as a document. Thirty extra tokens per chunk double the units for the same 60 candidates. The same page now lists per-instance Model Vault rates, and the Rerank 5 launch post quotes $0.05 (Pro) and $0.02 (Fast) per million tokens, so confirm which unit your contract bills before you build the cost model on any of them.
+
+Vendor throughput figures help with capacity, not latency. Cohere's launch post says Rerank 5 Fast processes about 187 documents of 1,000 tokens per second on one A100, measured at 96 documents per request and a concurrency of 8, and 2.9 times Pro's throughput. That is 187 / 96 = 1.9 requests of that shape per second per A100 for Fast, and 187 / 2.9 = 64 documents, or 0.67 such requests, per second for Pro. The post reports no per-request p95, so the latency fit above still has to come from your own measurement.
+
+## What a fine-tuned reranker buys
+
+The Sentence Transformers write-up is the clearest published recipe with numbers. It fine-tunes ModernBERT-base (150M parameters) as a cross-encoder on 99k GooAQ question-answer pairs, mines hard negatives to turn them into 578k labelled pairs, trains one epoch in about 30 minutes on an RTX 3090, and evaluates by reranking the top 30 of a fast static-embedding retriever on 1,000 held-out queries.
+
+| Model | Parameters | NDCG@10 (top 30 reranked) |
+|---|---|---|
+| Retriever alone | | 59.12 |
+| gte-reranker-modernbert-base | 150M | 73.18 |
+| bge-reranker-v2-m3 | 568M | 73.56 |
+| mxbai-rerank-large-v2 | 1.54B | 75.40 |
+| Fine-tuned ModernBERT-base | 150M | 77.14 |
+| Fine-tuned ModernBERT-large | 396M | 79.42 |
+
+The fine-tuned 150M model adds 18.02 points over the retriever and beats a general reranker with ten times its parameters by 1.74. The same base architecture, trained generally (gte-reranker-modernbert-base), sits 3.96 points lower, which isolates the gain from domain data. Two conditions bound the claim. The dev queries come from the same dataset as the training pairs, which is the case the recipe is for, but it says nothing about out-of-domain behaviour. And the post's second column, which inserts every relevant document into the candidate set whether or not the retriever found it, reports 83.51; that measures the reranker in isolation and overstates what a pipeline gets, because a reranker cannot promote a document the retriever missed.
+
+The recipe's decisions are the ones you will make:
+
+- Negatives come from the retriever you will deploy (here, 5 per query from its top 100), because the reranker's job is to separate what that retriever confuses. The walkthrough's settings skip the top 10 candidates, cap similarity at 0.8 and require a margin below the positive; all three exist to keep unlabelled relevant documents out of the negatives, which is the main way mined data poisons training.
+- Binary cross-entropy with `pos_weight` equal to the negatives per positive (5) is the post's recommended default over listwise losses, because its data is trivial to prepare.
+- Training only on hard negatives makes the model strict and can hurt easier queries; the post suggests mixing in random negatives.
+- Rerankers overfit quickly, so the stopping rule is the evaluator: evaluate every few thousand steps on held-out queries and keep the best checkpoint, not the last.
+
+## Distillation and LLM rerankers
+
+Distillation trains a small reranker on a larger model's scores or orderings. Xu and colleagues compare it with contrastive training for students from 0.5B to 7B parameters and find that distilling from a more capable teacher beats contrastive learning in and out of domain, while a teacher of the same capacity does not give the same advantage, especially out of domain. The decision rule is checkable before any training: measure the candidate teacher against your current reranker on your eval set, and distil only if the teacher is clearly better. Otherwise train contrastively on mined negatives.
+
+RankGPT (Sun and colleagues, EMNLP 2023) is the reference point for LLM listwise reranking. It reorders BM25's top 100 with a sliding window of 20 candidates and a step of 10, from the bottom of the list up. On TREC DL19, GPT-4 reached 75.59 nDCG@10 against 71.83 for monoT5 (3B) and 50.58 for BM25. On the BEIR average the gap was smaller, 53.68 against 51.36, and to control cost GPT-4 reordered only gpt-3.5-turbo's top 30. The cost table explains why: per query, the full GPT-4 run took 10 requests, 19,890 tokens and $0.596 at the paper's prices, against one request and $0.098 for the top 30 alone. Ten sequential requests also set a latency floor no cross-encoder has. The authors report that results are highly sensitive to the initial order of the candidates, so the first-stage ranking still matters.
+
+The same paper also distils ChatGPT's orderings into a DeBERTa-large cross-encoder, using 10,000 MS MARCO queries with 20 BM25 passages each and about $40 of API calls. The student's BEIR average, 53.03, beat its teacher's 49.37 and monoT5 (3B) at 51.36. That is the production pattern for LLM reranking: use the large model offline to label, ship a cross-encoder online.
+
+## Choosing
+
+Buy a hosted reranker when the domain is close to general web and support text, the team has no labelled queries, and the latency fit leaves room for a network round trip. Fine-tune your own when queries use vocabulary general models handle badly, you have query logs or documents from which to build pairs, and either the latency budget or data residency rules out a hosted call. Use an LLM to rerank online only when instructions in the query change what is relevant and the product tolerates several model calls; otherwise use it to label training data. In every case the comparison runs on your eval set, reranking the candidate count from the latency fit, with recall at that cut reported beside NDCG.
+
+<Callout kind="gotcha" label="Calibrated scores are a vendor claim">
+Cohere's launch post describes Rerank 5's relevance scores as calibrated probabilities, with a "more likely useful than not" threshold of 0.50 for Pro and 0.45 for Fast and an expected calibration error of about 0.06, all measured by the vendor. Older Cohere models and other rerankers make no calibration claim. A fixed score threshold that drops candidates before generation needs its own check on your labelled queries, and it changes meaning when you change model versions.
+</Callout>
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your RAG service reranks the top 100 fused candidates with a hosted cross-encoder at 180 ms p95. A new SLO requires cutting 100 ms from the end-to-end p95 by the end of the sprint, and the reranker is the largest stage. You can rerank fewer candidates, move to the vendor's faster tier, or fine-tune a 150M model to self-host, with one engineer and no labelled training data. What do you do this sprint and next quarter?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>This sprint: fit the latency line, then count on the eval set how often the first relevant document sits below each candidate cut in the fused list. If cutting to the count that saves 100 ms loses few relevant documents, ship the cut. Evaluate the faster tier on the same set in parallel. Next quarter: build training pairs from logs and mined negatives and fine-tune a small model to self-host, which removes the network round trip from the fixed cost.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The cut is the only option that fits a sprint with evidence behind it. With a fitted per-candidate cost, the saving from 100 to N candidates is computable, and the quality cost is a count, not a guess: queries whose first relevant document sits between N and 100 in the fused list. If that count is large, fusion is putting relevant documents low and the fix belongs upstream, in the window or the weights.</p>
+<p>The faster tier needs a held-out run comparing NDCG@10 at the new cut against the current model at 100; vendor benchmarks are on other data. I would not ship a model change and a candidate cut in the same release, because a regression could not be attributed.</p>
+<p>The fine-tune is a quarter's work: pairs from search logs with clicks or resolutions as weak positives, negatives mined from our own retriever with a margin to keep unlabelled positives out, a held-out set labelled by people, and checkpoint selection on that set. What I give up: the team now owns a model, its serving and its retraining when the corpus shifts. I would write that cost down next to the latency gain before starting.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The fine-tuned model wins 4 points of NDCG@10 on the dev set, which was built from the same logs as the training pairs. What else do you need before replacing the vendor model?</em> A held-out set from a later time window, labelled by people, and a check on queries from new product areas.</li>
+<li><em>An engineer proposes distilling from a frontier LLM instead of training on mined negatives. What do you measure first?</em> The LLM's ordering quality against the current reranker on our eval set; distillation pays only if the teacher is clearly stronger.</li>
+<li><em>The vendor retires your reranker version in sixty days and the replacement scores 2 points lower on one product area. Which do you ship, and what do you write down?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The latency fit assumes cost is linear in candidates. Batching on a GPU can make it a step function, and a hosted API's tail is partly set by the provider's queueing, which your candidate count does not control; refit after any change in concurrency or vendor tier.
+
+The fine-tuning gain is measured in domain on a dataset of short questions and answers. On long documents that must be chunked, the reranker sees chunks, not documents, and the gain depends on how chunk scores are combined into a document score, which none of the cited work evaluates for your corpus.
+
+The RankGPT numbers are from 2023 models and prices. Current models and prices differ, so the cost table has to be redone before it informs a decision, but the structural costs remain: several sequential calls per query, and sensitivity to the order of the input list.
+
+<SelfRate id="lesson:rag/hybrid-search/rerankers" />

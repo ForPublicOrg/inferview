@@ -1,0 +1,348 @@
+---
+title: Build a training memory and parallelism planner
+track: training
+module: distributed
+kind: lab
+minutes: 120
+summary: Grow one planner over six steps, from a parameter count read off a config to bytes per parameter, ZeRO stages, tensor and pipeline splits, activations with and without recomputation, and a search for a layout that fits on N GPUs.
+updated: 2026-10-28
+sources:
+  - title: Rajbhandari et al., ZeRO, Memory Optimizations Toward Training Trillion Parameter Models (arXiv 1910.02054)
+    url: https://ar5iv.labs.arxiv.org/html/1910.02054
+    note: "mixed-precision Adam needs 2 + 2 + K bytes per parameter with K = 12, 16 in total; a 7.5B model needs 120 GB under standard data parallelism, and at 64-way data parallelism 31.4 GB with optimizer states partitioned, 16.6 GB adding gradients and 1.9 GB adding parameters (steps 2 and 3). Checked 2026-10-28."
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "16 bytes per parameter for mixed-precision Adam, 20 with FP32 gradient accumulation; ZeRO-1, 2 and 3 memory formulas; PP and ZeRO-3 combined is not often done in practice; TP kept within a node, TP at most 8 (steps 2 to 6). Checked 2026-10-28."
+  - title: Korthikanti et al., Reducing Activation Recomputation in Large Transformer Models (arXiv 2205.05198)
+    url: https://ar5iv.labs.arxiv.org/html/2205.05198
+    note: "activation bytes per layer: sbh(34 + 5as/h) with no parallelism; sbh(10 + 24/t + 5as/(ht)) with tensor parallelism; (sbh/t)(34 + 5as/h) with tensor and sequence parallelism; 34sbh/t with selective recomputation; 2sbh with full recomputation; 16-bit activations and 1-byte dropout masks (step 5). Checked 2026-10-28."
+  - title: Llama 3.1 8B config.json (unsloth mirror of Meta-Llama-3.1-8B-Instruct)
+    url: https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct/blob/main/config.json
+    note: "hidden_size 4096, intermediate_size 14336, 32 layers, 32 attention heads, 8 key-value heads, head_dim 128, vocab_size 128256, tie_word_embeddings false (steps 1, 4 and 6). Checked 2026-10-28."
+steps:
+  - title: Parameter count from a config
+    brief: |
+      Write `param_count(cfg)` for a Llama-style decoder read from a Hugging Face config dict: per layer, the q and o projections (hidden x heads x head_dim each), k and v projections (hidden x kv_heads x head_dim each), a gated MLP with three matrices of hidden x intermediate, and two RMSNorm weight vectors of size hidden; then the token embedding, a separate output projection unless `tie_word_embeddings` is true, and one final norm. No biases. `head_dim` defaults to hidden / heads when absent. For the Llama 3.1 8B config the answer is 8,030,261,248, and 1,050,673,152 of it is the two vocabulary matrices, which is why the embedding is worth tracking separately when the model is split.
+    starter: |
+      LLAMA_31_8B = {
+          "hidden_size": 4096, "intermediate_size": 14336, "num_hidden_layers": 32,
+          "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+          "vocab_size": 128256, "tie_word_embeddings": False,
+      }
+
+
+      def param_count(cfg):
+          """Parameters of a Llama-style decoder described by a Hugging Face config dict."""
+          raise NotImplementedError
+    tests: |
+      assert param_count(LLAMA_31_8B) == 8_030_261_248
+      tied = dict(LLAMA_31_8B, tie_word_embeddings=True)
+      assert param_count(LLAMA_31_8B) - param_count(tied) == 128256 * 4096
+    hidden: |
+      _no_hd = {k: v for k, v in LLAMA_31_8B.items() if k != "head_dim"}
+      assert param_count(_no_hd) == 8_030_261_248, "head_dim defaults to hidden / heads"
+      _c70 = {"hidden_size": 8192, "intermediate_size": 28672, "num_hidden_layers": 80, "num_attention_heads": 64,
+              "num_key_value_heads": 8, "vocab_size": 128256, "tie_word_embeddings": False}
+      assert param_count(_c70) == 70_553_706_496
+      _a = dict(LLAMA_31_8B, num_hidden_layers=10)
+      _b = dict(LLAMA_31_8B, num_hidden_layers=11)
+      assert param_count(_b) - param_count(_a) == 218_112_000, "one layer of the 8B model"
+      _mha = dict(LLAMA_31_8B, num_key_value_heads=32)
+      assert param_count(_mha) - param_count(LLAMA_31_8B) == 32 * 2 * 4096 * 24 * 128
+    solution: |
+      LLAMA_31_8B = {
+          "hidden_size": 4096, "intermediate_size": 14336, "num_hidden_layers": 32,
+          "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+          "vocab_size": 128256, "tie_word_embeddings": False,
+      }
+
+
+      def _dims(cfg):
+          h = cfg["hidden_size"]
+          heads = cfg["num_attention_heads"]
+          kv = cfg.get("num_key_value_heads", heads)
+          hd = cfg.get("head_dim") or h // heads
+          return h, heads, kv, hd
+
+
+      def _layer_matmul(cfg):
+          h, heads, kv, hd = _dims(cfg)
+          return 2 * h * heads * hd + 2 * h * kv * hd + 3 * h * cfg["intermediate_size"]
+
+
+      def param_count(cfg):
+          h = cfg["hidden_size"]
+          layer = _layer_matmul(cfg) + 2 * h
+          emb = cfg["vocab_size"] * h
+          return cfg["num_hidden_layers"] * layer + emb * (1 if cfg.get("tie_word_embeddings") else 2) + h
+  - title: 16 versus 20 bytes per parameter
+    brief: |
+      Write `bytes_per_param(fp32_grad_accum=False)`, a dict with the bytes per parameter for `params` (bf16 weights, 2), `grads` (bf16 gradients, 2, or 6 when an fp32 accumulation buffer is kept beside them) and `optimizer` (fp32 master weights plus Adam's two moments, 12), and `state_bytes(n, fp32_grad_accum=False)`, their sum times n. That is 16 bytes per parameter, the ZeRO paper's 2 + 2 + K with K = 12, or 20 with fp32 gradient accumulation, the playbook's figure. Predict before running: how many GB of model state does the 8B model need with no sharding at all, and does it fit on one 80 GB GPU? About 128.5 GB, so no, before a single activation is stored.
+    starter: |
+
+
+      def bytes_per_param(fp32_grad_accum=False):
+          """{"params": ..., "grads": ..., "optimizer": ...} in bytes per parameter."""
+          raise NotImplementedError
+
+
+      def state_bytes(n, fp32_grad_accum=False):
+          raise NotImplementedError
+    tests: |
+      assert sum(bytes_per_param().values()) == 16 and sum(bytes_per_param(True).values()) == 20
+      assert state_bytes(param_count(LLAMA_31_8B)) == 128_484_179_968
+      assert state_bytes(7.5e9) == 120e9
+    hidden: |
+      assert bytes_per_param() == {"params": 2, "grads": 2, "optimizer": 12}
+      assert bytes_per_param(True)["optimizer"] == 12 and bytes_per_param(True)["params"] == 2
+      assert state_bytes(param_count(LLAMA_31_8B), True) == 20 * 8_030_261_248
+    solution: |
+      def bytes_per_param(fp32_grad_accum=False):
+          return {"params": 2, "grads": 6 if fp32_grad_accum else 2, "optimizer": 12}
+
+
+      def state_bytes(n, fp32_grad_accum=False):
+          return n * sum(bytes_per_param(fp32_grad_accum).values())
+  - title: ZeRO stages
+    brief: |
+      Write `zero_bytes(n, stage, dp, fp32_grad_accum=False)`: model-state bytes per GPU for n parameters replicated over dp data-parallel ranks. Stage 0 keeps everything on every rank; stage 1 shards the optimizer states; stage 2 also shards the gradients; stage 3 also shards the parameters. With p, g and k the per-parameter bytes from step 2, that is (p + g + k) n, then (p + g) n + k n / dp, then p n + (g + k) n / dp, then (p + g + k) n / dp. The tests reproduce the ZeRO paper's 7.5B example at 64-way data parallelism. The price of stage 3 is in the communication, not here: about 3 units of traffic per step against 2 for stages 0 to 2, because the parameters are gathered again for the backward pass.
+    starter: |
+
+
+      def zero_bytes(n, stage, dp, fp32_grad_accum=False):
+          """Model-state bytes per GPU under ZeRO stage 0, 1, 2 or 3."""
+          raise NotImplementedError
+    tests: |
+      assert zero_bytes(7.5e9, 0, 64) == 120e9
+      assert round(zero_bytes(7.5e9, 1, 64) / 1e9, 1) == 31.4
+      assert round(zero_bytes(7.5e9, 2, 64) / 1e9, 1) == 16.6
+      assert round(zero_bytes(7.5e9, 3, 64) / 1e9, 1) == 1.9
+    hidden: |
+      _n = param_count(LLAMA_31_8B)
+      assert all(zero_bytes(_n, s, 1) == state_bytes(_n) for s in range(4)), "one rank shards nothing"
+      assert all(zero_bytes(_n, s, 8) >= zero_bytes(_n, s + 1, 8) for s in range(3))
+      assert zero_bytes(_n, 3, 32, True) == 20 * _n / 32
+      assert zero_bytes(_n, 2, 16, True) == 2 * _n + 18 * _n / 16
+      try:
+          zero_bytes(_n, 4, 8)
+          _raised = False
+      except ValueError:
+          _raised = True
+      assert _raised
+    solution: |
+      def zero_bytes(n, stage, dp, fp32_grad_accum=False):
+          b = bytes_per_param(fp32_grad_accum)
+          p, g, k = b["params"] * n, b["grads"] * n, b["optimizer"] * n
+          if stage == 0:
+              return p + g + k
+          if stage == 1:
+              return p + g + k / dp
+          if stage == 2:
+              return p + (g + k) / dp
+          if stage == 3:
+              return (p + g + k) / dp
+          raise ValueError("stage must be 0, 1, 2 or 3")
+  - title: Tensor and pipeline splits
+    brief: |
+      Write `params_per_gpu(cfg, tp, pp)`: the parameters held by the most loaded GPU when every layer's matrices are split over tp ranks and the layers over pp stages. tp must divide the attention heads and the key-value heads and pp the layer count; raise ValueError otherwise. Norm weights are replicated, not split. The embedding sits on the first stage and the output projection on the last, both split over tp by vocabulary; with tied embeddings and pp above 1 both stages keep a copy, and the final norm sits on the last stage. For the 8B model at tp 8 the answer is 1,004,015,616. Then write `state_per_gpu(cfg, tp, pp, dp, zero, fp32_grad_accum=False)`, which applies `zero_bytes` to that count. Note what the tensor-parallel limit does to this model: with 8 key-value heads, tp cannot exceed 8 here without replicating heads, which this planner does not model.
+    starter: |
+
+
+      def params_per_gpu(cfg, tp, pp):
+          """Parameters on the most loaded GPU under tp-way tensor and pp-way pipeline parallelism."""
+          raise NotImplementedError
+
+
+      def state_per_gpu(cfg, tp, pp, dp, zero, fp32_grad_accum=False):
+          raise NotImplementedError
+    tests: |
+      assert params_per_gpu(LLAMA_31_8B, 1, 1) == param_count(LLAMA_31_8B)
+      assert params_per_gpu(LLAMA_31_8B, 8, 1) == 1_004_015_616
+      assert params_per_gpu(LLAMA_31_8B, 4, 2) == 1_003_884_544
+      assert state_per_gpu(LLAMA_31_8B, 8, 1, 4, 3) == 16 * 1_004_015_616 / 4
+      try:
+          params_per_gpu(LLAMA_31_8B, 16, 1)
+          raised = False
+      except ValueError:
+          raised = True
+      assert raised, "16 does not divide 8 key-value heads"
+    hidden: |
+      _c = LLAMA_31_8B
+      assert params_per_gpu(_c, 2, 4) == 8 * (218_103_808 // 2 + 8192) + 128256 * 4096 // 2 + 4096
+      _t = dict(_c, tie_word_embeddings=True)
+      assert params_per_gpu(_t, 1, 1) == param_count(_t)
+      assert params_per_gpu(_t, 1, 2) == params_per_gpu(_c, 1, 2)
+      try:
+          params_per_gpu(_c, 1, 3)
+          _raised = False
+      except ValueError:
+          _raised = True
+      assert _raised, "3 does not divide 32 layers"
+      assert all(params_per_gpu(_c, t, q) >= param_count(_c) / (t * q) for t in (1, 2, 4, 8) for q in (1, 2, 4, 8))
+    solution: |
+      def params_per_gpu(cfg, tp, pp):
+          h, heads, kv, hd = _dims(cfg)
+          layers = cfg["num_hidden_layers"]
+          if heads % tp or kv % tp:
+              raise ValueError("tp must divide the attention heads and the key-value heads")
+          if layers % pp:
+              raise ValueError("pp must divide the layer count")
+          layer = _layer_matmul(cfg) // tp + 2 * h
+          emb = cfg["vocab_size"] * h // tp
+          tied = cfg.get("tie_word_embeddings", False)
+          stages = []
+          for s in range(pp):
+              n = (layers // pp) * layer
+              if s == 0:
+                  n += emb
+              if s == pp - 1:
+                  n += h + (0 if tied and pp == 1 else emb)
+              stages.append(n)
+          return max(stages)
+
+
+      def state_per_gpu(cfg, tp, pp, dp, zero, fp32_grad_accum=False):
+          return zero_bytes(params_per_gpu(cfg, tp, pp), zero, dp, fp32_grad_accum)
+  - title: Activation estimate with and without recompute
+    brief: |
+      Write `activation_bytes(s, b, h, a, layers, tp=1, sp=False, recompute="none")` from Korthikanti et al.: bytes per layer of sbh(10 + 24/t + 5as/(ht)) with tensor parallelism alone, (sbh/t)(34 + 5as/h) with sequence parallelism added, sbh(10 + 24/t) or 34sbh/t with selective recomputation (the attention scores recomputed, which is also what FlashAttention avoids storing), and 2sbh with full recomputation, times the layer count. With 1F1B, the first pipeline stage holds p micro-batches of L/p layers, so the layer count is L whatever the pipeline degree. The coefficients are the paper's for a GPT-style block with a 4h MLP; a SwiGLU block with grouped-query attention stores a different mix, so treat them as an estimate with a stated error. Predict before running: for the 8B model at sequence length 8,192 with no recomputation and no parallelism, how much do the attention scores alone cost? 5as/h is 320 against 34, so about 90% of the 380 GB.
+    starter: |
+
+
+      def activation_bytes(s, b, h, a, layers, tp=1, sp=False, recompute="none"):
+          """Activation bytes per GPU held for the backward pass (Korthikanti et al.)."""
+          raise NotImplementedError
+    tests: |
+      assert activation_bytes(8192, 1, 4096, 32, 32) == 380_104_605_696
+      assert activation_bytes(8192, 1, 4096, 32, 32, recompute="selective") == 36_507_222_016
+      assert activation_bytes(8192, 1, 4096, 32, 32, recompute="full") == 2_147_483_648
+      assert activation_bytes(8192, 1, 4096, 32, 32, tp=8, sp=True, recompute="selective") == 4_563_402_752
+    hidden: |
+      _s, _b, _h, _a, _L = 2048, 1, 12288, 96, 96
+      _none_tp = activation_bytes(_s, _b, _h, _a, _L, tp=8)
+      _sp = activation_bytes(_s, _b, _h, _a, _L, tp=8, sp=True)
+      _sel = activation_bytes(_s, _b, _h, _a, _L, tp=8, sp=True, recompute="selective")
+      _full = activation_bytes(_s, _b, _h, _a, _L, tp=8, sp=True, recompute="full")
+      assert _none_tp > _sp > _sel > _full
+      assert abs(_sp - _s * _b * _h / 8 * (34 + 5 * _a * _s / _h) * _L) < 1
+      assert abs(_none_tp - _s * _b * _h * (10 + 24 / 8 + 5 * _a * _s / (_h * 8)) * _L) < 1
+      assert activation_bytes(4096, 2, 4096, 32, 32) == 2 * activation_bytes(4096, 1, 4096, 32, 32)
+      assert activation_bytes(4096, 1, 4096, 32, 32, tp=1, sp=True) == activation_bytes(4096, 1, 4096, 32, 32)
+      try:
+          activation_bytes(4096, 1, 4096, 32, 32, recompute="some")
+          _raised = False
+      except ValueError:
+          _raised = True
+      assert _raised
+    solution: |
+      def activation_bytes(s, b, h, a, layers, tp=1, sp=False, recompute="none"):
+          sbh = s * b * h
+          if recompute == "full":
+              per = 2 * sbh
+          elif recompute == "selective":
+              per = 34 * sbh / tp if sp else sbh * (10 + 24 / tp)
+          elif recompute == "none":
+              per = sbh / tp * (34 + 5 * a * s / h) if sp else sbh * (10 + 24 / tp + 5 * a * s / (h * tp))
+          else:
+              raise ValueError("recompute must be none, selective or full")
+          return per * layers
+  - title: Fits on N GPUs?
+    brief: |
+      Write `total_bytes(cfg, layout, s, b, fp32_grad_accum=False)` for a layout dict with keys tp, pp, dp, zero and recompute (sequence parallelism on whenever tp is above 1): the state from step 4 plus the activations from step 5. Then write `plan(cfg, n_gpus, gpu_bytes, s, b, gpus_per_node=8, fp32_grad_accum=False)`, which returns a layout with tp x pp x dp equal to n_gpus, tp at most gpus_per_node, and total bytes within gpu_bytes (with a `bytes` key holding the total), or None when no layout fits. Which feasible layout to return is your policy, with one rule the tests enforce: never return full recomputation when the same layout fits with selective, because full recomputation costs a second forward pass. The reference prefers the cheapest recomputation, then the smallest pipeline degree, then the smallest tensor degree, then the lowest ZeRO stage, and skips ZeRO-3 with pp above 1. The hidden tests compare your answer with an exhaustive search: if any layout fits, you must return one.
+    starter: |
+
+
+      def total_bytes(cfg, layout, s, b, fp32_grad_accum=False):
+          """Model state plus activations per GPU for a layout {tp, pp, dp, zero, recompute}."""
+          raise NotImplementedError
+
+
+      def plan(cfg, n_gpus, gpu_bytes, s, b, gpus_per_node=8, fp32_grad_accum=False):
+          """A layout dict (with a "bytes" key) that fits in gpu_bytes per GPU, or None."""
+          raise NotImplementedError
+    tests: |
+      lay = {"tp": 8, "pp": 1, "dp": 1, "zero": 0, "recompute": "none"}
+      assert total_bytes(LLAMA_31_8B, lay, 8192, 1) == 16 * 1_004_015_616 + 47_513_075_712
+      got = plan(LLAMA_31_8B, 8, 80e9, 8192, 1)
+      assert got is not None and got["tp"] * got["pp"] * got["dp"] == 8 and got["tp"] <= 8
+      assert got["bytes"] <= 80e9 and abs(got["bytes"] - total_bytes(LLAMA_31_8B, got, 8192, 1)) < 1
+      c70 = {"hidden_size": 8192, "intermediate_size": 28672, "num_hidden_layers": 80, "num_attention_heads": 64,
+             "num_key_value_heads": 8, "vocab_size": 128256, "tie_word_embeddings": False}
+      assert plan(c70, 8, 24e9, 8192, 1) is None
+    hidden: |
+      def _valid(cfg, n, mem, s, b, out, node=8):
+          if out["tp"] * out["pp"] * out["dp"] != n or out["tp"] > node:
+              return False
+          if total_bytes(cfg, out, s, b) > mem:
+              return False
+          if out["recompute"] == "full" and total_bytes(cfg, dict(out, recompute="selective"), s, b) <= mem:
+              return False
+          return True
+
+      def _exists(cfg, n, mem, s, b, node=8):
+          for tp in range(1, node + 1):
+              for pp in range(1, n + 1):
+                  if n % (tp * pp):
+                      continue
+                  for zero in range(4):
+                      for rc in ("none", "selective", "full"):
+                          lay = {"tp": tp, "pp": pp, "dp": n // (tp * pp), "zero": zero, "recompute": rc}
+                          try:
+                              if total_bytes(cfg, lay, s, b) <= mem:
+                                  return True
+                          except ValueError:
+                              pass
+          return False
+
+      _c70 = {"hidden_size": 8192, "intermediate_size": 28672, "num_hidden_layers": 80, "num_attention_heads": 64,
+              "num_key_value_heads": 8, "vocab_size": 128256, "tie_word_embeddings": False}
+      _ok = True
+      for cfg, n, mem, s, b in [(LLAMA_31_8B, 8, 80e9, 8192, 1), (LLAMA_31_8B, 32, 80e9, 8192, 1), (LLAMA_31_8B, 4, 40e9, 4096, 1),
+                                (LLAMA_31_8B, 1, 80e9, 2048, 1), (_c70, 64, 80e9, 8192, 1), (_c70, 16, 80e9, 4096, 1),
+                                (_c70, 256, 80e9, 32768, 1), (_c70, 8, 24e9, 8192, 1), (LLAMA_31_8B, 16, 24e9, 8192, 2)]:
+          out = plan(cfg, n, mem, s, b)
+          _ok = _ok and ((out is None) == (not _exists(cfg, n, mem, s, b))) and (out is None or _valid(cfg, n, mem, s, b, out))
+      assert _ok
+    solution: |
+      RECOMPUTE = ("none", "selective", "full")
+
+
+      def total_bytes(cfg, layout, s, b, fp32_grad_accum=False):
+          tp, pp = layout["tp"], layout["pp"]
+          state = state_per_gpu(cfg, tp, pp, layout["dp"], layout["zero"], fp32_grad_accum)
+          act = activation_bytes(s, b, cfg["hidden_size"], cfg["num_attention_heads"], cfg["num_hidden_layers"],
+                                 tp, tp > 1, layout["recompute"])
+          return state + act
+
+
+      def plan(cfg, n_gpus, gpu_bytes, s, b, gpus_per_node=8, fp32_grad_accum=False):
+          best = None
+          for tp in range(1, gpus_per_node + 1):
+              if n_gpus % tp:
+                  continue
+              for pp in range(1, n_gpus // tp + 1):
+                  if (n_gpus // tp) % pp:
+                      continue
+                  dp = n_gpus // (tp * pp)
+                  for zero in range(4):
+                      if zero == 3 and pp > 1:
+                          continue
+                      for cost, rc in enumerate(RECOMPUTE):
+                          layout = {"tp": tp, "pp": pp, "dp": dp, "zero": zero, "recompute": rc}
+                          try:
+                              need = total_bytes(cfg, layout, s, b, fp32_grad_accum)
+                          except ValueError:
+                              break
+                          if need <= gpu_bytes:
+                              key = (cost, pp, tp, zero)
+                              if best is None or key < best[0]:
+                                  best = (key, dict(layout, bytes=need))
+                              break
+          return None if best is None else best[1]
+---
+
+This lab builds the planner from the step-memory lesson as one program. Each step adds functions to the same file and its tests run against everything written so far: the plan in step 6 adds the state from steps 2 to 4 to the activations from step 5 for every layout it considers.
+
+The visible tests are hand-computed cases on the Llama 3.1 8B config, the one foundations problem fnd-009 uses, and the ZeRO paper's 7.5B example. The hidden tests check properties: one layer of the 8B model is 218,112,000 parameters, sharding never increases memory, activations scale with micro-batch size, and the plan agrees with an exhaustive search about whether anything fits. Which feasible layout to prefer is yours.
+
+The planner skips several terms a real run pays for, so its answers are lower bounds with known gaps. It ignores the temporary buffers of collectives, the gathered parameters ZeRO-3 holds while a layer runs, the logits and loss, which at a 128,256-token vocabulary and 8,192 tokens are about 1.05 billion values per micro-batch, and allocator fragmentation. Its preference order is also a policy, not a law: the reference skips ZeRO-3 with pipeline parallelism because the playbook calls that combination rare, which a team with a very large global batch could reasonably reverse.

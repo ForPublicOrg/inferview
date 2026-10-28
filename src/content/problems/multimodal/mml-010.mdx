@@ -1,0 +1,90 @@
+---
+id: mml-010
+title: Serve gpt-oss-120b for 128K-token documents, or not
+subtitle: banded windows, sinks and a fixed GPU budget
+track: multimodal
+module: architectures
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 40
+core: false
+tags: [kv-cache, sliding-window, attention-sinks, long-context, capacity-planning, gpt-oss]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: gpt-oss-120b and gpt-oss-20b model card (arXiv 2508.10925), OpenAI
+    url: https://arxiv.org/html/2508.10925
+    note: "36 layers; 64 query heads of dimension 64, 8 KV heads; attention alternates banded window (128 tokens) and fully dense; a learned bias in each head's softmax denominator; RoPE with dense layers extended to 131,072 tokens by YaRN; MXFP4 MoE weights so the 120b fits a single 80GB GPU. Checked 2026-10-28."
+  - title: gpt-oss-120b, config.json
+    url: https://huggingface.co/openai/gpt-oss-120b/blob/main/config.json
+    note: "36 layers alternating sliding_attention and full_attention (18 each), sliding_window 128, num_key_value_heads 8, head_dim 64, YaRN factor 32 from initial_context_length 4096, max_position_embeddings 131072. Checked 2026-10-28."
+  - title: Kimi-Linear-48B-A3B-Instruct, config.json
+    url: https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct/blob/main/config.json
+    note: "7 full-attention MLA layers of 27, kv_lora_rank 512, qk_rope_head_dim 64; used for the alternative's per-token cache. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"We are launching a contract-review product where customers upload documents of up to 120,000 tokens and ask questions across the whole document. Leadership wants it on gpt-oss-120b because we already run it for chat. Compute the KV cache per token and per 128K sequence from the published config, and decide whether we serve it for this product on the hardware we have."
+</Callout>
+
+The situation (scenario):
+
+- One node of 8 GPUs with 80 GB each, already running gpt-oss-120b, one replica per GPU. After weights and activations, the engine reports 14 GiB free for KV on each GPU.
+- Expected peak: 40 concurrent long-document sessions, plus chat traffic that must keep its current capacity of short sessions on the same node.
+- Launch in six weeks; the inference team is three engineers; no new hardware this quarter.
+- The legal team will not accept answers that miss a clause the customer asked about; product will accept slower answers.
+
+The published config (checked 2026-10-28): 36 layers alternating a 128-token banded window and full attention, 8 KV heads of dimension 64, a learned softmax bias per head, YaRN to 131,072 tokens on the dense layers.
+
+Write the cache arithmetic, a decision, what you give up, and the rollout note you would send.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask the inference team whether the engine allocates the banded layers at 128 tokens or at the full sequence length.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask how the model scores on questions drawn from your own contracts at 100K tokens, not on a needle test.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what share of the 40 peak sessions are actually near 120K tokens.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Only the 18 full-attention layers grow with context: 18 × 2 × 8 × 64 × 2 bytes = 36,864 bytes per token, 4.5 GiB per 131,072-token sequence in 16-bit, plus 4.5 MiB for the banded layers. The sinks cost nothing per token. With 14 GiB free per GPU that is 3 long sessions per GPU, 24 on the node, short of 40, and it leaves nothing for chat on those GPUs. 8-bit KV doubles it to 6 per GPU. I would not serve whole documents at full length to every session: launch with retrieval over the document into a 32K window by default, route only the questions that need the whole document to full-length sessions on a capped pool, and run an 8-bit KV evaluation on our contracts before raising the cap.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>Arithmetic.</b> Full layers: 18 × 2 × 8 × 64 = 18,432 values per token, 36,864 bytes in 16-bit. At 131,072 tokens: 4,831,838,208 bytes, 4.50 GiB. Banded layers hold at most 128 tokens: 18 × 2,048 values × 2 bytes × 128 = 4.5 MiB. If the engine allocates banded layers at full length, the per-sequence figure doubles to 9.00 GiB and the node holds 8 long sessions, one per GPU, which is the first thing to check. The learned sink is a per-head scalar in the softmax denominator, so it adds no cache.</p>
+<p><b>Capacity.</b> 14 GiB per GPU at 4.5 GiB gives 3 sessions per GPU (13.5 GiB), 24 on the node, and those GPUs then have no cache left for chat. 8-bit KV gives 2.25 GiB per session, 6 per GPU, 48 on the node, but again with no chat headroom. A 32K window costs 32,768 × 36,864 bytes = 1.125 GiB, 12 sessions per GPU.</p>
+<p><b>Two defensible designs.</b></p>
+<ul>
+<li>Full-length sessions for everyone, with 8-bit KV and two GPUs taken from chat. Cost: chat loses a quarter of the node, 8-bit KV is unvalidated on long contracts, and 40 sessions still do not fit on six GPUs (36). It reads the whole document, which is what legal wants.</li>
+<li>Retrieval into a 32K window by default, with a capped full-length pool of two GPUs (6 sessions at 16-bit) for questions that span the document ("does any clause contradict section 3?"). Cost: a retrieval stage that can miss a clause, a router that must classify questions, and queueing for the full-length pool at peak.</li>
+</ul>
+<p>I choose the second, because it fits the hardware and the six-week deadline and keeps chat, and because full-length reading is reserved for the questions that need it. The conflict is legal's "never miss a clause" against a fixed node: the first design reads everything but cannot serve the peak; the second serves the peak but can miss a clause in retrieval.</p>
+<p><b>What we give up.</b> Questions routed to retrieval can miss a clause outside the retrieved window, and full-length questions queue at peak. Both are written into the risk note with the measurement that tracks them.</p>
+<p><b>Rollout note.</b> Week 1: confirm the engine's per-layer allocation for banded layers and measure the free KV at 16-bit and 8-bit. Weeks 1 to 3: build an evaluation from 200 real contracts with clause-level questions, scored for exact clause citation, at 32K retrieval and at full length. Weeks 3 to 5: router and capped pool behind a flag for one customer. Rollback triggers: clause-citation accuracy on the retrieval path more than a pre-agreed margin below full length, or full-length queue time past the product's limit at peak.</p>
+<p><b>Failure mode of the recommendation.</b> The router is a classifier, and a question that looks local ("what is the termination fee?") can depend on a definition 80,000 tokens away. Log every retrieval-path answer's cited clauses and sample them weekly against a full-length run.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Legal reads your risk note and refuses any retrieval path. You can have the full-length design only by cutting chat capacity by half for six weeks. Which ships degraded, and who signs off?</li>
+<li>What would you need to see in production to reverse the decision and move every session to full length?</li>
+<li>The inference lead proposes Kimi Linear instead, at 7 × 576 × 2 = 8,064 bytes per token, about 1 GiB per 128K session. What do you need to know before taking that seriously, given that the evaluation and the engine support both take time you do not have?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- The model card says the dense layers reach 131,072 tokens with YaRN from a 4,096-token original. What evaluation shows that a 120K contract is used, not just accepted?
+- How do prefix caching and a per-customer contract interact: is one customer's 120K document worth caching across their questions, and for how long?
+
+## Common mistakes
+
+- Charging all 36 layers for every token, which gives 9 GiB per session and halves the capacity estimate, unless the engine really does allocate that way.
+- Counting the attention sink as cache. It is one scalar per head.
+- Treating "fits on one 80 GB GPU" as a capacity statement; it says nothing about how many long sessions fit beside the weights.
+- Accepting a 128K needle-test result as evidence that the model answers clause-level questions over 120K-token contracts.

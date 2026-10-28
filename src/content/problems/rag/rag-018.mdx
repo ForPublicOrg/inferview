@@ -1,0 +1,126 @@
+---
+id: rag-018
+title: Retrieval over a corpus where every page has its own readers
+subtitle: filter placement, partitioning, deletes and the recall you accept
+track: rag
+module: retrieval-foundations
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 50
+core: true
+tags: [permissions, acl, pgvector, hnsw, partitioning, multi-tenant, freshness, deletes]
+companies:
+  - name: Scale AI
+    url: https://www.hellointerview.com/community/questions/rag-system-design/cmoaemvhf1emv09adwqq9wk3f
+  - name: Atlassian
+    url: https://www.hellointerview.com/community/questions/rag-system-design/cmoaemvhf1emv09adwqq9wk3f
+updated: 2026-10-28
+sources:
+  - title: Hello Interview community, RAG system design question (checked 2026-10-28)
+    url: https://www.hellointerview.com/community/questions/rag-system-design/cmoaemvhf1emv09adwqq9wk3f
+    note: "candidate reports, unverified: Scale AI, Principal, late July 2026 ('Design search system for Confluence') and Senior, late April 2026; Atlassian, Staff, mid July 2026 ('Design an ML-powered enterprise search system using Retrieval-Augmented Generation (RAG)'). The page gives no detail on permissions or scale; the exercise here is original."
+  - title: pgvector README (v0.8.7, checked 2026-10-28)
+    url: https://github.com/pgvector/pgvector
+    note: "filtering is applied after an approximate index scan; hnsw.ef_search defaults to 40; iterative scans from 0.8.0 with hnsw.max_scan_tuples defaulting to 20,000; an index on the filter column can give fast exact search; partial indexes for a few filter values and partitioning for many; dead tuples can reduce results; vacuuming HNSW can take a while and reindexing first speeds it up"
+  - title: pgvector changelog (checked 2026-10-28)
+    url: https://github.com/pgvector/pgvector/blob/master/CHANGELOG.md
+    note: "0.8.3 (2026-06-17) fixed possible index corruption with HNSW vacuuming; 0.8.4 (2026-06-30) fixed the 'hnsw graph not repaired' error and inserts during HNSW vacuuming"
+  - title: Pinecone docs, Implement multitenancy (checked 2026-10-28)
+    url: https://docs.pinecone.io/guides/index-data/implement-multitenancy
+    note: "vendor documentation: one namespace per tenant, stored separately for physical isolation; namespaces per serverless index from 100 on Starter to 1,000,000 on Enterprise; deleting a namespace offboards a tenant almost instantly; operations target one namespace; metadata-filter alternative scans the whole namespace, $in and $nin take at most 10,000 values, and filtering on long lists of user ids is called an anti-pattern"
+  - title: Microsoft Learn, Data, Privacy, and Security for Microsoft Copilot (ms.date 2026-07-09, checked 2026-10-28)
+    url: https://learn.microsoft.com/en-us/copilot/microsoft-365/microsoft-365-copilot-privacy
+    note: "Copilot only surfaces organizational data to which individual users have at least view permissions; the Semantic Index honours the user identity-based access boundary so grounding only accesses content the current user is authorized to access; customers are told to get their Microsoft 365 permission models right"
+  - title: hnswlib, ALGO_PARAMS.md (checked 2026-10-28)
+    url: https://github.com/nmslib/hnswlib/blob/master/ALGO_PARAMS.md
+    note: "graph memory roughly M * 8 to 10 bytes per element"
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"Our workspace product is adding answers over customers' pages. Every page has its own readers, permissions change all day, and pages get deleted. Design retrieval so nobody ever gets an answer grounded in a page they cannot open, and tell me what recall you are willing to lose for it."
+</Callout>
+
+The operating constraints are a scenario, given by the interviewer:
+
+- 1,200 customer organisations, 90 million chunks in total, embedded at 1,024 dimensions. The largest organisation has 9 million chunks; the median has 20,000.
+- Inside an organisation, about 70% of chunks sit in spaces every member can read. The rest are restricted to groups or named users, and a user belongs to between 5 and 300 groups.
+- The search team is five engineers and the company runs Postgres 17 with pgvector 0.8.7. No new datastore can be adopted this year.
+- Security requires that a revoked permission stops affecting answers within 5 minutes. Legal requires a deleted page to leave results at once and storage within 30 days. Retrieval has a p95 budget of 300 ms.
+- The security lead wants every retrieved chunk checked against the page service's permission API before it reaches the model. The search lead says that call costs too much latency at the 95th percentile. Both report to you.
+
+Write the design: where the permission filter sits, how the data is partitioned, how permission changes and deletes flow, and the recall you accept. End with a decision on the security lead's request, a rollout plan and rollback triggers.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the distribution of how many restricted chunks a single user can read, not the average.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the rate of permission changes per hour, split into group-membership changes and page-restriction changes.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask for the p95 and p99 latency of the page service's permission API for a batch of 20 page ids.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Partition by organisation, with the largest organisations in their own partitions, so the tenant filter is the partition and never a post-filter. Inside an organisation, split retrieval in two legs: an HNSW index over the chunks every member can read, and exact search over the restricted chunks this user can read, merged by distance. Keep permissions as group ids on a page-level table, not copied onto every chunk, so a membership change touches one cache entry and a restriction change touches one page row, plus the chunks' open flag only when a page moves between open and restricted. Delete chunk rows when the page is deleted, run a pgvector version with the HNSW vacuum fixes, and keep a final check against our own permission tables before the model sees anything. I would not put the page service's API on the hot path; I would sample it asynchronously and alert on any disagreement.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Where the filter sits.</strong> A single HNSW index with the permission condition in the <code>WHERE</code> clause fails on arithmetic: pgvector filters after the scan, so with the default <code>ef_search</code> of 40, a user whose readable restricted chunks are 0.5% of the organisation gets 40 x 0.005 = 0.2 restricted candidates per query. Iterative scans raise that ceiling to 20,000 tuples by default, which still leaves 20,000 x 0.005 = 100 candidates for the 0.5% user but only 2 for a user who can read 0.01% of the organisation, and every such query reads the whole scan budget. So the restricted content gets its own leg.</p>
+<p><strong>Leg one: open chunks.</strong> A partial HNSW index per partition over chunks readable by every member. The only filter left is the organisation, which the partition already applies for large organisations; for the many small ones sharing a hash partition, the organisation filter keeps a share of candidates that iterative scans can fill, and the smallest organisations go to exact search through a B-tree on <code>org_id</code>.</p>
+<p><strong>Leg two: restricted chunks this user can read.</strong> Resolve the user's groups from a membership cache, find the restricted pages those groups can read through a GIN index on the page table's group array, and compute exact distances over their chunks. Exact search here is a feature: recall on the content people are most careful about is 1.0. Its cost grows with the number of restricted chunks a user can read, so above a threshold you choose, the leg switches to a partial HNSW index over restricted chunks with an iterative scan.</p>
+<p><strong>Permission changes.</strong> Chunks carry a page id, not an access list. A group-membership change invalidates one entry in the membership cache, whose time to live is at most the 5-minute requirement, and is also pushed as an event so most changes apply in seconds. A page-restriction change updates one row of the page table, and touches the page's chunks only when the page moves between open and restricted, because the open flag decides which partial index holds them. Copying access lists onto every chunk row would turn each restriction change into updates of every chunk of the page, each a new tuple version in a table with a vector index on it, and the dead versions it leaves behind also cost candidates until vacuum.</p>
+<p><strong>Deletes.</strong> A page deletion deletes its chunk rows in the same transaction as the page-table update, so results lose the page at once. Dead tuples stay in the HNSW graph until vacuum; the README notes they reduce results and that HNSW vacuums are slow, and pgvector 0.8.3 and 0.8.4 fixed vacuum corruption and repair errors, so 0.8.4 is the floor and 0.8.7 is what we run. For the 30-day storage requirement, the vectors are derived data and leave with the rows, but WAL archives and backups hold them too, so backup retention must be under 30 days or the requirement must name backups explicitly.</p>
+<p><strong>The final check.</strong> After the merge and before the prompt, every chunk's page is checked against the page table and the membership cache in one query. This catches a chunk whose page changed between retrieval and assembly. It costs one indexed lookup per request, not a network call per chunk.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The security lead escalates: a cache with a 5-minute time to live means a fired employee's last query can still read restricted pages. Your design lets that happen in writing. What do you change, and what does it cost the p95?</em></li>
+<li><em>Users in 300 groups make leg two read 400,000 chunks exactly and blow the latency budget. Do you raise the threshold, move them to the restricted HNSW leg and accept its recall, or cap the groups considered, and which risk goes in the memo?</em></li>
+<li><em>What would you need to see in production to reverse the decision to stay on Postgres and move to a namespace-per-tenant vector service next year?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+### The numbers you were asked to choose
+
+**The exact-search threshold for leg two.** At 1,024 dimensions in halfvec, each chunk is 2,048 bytes, so 50,000 readable restricted chunks are about 102 MB of vectors per query. Pick the threshold from a measured p95 of exact distance over 10,000, 50,000 and 200,000 rows on production hardware, against what is left of the 300 ms after leg one. A threshold set from the average user is unreasonable: the users in 300 groups are the ones who hit it.
+
+**Dedicated partitions.** The 9-million-chunk organisation is 18.4 GB of halfvec vectors before the graph, and hnswlib's own estimate puts the graph at about 1.2 to 1.4 GB at `M` = 16. Giving every organisation above about 1 million chunks its own partition keeps each HNSW index buildable inside `maintenance_work_mem` and lets one large customer be reindexed without touching the others. A partition per organisation for all 1,200 is unreasonable for a five-person team: 1,200 indexes to build, vacuum and monitor, most of them small enough for exact search.
+
+**The recall you accept.** Leg two is exact, so restricted content has recall 1.0 below the threshold. Leg one targets recall@20 of 0.95 against exact search over the same open chunks, measured per partition and per organisation-size bucket. Above the threshold, the restricted HNSW leg gets its own measured target, written down, because that is where a user is most likely to miss a page they can read.
+
+### Two defensible designs
+
+| | Postgres, partitioned, two legs | A vector service with a namespace per organisation |
+|---|---|---|
+| Isolation | Partitions for large organisations, a shared hash partition for the rest | Physical per namespace; deleting one offboards an organisation almost instantly (Pinecone's documentation) |
+| Permissions inside a tenant | Exact leg for restricted content, joined to page and membership tables | Still a metadata filter; Pinecone caps `$in` at 10,000 values and calls filtering on long user-id lists an anti-pattern |
+| Freshness | Permission and delete changes are transactions in the same database | A sync pipeline between the page service, Postgres and the vector service, with its own lag |
+| Cost | Exact-search CPU for heavy restricted users; HNSW vacuum windows | A second datastore, dual writes and a namespace limit that depends on the plan |
+
+The constraint rules out the second this year. It stays the reversal option.
+
+**Decision on the security lead's request.** Do not call the page service per chunk on the hot path. The final check against our own page table and membership cache runs on every request. The page service is sampled asynchronously for a fixed fraction of requests, and any disagreement between it and our tables pages the on-call engineer and blocks the affected organisation's answers until the sync is repaired. What we give up: for up to the cache's time to live, a revoked membership that missed its event can still ground an answer. That is written in the risk note and signed by the security lead, not left implicit.
+
+**Rollout.** Weeks 1 to 3: page table with group arrays, membership cache with events, the final check, sampling against the page service. Weeks 4 to 6: partitions for organisations above the threshold, partial HNSW indexes for open chunks, exact leg for restricted chunks. Weeks 7 and 8: recall sweeps per bucket against exact search, then a canary on ten organisations chosen to include the largest and several with heavy restriction.
+
+**Rollback triggers.** Any sampled disagreement where our tables allowed a page the page service denies stops answers for that organisation. Leg two's p95 above its share of the budget for a day moves the threshold down and reports the recall cost. Rows returned under the requested limit for more than a set fraction of queries in any partition blocks the rollout to the next cohort.
+
+**The failure mode of this design.** It moves the permission model into our database, so it is exactly as correct as the sync from the page service. A missed event, a schema change in the page service or a new kind of restriction, such as inherited permissions from a parent page, produces answers that our tables allow and the product does not. The asynchronous sampling is the only thing that would notice, which is why its disagreements stop answers instead of filing tickets. And because retrieval now honours permissions faithfully, every page a customer overshared becomes findable by a question; Microsoft's Copilot documentation puts the same burden on customers' own permission models.
+
+## Follow-ups
+
+- *A customer's admin restricts a space of 200,000 pages. How long until answers reflect it, which tables change, and what does it do to the HNSW index?*
+- *Two senior engineers disagree: one wants access lists on every chunk for a single-query design, the other wants the page table. How do you decide without deciding by rank?* Replay a week of permission-change events against both schemas and compare write amplification, dead tuples and time to consistency.
+- *Legal now says embeddings are personal data and must leave backups within 30 days too. What changes in the storage design?*
+
+## Common mistakes
+
+- One HNSW index for all organisations with the permission condition as a post-filter.
+- Copying access lists onto chunk rows, so a restriction change rewrites every chunk of a page.
+- Treating a soft delete flag as deletion while the vectors remain in the graph and in backups.
+- Measuring recall against exact search over the whole organisation instead of over what the user may read.
+- Calling the source system per chunk on the hot path, or not checking it at all.

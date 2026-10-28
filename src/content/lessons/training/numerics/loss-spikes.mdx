@@ -1,0 +1,124 @@
+---
+title: Loss spikes and how labs stopped them
+track: training
+module: numerics
+order: 3
+kind: lesson
+level: staff
+minutes: 14
+summary: What OLMo 2, Kimi K2 and DeepSeek-V3 report about loss spikes, each fix tied to the run that motivated it, turned into a first-hour procedure for an upward spike in a long run.
+prerequisites: [training/numerics/mixed-precision]
+updated: 2026-10-28
+sources:
+  - title: OLMo Team, 2 OLMo 2 Furious (arXiv 2501.00656, v3)
+    url: https://arxiv.org/html/2501.00656
+    note: "Spike score is the percentage of values at least seven standard deviations from a rolling average over the last 1,000 values; larger models spiked more often; dramatic gradient-norm spikes often preceded loss spikes; filter removes documents with a sequence of 32 or more repeated n-grams (n-grams of 1 to 13 tokens) and the trainer masks such sequences, a mitigation, not an elimination; N(0, 0.02) initialization cut the gradient-norm spike score from 0.40 to 0.03 in the test setting; reordered norm plus QK-norm took it from 0.108 to 0.069, neither alone helped; RMSNorm versus LayerNorm showed no difference; z-loss 10^-4 log^2 Z in the text, 10^-5 in Table 1; no weight decay on embeddings, 0.16 to 0.092; AdamW epsilon lowered from 10^-5 to 10^-8. Checked 2026-10-28."
+  - title: Kimi Team, Kimi K2 technical report (arXiv 2507.20534)
+    url: https://arxiv.org/html/2507.20534
+    note: "A 9B-activated, 53B-total MoE with vanilla Muon saw max attention logits exceed 1000; QK-Clip per head with threshold tau = 100 and gamma_h = min(1, tau / S_max^h), applied only when S_max^h exceeds tau; for MLA, q^C and k^C scaled by sqrt(gamma_h), q^R by gamma_h, shared k^R untouched; clipping changes weights after the update, not the current step; logits capped at 100 then decayed to a stable range after about 30% of training steps without changing tau; 15.5T tokens without a single loss spike; only a small subset of heads show exploding logits. Checked 2026-10-28."
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437)
+    url: https://arxiv.org/abs/2412.19437
+    note: "Abstract: no irrecoverable loss spikes and no rollbacks during training; 14.8T tokens; 2.788M H800 GPU hours. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision in the first hour
+
+An upward spike at step N in a long run forces a choice between three actions, each with a cost that grows by the hour: let the run continue and watch whether the loss recovers, roll back to a checkpoint before the spike and resume on the same data, or roll back and change something (the data window, a hyperparameter, a stabilising term) before resuming. Continuing costs nothing if the spike is a one-off and a great deal if the model has moved into a state it will not recover from. Rolling back costs the compute since the checkpoint. Changing something mid-run costs comparability with every earlier ablation.
+
+The evidence that picks between them is in logs most runs already keep, if they keep them per layer and per head. Three public reports describe what the spikes in their runs were and what stopped them, and the procedure below is assembled from them.
+
+## What a spike looks like before it is a spike
+
+OLMo 2's report makes two observations that set the order of investigation. Larger models spiked more often in its experiments, so a recipe that was quiet at 7B is not evidence about 32B. And dramatic spikes in the gradient norm often came before loss spikes. The gradient norm is the leading indicator; the loss is the lagging one.
+
+The report quantifies spikiness with a spike score: the percentage of values in a series at least seven standard deviations from the rolling average of the previous 1,000 values.
+
+<Predict id="trn-num-ls-score" question="Scenario: over 50,000 logged steps, 200 gradient-norm values sit at least seven standard deviations above their 1,000-step rolling average. What is the spike score, in percent?" answer={0.4} tolerance={0.01} unit="%">
+<p>200 / 50,000 = <b>0.4%</b>. That is the score OLMo 2 reports for its earlier recipe in the initialization test, 0.40, against 0.03 for the new initialization, which over the same 50,000 steps would be 15 outlying values. The score is a count, so it says how often the run is disturbed, not how badly; one spike that diverges and two hundred that recover can score the same.</p>
+</Predict>
+
+## Three runs, three causes
+
+### OLMo 2: data, initialization, architecture, decay
+
+OLMo 2 found four contributors and fixed each with an ablation behind it.
+
+Data. Spikes correlated with batches containing long repeated sequences. The fix filters documents that contain a sequence of 32 or more repeated n-grams, with n from 1 to 13 tokens, and masks such sequences in the data loader as well. The report is careful: the relationship is not deterministic, and the filter is a mitigation, not an elimination. It removed many spikes and had no effect on the slow growth of the gradient norm.
+
+Initialization. Replacing the earlier scaled initialization with every parameter drawn from a normal distribution with mean 0 and standard deviation 0.02 dropped the gradient-norm spike score in the test setting from 0.40 to 0.03, with no loss spikes in the new run.
+
+Architecture. Applying RMSNorm to the outputs of the attention and MLP blocks instead of their inputs, and adding RMSNorm on queries and keys (QK-norm), took the spike score from 0.108 to 0.069. Neither change alone gave good results. The swap from LayerNorm to RMSNorm itself made no difference in the report's ablations, which is worth knowing before anyone credits it.
+
+Regularisation and optimizer. A z-loss term penalises the log of the softmax denominator of the output logits, keeping it near zero. Weight decay was turned off for embeddings, which moved the spike score from 0.16 to 0.092. AdamW's epsilon was lowered from 10^−5 to 10^−8, which gave a lower, more stable gradient norm early in training.
+
+<Predict id="trn-num-ls-zloss" question="The z-loss adds coefficient × (log Z)^2 to the loss, where Z is the softmax denominator. With log Z = 30 at some step and a coefficient of 10^-4, how large is the z-loss term?" answer={0.09} tolerance={0.001} unit="">
+<p>10^−4 × 30^2 = <b>0.09</b>. Against a language-model loss near 2, that is about 4.5% of the objective, enough to pull log Z down. The OLMo 2 report gives 10^−4 in its text and 10^−5 in its Table 1; at 10^−5 the same term is 0.009, ten times weaker. When a fix is copied from a paper, the coefficient is part of the fix, and a discrepancy like this one is resolved by reading the released config, not by picking one.</p>
+</Predict>
+
+### Kimi K2: one optimizer, a few heads
+
+Kimi K2's spikes came from the optimizer. Training a 9B-activated, 53B-total MoE with vanilla Muon, the team saw maximum attention logits exceed 1,000. A logit that size saturates the softmax: one key takes the whole attention row, gradients through the rest vanish, and the head stops learning anything but that key. The report says only a small subset of heads did this.
+
+The fix, QK-Clip, works on weights after each optimizer update. For each head h it records the largest pre-softmax logit over the batch, S_max^h, and if that exceeds a threshold τ it scales the head's query and key projections by γ_h = min(1, τ / S_max^h), split between them so their product shrinks by γ_h. Heads below the threshold are untouched, which is the difference from a global clip. In K2's MLA attention the head-specific query and key components are each scaled by √γ_h, the head-specific rotary query component by γ_h, and the rotary key component, which all heads share, is left alone.
+
+<Predict id="trn-num-ls-qkclip" question="A head's largest logit in a batch is 400 and the threshold is 100. By what factor does QK-Clip scale each of that head's query and key projection matrices?" answer={0.5} tolerance={0.001} unit="">
+<p>γ = min(1, 100 / 400) = 0.25, split as √0.25 = <b>0.5</b> on each of the query and key projections. The logit is their product, so it scales by 0.5 × 0.5 = 0.25, from 400 to 100. Scaling only one projection by 0.25 gives the same logit but leaves the other projection's growth unchecked, which is why the split matters.</p>
+</Predict>
+
+With τ = 100, K2's logits were capped at 100 early in training and then decayed to a normal operating range after about 30% of training steps, without anyone changing τ. The report says the 15.5T-token pretraining run had no loss spike at all. The clip stopped acting on its own once the heads no longer needed it, which also means it cost nothing for most of the run.
+
+### DeepSeek-V3: the claim without the mechanism
+
+DeepSeek-V3's report states that the 14.8T-token run had no irrecoverable loss spikes and needed no rollbacks. That is a claim about outcomes; the report does not attribute it to one mechanism, and it is consistent with transient spikes that recovered on their own. It is useful as a bar: a frontier MoE run, with FP8 GEMMs, completed without a rollback, so a run that needs several is telling you about its recipe.
+
+## The first hour
+
+The three reports give a procedure for the hour after an upward spike at step N.
+
+| Check | What it separates | Run it came from |
+|---|---|---|
+| Gradient norm over the 2,000 steps before N, total and per layer | A sudden event from a slow drift that has been building | OLMo 2 |
+| The batch at step N and its neighbours, scanned for long repeated sequences | A data-triggered spike from a model-state one | OLMo 2 |
+| Maximum attention logit per head over the same window | A few heads saturating from a model-wide problem | Kimi K2 |
+| log Z of the output softmax, if z-loss is off | Output-logit drift from attention-logit growth | OLMo 2 |
+| Whether the same spike recurs on a different data order after rollback | Whether the data or the state is the cause | All three |
+| Embedding norms and the parameter groups that receive weight decay | Decay configuration as a contributor | OLMo 2 |
+
+The decision follows the evidence. A spike with a clean gradient-norm history and a degenerate batch at N points at data: roll back, skip or reorder the window, and add the repeated-sequence filter to the pipeline for the rest of the run. A gradient norm that has been climbing for thousands of steps, with a few heads' logits rising with it, points at model state: rolling back to resume the same trajectory will replay the spike, so something has to change, and the least invasive change is one that acts only on the offending heads, as QK-Clip does. A spike that recovers within a few hundred steps with nothing abnormal in either log may be left alone, with the check scheduled again at the next spike.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your 400B MoE run is 60% through its token budget. Loss spiked at step N and has recovered halfway. Max logits in four heads have tripled over 3,000 steps. Rolling back to the last checkpoint costs two days of cluster time, and the release date does not move. What do you do in the next hour, and what do you change?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Roll back, add a per-head logit clip on the four heads' query and key projections, and resume. The logit trend says the spike was model state, not a bad batch, so continuing or replaying the same trajectory risks the next spike being the one that does not recover. A clip acts only where the logits exceed the threshold, so it leaves the rest of the model's trajectory and the earlier ablations comparable.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Two answers are defensible. Continue and monitor: no lost compute, but the four heads are still saturating, and a second spike late in the run, during the learning-rate decay, costs more than two days. Roll back and change: two days of compute and a mid-run intervention that has to be written up, against a much lower risk of a late divergence.</p>
+<p>Within the hour I check the batch at N for repeated sequences, because a data trigger on top of the logit growth changes what I skip; I confirm the four heads are the only ones growing; and I pick the threshold from the logs, above where healthy heads sit and below where the four started saturating. Kimi K2 used 100 for its run; my value comes from my own heads' distribution.</p>
+<p>What I give up: two days, and the claim that the run is a clean replication of its recipe. I write the risk note before resuming: the clip, the threshold and why, the trigger for a second rollback (any further head crossing the threshold for more than a few hundred steps after the clip stops acting), and who signs off on the slip.</p>
+<p>How this fails: a clip bounds the logits without explaining why they grew. If the growth comes from a learning rate too high for those heads, the clip may stay active for the rest of the run and quietly limit what the heads can represent. I log how often it fires per head, and a clip that never stops firing is a finding, not a fix.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The checkpoint before the logit growth started is 9 days old, not 2. Does your answer change, and what do you tell the release owner?</li>
+<li>A colleague wants QK-norm instead, because OLMo 2 used it. What does adding a normalization layer mid-run do that a weight clip does not?</li>
+<li>After the clip, the four heads stay pinned at the threshold for 20,000 steps. What would you need to see to remove the clip, and what would make you lower the learning rate instead?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Each fix above was validated on one recipe. OLMo 2's spike scores come from controlled comparisons at the scale of its test setting, and the report says larger models spike more, so an improvement measured small can shrink at size. QK-Clip was built for Muon's logit growth; under AdamW with QK-norm already in place, the same symptom may have a different cause. The data filter is explicitly a partial mitigation.
+
+The procedure also assumes the spike is numerical or data-driven. A spike that coincides with a node replacement, a restart or a change in the data loader's sharding can be an infrastructure fault that no stabilising term will fix; the first check in that case is whether the step that spiked ran on the same hardware and the same data as the logs say it did.
+
+<SelfRate id="lesson:training/numerics/loss-spikes" />

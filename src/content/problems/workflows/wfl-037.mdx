@@ -1,0 +1,129 @@
+---
+id: wfl-037
+title: The test plan and CI gate for a refund workflow
+track: workflows
+module: operating-workflows
+type: workflow
+difficulty: hard
+seniority: [staff]
+minutes: 40
+core: true
+tags: [testing, temporal, replay, time-skipping, crash-injection, golden-traces, ci]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Temporal docs, Python testing suite
+    url: https://docs.temporal.io/develop/python/testing-suite
+    note: WorkflowEnvironment.start_time_skipping fast-forwards timers except while activities run; mocked activities need the same name and signature; Replayer.replay_workflows; histories fetched with list_workflows(...).map_histories(), which needs Advanced Visibility from server v1.18; recommended CI check fails on any replay error (checked 2026-10-28)
+  - title: Temporal docs, Python versioning
+    url: https://docs.temporal.io/develop/python/versioning
+    note: workflow.patched inserts a marker; replay fails when the code does not produce the same marker; deprecate_patch once pre-patch workflows are gone; Worker Versioning (checked 2026-10-28)
+  - title: Duolingo engineering blog, A production-ready AI agent platform (2026-08-04)
+    url: https://blog.duolingo.com/production-ready-ai-agent-platform/
+    note: evals run on Temporal as a suite workflow with a child workflow per case and repetition; deterministic graders are the foundation and LLM-as-judge is optional
+  - title: LangGraph docs, time travel
+    url: https://docs.langchain.com/oss/python/langgraph/use-time-travel
+    note: replay re-executes nodes after the checkpoint; LLM calls and API requests fire again (checked 2026-10-28)
+  - title: Inngest docs, Replay
+    url: https://www.inngest.com/docs/platform/replay
+    note: bulk replay creates new executions, so charges or messages in those runs can happen again (checked 2026-10-28)
+checklist:
+  - Workflow tests with mocked activities and recorded model responses cover every branch, including approval timeout, escalation and auto-deny
+  - The 72-hour and 24-hour timers run under time skipping, and the plan notes that time does not skip while an activity is running
+  - Replay of recorded histories against the new workflow code fails the build on any nondeterminism error
+  - Says where the replayed histories come from and how the customer data inside them is kept out of places it should not be
+  - Crash injection at every activity boundary, before and after the side effect, asserts one refund call per idempotency key and one customer email per decision
+  - Model steps are graded on a golden set with deterministic checks first (amount within order total, policy limit, schema) and judged quality second
+  - Chooses a golden-set size and a pass rule, and says which changes trigger it
+  - Assigns each layer to blocks-merge, blocks-deploy or nightly, and fits the merge gate inside the stated CI budget
+  - Ships the fraud-check step behind workflow.patched or worker versioning so workflows already waiting on timers keep their old path
+  - A rollout plan with numeric rollback triggers and a date to remove the patch
+  - Names what history replay cannot catch (a change inside an activity) and which layer covers it
+  - Writes down what the plan gives up
+---
+
+## Question
+
+A refund workflow runs on Temporal (Python SDK). Five steps:
+
+1. `classify_request`: a model call that reads the customer's email and extracts the order id and the reason.
+2. `load_order_and_policy`: reads the order and the refund policy.
+3. `draft_decision`: a model call with structured output: approve, deny or partial, with an amount and a reason.
+4. Approval: decisions over $200 wait for a human signal with a 72-hour timer; on timeout the request goes to a team lead with a second 24-hour timer, then is denied with an apology email.
+5. `issue_refund` through the payment provider, which accepts an idempotency key, then `notify_customer` by email.
+
+The operating constraints (scenario):
+
+- Three engineers own it.
+- The merge gate must finish in 15 minutes.
+- Workflow histories contain customer emails and order data and may not be copied out of the production account unredacted.
+- About 2,000 workflows are open at any time, most of them waiting on an approval timer.
+- Next month the team inserts a `fraud_check` activity between steps 2 and 3 and swaps the drafting model.
+
+Write the test plan and the CI gate. For each test layer say what it asserts, what it runs against, and whether it blocks merge, blocks deploy or runs nightly. Then write the rollout plan for the fraud-check change, with rollback triggers. Then check your design against the checklist.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which of the five steps have side effects outside the workflow, and which external systems de-duplicate a repeated call.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask how long the longest open workflow has been running, and which code it will run when a new worker picks it up.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the current merge gate takes in minutes, and which part of it is spent waiting on external services.</p></details>
+
+## Answer
+
+"Replay" means three different things in this space, and a test plan that does not say which one it means gets misread in review. In Temporal it re-runs workflow code against a recorded history and checks that the code issues the same commands; no activity runs, nothing is charged. LangGraph's time-travel replay re-executes the nodes after a checkpoint, and the docs say LLM calls and API requests fire again. Inngest's Replay creates new executions of failed runs after a fix, and its docs warn that charges or messages in those runs can happen again. This plan uses the first meaning, and the third is the reason `issue_refund` needs its idempotency key even outside crashes.
+
+### The layers
+
+| Layer | Asserts | Runs against | Gate |
+|---|---|---|---|
+| Workflow tests | Every branch: auto path under $200, approve, deny, partial, approval timeout to escalation, escalation timeout to auto-deny | `WorkflowEnvironment.start_time_skipping()`, mocked activities with the same names and signatures, model responses recorded as fixtures | Blocks merge |
+| History replay, recorded | New workflow code replays histories without a nondeterminism error | Histories exported from the workflow-test runs and committed to the repository, one per branch | Blocks merge |
+| Crash injection | One `issue_refund` call per idempotency key and one email per decision, whatever the crash point | An in-process worker; a fake payment provider and mail service that record calls; activities that raise after their side effect | Blocks merge |
+| Golden set | Deterministic: amount at most the order total, no approval over the policy limit, schema valid. Then judged quality of the reason text | A fixed set of labelled refund emails, real model calls, run as a Temporal suite workflow with a child workflow per case | Blocks merge when prompts, model or schema change; nightly otherwise |
+| History replay, production | New code replays every open refund workflow and a sample of closed ones | A job inside the production account; histories never leave it | Blocks deploy |
+| Provider contract | The sandbox de-duplicates a repeated idempotency key the way the fake assumes, including after the key's retention window | Payment provider sandbox | Nightly |
+
+Time skipping makes the 72-hour and 24-hour timers run in milliseconds. Timers are not fast-forwarded while an activity is running, so the mocked activities return immediately.
+
+Crash injection, concretely: for each of the five steps, two cases. One crashes the worker before the side effect, and one lets the side effect happen and then raises before the activity completes, which is the case where a retry repeats the effect. Ten cases, each asserting the call counts on the fakes. The `notify_customer` case usually fails first: most mail APIs have no idempotency key, so the activity needs its own sent-marker keyed by workflow id and decision, or the team accepts at-least-once email and writes that down.
+
+The golden set is a number to choose. Each case makes two model calls (classify and draft); at three repetitions, 200 cases is 1,200 calls per run. Somewhere between 150 and 400 cases is reasonable for a three-person team: enough to cover each refund reason and the partial-refund edge cases several times, small enough to label by hand. The pass rule has two parts. The deterministic checks are absolute: zero approvals over the policy limit and zero amounts above the order total. The decision agreement with the labels is compared with the current production prompt on the same cases, as a paired comparison, and a drop beyond the noise measured between two runs of the baseline blocks. A fixed agreement threshold such as "95 percent" is unreasonable without measuring that noise first. Duolingo runs its evals as Temporal workflows with deterministic graders as the foundation and a judge as an option; the same split applies here.
+
+### Where the replay histories come from
+
+This is the decision with two defensible answers. Replaying real production histories in the PR gate catches paths the tests never produce, but it moves customer emails into CI, which the constraint forbids unless every payload is redacted, and redaction can change what the workflow code branches on. Replaying only histories from the test suite keeps the gate fast and clean, but misses the shapes only production creates. The plan does both, at different gates: recorded histories block merge, and real open workflows are replayed inside the production account before deploy. The cost is that a nondeterminism bug that only a real history exposes is found at deploy time, a day after merge, not in the PR. Fetching real histories with `list_workflows(...).map_histories()` needs Advanced Visibility on the server; confirm it before promising this job.
+
+### The fraud-check change, and the rollout
+
+Inserting an activity between steps 2 and 3 changes the commands the workflow issues, so every open workflow past step 2 would fail replay on a new worker. Most of the 2,000 open workflows are past step 2 and waiting on a timer for up to 96 hours. Wrap the new call in `workflow.patched("fraud-check")` so histories without the marker keep the old path; the production replay job proves this before deploy. Worker Versioning, where old workers keep running old code paths and new workers run new ones, is the alternative; it keeps the workflow code free of patch branches and costs running two worker deployments until the old workflows drain.
+
+Rollout, written down:
+
+1. Deploy the patched code with the fraud check on for new workflows only.
+2. Ship the model swap separately, a week later, after the golden set passes against the new model.
+3. Rollback triggers, any one of which rolls back the deploy:
+    - any nondeterminism error in worker logs;
+    - any refund issued twice for one idempotency key in the payment provider's report;
+    - the approval rate for workflows started after the deploy outside the range of the previous four weeks.
+4. Replace `patched` with `deprecate_patch` once no workflow that started before the deploy remains open: at least 96 hours after the deploy, checked by a visibility query, not assumed.
+
+### What this plan gives up, and how it fails
+
+What it gives up: no real model call and no real payment-provider call in most PR runs; production-history replay at deploy time instead of merge time; email de-duplication only as good as the sent-marker.
+
+The failure mode of the plan is that replay is a test of workflow code only. A change inside an activity, such as `load_order_and_policy` starting to return the refundable balance in cents instead of dollars, replays cleanly, because the recorded history carries the old activity results. Only the workflow tests with fresh fixtures and the golden set exercise activity code, so an activity change with no fixture update and no golden-set trigger reaches production untested. Add activity unit tests that run under `ActivityEnvironment` and a rule that any change to an activity's return type updates the fixtures in the same PR.
+
+## Follow-ups
+
+- *The merge gate takes 25 minutes and the team wants 10. Which layer leaves the merge gate, and what risk do you accept in writing?* The golden set leaves first, since prompts change less often than code. The risk accepted: a prompt or model change merged on Friday is graded by the nightly run on Saturday.
+- *What would you need to see in production to stop running the production replay job before every deploy?* Months of deploys where it never caught something the recorded-history replay missed, and an incident budget that tolerates a stuck-workflow incident during a 96-hour drain. Without both, keep it, since it is the only check that sees real open workflows.
+- *Security and the team disagree about exporting redacted production histories into CI. How do you settle it without deciding by rank?* Run both replay sources side by side for a month, count the bugs each catches that the other misses, and decide on that count and on the cost of the redaction pipeline.
+- *The payment provider changes its idempotency-key retention window. Which test fails first?* Only the nightly contract test, if it waits past the window; the fakes in the merge gate encode the old assumption and keep passing.
+
+## Common mistakes
+
+- Waiting on real timers, or setting the approval timeout to seconds in test config, so the 72-hour path that production takes is never the one tested.
+- Running replay only against the newest histories. Open workflows waiting on a timer are the ones a new worker replays, and they are the oldest.
+- Asserting the refund happened instead of asserting it happened once per key.
+- Grading the drafting model with a judge alone, so a policy-violating approval passes because the reason text reads well.
+- Shipping the fraud check and the model swap in one deploy, so a regression cannot be attributed to either.

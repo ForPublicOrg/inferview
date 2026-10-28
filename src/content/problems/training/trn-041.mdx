@@ -1,0 +1,119 @@
+---
+id: trn-041
+title: Two experts take most of the tokens
+subtitle: rank the causes from a diff and four log lines
+track: training
+module: moe
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 25
+core: false
+tags: [mixture-of-experts, routing, load-balancing, training-stability]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Fedus, Zoph and Shazeer, Switch Transformers (JMLR 2022, arXiv 2101.03961)
+    url: https://arxiv.org/abs/2101.03961
+    note: "balance loss alpha x N x sum f_i P_i; f (fraction of tokens dispatched) is not differentiable, P (fraction of router probability) is; minimised at 1/N each; alpha 10^-2; router input cast to float32 inside the router for stability; overflowed tokens skip the layer through the residual. Checked 2026-10-28."
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: "top-K affinities normalised over the selected experts to form gate values; per-expert selection bias as an alternative balancer. Checked 2026-10-28."
+choices:
+  - text: Router logits and softmax now run in bf16, so small score gaps round away and the router locks onto two experts
+    correct: false
+    why: It is a real defect that Switch Transformers warns about and it can make collapse faster, but a working balance loss would push back on it, and here the loss has stopped pushing at all.
+  - text: The balance loss is built from statistics taken without gradient, so it is logged but never trains the router
+    correct: true
+    why: The logged value rises from 1.01 to 10.28 while nothing pushes back, which is what a loss with no path to the router's weights looks like, and the stats helper runs under no_grad.
+  - text: Capacity factor 1.0 drops overflowing tokens, and the lost gradient starves the cold experts of any updates
+    correct: false
+    why: Dropped tokens are the hot experts' overflow, so the drops cost the hot experts gradient, not the cold ones; the drop rate grows after the skew, as a consequence of it.
+  - text: Top-2 gates are not renormalised over the chosen pair, so the hot experts take a larger share of the gradient
+    correct: false
+    why: Unnormalised top-k gates are a legitimate design choice used in published routers; they change output scale, not the balance pressure, and they were not touched by this change.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"A few thousand steps into a new MoE run, the routing dashboard shows two experts in every layer taking most of the tokens. The previous run on the same data did not. Here is the change and the logs. What happened, and what do you do before the next checkpoint?"
+</Callout>
+
+The model has 32 experts per layer with top-2 routing and alpha = 0.01. Between the two runs, one pull request refactored the router so that routing statistics could be logged, and a config change lowered the capacity factor from 1.25 to 1.0 to save memory.
+
+```diff
+ class Router(nn.Module):
+     def forward(self, x):
+-        logits = self.proj(x.float())
++        logits = self.proj(x)
+         probs = logits.softmax(dim=-1)
+         gate, idx = probs.topk(self.k, dim=-1)
+-        aux = load_balance_loss(probs, idx, self.n_experts)
+-        return gate, idx, aux
++        stats = self.stats(probs, idx)
++        aux = self.n_experts * (stats.f * stats.P).sum()
++        return gate, idx, aux, stats
++
++    @torch.no_grad()
++    def stats(self, probs, idx):
++        f = F.one_hot(idx, self.n_experts).float().mean(dim=(0, 1))
++        P = probs.mean(dim=0)
++        return RouterStats(f=f, P=P, max_over_mean=f.max() * self.n_experts)
+```
+
+```diff
+-capacity_factor: 1.25
++capacity_factor: 1.0
+```
+
+Layer 12, averaged over 50 steps. The aux column is the logged value of N x sum f_i P_i, before alpha.
+
+| step | aux (logged) | max load / mean load | dropped assignments |
+|---|---|---|---|
+| 500 | 1.01 | 1.3 | 1.8% |
+| 1,000 | 1.13 | 2.4 | 8.8% |
+| 2,000 | 3.56 | 7.2 | 38.8% |
+| 3,000 | 10.28 | 12.8 | 73.8% |
+
+<p class="tiny">The model, the logs and the numbers are synthetic. They are computed from a load split in which the two hottest experts share 8%, 15%, 45% and 80% of assignments, the rest spread evenly, and router probability equal to load.</p>
+
+You do not have the previous run's per-layer logs, a gradient-norm breakdown for the router, or the language-model loss per layer. Pick the cause of the collapse, then rank the other candidates by how much each would matter after the cause is fixed, and say what you would collect and what you would ship without it.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the router projection's gradient norm on one batch with only the auxiliary term in the loss.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the logged aux value did in the previous run over the same 3,000 steps.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask when the drop rate started climbing relative to the max-over-mean load.</p></details>
+
+## Answer
+
+The cause is the stats helper. `stats` is decorated with `torch.no_grad()`, so `P` comes back as a tensor with no graph, and `aux` is built from two gradient-free vectors. The value is correct, the dashboard shows it, and its gradient with respect to the router is zero. The balance loss works only through `P`: `f` comes from an argmax and never had a gradient, and `P` is the path that pushes probability away from overloaded experts. The refactor kept the number and removed the force. The logs read exactly like that: the aux value climbs tenfold over 3,000 steps and nothing pulls it back, because nothing can.
+
+The change hides the defect well: the new line computing `aux` is mathematically identical to the Switch formula, and the decorator sits on a helper whose name says it only computes statistics, which is also what a reviewer was told it was for.
+
+**Ranking the rest after the fix.**
+
+1. *bf16 router logits.* Real and second. Switch Transformers casts the router input to float32 inside the router specifically for stability, then casts the dispatch and combine tensors back so no float32 crosses the network. With a working balance loss the run may survive bf16 routing, but collapse becomes easier to trigger and harder to reproduce. Restore the cast; it costs almost nothing.
+2. *Capacity factor 1.0.* Real and third. It turns any imbalance into dropped tokens, and the 73.8% drop rate is what the skew costs under it. With balance restored and a balanced load near 1.0 times the mean, drops at 1.0 may be acceptable; measure them per layer before deciding to return to 1.25, which costs memory the team wanted back.
+3. *Unnormalised top-2 gates.* Not a defect. Normalising over the selected experts, as DeepSeek-V3 does, is one design; using the raw top-k probabilities is another, and this change did not touch it.
+
+**What to collect.** The router weight gradient from the auxiliary term alone on one batch (zero confirms it in a minute), the previous run's aux curve for the same steps, and per-layer drop rates. **What to ship without it.** Moving `P` out of the `no_grad` helper (compute `f` there for logging, `P` in the forward pass) and restoring the float32 cast are safe today, since neither changes anything a correct run depends on.
+
+**Restart or continue.** That is the decision with two defensible answers. Continuing from the latest checkpoint with the fix keeps 3,000 steps of compute, but the router and the two hot experts have trained into a collapsed state, and a balance loss at 0.01 may take a long time to pull it back, or settle into a different local skew. Restarting from the last checkpoint before step 1,000, where max-over-mean was 2.4, throws away 2,000 of the 3,000 steps and starts from a router that was still close to balanced. The choice depends on how much compute the steps represent against how long recovery takes: run both for a few hundred steps if the budget allows and pick by max-over-mean and loss.
+
+**How the fix fails.** A per-batch balance loss with small micro-batches still lets individual sequences collapse onto a few experts; and if someone later moves `P` back into a logging helper, the same bug returns silently. Add an assertion that `aux.requires_grad` is true in the training step, and a test that the router receives gradient from the auxiliary term alone.
+
+## Follow-ups
+
+- *Your restart decision costs a day of cluster time, and the deadline does not move. Which of the three fixes do you ship if you can only restart once, and what risk do you write down?*
+- *After the fix, two layers still sit at 4 times the mean load while the rest are balanced. Would you raise alpha globally, per layer, or switch those layers to a bias balancer, and what would make you reverse that?*
+- *How would you make this class of bug, a loss that is logged but carries no gradient, fail CI instead of failing a run?*
+
+## Common mistakes
+
+- Picking bf16 because it is the most familiar MoE stability fix, without checking whether the balance loss still has a path to the router.
+- Treating the drop rate as the cause; it rises after the skew and is a symptom of it under a tighter capacity.
+- Raising alpha, which multiplies a gradient of zero.
+- Reading only the newest log line; the slope from step 500 to 1,000, with the aux value already rising, is the evidence that the balancer is absent rather than overwhelmed.

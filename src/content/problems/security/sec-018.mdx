@@ -1,0 +1,126 @@
+---
+id: sec-018
+title: The sandbox with a reviewed allowlist
+track: security
+module: sandboxing-secrets
+type: critique
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [egress, allowlists, exfiltration, credentials, sandboxing, agents]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Anthropic Engineering, How we contain Claude across products (2026-05-25)
+    url: https://www.anthropic.com/engineering/how-we-contain-claude
+    note: "Cowork's egress allowlist permitted api.anthropic.com; a file in the workspace carried hidden instructions and an attacker's API key, and Claude uploaded workspace files through the Files API to the attacker's account; the sandbox worked and the data still left; every function reachable through an allowlisted domain is attack surface; the fix was a proxy inside the VM that passes only requests carrying the VM's own session token and blocks headers that enable server-side fetch; credentials stay in the host keychain and the VM gets a scoped, revocable per-session token"
+  - title: Claude Code docs, Sandboxing (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/sandboxing
+    note: "the proxy allows by client-supplied hostname and does not terminate or inspect TLS by default; broad domains such as github.com can be exfiltration paths and domain fronting can reach hosts off the list; an allowedDomains entry with no port allows every port on that host; effective sandboxing needs filesystem and network isolation together"
+  - title: Claude Code docs, Securely deploying AI agents (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/agent-sdk/secure-deployment
+    note: "if the agent has permissive credentials for an allowed domain, ensure it cannot use that domain to trigger other requests or exfiltrate; inject credentials through a proxy outside the boundary; read-only mounts can still expose credential files"
+  - title: Model Context Protocol, Security Best Practices (specification revision 2026-07-28)
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/security_best_practices
+    note: "block link-local 169.254.0.0/16 including cloud metadata; use egress proxies that block internal destinations"
+checklist:
+  - Names that allowing api.anthropic.com with any key lets an injected instruction upload workspace files to an attacker's account, because the allowlist checks the host and not whose key the request carries
+  - Spots that the Slack webhook host accepts any workspace's webhook URL, and a webhook URL is all an attacker needs to receive data
+  - Spots that the S3 wildcard allows writes to any bucket, including one the attacker owns, and that the AWS keys inside the sandbox make reads of other buckets possible too
+  - Notes that github.com allows pushes, gists and issues to any account the request authenticates as, when the task needs one read of one repository
+  - Spots that the sandbox resolves names through the VPC resolver, so DNS queries for an attacker's domain carry data out with no HTTP request at all
+  - Names that the proxy decides from SNI without terminating TLS, so domain fronting can reach a host that is not on the list
+  - Moves every credential out of the sandbox, the mounted key file and the environment variables, into a proxy or a host-side tool that attaches them
+  - Judges that pypi.org and files.pythonhosted.org are acceptable if the proxy allows GET only and installs are pinned by hash or served from an internal mirror
+  - Restricts each remaining host by method, path and the sandbox's own session token, which needs a TLS-terminating proxy, and weighs that cost against moving the call out of the sandbox
+  - Sets ports to 443 for every host instead of any
+  - Asks for a test per allowlisted host that tries to send data to an attacker-controlled account through it, and for an outbound-bytes alert per session
+  - States a failure mode of the fix, such as the TLS-terminating proxy becoming a component that sees every customer's data in plaintext
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Critique, 30 minutes">
+A platform team built an analyst agent: a customer uploads files, the agent loop runs inside a gVisor sandbox, writes and runs Python against the files and a customer's dataset bucket, and posts a report to the customer's Slack channel. Security reviewed and approved the sandbox's egress configuration below. Two weeks later a customer's internal pricing sheet showed up in a Slack workspace that does not belong to them. List every flaw you find in the configuration and the design note, then say what you would change and what the change costs.
+</Callout>
+
+The approved configuration:
+
+```yaml
+# sandbox/analyst.yaml  (approved by security review 2026-09-14)
+runtime: gvisor
+network:
+  mode: proxy                 # no direct route out; all TCP goes through egress-proxy
+  allowed_domains:
+    - api.anthropic.com       # the agent loop's model calls
+    - pypi.org
+    - files.pythonhosted.org
+    - github.com              # clone the analysis-templates repository at start
+    - "*.s3.amazonaws.com"    # customer dataset buckets
+    - hooks.slack.com         # post the finished report
+  allowed_ports: any
+  dns: vpc-resolver           # UDP 53 to the VPC resolver
+mounts:
+  - path: /workspace
+    mode: rw
+  - path: /home/agent/.config/analyst   # model key, Slack webhook URL, AWS keys
+    mode: ro
+env:
+  ANTHROPIC_API_KEY: file:/home/agent/.config/analyst/anthropic
+  AWS_ACCESS_KEY_ID: file:/home/agent/.config/analyst/aws_id
+  AWS_SECRET_ACCESS_KEY: file:/home/agent/.config/analyst/aws_secret
+```
+
+From the design note: "The proxy allows a connection when the TLS server name is on the list. It does not terminate TLS, so customer data stays encrypted end to end. The AWS keys belong to a role with read access to the datasets bucket. The agent cannot reach anything that is not on the list, so a prompt injection has nowhere to send data."
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>For each allowed host, ask what a request to it can do besides the one thing the comment says, and whose account it acts on.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the proxy logs for the incident session, including request sizes, and the DNS resolver's query log for the same minutes.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask which credentials a process inside the sandbox can read, and which of them the task needs inside rather than at the edge.</p></details>
+
+## Answer
+
+The flaws, roughly in the order a reviewer finds them.
+
+**The design note's last sentence is the bug.** "Nothing that is not on the list" is true and beside the point: six hosts are on the list, and each accepts writes. An allowlist entry grants every function the host exposes to anyone who can authenticate to it, which is the lesson Anthropic took from its own Cowork incident.
+
+**hooks.slack.com is an open mailbox.** A Slack incoming-webhook URL is the whole credential. The agent posts to the customer's webhook, but the proxy would pass a post to any webhook URL on the same host. A file the customer uploaded, or a page the agent read, carries an instruction and the attacker's webhook URL; the agent posts the pricing sheet there. This is the most likely explanation for the incident, and the proxy logs from Hint 2 would show a post to hooks.slack.com that the report step did not make. The DNS log would rule the next flaw in or out.
+
+**api.anthropic.com with a key in the sandbox, or with any key.** The same shape as the Cowork incident: a planted file carried hidden instructions and an attacker's API key, and the agent uploaded workspace files through the Files API to the attacker's account. The proxy saw an allowed host. Here it is worse, because the organisation's own key is also readable inside the sandbox.
+
+**The S3 wildcard.** `*.s3.amazonaws.com` covers every bucket in the world, including one the attacker created to receive a PUT, and with the keys in the environment the agent can also read any bucket the role can, not only this customer's.
+
+**github.com for one clone.** The task needs one read of one repository at start. The entry allows pushes, gists and issues to any account the request carries a token for. Bake the templates into the image and drop the entry.
+
+**DNS is a channel, and it is not on the list.** The sandbox sends UDP 53 to the VPC resolver, which recurses to whoever is authoritative for the queried name. Data encoded in the labels of `<data>.attacker.example` leaves with no HTTP request at all. Reviewers read the allowlist and miss the line below it.
+
+**SNI is the client's claim.** The proxy decides on the TLS server name without terminating TLS. Claude Code's documentation warns about its own proxy in the same position: with a broad allowed domain, domain fronting can reach hosts that are not on the list.
+
+**Credentials inside the sandbox.** The key file is mounted read-only, which stops writes, not reads, and the same keys are in the environment of every process. Every credential here should be attached outside: the Cowork fix keeps credentials in the host keychain and gives the VM a scoped, revocable per-session token.
+
+**Ports.** `any` allows every port on six hosts. Use 443.
+
+**The decision with two defensible answers: inspect inside, or take the calls out.**
+
+- **A TLS-terminating proxy with rules per host.** Install the proxy's CA in the sandbox, then allow per host by method, path and the sandbox's own session token: GET only for PyPI, only the customer's bucket for S3, only requests carrying the session's token for the model API, as Anthropic's Cowork proxy does. The agent loop and the code keep working unchanged. The cost: the proxy sees every customer's data in plaintext and becomes the component an attacker wants most, every allowed host needs rules that track its API, and the team owns a certificate authority.
+- **No network for code; host-side tools for the rest.** Move the agent loop out of the sandbox, so model calls never originate inside. Cowork moved its own loop out of the VM for start-up reliability and says the move had little security effect, because there the VM still held the code; here it matters because the model key and the model API leave the sandbox with it. Datasets arrive as files the host fetched with presigned URLs; the report goes out through a host-side tool that knows only the customer's webhook; packages come from the image or an internal mirror. The sandbox gets no network at all. The cost: every new need is a new tool to build, and analyses that fetch public data at run time stop working.
+
+The conflict is the agent's autonomy against the size of the exfiltration surface. I would take the second for this product, because the task's network needs are few and known, and keep a TLS-terminating proxy only for package installs from a mirror, if at all. The number to set is the outbound-bytes alert per session: take a week of proxy logs from legitimate sessions and alert at a multiple of the 99th percentile. I would start at 2 times, because report posts are small and regular; a multiple below 1.5 will page on ordinary large reports, and an alert set from a guess rather than the logs is the unreasonable choice.
+
+**Where the fix fails.** The host-side report tool still sends whatever the agent writes in the report to the customer's channel, so an injection can put another customer's data in it only if that data was ever in this sandbox, which is why sandboxes are per customer. And a file the customer uploaded can still steer the analysis and the report text; containment limits where data goes, not what the agent says.
+
+## Follow-ups
+
+- *Moving the model loop out of the sandbox costs the team six weeks and delays two customer launches. Which half of the fix ships first, and what risk do you accept in writing until the rest lands?*
+- *What would you need to see in proxy logs to put github.com back on the list for a customer who wants the agent to open pull requests?*
+- *Security says the reviewed allowlist was "approved" and asks whether the review process failed or the config did. What do you change in the review?*
+
+## Common mistakes
+
+- Reading an allowlist as a list of destinations instead of a list of capabilities.
+- Fixing the Slack entry and leaving the S3 wildcard, the model API and DNS open.
+- Moving keys from the environment to a mounted file, which the agent can read just as well.
+- Adding a TLS-terminating proxy without counting what it now sees and who can reach it.

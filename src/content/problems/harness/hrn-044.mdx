@@ -1,0 +1,135 @@
+---
+id: hrn-044
+title: Twelve agents, one bare repository and a claim script
+track: harness
+module: long-running-parallel
+type: critique
+difficulty: hard
+seniority: [staff]
+minutes: 35
+core: false
+tags: [parallel-agents, task-claiming, git, locking, leases, coding-agents]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Anthropic Engineering, Building a C compiler with a team of parallel Claudes (Nicholas Carlini, 2026-02-05)
+    url: https://www.anthropic.com/engineering/building-c-compiler
+    note: "16 agents in Docker containers against a bare upstream repository mounted at /upstream; an agent takes a lock by writing a text file to current_tasks/, git's synchronization forces a second claimant to pick another task, and the agent removes the lock after pulling, merging and pushing; no orchestration agent; merge conflicts were frequent; a CI pipeline was added near the end so new commits stopped breaking existing code; on the Linux kernel every agent hit the same bug and overwrote the others' fixes until GCC was used as an oracle; one session ran pkill -9 bash and killed its own loop"
+  - title: Git documentation, git-rebase (checked 2026-10-28)
+    url: https://git-scm.com/docs/git-rebase
+    note: "by default a rebase drops commits whose changes are already upstream, unless --reapply-cherry-picks is given"
+  - title: Cognition, Don't build multi-agents (Walden Yan, 2025-06-12)
+    url: https://cognition.com/blog/dont-build-multi-agents
+    note: "actions carry implicit decisions, and conflicting decisions carry bad results"
+checklist:
+  - "Finds the race: two agents write identical lock files, the second agent's pull --rebase drops its claim commit as already applied, its push succeeds as a no-op and both print claimed"
+  - Notes that with different lock contents the second agent hits an add/add conflict and set -e exits the script mid-rebase, leaving the workspace in a state the prompt does not cover
+  - Notes that a lock has no owner, expiry or heartbeat, so a session that ends at --max-turns, crashes or is killed leaves the task locked forever, and the next session in a fresh clone does not know it held it
+  - Notes that task names are free text chosen by the agent, so the same failing test can be claimed under two names
+  - Notes that the push rule only covers the tests the agent touched, so merged work can break the rest of the suite on main
+  - Rewrites claiming with a unique owner and expiry in the lock, a check after push that the upstream lock is still the agent's own, and an abort to a clean tree when it is not
+  - Releases the lock in the same push as the work, so the fast-forward rule acts as the compare-and-swap and a lost lock shows up as a conflict
+  - Chooses the lease length from measured task durations and states what happens to a slow agent whose lease expires
+  - "Judgement call: git as the lock service is acceptable if claims are rare next to push latency and every lock names its owner; at much higher agent counts a lease service is worth its cost"
+  - "Judgement call: no orchestrator is acceptable if the failing tests are independent; when many failures share one cause, parallel agents duplicate the fix and the work needs splitting first"
+  - States a failure mode of the fixed scheme, such as heartbeat commits adding push contention or an expired lease taken over from an agent that was still working
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Critique, 35 minutes">
+Your team copied the setup from Anthropic's C compiler post to run twelve agents against a backlog of about 400 failing conformance tests in a parser library. Below are the loop, the prompt excerpt and the two scripts. A reviewer approved them. List every flaw you find, starting with the one that lets two agents work on the same task, then say how you would fix the scheme and what the fix costs.
+</Callout>
+
+Each agent runs in its own container with the bare upstream repository mounted at `/upstream` and no network access.
+
+```bash
+# loop.sh, one per container
+while true; do
+  rm -rf /workspace && git clone -q /upstream /workspace && cd /workspace
+  claude --dangerously-skip-permissions -p "$(cat /harness/AGENT_PROMPT.md)" \
+    --max-turns 200 > "/logs/agent_$(date +%s).log" 2>&1
+done
+```
+
+From `AGENT_PROMPT.md`:
+
+```text
+Pick the most important failing conformance test that nobody is working on.
+Name your task in snake_case after what you will fix, for example fix_ternary_precedence.
+Run ./claim.sh <task> before you change any code. If it prints "taken", pick something else.
+When your fix is pushed, run ./release.sh <task>.
+Never push if the tests you touched fail.
+```
+
+```bash
+#!/usr/bin/env bash
+# claim.sh <task>
+set -e
+TASK="$1"
+git pull --rebase --quiet origin main
+if [ -f "current_tasks/$TASK.txt" ]; then
+  echo "taken"; exit 1
+fi
+echo "$TASK" > "current_tasks/$TASK.txt"
+git add "current_tasks/$TASK.txt"
+git commit -qm "lock: $TASK"
+until git push -q origin main; do
+  git pull --rebase --quiet origin main
+done
+echo "claimed"
+```
+
+```bash
+#!/usr/bin/env bash
+# release.sh <task>
+set -e
+TASK="$1"
+git pull --rebase --quiet origin main
+git rm -q "current_tasks/$TASK.txt"
+git commit -qm "release: $TASK"
+git push -q origin main
+```
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Run two copies of <code>claim.sh</code> for the same task by hand, interleaved: both check, both commit, one pushes first. What does the second one's pull do with its commit?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask how a session ends when it reaches 200 turns, and what the next session in that container knows about the previous one's locks.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the list of lock file names after a day of running. How many of them refer to the same failing test?</p></details>
+
+## Answer
+
+**The race.** Agents A and B both pull, both see no lock, and both commit a lock file whose content is the task name, so the two commits make the identical change. A pushes first. B's push is rejected, and B runs `git pull --rebase`. By default a rebase drops a commit whose change is already upstream, so B's claim commit disappears, B's branch now equals upstream, the next `git push` succeeds with nothing to push, and the script prints `claimed`. Both agents work on the same test. The reviewer missed it because the scheme reads as "git rejects the second push", and it does; the retry loop then turns the rejection into success. Writing the same command sequence by hand in two clones reproduces it.
+
+**The conflict path.** If the lock contents differed, B's rebase would stop on an add/add conflict. `set -e` applies inside the `until` body, so the script exits non-zero in the middle of a rebase without printing either `taken` or `claimed`. The prompt covers neither, and the agent now holds a workspace in a rebase state.
+
+**Locks never expire.** A lock has no owner and no expiry. A session that reaches `--max-turns 200` mid-task ends without running `release.sh`, and so does one that crashes; the C compiler post records a session that ran `pkill -9 bash` and killed its own loop. The next iteration deletes `/workspace`, clones fresh and has no record that this container held the lock. With a turn cap, this is not rare: every long task that hits the cap leaves a lock behind, and no one ever takes that test again.
+
+**Locks name strings, not work.** The agent invents the task name. `fix_ternary_precedence` and `fix_conditional_expression_parsing` can be the same failing test, and both claims succeed. Lock by a canonical identifier the harness generates, the failing test's ID.
+
+**The push rule protects only the agent's own tests.** "Never push if the tests you touched fail" lets a fix that passes its own test break others on `main`, and with twelve agents merging, `main` drifts. The C compiler post added a CI pipeline near the end for exactly this. A pre-receive hook on the bare repository that runs a fast sample of the suite is the cheapest gate here.
+
+**The fix.** Write the owner and an expiry into the lock (`agent-07 2026-10-28T03:10Z expires 06:10Z`), so contents always differ. After the push loop, compare `git show origin/main:current_tasks/<id>.txt` with what you wrote; if the conflict path fires or the content is not yours, run `git rebase --abort`, `git reset --hard origin/main` and report `taken`. Release the lock in the same commit as the work. Then the fast-forward rule on `main` is the compare-and-swap: if another agent replaced your expired lock while you worked, your work push conflicts on the lock file and you learn you lost it before your work lands. A session that finds an expired lock may take it over by replacing the file through the same push.
+
+**The quantity: lease length.** Choose it from task durations in the logs, not from a guess. If tasks take a median of 40 minutes and a 95th percentile of 2.5 hours (scenario numbers), a 3-hour lease lets fewer than one task in twenty run past its lease and risk a takeover. A 1-hour lease sits above the median and below the 95th percentile, so some share of tasks between those two would run past it; how large a share depends on the distribution between them, which the logs give you. Heartbeat commits every 30 minutes extend the lease and cost 12 agents × 2 pushes an hour, 24 extra pushes an hour on the same ref.
+
+**Keep git or move to a lease service.** Both are defensible. Git needs no new infrastructure, keeps the containers off the network, and the history is the audit log of who claimed what. A lease service (a table with a conditional update and a TTL) gives real compare-and-swap and expiry without commit noise; it costs a service to run, a tool for the agents and network access from containers that have none today. The conflict is isolation against coordination correctness. At twelve agents I keep git with the fixes above.
+
+**Failure mode of the fixed scheme.** An agent whose lease expired while it was still making progress loses the task to a newcomer, and if it pushes before noticing, the lock conflict saves the work from landing twice but the tokens are already spent. Heartbeats also add push contention on one ref, and every rejected push costs the agent a pull and a retry.
+
+**What no lock fixes.** Locks prevent two agents taking the same task. They do nothing when many failing tests share one root cause: every agent claims a different test and fixes the same parser bug in its own way, the conflict Cognition describes as parallel actions carrying conflicting decisions. Before fanning out, group the failures by first failing assertion or stack, and claim groups.
+
+## Follow-ups
+
+- *Pushback: heartbeats double the commit history and reviewers complain. Do you drop them, lengthen the lease, or move locks out of git, and what risk do you accept in writing?*
+- *Reversal: what would you need to see in a week of logs to move to a lease service?*
+- *Two senior engineers disagree: one wants an orchestrator agent that assigns tasks, the other wants no orchestrator. How do you decide without deciding by rank?*
+- *Operating: after the fix, 30 of the 400 tests are still failing after five days and every agent that claims one hits the turn cap. What do you change?*
+
+## Common mistakes
+
+- Trusting the push rejection as the mutual exclusion without asking what the retry loop does after it.
+- Adding expiry without fencing, so an agent that lost its lock still lands its work.
+- Naming the lock after the agent's description of the work instead of a canonical ID.
+- Blaming merge conflicts on the agents when the scheme has no gate on `main`.

@@ -1,0 +1,142 @@
+---
+title: "Constrained decoding: what a grammar mask guarantees and what it costs"
+track: foundations
+module: sampling
+order: 3
+kind: lesson
+level: senior
+minutes: 15
+summary: A grammar mask removes invalid tokens before each draw, which guarantees syntax for a response that finishes and says nothing about whether its values are right.
+prerequisites: [foundations/sampling/samplers]
+updated: 2026-10-28
+sources:
+  - title: "XGrammar: Flexible and Efficient Structured Generation Engine for Large Language Models (2024)"
+    url: https://arxiv.org/abs/2411.15100
+    note: vocabulary split into context-independent tokens checked ahead of time and context-dependent tokens checked at runtime; persistent stack; grammar work overlapped with GPU execution; abstract claims up to 100x speedup over existing solutions and near-zero overhead end to end; checked 2026-10-28
+  - title: vLLM docs, structured outputs
+    url: https://docs.vllm.ai/en/latest/features/structured_outputs.html
+    note: choice, regex, json, grammar and structural_tag; xgrammar and guidance backends, auto selection; regex syntax differs by backend so switching can change output; reasoning parser keeps reasoning separate; tags such as </think> need token-level structural tags in XGrammar; guided_* fields removed in v0.12.0; schema in the prompt recommended; checked 2026-10-28
+  - title: Claude docs, structured outputs
+    url: https://platform.claude.com/docs/en/build-with-claude/structured-outputs
+    note: schema compiled to a grammar; extra latency on first use; grammars cached 24 hours from last use; refusal and max_tokens can break the schema; reasoning-style properties can trigger a reasoning_extraction refusal; enum casing not guaranteed; no recursive schemas, numerical or string-length constraints; limits of 20 strict tools, 24 optional parameters, 16 anyOf or type-array parameters, 180 s compile timeout; checked 2026-10-28
+  - title: Claude docs, thinking (response prefill)
+    url: https://platform.claude.com/docs/en/build-with-claude/thinking
+    note: Claude 4.6 and later reject a prefilled final assistant turn with a 400 error; checked 2026-10-28
+  - title: "Let Me Speak Freely? A Study on the Impact of Format Restrictions on Performance of Large Language Models (Tam et al., 2024)"
+    url: https://arxiv.org/abs/2408.02442
+    note: "JSON-mode, format-restricting instructions and NL-to-format compared; reasoning degraded under restriction, e.g. GPT-3.5 Turbo GSM8K 76.6% free-form against 49.3% JSON-mode; classification mixed: Gemini 1.5 Flash DDXPlus 41.6% to 60.3%, GPT-3.5 Turbo Sports 67.2% to 80.0%, Claude 3 Haiku Task280 61.1% to 49.5%; answers extracted with Claude 3 Haiku as parser; checked 2026-10-28"
+  - title: Say What You Mean, a response to Let Me Speak Freely (Will Kurt, dottxt)
+    url: https://blog.dottxt.ai/say-what-you-mean.html
+    note: "vendor's own rerun on Llama-3-8B-Instruct: GSM8K 0.77 unstructured, 0.78 structured; Last Letter 0.73, 0.77; Shuffled Objects 0.41, 0.44; criticises different prompts per condition and the LLM parser (Last Letter: strict regex 0.35, AI parser 0.57, flexible regex 0.61); checked 2026-10-28"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+There are three ways to get structured data out of a model: constrain decoding to a schema, have the model call a tool whose input schema is enforced, or let it write freely and validate and repair afterwards. The first two remove invalid tokens before each draw; the third rejects invalid outputs after the fact. The choice per task turns on what the constraint guarantees, what it costs at compile time and per token, and whether it changes the content. This lesson takes the three in that order.
+
+## The mechanism
+
+At each decoding step the engine holds a parser state for the output so far. Before sampling it computes the set of vocabulary tokens that can extend the output and still be a prefix of some string in the grammar, and sets every other token's logit to minus infinity. The sampler then runs as usual over what is left. Greedy, top-p and min-p all compose with the mask, because the mask is applied first and the samplers renormalise. A schema becomes a grammar by compilation, the way a regular expression becomes an automaton before it matches anything.
+
+The hard part is that tokens do not line up with grammar symbols. One token may close a string, add a comma and open the next key; another may be half of a keyword. So the check per token is not "is this symbol legal next" but "does the parser accept this whole byte sequence from the current state", and that has to be answered for every token in the vocabulary at every step. With a vocabulary of 128,000 entries and a 400-token response, that is 128,000 x 400 = 51.2 million token checks for one response if done naively.
+
+XGrammar's answer is to split the vocabulary. For most tokens, whether they are accepted depends only on the grammar position, not on the parser stack below it, so those context-independent tokens can be checked once per grammar position ahead of time and stored as a mask. Only the context-dependent remainder is checked at runtime, against a persistent stack that makes branching cheap, and the grammar work runs on the CPU while the GPU computes the next logits. The paper's abstract claims up to 100x speedup over existing solutions and near-zero overhead in end-to-end serving; the abstract does not name the baselines, so treat the 100x as the paper's own comparison.
+
+The token-boundary problem has a second consequence: the same text can be reached by different token sequences, and the mask allows all of them. A model trained on one tokenization of `{"label": "` may find the mask has steered it into another, which is a sequence it rarely saw in training. The toy below shows the mask and the choice.
+
+```python
+LABELS = ["billing", "bug", "outage"]
+VALID = [f'{{"label": "{l}"}}' for l in LABELS]
+
+def allowed(prefix, vocab):
+    return [t for t in vocab if any(v.startswith(prefix + t) for v in VALID)]
+
+def constrained_greedy(logits_for, vocab):
+    out = ""
+    while out not in VALID:
+        ok = allowed(out, vocab)
+        scores = logits_for(out)
+        out += max(ok, key=lambda t: scores.get(t, -1e9))
+    return out
+
+vocab = ['{"', 'label', '":', ' "', 'b', 'illing', 'ug', 'out', 'age', '"}', 'Sure', '!', '{"label": "']
+
+def model(prefix):
+    return {"Sure": 5.0, "!": 4.0, '{"': 1.0, '{"label": "': 0.5, "label": 1.0, '":': 1.0, ' "': 1.0,
+            "b": 1.0, "ug": 0.9, "illing": 0.8, "out": 0.7, "age": 1.0, '"}': 1.0}
+
+print(allowed("", vocab))                 # ['{"', '{"label": "']
+print(constrained_greedy(model, vocab))   # {"label": "bug"}
+```
+
+The scripted model wants to say "Sure". The mask removes that, and two tokenizations of the opening survive. The label it lands on, `bug`, comes from the masked logits at the step where `b` was chosen and `ug` beat `illing`; nothing in the mask knows which label is right. A real engine computes `allowed` from a compiled automaton rather than by listing the language, which is the work XGrammar makes cheap.
+
+## What it guarantees, exactly
+
+A response that finishes matches the grammar. Three things can still break that or make it useless, and Claude's structured-outputs documentation lists them.
+
+- **Refusals.** Safety behaviour takes precedence over the schema. The response returns 200 with `stop_reason: "refusal"`, is billed, and may not match the schema. Properties that ask for step-by-step reasoning can themselves trigger a `reasoning_extraction` refusal; the docs suggest asking for a short explanation instead.
+- **Truncation.** With `stop_reason: "max_tokens"` the object is cut off and does not parse.
+- **Values.** Casing of `enum` and `const` strings is not guaranteed: an enum containing "Conversation topic 3" can come back as "Conversation Topic 3". Compare case-insensitively and do not define enum values that differ only in case.
+
+And the schema language is narrower than JSON Schema. Recursive schemas, numerical constraints such as `minimum` and `maximum`, and string length constraints are unsupported and return 400. Array `minItems` is limited to 0 or 1. Across all strict schemas in one request, the limits are 20 strict tools, 24 optional parameters and 16 parameters using `anyOf` or type arrays, with a 180-second compile timeout; a schema too complex for compilation returns 400. The first request with a new schema pays compile latency, and compiled grammars are cached for 24 hours from last use, with any change to the schema structure, or to the set of tools when both are used, invalidating the cache.
+
+<Predict id="constrained-optional-params" question="One request carries 5 strict tools with 4 optional parameters each, plus a JSON output schema with 6 optional fields. How many optional parameters count against the per-request limit?" answer={26} tolerance={0} unit="parameters">
+<p><b>26</b>, from 5 x 4 + 6. The limit is 24 across all strict tool and JSON output schemas in the request, so the request fails with a 400 before generating anything. The usual fixes are to make fields required with an explicit empty value, or to split the tool set by route so each request carries only the tools it can use. Making them required and nullable through a type array moves them under the separate limit of 16 parameters using `anyOf` or type arrays, so that route has a ceiling of its own. Each tool you remove from a request also changes the tool set, which invalidates the cached grammar for that combination.</p>
+</Predict>
+
+vLLM exposes the same mechanism with more choice. A request can constrain to a fixed `choice` list, a `regex`, a `json` schema, a context-free `grammar`, or a `structural_tag` that applies a schema only inside given tags. The backends are xgrammar and guidance, with `auto` choosing per request. The regex dialect differs by backend, and the docs warn that switching backends can change the allowed tokens and so the output; validate before migrating. With a reasoning model, a reasoning parser keeps the reasoning text outside the constraint and applies the schema to the answer, and grammars that must match boundaries such as `</think>` need token-level structural tags, because matching the decoded text is not enough. The `guided_json` and `guided_regex` fields were removed in v0.12.0 in favour of `structured_outputs`, which matters if your client code predates that.
+
+On Claude the older way to force JSON, starting the assistant turn with an opening brace, is gone: Claude 4.6 and later models reject a prefilled final assistant turn with a 400 error. Structured outputs and strict tool use replace it.
+
+## Does the constraint change the answer
+
+In 2024 Tam et al. compared three ways of getting formatted output: constrained decoding (JSON-mode), instructions to answer in a format, and answering in natural language and converting afterwards. On reasoning tasks the restricted formats did worse, with JSON-mode usually worst: GPT-3.5 Turbo on GSM8K scored 76.6% in natural language and 49.3% in JSON-mode. On classification the results went both ways. JSON-mode raised Gemini 1.5 Flash on DDXPlus from 41.6% to 60.3% and GPT-3.5 Turbo on Sports from 67.2% to 80.0%, and lowered Claude 3 Haiku on Task280 from 61.1% to 49.5%. Free-form answers were scored by using Claude 3 Haiku as an answer extractor.
+
+dottxt, which sells structured generation, replied by rerunning the reasoning tasks on Llama-3-8B-Instruct with the same prompt in both conditions and the schema and an example in the prompt. Its own numbers show structured at or above unstructured: GSM8K 0.78 against 0.77, Last Letter 0.77 against 0.73, Shuffled Objects 0.44 against 0.41. It also measured the parser: on Last Letter, a strict regex scored 0.35, the LLM parser 0.57 and a flexible regex 0.61, so the original paper's free-form scores depend on how answers were extracted.
+
+Both are measurements on different models, prompts and harnesses, and both sides have an interest. What survives is a mechanism and a procedure. The mechanism: a schema whose first field is the answer forces the model to commit before any reasoning tokens, and a mask that bans the model's preferred opening pushes it onto token paths it rarely saw. The procedure: put the schema and an example in the prompt (vLLM's docs recommend this too), let the model reason before the constrained part (a reasoning field first, or a reasoning model with the constraint applied to the answer only), and measure accuracy with and without the constraint on your own labelled set before deciding the constraint is free.
+
+## Choosing per task
+
+**Strict schema decoding** fits extraction and classification where the output is data a program consumes and the schema fits inside the supported subset. You still handle refusal and truncation, compare enums case-insensitively, and validate the rules the schema language cannot express, such as a total that must equal the sum of line items.
+
+**Strict tool use** is the same mask on tool names and inputs, and fits when the model chooses whether and which tool to call. Its limits are shared with JSON outputs in one request, so a large tool catalogue competes with the output schema for the same optional-parameter budget.
+
+**Validate and repair** fits when the schema uses features the grammar compiler rejects, when the provider or engine offers no constraint, or when the measured accuracy under the constraint is lower. It costs a retry on failure and a second round of latency, and its failure rate is a number you can track.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"An insurance intake service extracts 40 fields from claim letters with strict schema decoding on a hosted model. After a schema change added 12 optional fields, a quarter of requests fail with 400 and the team wants to drop the constraint and parse free text. Release is in two weeks and the downstream system rejects any record that does not validate. What do you do?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>The 400s are the per-request limits, not the constraint failing, so I would keep strict decoding and restructure the schema: make most optional fields required, with an explicit empty value or a nullable type for at most 16 of them, which removes them from the optional count, and split the extraction into two calls by section if the schema is still too complex to compile. Dropping the constraint moves the failure to parse errors and repairs, which the downstream validator will reject. I would accept a second call's latency and cost, and write down that the two calls can disagree on shared fields.</p>
+</Fragment>
+<Fragment slot="long">
+<p>First, confirm the 400s: if they name the optional-parameter or complexity limit, the schema change is the cause, and the fix is in the schema. Required fields with an explicit empty value express "may be absent" without counting against the optional budget; nullable type arrays do the same but count against the separate limit of 16. If the schema still fails to compile, splitting it by section of the letter (claimant, incident, policy) gives two or three smaller schemas, at the cost of one extra call per letter and a merge step.</p>
+<p>The alternative, free text with validate and repair, is defensible if the constrained version's accuracy is measurably worse on our labelled letters. With two weeks I would run both on the labelled set: field-level accuracy, the rate of records that fail the downstream validator, and p95 latency. If the constrained version wins or ties, ship the restructured schema; if free text wins on accuracy, ship it with a repair loop and a hard cap on retries, and accept a non-zero rejection rate in writing.</p>
+<p>The failure mode of the recommended answer is that required fields with an empty value make "absent" and "the model did not find it" the same value. A field that is null at a much higher rate after the change than before is the signal; I would track null rate per field from day one.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Splitting adds a second call and doubles your token spend on long letters. Product says that is not in budget. Which fields do you drop from the schema, and who agrees to losing them?</em></li>
+<li><em>The labelled set shows free text is two points more accurate on fields but fails the downstream validator three times as often. Which do you ship?</em></li>
+<li><em>What would you need to see in production after launch to move from strict decoding back to validate and repair?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The lesson describes the mask as exact: every disallowed token gets probability zero. That holds for the engines and APIs cited here, but a provider's "JSON mode" may be a trained behaviour rather than a mask, with no guarantee at all; read which one you have. The quality evidence is contested and model-specific, and the models in both studies are now old; newer models trained heavily on tool calls and structured outputs may show neither the degradation nor the gain, which is a reason to measure rather than a reason to assume it is gone.
+
+The supported-feature list and limits quoted here are one provider's, as of the date checked. They change with releases, and other providers and engines publish different lists. And a mask over tokens says nothing about semantics: the model can fill every field with a plausible, schema-valid, wrong value, and only an evaluation against labels will show it.
+
+<SelfRate id="lesson:foundations/sampling/constrained-decoding" />

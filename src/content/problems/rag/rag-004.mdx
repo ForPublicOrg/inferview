@@ -1,96 +1,115 @@
 ---
 id: rag-004
 title: LIMIT 10 returns 3 rows
-subtitle: find and fix
+subtitle: two weeks after the HNSW migration
 track: rag
 module: retrieval-foundations
 type: debug
 difficulty: hard
 seniority: [senior, staff]
-minutes: 20
+minutes: 25
 core: true
-tags: [pgvector, hnsw, filtering, multi-tenant]
+tags: [pgvector, hnsw, filtering, multi-tenant, postgres]
 companies: []
 updated: 2026-10-28
 sources:
   - title: llmgenai/LLMInterviewQuestions
     url: https://github.com/llmgenai/LLMInterviewQuestions
-    note: source of the question shape ("types and challenges associated with filtering in vector DB")
-  - title: pgvector README
+    note: "the question shape: types and challenges of filtering in a vector database; a synthesised question bank, so no company tag"
+  - title: pgvector README (v0.8.7, checked 2026-10-28)
     url: https://github.com/pgvector/pgvector
-    note: filtering applies after the index scan; 10% filter with ef_search 40 returns about 4 rows; iterative scans with hnsw.iterative_scan and hnsw.max_scan_tuples (default 20,000); relaxed_order trades exact distance order for better recall, re-sorted with a materialized CTE and ORDER BY distance + 0 on Postgres 17+; partial indexes and partitioning
-  - title: pgvector changelog
+    note: "with approximate indexes, filtering is applied after the index is scanned; hnsw.ef_search defaults to 40, and with a filter matching 10% of rows about 4 rows match on average; there may be even fewer results due to dead tuples or filter conditions; iterative scans from 0.8.0 with strict_order or relaxed_order; hnsw.max_scan_tuples defaults to 20,000; relaxed results can be re-sorted with a materialized CTE and ORDER BY distance + 0 on Postgres 17 and later; an index on the filter column, partial indexes for a few values and partitioning for many"
+  - title: pgvector changelog (checked 2026-10-28)
     url: https://github.com/pgvector/pgvector/blob/master/CHANGELOG.md
-    note: iterative index scans added in 0.8.0
+    note: "iterative index scans added in 0.8.0 (2024-10-30); 0.8.3 and 0.8.4 (June 2026) fixed HNSW vacuum errors"
 choices:
-  - text: The graph is too sparse; rebuild the index with `m = 48` so each node has more neighbours
+  - text: Soft-deleted rows are still nodes in the HNSW graph and take up candidate slots before the tenant filter runs
     correct: false
-    why: A denser graph improves recall of the 40 candidates, but the scan still returns 40 candidates and the tenant filter still keeps about 8% of them.
-  - text: HNSW returns `hnsw.ef_search` (40) candidates and the tenant filter runs afterwards, so about 8% of 40, roughly 3, survive
+    why: True and worth fixing, but 6% of candidates lost to deleted rows takes ten results to about nine, not to three.
+  - text: The SET in migration 0042 lasted only for the migration session, so application queries never enabled iterative scans
     correct: true
-    why: The arithmetic matches the symptom exactly, and it explains why large tenants get closer to 10 rows than small ones.
-  - text: "`<=>` is cosine distance but the index uses another operator class, so Postgres skips the index"
+    why: Every count in the log matches a scan that hands back a fixed candidate list for the filters to thin, which is the behaviour with iterative scans off.
+  - text: hnsw.max_scan_tuples, at its default of 20,000, ends the iterative scan before ten of the tenant rows are found
     correct: false
-    why: The index is built with `vector_cosine_ops`, which matches `<=>`; and if the index were skipped, Postgres would run an exact scan and return all 10 rows, slowly.
-  - text: Postgres applies `LIMIT 10` before the `WHERE` clause, so it filters only the first ten rows
+    why: An iterative scan over 20,000 tuples at this tenant's share would find well over ten rows; the cap only bites for the smallest tenants once scans are on.
+  - text: The HNSW index was built before most of this tenant's rows were bulk loaded, so the graph has few links into their region
     correct: false
-    why: SQL applies WHERE before LIMIT. The rows are lost inside the index scan, which hands back a fixed number of candidates before the filter ever runs.
+    why: HNSW inserts each row into the graph as it arrives; training on early data is an IVFFlat concern, and it would lower recall, not cap the row count.
 ---
 import Callout from '../../../components/Callout.astro';
 
 ## Question
 
 <Callout kind="interview" label="The prompt">
-"A multi-tenant RAG service stores all tenants' chunks in one pgvector table. Tenants complain that answers use too little context. Find out why."
+"Tenants of our RAG product say answers cite too few sources. Here is what we have. Which explanation fits the symptom, what else is wrong, and what do you change first?"
 </Callout>
 
-The table holds about 30 million chunks. Tenant 42 owns about 8% of them. pgvector is 0.8.7 with default settings.
+One pgvector table holds about 30 million chunks for every tenant. pgvector is 0.8.7 and every setting not shown is the default. Two weeks ago migration 0042 shipped:
 
 ```sql
-CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops);
+DROP INDEX IF EXISTS chunks_embedding_ivfflat;
+CREATE INDEX chunks_embedding_hnsw ON chunks USING hnsw (embedding vector_cosine_ops);
+SET hnsw.iterative_scan = relaxed_order;
+CREATE INDEX chunks_tenant_idx ON chunks (tenant_id);  -- for the admin page's per-tenant counts
+```
 
-SELECT id, title
+The retrieval query, issued by the application through its connection pool:
+
+```sql
+SELECT id, title, embedding <=> $1 AS distance
 FROM chunks
-WHERE tenant_id = 42
+WHERE tenant_id = $2 AND deleted_at IS NULL
 ORDER BY embedding <=> $1
 LIMIT 10;
 ```
 
-The application log for tenant 42 over an hour:
+Rows returned per query over one hour, with each tenant's share of the table:
 
-```text
-rows_returned: 3 3 4 2 3 3 3 5 3 2 3 4 3 3
-```
+| Tenant | Share of rows | Mean rows returned |
+|---|---|---|
+| 7 | 41% | 10.0 |
+| 42 | 8% | 3.1 |
+| 311 | 1.2% | 0.4 |
+| 980 | 0.05% | 0.0 |
 
-Tenants with smaller shares of the table see 0 or 1 rows. A tenant with about 40% of the rows usually sees 10.
+About 6% of all rows have `deleted_at` set; soft-deleted chunks are kept for 30 days before a nightly job removes them. A plain `EXPLAIN` of the query for tenant 42, run by the on-call engineer from psql, shows an index scan on `chunks_embedding_hnsw` with the tenant and `deleted_at` conditions as a filter. Nobody has run `EXPLAIN ANALYZE` from the application's role yet.
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>How many candidates does the HNSW scan hand to the rest of the query by default?</p></details>
-<details class="hint"><summary>Hint 2</summary><p>Multiply that number by each tenant's share of the table and compare with the log.</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask for the value of every `hnsw.` setting as an application connection sees it, not as psql sees it.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the mean rows returned for each tenant and check whether it scales with the tenant's share or stays flat.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what fraction of a small tenant's rows are soft-deleted, compared with the table as a whole.</p></details>
 
 ## Answer
 
-The HNSW scan returns `hnsw.ef_search` candidates, 40 by default, ordered by distance. The `WHERE tenant_id = 42` filter runs on those 40, not on the table. About 8% of 40 is 3.2, which is the log almost row for row. The pgvector README gives the same arithmetic: with a filter matching 10% of rows and `ef_search` 40, "only 4 rows will match on average". A tenant with 40% of rows gets about 16 candidates that pass, enough to fill `LIMIT 10`; a tenant with 1% gets 0.4.
+**The cause.** `SET` changes a setting for the session that runs it. The migration's session turned on iterative scans for itself and then ended; the application's pooled connections never ran the statement, so their HNSW scans still return `hnsw.ef_search` candidates, 40 by default, and the `WHERE` clause thins those. The table is the check: 40 x 0.08 x 0.94 = 3.0 expected rows for tenant 42, 40 x 0.012 x 0.94 = 0.45 for tenant 311, and 15.4 for tenant 7, which `LIMIT 10` caps at 10. Mean rows returned scale with the tenant's share, which is what a fixed candidate list predicts and what no index-quality problem would produce.
 
-Fixes, in the order I would try them:
+**Why the other options are tempting.** Soft-deleted rows are a real defect: they are live tuples in the graph, they match nothing, and the README warns that dead tuples and filter conditions both shrink results. At 6% they cost about one row in ten for a tenant that otherwise fills its limit. The `max_scan_tuples` cap is real too, but it only applies once iterative scans run; a scan of 20,000 tuples at 8% x 0.94 would pass about 1,500 qualifying rows. It will matter for tenant 980 after the fix: 20,000 x 0.0005 x 0.94 is about 9 rows, so the smallest tenants can still come back short. Building HNSW before a bulk load is a reflex carried over from IVFFlat, whose lists are trained on the data present at build time; an HNSW graph adds each row as it arrives.
 
-1. **Iterative index scans** (pgvector 0.8.0 and later): `SET hnsw.iterative_scan = strict_order;` or `relaxed_order`. The scan keeps fetching candidates until enough rows pass the filter or it reaches `hnsw.max_scan_tuples`, 20,000 by default. `relaxed_order` can return results slightly out of order by distance in exchange for better recall; if order matters, wrap the query in a materialized CTE and `ORDER BY distance + 0` (the `+ 0` is needed on Postgres 17 and later).
-2. **A higher `ef_search`** for filtered queries. To expect 10 rows at 8% selectivity you need at least 10 / 0.08 = 125 candidates. It is a blunt fix: latency rises for every query that uses the setting, and it still fails for the smallest tenants.
-3. **Partial indexes or partitioning** for large tenants (`CREATE INDEX ... WHERE tenant_id = 42`, or a partition per tenant or tenant group), so the filter is part of the index and every candidate qualifies.
-4. **Exact search for small tenants**: a B-tree index on `tenant_id` lets the planner fetch one small tenant's rows and compute distances exactly, which is correct and often fast enough.
+**The evidence that is missing, and what to do without it.** Run `SHOW hnsw.iterative_scan` and `EXPLAIN (ANALYZE, BUFFERS)` through the application's pool and role, because psql sessions and pooled sessions can see different settings. Count soft-deleted rows per tenant, since a tenant that recently re-imported its corpus may have far more than 6%. Without those, the arithmetic is strong enough to act on, and the first change is reversible: set the parameter where the application's sessions pick it up, with `ALTER ROLE app_user SET hnsw.iterative_scan = strict_order`, and watch rows returned per tenant.
 
-Why the wrong picks are tempting. A larger `m` is the reflex for any recall problem, but the issue is not recall of the graph, it is the number of candidates. Operator-class mismatches are a real pgvector bug, but they produce slow exact scans with full results, the opposite symptom. And "LIMIT before WHERE" describes the effect well enough that it sounds right, but it misplaces the cause in SQL semantics rather than in the index scan.
+**The decision: which ordering, and what else.** Two defensible answers.
+
+- *Iterative scans for everyone, with `strict_order`.* One setting, results stay in distance order, nothing else in the query changes. Cost: the README says relaxed ordering gives better recall, so strict ordering leaves some on the table, and every selective query now reads more of the graph, so p95 rises most for the smallest tenants, which read up to 20,000 tuples and may still return short.
+- *`relaxed_order` plus an exact path for small tenants.* Small tenants get `WHERE tenant_id = $2` through the B-tree index and exact distances, which is correct and cheap when the tenant has few rows; large tenants use the HNSW scan with relaxed ordering, re-sorted in a materialized CTE with `ORDER BY distance + 0` on Postgres 17 and later. Cost: two query shapes and a threshold to maintain, and the re-sort is easy to drop in a later refactor, after which citations arrive slightly out of order.
+
+The threshold is a number you choose: the tenant row count below which exact search's measured p95 is inside the latency budget. Measure the exact scan for tenants of 10,000, 100,000 and 1 million rows on production hardware before picking it; a threshold chosen from the table's size alone is unreasonable.
+
+**The constraint conflict** is latency against result count. Every fix that returns ten rows to tenant 980 reads more data per query, and the cheapest one, a higher `ef_search`, raises latency for every tenant to help a few.
+
+**The failure mode of the recommended fix.** Role-level settings apply when a session starts. A pooler that keeps server connections open for hours serves the old setting until those connections recycle, so the fix looks partial for a while, and a later role or database change can silently override it. Assert the setting in the retrieval path's health check, and alert on rows returned divided by the requested limit, per tenant, so the next regression is caught by a ratio rather than by a complaint.
 
 ## Follow-ups
 
-- *How would you have caught this before tenants did?* Log `rows_returned` against the requested limit per tenant, and alert when the ratio drops. An eval set with only one large tenant would never show it.
-- *Is the iterative scan free?* No. It reads more of the graph for selective filters; cap it with `hnsw.max_scan_tuples` and watch p95 latency for small tenants.
-- *Does a dedicated vector database avoid this?* Many support filtering during the graph search rather than after it, but each has its own behaviour for very selective filters. Test the smallest tenant, not the average one.
+- *The iterative scan doubles p95 for the smallest 200 tenants and they are on a latency SLA. Do you ship it to them, move them to the exact path this week, or accept short results in writing until next quarter?*
+- *The nightly purge of soft-deleted rows makes every HNSW vacuum take hours. What do you change: the retention window, the purge schedule, or a reindex before vacuum as the README suggests, and what does each cost?*
+- *What would you need to see in production to reverse the decision to keep all tenants in one table, and move the largest ones to their own partitions?*
+- *Two senior engineers disagree: one wants `strict_order` everywhere, the other `relaxed_order` with the re-sort. How do you decide without deciding by rank?* Replay a day of queries under both and compare rows returned per tenant and how often the top three citations change order.
 
 ## Common mistakes
 
-- Raising `LIMIT` to 50, which changes nothing because the scan still returns 40 candidates.
-- Rebuilding the index with larger `m` or `ef_construction`.
-- Testing with the biggest tenant and concluding filtering works.
-- Turning on `relaxed_order` and forgetting that the results may need re-sorting.
+- Raising `LIMIT`, which changes nothing while the scan returns 40 candidates.
+- Rebuilding the index with a larger `m` or `ef_construction` for what is a candidate-count problem.
+- Testing the fix in psql, where a `SET` in the same session makes it look solved.
+- Turning on `relaxed_order` without the re-sort when the order of citations matters.
+- Ignoring soft-deleted rows because they are a small fraction of the table, when they can be a large fraction of one tenant.

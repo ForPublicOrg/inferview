@@ -24,6 +24,7 @@ const TYPES = {
   '.woff2': 'font/woff2',
   '.woff': 'font/woff',
   '.txt': 'text/plain; charset=utf-8',
+  '.py': 'text/plain; charset=utf-8',
   '.wasm': 'application/wasm',
   '.pf_meta': 'application/octet-stream',
   '.pf_index': 'application/octet-stream',

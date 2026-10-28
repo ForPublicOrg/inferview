@@ -1,0 +1,183 @@
+---
+title: Security evals in CI
+track: security
+module: security-ops
+order: 4
+kind: lesson
+level: senior
+minutes: 12
+summary: Three security suites with different cadences and blocking rules (deterministic control tests on every pull request, a pinned battery of known attacks per release, adaptive attacks nightly and before release), why a small attack battery cannot gate on zero successes, and the 2026 tooling changes to promptfoo and PyRIT that affect pipelines.
+prerequisites: [security/secure-architecture/threat-model-to-tests]
+updated: 2026-10-28
+sources:
+  - title: promptfoo documentation, Red team quickstart (checked 2026-10-28)
+    url: https://www.promptfoo.dev/docs/red-team/quickstart/
+    note: "promptfoo redteam setup, redteam init --no-gui, redteam run (generates adversarial inputs into redteam.yaml and runs them), redteam report; config in promptfooconfig.yaml; purpose is optional but improves generated tests and grading; a run generates several hundred adversarial inputs across many categories; strategies wrap generated inputs in attack patterns"
+  - title: promptfoo documentation, CI/CD integration (checked 2026-10-28)
+    url: https://www.promptfoo.dev/docs/integrations/ci-cd/
+    note: "promptfoo redteam eval runs previously generated probes from redteam.yaml; --fail-on-error; JSON, HTML and JUnit XML outputs; example pass-rate gate computed from JSON with a script at 95%; GitHub Action promptfoo/promptfoo-action@v1"
+  - title: NVIDIA garak (GitHub README, checked 2026-10-28)
+    url: https://github.com/NVIDIA/garak
+    note: "LLM vulnerability scanner; probes, detectors, generators, harnesses (default probewise), evaluators; example python3 -m garak --target_type openai --target_name gpt-5-nano --spec probes.encoding; JSONL report per run and a hit log; Apache-2.0"
+  - title: "Debenedetti et al., AgentDojo: A Dynamic Environment to Evaluate Prompt Injection Attacks and Defenses for LLM Agents (arXiv 2406.13352, v3 24 November 2024)"
+    url: https://arxiv.org/abs/2406.13352
+    note: "97 realistic tasks and 629 security test cases; an extensible environment rather than a static test suite; metrics benign utility, utility under attack and targeted attack success rate (section 3.4); suites workspace 40 user tasks and 6 injection tasks, slack 21 and 5, travel 20 and 7, banking 16 and 9 (Table 1); the tool filter defense lowers GPT-4o's targeted attack success to 7.5% in the text and 6.84% in Table 5"
+  - title: AgentDojo repository (checked 2026-10-28)
+    url: https://github.com/ethz-spylab/agentdojo
+    note: "python -m agentdojo.scripts.benchmark -s workspace -ut user_task_0 --model ... --defense tool_filter --attack tool_knowledge; API still under development"
+  - title: "Nasr et al., The Attacker Moves Second (arXiv 2510.09023, 10 October 2025)"
+    url: https://arxiv.org/abs/2510.09023
+    note: "adaptive attacks (gradient descent, reinforcement learning, random search, human-guided exploration) bypass 12 recent defenses with attack success above 90% for most; most had reported near-zero attack success"
+  - title: "OpenAI, OpenAI to acquire Promptfoo (9 March 2026)"
+    url: https://openai.com/index/openai-to-acquire-promptfoo/
+    note: "Promptfoo technology to be integrated into OpenAI Frontier; 'we will continue building the open-source project'; closing subject to customary closing conditions"
+  - title: Azure/PyRIT repository (archived; checked 2026-10-28)
+    url: https://github.com/Azure/PyRIT
+    note: "README: PyRIT has moved to github.com/microsoft/PyRIT; repository archived 27 March 2026"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Three suites, three questions
+
+A security eval in CI is three different instruments that happen to share a runner. Each answers a different question, costs a different amount, and fails in a different way, so each gets its own cadence and its own blocking rule.
+
+<div class="tablewrap">
+
+| Suite | Question | Model in the loop | Cadence | Blocks on |
+|---|---|---|---|---|
+| Control tests | Does each construction control still hold? | no | every pull request | any failure |
+| Pinned attack battery | Did this release get worse against known attacks? | yes, fixed inputs | every release candidate | new successes at blocking severity, paired against the last release |
+| Adaptive attacks | How does the system fare against an attacker who optimises against it? | yes, attacker adapts | nightly and before major releases | a human decision on the findings |
+
+</div>
+
+The split follows the label every control in this track carries. A control that holds by construction (the dispatcher refuses a tool, the renderer drops external URLs, the MCP server rejects a token with the wrong audience) has a property that is true or false, so it gets a deterministic test that never calls a model and runs in seconds. A control that lowers a rate (a classifier, a spotlighted prompt, the model's own refusals) has a number, so it gets a measurement, and a measurement has variance.
+
+## Why a small battery cannot gate on zero
+
+Teams often start by putting twenty jailbreak prompts in the PR pipeline and failing the build if any succeeds. The arithmetic says this tells you little.
+
+<Predict id="sec-evals-attempts" question="How many independent attempts are needed to see at least one success with 95% probability?" answer={149} tolerance={2} unit="attempts">
+<Fragment slot="prompt">
+<p>A defended agent lets a particular attack through on 2% of attempts, independently per attempt. You want a test that, if the true rate is 2%, shows at least one success 95% of the time.</p>
+</Fragment>
+<p>The chance of zero successes in n attempts is 0.98ⁿ. Setting 0.98ⁿ ≤ 0.05 gives n ≥ ln 0.05 / ln 0.98 = (−2.996) / (−0.0202) = 148.3, so <b>149 attempts</b>. A twenty-prompt battery that passes is consistent with a 2% rate, and with rates well above it. Run the other way: zero successes in all 629 of AgentDojo's security cases bounds the rate at about 0.48% with 95% confidence (1 − 0.05^(1/629)), and only for the attacks in those cases.</p>
+</Predict>
+
+Two consequences. The per-PR suite has to be deterministic, because nothing stochastic and fast enough for every PR has the power to block reliably. And the release battery has to compare against the previous release case by case, not against zero, because what you can detect cheaply is a change: a case that never succeeded before and now does.
+
+## Suite 1: control tests on every pull request
+
+These are ordinary tests that target enforcement points:
+
+- For each session type, the dispatcher accepts exactly its registered tools and rejects every other name in the catalogue.
+- The output renderer strips external image and link targets from model output, including reference-style links and encoded URLs.
+- The egress proxy refuses private and link-local ranges, including after a redirect and after DNS resolution.
+- The MCP server rejects tokens whose audience is not itself.
+- State-changing tools refuse to run without an approval record whose digest matches the arguments.
+- The per-tenant budget rejects a reservation above the daily cap.
+- Every tool's audit summary, run on fixture arguments, contains no free-text field.
+
+They block on any failure, they run in seconds, and they are where every construction-control finding from the other two suites ends up.
+
+## Suite 2: a pinned attack battery per release
+
+Two open-source scanners cover most of this.
+
+**promptfoo** generates attacks from a description of the target. `promptfoo redteam run` reads `promptfooconfig.yaml`, generates adversarial inputs (the quickstart says several hundred, across many categories), writes them to `redteam.yaml` and runs them; the `purpose` field is optional but the docs say it significantly improves generated tests and grading. Strategies wrap the generated inputs in attack patterns. For CI the important command is `promptfoo redteam eval`, which runs the previously generated probes from `redteam.yaml`. Generate once, commit the file, and every release runs the same cases. Results come out as JSON, HTML or JUnit XML; the CI guide's own gate is a script that computes a pass rate from the JSON and fails below 95%.
+
+**garak** is a scanner organised as probes (generate the attack), detectors (decide whether the output shows the failure), generators (connect to the target) and harnesses. `python3 -m garak --target_type openai --target_name <model> --spec probes.encoding` runs one probe family; it writes a JSONL report per run and a hit log of the attempts that succeeded. It is useful as a second, differently built battery, especially for model-level weaknesses such as encoded payloads.
+
+The blocking rule compares this release to the last one on the same cases. Pin the attack file, the scanner version and the grader configuration; run each high-severity case several times so a single stochastic hit does not decide; block on any case at critical or high severity that never succeeded on the previous release and now does; allow a small number of new medium-severity successes with a ticket.
+
+```python
+import math
+
+def attempts_to_observe(p, confidence=0.95):
+    """Attempts needed to see at least one success of a per-attempt rate p with the given probability."""
+    return math.ceil(math.log(1 - confidence) / math.log(1 - p))
+
+def upper_bound_zero_hits(n, confidence=0.95):
+    """Exact one-sided upper bound on the rate when n attempts produced zero successes."""
+    return 1 - (1 - confidence) ** (1 / n)
+
+def release_gate(prev, curr, block_severities=("critical", "high"), max_new_medium=2):
+    """prev, curr: {case_id: {"severity": str, "hits": int, "runs": int}} on the same pinned attack set."""
+    missing = sorted(set(prev) - set(curr))
+    if missing:
+        return "block", f"pinned cases missing from this run: {missing}"
+    new = [c for c, r in curr.items() if r["hits"] and not prev.get(c, {"hits": 0})["hits"]]
+    severe = [c for c in new if curr[c]["severity"] in block_severities]
+    medium = [c for c in new if curr[c]["severity"] == "medium"]
+    if severe:
+        return "block", f"new successful attacks at blocking severity: {severe}"
+    if len(medium) > max_new_medium:
+        return "block", f"{len(medium)} new medium-severity successes"
+    return "pass", f"{len(new)} new successes below the blocking rule"
+
+print(attempts_to_observe(0.02))                      # 149
+print(round(upper_bound_zero_hits(629) * 100, 2))     # 0.48 (percent)
+prev = {"exfil-img-01": {"severity": "critical", "hits": 0, "runs": 5},
+        "tone-03": {"severity": "low", "hits": 1, "runs": 5}}
+curr = {"exfil-img-01": {"severity": "critical", "hits": 1, "runs": 5},
+        "tone-03": {"severity": "low", "hits": 2, "runs": 5}}
+print(release_gate(prev, curr))                       # ('block', ... ['exfil-img-01'])
+```
+
+The `missing` check matters more than it looks. A battery that silently shrinks (a case that errors out, a category dropped from the config) passes more easily every release, and nobody notices because the pass rate went up.
+
+## Suite 3: adaptive attacks, nightly and before release
+
+The pinned battery measures regression against attacks someone already wrote. It says nothing about an attacker who studies the current defence. Nasr and colleagues (October 2025) showed how large that gap is: with systematically tuned gradient descent, reinforcement learning, random search and human-guided exploration, they bypassed 12 recent defences with attack success above 90% for most, where most had originally reported near-zero.
+
+AgentDojo is the standard harness for agent-level injection. The paper describes it as an extensible environment rather than a static suite, with 97 realistic tasks and 629 security test cases across four suites (workspace, Slack, travel, banking). It reports three numbers, and the CI dashboard should carry all three: benign utility (user tasks solved with no attack), utility under attack (security cases where the user task is solved with no adversarial side effects), and targeted attack success rate. Defences trade between them. The paper reports a tool-filter defence lowering GPT-4o's targeted attack success to 7.5% in its text (6.84% in Table 5); that number is against the paper's attacks, and Nasr's result is the reason to treat any such figure as a floor on what an adaptive attacker achieves. The repository's runner takes the suite, the model, a defence and an attack by name (`python -m agentdojo.scripts.benchmark ... --defense tool_filter --attack tool_knowledge`).
+
+The useful move is to port your own tools into the environment as a suite, so the adaptive runs exercise your agent's real capabilities rather than a demo banking app. The nightly job runs the adaptive attacks against the current main branch; it does not block merges, because its findings need triage. What it produces is a queue: each successful attack is classified as a construction-control bypass (a bug, fixed and added to suite 1) or a rate-control miss (added to the pinned battery in suite 2, so the next release is measured against it).
+
+## Tooling changed in 2026
+
+Two changes affect pipelines built in 2025. On 9 March 2026 OpenAI announced it would acquire Promptfoo, integrate its technology into OpenAI Frontier, and continue building the open-source project; the announcement says closing is subject to customary conditions. Pipelines that use the CLI keep working, but a red-team tool now owned by a model vendor is a procurement question when the models under test include that vendor's competitors, and a second, independently maintained scanner such as garak (Apache-2.0, maintained by NVIDIA) is cheap insurance.
+
+PyRIT moved: the `Azure/PyRIT` repository's README points to `microsoft/PyRIT`, and the old repository was archived on 27 March 2026. Pipelines that install from the old repository URL are pinned to an archived codebase.
+
+Pin scanner versions in every suite. An upgrade changes the generated attacks and the graders, and a release comparison across a scanner upgrade is not paired.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Product wants daily releases. The full release battery takes three hours and costs more in API calls per run than the team's monthly tooling budget allows at that cadence. Security wants every release red-teamed. What runs on every release, what runs less often, and what do you write down?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Every release runs the control tests and a pinned subset of the battery: the critical and high cases, each repeated, sized to the budget. The full battery runs weekly and before any change to the model, the system prompt or the tool list. Adaptive attacks run nightly against main without blocking. The written risk is that medium-severity regressions can ship for up to a week.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The constraints are a daily cadence, a budget, and security's coverage ask. The budget fixes how many model calls a release gate can spend, so the question becomes which calls buy the most detection. Critical and high cases are where a regression costs most, and repeating them buys the power that a single run lacks; at a 2% per-attempt rate, 149 attempts are needed to see a success with 95% probability, so one run per case is not a test.</p>
+<p>Release risk is not uniform across releases. A copy change in the UI does not move attack success; a model version, system prompt or tool change can. Those changes trigger the full battery regardless of the schedule, which puts the spend where the risk moves.</p>
+<p>What we give up: a release that regresses on a medium case ships, and is caught by the weekly full run. I would write that down with the owner, and add a rollback trigger: a weekly run that finds a new medium success rolls the feature flag back to the last release that passed.</p>
+<p>The failure mode is that "prompt change" is not detected as a risky change because prompts live outside the repo. Pinning prompts by hash in the release manifest makes the trigger mechanical.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The weekly run finds a new critical success in a release that shipped four days ago. Who decides between rollback and hotfix, and on what evidence?</em></li>
+<li><em>Your graders are LLM judges, and human reviewers overturn some of their hits. Does a judge-reported success block a release, and how do you keep the block rule from being argued away every time?</em></li>
+<li><em>What would you need to see in six months of nightly adaptive runs to move them from advisory to blocking?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Paired comparison assumes the target is the only thing that changed. A model alias that resolves to a new snapshot, a provider-side safety update, or a grader model change moves the numbers between two runs of identical code. Record the served model id and the grader version with every result, and treat a shift across those as a new baseline rather than a regression.
+
+Attack success graded by an LLM judge has its own error rate, and that error is not symmetric across categories. A gate that blocks on judge-reported successes without periodic human review of the hits will drift into blocking on judge noise or, worse, into a team that ignores the gate.
+
+Attack success falls when utility collapses: an agent that refuses everything is never hijacked. That is why AgentDojo reports utility under attack alongside attack success, and why a release that lowers attack success while lowering benign utility is not a security improvement until someone has looked.
+
+The three-suite design assumes construction controls exist to test. A system whose only defences are rate controls has an empty suite 1, and its whole security posture is a number from suite 2 measured against attacks someone else wrote.
+
+<SelfRate id="lesson:security/security-ops/security-evals-ci" />

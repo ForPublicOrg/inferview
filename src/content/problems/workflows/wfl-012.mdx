@@ -1,0 +1,104 @@
+---
+id: wfl-012
+title: Ship a new prompt and tool while thousands of agent runs are in flight
+track: workflows
+module: durable-execution
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 40
+core: false
+tags: [deploys, versioning, worker-versioning, rainbow-deployments, agents, temporal]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Anthropic, How we built our multi-agent research system (13 June 2025)
+    url: https://www.anthropic.com/engineering/multi-agent-research-system
+    note: official engineering post; agents run for long periods and keep state across many tool calls; rainbow deployments shift traffic gradually from old to new versions to avoid disrupting running agents
+  - title: Temporal docs, Worker Versioning
+    url: https://docs.temporal.io/worker-versioning
+    note: Pinned Workflows complete on one Worker Deployment Version; Auto-Upgrade Workflows move to the current version and need patching; ramping by Workflow ID; Draining and Drained; Pinned versions persist across Continue-As-New
+  - title: Temporal docs, Python SDK versioning
+    url: https://docs.temporal.io/develop/python/workflows/versioning
+    note: patched() and deprecate_patch(); Workflow cutovers to a new type name cannot version still-running Workflows
+  - title: Temporal blog, Of course you can build dynamic AI agents with Temporal (12 November 2025)
+    url: https://temporal.io/blog/of-course-you-can-build-dynamic-ai-agents-with-temporal
+    note: model calls and tools run in Activities; recovery replays recorded model decisions from Event History
+  - title: Temporal docs, Workflow Definition
+    url: https://docs.temporal.io/workflow-definition
+    note: Activities execute outside the replay path; Commands must not be reordered, added or removed
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Thousands of agent runs are in flight. We need to ship a new system prompt and a new tool this week. Design the deploy."
+</Callout>
+
+Scenario. A contracts assistant runs one Temporal workflow per customer request. About 6,000 runs are open at any time; the median run takes 40 minutes, and the slowest wait up to three days for a human approval. The model call is an Activity whose code builds the prompt from a template file and passes the tool list. Tool calls come back from the model and are dispatched by name in workflow code to one Activity per tool.
+
+The change: system prompt v12, which tells the model to call a new tool `lookup_contract` before quoting terms, and the Activity that implements it. The reason for urgency is real: prompt v11 sometimes quotes contract terms from memory, and legal has flagged two such answers. The constraints:
+
+- Product wants v12 on every run, including open ones, within 24 hours.
+- The SRE lead wants no behaviour change to any run already in flight.
+- Three engineers, and the change must ship by Friday.
+- The workflow code cannot be rewritten this week.
+
+Design the rollout. Say what you give up, and write the rollout plan with its rollback triggers.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask where the prompt text and the tool list live: workflow code, which is replayed, or Activity code, which is not. What does a plain deploy do to an open run at its next model call?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what happens on an old worker when a model response names a tool that worker does not know.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask legal which open runs are actually at risk: all 6,000, or the ones that will quote terms before they finish?</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>A plain deploy already changes every open run, because the prompt lives in Activity code, which is not replayed: each run's next model call gets v12 while its workflow code may not know <code>lookup_contract</code>. So make versions explicit. Record the prompt and tool-set version in each run at start, keep both templates in the model Activity, and pin workflows to their worker version so old runs drain on old code while new runs get v12, ramped gradually. For the legal risk in open runs, do not move them onto v12 mid-conversation; hold, where answers are delivered, any quoted contract term that no lookup in the run backs. I give up a three-day tail of the old prompt and a second fleet while it drains.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>What a naive deploy does.</strong> Workflow code is replayed against history; Activity code is not. The prompt template is read inside the model Activity, so deploying v12 changes the prompt for every open run at its next model call, with no record in history of which prompt produced which turn. The new tool is worse: the v12 model asks for <code>lookup_contract</code>, and a run whose workflow code predates the tool either fails to dispatch it or, on a worker without the Activity registered, retries the Activity task until a new worker picks it up. So the SRE lead's "no change to in-flight runs" is not the status quo; it has to be built.</p>
+<p><strong>Make the version part of the run.</strong> The model Activity takes a <code>prompt_version</code> argument and keeps both templates. The workflow records the prompt and tool-set version when it starts, as input or as its first step, and passes it on every call. That and the new dispatch entry are a small change to workflow code, not a rewrite. Under pinning (below) old runs never replay the new code, so it needs no patch; under Auto-Upgrade it goes behind a <code>patched()</code> branch so old histories take the old path.</p>
+<p><strong>Route runs to code that matches them.</strong> Two defensible choices. Pinned Worker Versioning: each run completes on the deployment version it started on, a set share of new runs goes to the ramping version, and the old version is Draining until its last pinned run closes. Cost: two fleets for up to three days, and a fix that cannot reach open runs. Auto-Upgrade with patching: one fleet, every run moves to new workers, and the <code>patched()</code> branches keep replay safe. Cost: every workflow change from now on needs a patch and a removal plan, and one mistake stalls open runs with non-determinism errors. With a 40-minute median and a three-day tail, I pin: most of the old fleet's load is gone within hours, and only the approval-waiting tail keeps it alive. This is the rainbow deployment Anthropic describes for its research agents: shift traffic gradually so that running agents are not disrupted.</p>
+<p><strong>The legal risk in open runs.</strong> Product's goal is that no customer receives a remembered contract term. Moving an open run to v12 mid-conversation does that only for the turns after the switch, mixes two prompts in one transcript that no eval has seen, and changes the tool list, so the cached prompt prefix is invalidated for that run's next call. A narrower control reaches the same goal: a check where answers leave the system, in the service that delivers them to customers, which holds any answer quoting contract terms and routes it to review unless the run recorded a contract lookup. No workflow version owns that service, so it covers pinned v11 runs without touching their code. For the approval-waiting tail, the reviewer sees the hold before approving.</p>
+<p><strong>Quantities you choose.</strong> The ramp: 5 percent of new runs on v12 until at least a few hundred have completed, then 25, then 100, holding each step at least one median run length plus the time your offline eval needs to score the completed runs. The rollback triggers, each with a threshold you set from the v11 baseline measured this week: <code>lookup_contract</code> error rate, share of answers that quote terms without a lookup, cost per completed run, and p90 run duration. Write the thresholds down before the ramp starts.</p>
+<p><strong>What rollback means here.</strong> Setting the current version back to v11 stops new runs from starting on v12, but runs already pinned to v12 stay on v12. Rollback does not rescue them. That is why the ramp starts small, and why the plan names who decides whether pinned v12 runs are left to finish, moved with <code>update-options</code>, or terminated.</p>
+<p><strong>What you give up.</strong> Up to three days of v11 answers on old runs, held at delivery rather than fixed. Capacity for two fleets. And product's 24-hour goal for open runs, which you replace with "no unverified term reaches a customer from any run" in writing, signed by legal.</p>
+<p><strong>Where the recommended answer fails.</strong> The delivery check detects quoted terms with a model or a pattern, and it will miss some; legal must accept that rate, and you must measure it on the flagged answers. Pinned runs that continue-as-new keep their version, so a long-lived run that continues every day never reaches v12 unless you move it. And the old fleet's drain depends on humans approving: one forgotten approval keeps two fleets running until someone closes it, so the plan needs a cap after which open v11 runs are escalated.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Pushback.</em> Finance says two fleets for three days doubles the worker bill this week and asks you to auto-upgrade instead. Which risk do you accept in writing, and what test must pass before you agree?</li>
+<li><em>Reversal.</em> What would you need to see in the first 5 percent ramp to stop and go back to v11, and what would make you skip straight to 100?</li>
+<li><em>Two senior engineers disagree.</em> One wants every prompt change to be a new workflow type name; the other wants prompts as data with no code change at all. How do you decide without deciding by rank?</li>
+<li><em>Operating.</em> Next quarter the model version behind both prompts is retired with 60 days' notice. Which runs does your version scheme let you move, and which must drain?</li>
+</ul>
+</Fragment>
+</Depth>
+
+### The rollout plan, written down
+
+1. Turn on the delivery hold for answers that quote contract terms without a recorded lookup. It applies to every run, old and new, from today.
+2. Build a new Pinned deployment version: the model Activity with v11 and v12 templates, the `lookup_contract` Activity, and workflow code that records the prompt version at start and dispatches the new tool. Replay-test it against a sample of production histories before it takes traffic.
+3. Ramp new runs to v12 at 5 percent. Hold for at least one median run length plus eval scoring. Rollback triggers: each metric above crossing its written threshold.
+4. Ramp to 25 percent, then 100 percent, with the same hold and triggers.
+5. Track the v11 version's open pinned runs to zero. At the cap, escalate open approval-waiting runs to their owners. Remove the old version once Drained.
+6. Record in the decision memo: what open runs receive (v11 plus the delivery hold), who signed off, and the date the v11 template and patch branch are deleted.
+
+## Follow-ups
+
+- The model provider caches prompt prefixes. What does your version scheme do to cache hit rates during the ramp, and does that change the cost trigger's threshold?
+- Where else in this system does Activity code silently change open runs, besides the prompt template?
+- How would you run the same rollout on an engine that has no worker versioning?
+
+## Common mistakes
+
+- Treating a prompt change as safe for in-flight runs because the model call is an Activity and "replay is not affected". Replay is not affected; behaviour is.
+- Shipping the new tool to the prompt before every worker that might receive the call can execute it.
+- Using a new workflow type name and assuming open runs are covered; cutovers do not version running workflows.
+- Planning a rollback that assumes runs already on the new version go back with it.
+- Meeting the urgent fix by moving open runs to the new prompt mid-conversation without an eval of mixed transcripts.

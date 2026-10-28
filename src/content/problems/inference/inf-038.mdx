@@ -1,0 +1,133 @@
+---
+id: inf-038
+title: One tenant's requests fail after a routine adapter-pool deploy
+subtitle: every other adapter on the pool is fine
+track: inference
+module: fleet
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [lora, multi-adapter, vllm, deploys, debugging, config-change]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: vLLM source, PEFT adapter validation (vllm/lora/peft_helper.py, main branch)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/lora/peft_helper.py
+    note: "validate_legal takes the largest of r and every rank_pattern value and raises ValueError (\"LoRA rank ... is greater than max_lora_rank ...\") when it exceeds max_lora_rank; it also rejects adapter bias and unsupported features such as DoRA. Checked 2026-10-28."
+  - title: vLLM source, LoRA config (vllm/config/lora.py, main branch)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/config/lora.py
+    note: "max_lora_rank takes one of 1, 8, 16, 32, 64, 128, 256, 320, 512 (default 16); max_loras is the maximum number of LoRAs in a single batch; max_cpu_loras must be at least max_loras. Checked 2026-10-28."
+  - title: vLLM source, LoRA linear layers (vllm/lora/layers/base_linear.py, main branch)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/lora/layers/base_linear.py
+    note: "the GPU LoRA weight stacks are allocated with shapes (max_loras, 1, max_lora_rank, input_size) and (max_loras, 1, output_size, max_lora_rank), so slot memory scales with max_loras x max_lora_rank. Checked 2026-10-28."
+  - title: vLLM documentation, LoRA adapters
+    url: https://docs.vllm.ai/en/latest/features/lora.html
+    note: "set --max-lora-rank to the highest rank among your adapters; resolver plugins load adapters on demand from a local directory set by VLLM_LORA_RESOLVER_CACHE_DIR. Checked 2026-10-28."
+choices:
+  - text: acme-support v3 trains one projection at a rank above 32 that the registry column omits, so the new limit fails every load of it.
+    correct: true
+    why: v3 served from 10:12 until the rollout, its file is 201.8 MB where a rank-32 adapter on this base is 161.5 MB, and the rank check covers every module's rank, not only r.
+  - text: The resolver now reads from the local NVMe directory, and acme-support v3 was never copied there, so every load of it fails.
+    correct: false
+    why: The sync log lists acme-support/v3 copied with a matching checksum before the rollout, and the other 411 adapters load from the same directory.
+  - text: Doubling max_loras at half the rank left slot memory unchanged, so the pool runs short of KV cache and rejects acme's long prompts.
+    correct: false
+    why: The first half is a real defect (16 x 32 equals 8 x 64), but unchanged slot memory cannot shrink the KV cache, and KV usage fell after the deploy.
+  - text: The new engine image validates adapter configs more strictly and rejects a field in acme-support v3 that the old image ignored.
+    correct: false
+    why: globex-legal v7 came out of the same training pipeline version on the same day and serves normally on the new image.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Debugging round">
+"Since yesterday's deploy to the adapter pool, every request for one customer's adapter fails. Every other customer is fine. What happened, and what do you do in the next hour?"
+</Callout>
+
+The pool serves 412 tenant adapters on one 7B base model, 30 replicas, through a filesystem resolver. Adapters come from the platform's fine-tuning service, where tenants can set a rank per projection. The deploy rolled out from 16:05 to 16:20 on day 2. Its diff:
+
+```yaml
+-image: serving-engine@sha256:4c1e...
++image: serving-engine@sha256:9a07...
+ enable_lora: true
+-max_lora_rank: 64
++max_lora_rank: 32
+-max_loras: 8
++max_loras: 16
+-max_cpu_loras: 200
++max_cpu_loras: 400
+ enable_prefix_caching: true
+ env:
+-  VLLM_LORA_RESOLVER_CACHE_DIR: /mnt/adapters
++  VLLM_LORA_RESOLVER_CACHE_DIR: /var/cache/adapters
+```
+
+The pull request description: "Cut LoRA slot memory: the registry shows no active adapter above rank 32 (query run 2026-10-19, attached). Double the slots for the long tail. Move the resolver cache to local NVMe. Engine image bumped to the current release."
+
+Gateway log summary for the pool (the gateway records status and latency; response bodies are not logged):
+
+| Window, day 2 | acme-support (v3) | All other adapters |
+|---|---|---|
+| 10:12 to 16:05 | 41,200 requests, 0 errors | 2.9M requests, 0.02% errors |
+| 16:20 onward | 6,850 requests, 100% HTTP 400 | 1.1M requests, 0.02% errors |
+
+Other evidence:
+
+- Registry, acme-support: v3 published day 2 at 10:12 by the fine-tuning service, `rank: 32`. v2 (rank 16) was retired at 10:12. The registry's `rank` column is filled from each adapter's `r`.
+- Sync job, day 2 at 15:58: `copied 412 adapters to /var/cache/adapters, checksums verified`. Sample lines: `acme-support/v3 201.8 MB sha256 ok`, `globex-legal/v7 161.5 MB sha256 ok`, `initech-ops/v12 80.7 MB sha256 ok`.
+- globex-legal v7 (registry rank 32) was published day 2 at 11:40 by the same fine-tuning service version as acme-support v3. It serves normally after the deploy.
+- Pool metrics after the deploy: KV cache usage at peak 58%, down from 61%; no preemptions.
+- Engine logs from 16:00 to 18:00 were lost: the logging sidecar restarted with the deploy and dropped its buffer.
+
+Which explains the symptom?
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the size a rank-32 adapter on all projections of this base should have, and compare it with the sync log.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request acme-support v3's adapter config file exactly as stored, not the registry row.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the registry query in the pull request would have returned if it had run on day 2.</p></details>
+
+## Answer
+
+**Why the correct choice is correct.** acme-support v3 served for six hours before the deploy and failed on every request after it, so the cause is in the deploy and specific to that adapter. The sync log rules out a missing file. The sizes give it away: on this base, rank 16 on all seven projections is 80.7 MB (initech-ops) and rank 32 is 161.5 MB (globex-legal), but acme-support v3 is 201.8 MB. That fits rank 32 on six projections and rank 64 on one MLP projection: with the base's hidden size of 3,584, KV width of 512 and MLP size of 18,944, per layer 32 x (2 x 7,168 + 2 x 4,096 + 2 x 22,528) + 64 x 22,528 = 3,604,480 parameters, 28 layers, 2 bytes each, 201.8 MB. The fine-tuning service lets tenants set rank per projection, which PEFT stores in `rank_pattern`; the registry reads only `r`, so it says 32. vLLM's validation takes the largest of `r` and every `rank_pattern` value and raises a `ValueError` when it exceeds `max_lora_rank`. With the limit at 64 it loaded; at 32 every load fails, and the 400 is the engine refusing a request whose adapter it cannot load. The audit query in the pull request ran on 2026-10-19, before v3 existed, and would have said 32 even on day 2.
+
+**Why each wrong option is tempting.**
+
+- *The cache directory.* It changed in the same deploy and a missing file would fail exactly one adapter's loads. But the sync log names acme-support/v3 with a verified checksum, and 411 adapters load from the same directory.
+- *The slot memory.* This one is half right and worth reporting: vLLM allocates the GPU LoRA stacks as `max_loras` by `max_lora_rank`, so 16 slots at rank 32 cost exactly what 8 slots at rank 64 did, and the deploy saved no GPU memory at all. But unchanged slot memory cannot shrink the KV cache, KV usage went down, and nothing else on the pool failed.
+- *The engine image.* Image bumps do tighten validation, and rejection of an unsupported config field would look identical from the gateway. globex-legal v7 came from the same training pipeline version on the same day and loads on the new image, which makes a pipeline-wide config field unlikely, though not impossible if acme set an option globex did not.
+
+**Ranking what is wrong, beyond the cause.**
+
+1. The cause: the limit was lowered from a stale audit of the wrong field.
+2. The registry's `rank` column describes `r`, not the largest rank in the adapter. Every future decision on `max_lora_rank` inherits this.
+3. The deploy saved no memory, so the stated reason for the change was never met; nobody computed slot memory before and after.
+4. The deploy changed four things at once on a pool with no per-adapter load check, so a load failure could only show up as customer errors.
+5. Logs were lost at exactly the moment they were needed, because the sidecar restarts with the engine.
+
+**What to collect, and what to do without it.** Collect v3's `adapter_config.json` as stored (to confirm `rank_pattern`), the body of one 400 by replaying a request against one replica, and a load attempt of v3 on a staging replica with the new config. None of that is needed to act: the customer has been down since 16:20, and the action that restores them is safe whichever hypothesis is true.
+
+**The decision.** Two defensible answers.
+
+- *Revert the whole deploy.* Restores acme-support for any of the four hypotheses, including the image. The cost: the cache move and the image bump go back too, and they are not implicated; the next attempt carries the same four changes and the same blast radius.
+- *Revert `max_lora_rank` to 64 only*, on a canary replica first, then the pool. Faster to confirm (if v3 loads on the canary, the cause is proven) and keeps the rest. The cost: if the image is the cause after all, acme stays down for another canary cycle.
+
+The conflict is the customer's outage against learning which change did it. I revert `max_lora_rank` on one replica, route acme-support to it, and if it serves within a few minutes roll the value out to the pool; if it does not, revert the whole deploy at once. The failure mode of this choice: it restores the memory waste the deploy meant to remove (which, as computed, it never removed), and it leaves the pool one adapter upload away from the same outage until the gate checks every module's rank against the pool limit before an adapter version is published.
+
+## Follow-ups
+
+- *Pushback: finance still wants the memory back, and acme is the only adapter above 32. Do you keep the pool at 64 for one tenant, or ask them to retrain, and what do you accept in writing?* Move acme to a smaller pool at 64 and drop the main pool to 32 with the slot count held at 8, which does save memory; write down the cost of the extra pool and the date acme agrees to retrain, or the price at which they keep rank 64.
+- *Reversal: what would you need to see to stop allowing per-projection ranks in the fine-tuning service?* Evidence that adapters with mixed ranks do not score better on tenants' evals than uniform ones at the same total size, plus a second incident from the same mismatch.
+- *Operating: the gate that should have caught this belongs to another team, which is mid-migration and says six weeks. What do you put in place by tomorrow?* A pre-deploy check in the pool's pipeline that loads every active adapter's config, computes the largest rank across `r` and `rank_pattern`, and fails the deploy if any exceeds the new `max_lora_rank`.
+- *How do you make the next deploy to this pool smaller?* One change per deploy for the engine image and the LoRA limits, with a canary replica that loads every active adapter before the pool rolls.
+
+## Common mistakes
+
+- Reading the registry's rank column as the adapter's rank.
+- Stopping at "the directory changed" because it is the most visible line in the diff.
+- Accepting the pull request's memory claim without multiplying slots by rank.
+- Waiting for logs before restoring a customer whose failure began at a known deploy.
+- Reverting everything and never learning which change caused it.

@@ -1,0 +1,385 @@
+---
+title: Preference learning by hand
+track: training
+module: post-training
+kind: lab
+minutes: 100
+summary: Build a pairwise reward model, the DPO loss, its hand-derived gradient, a beta sweep on noisy labels and Llama 3's NLL term in standard-library Python, and watch DPO move probability onto a response no label mentioned.
+updated: 2026-10-28
+sources:
+  - title: Rafailov et al., Direct Preference Optimization, Your Language Model is Secretly a Reward Model (v3, 2024-07-29)
+    url: https://arxiv.org/abs/2305.18290
+    note: the DPO objective, the implicit reward beta log(pi / pi_ref) and the Bradley-Terry model it starts from; steps 1 to 4; checked 2026-10-28
+  - title: Llama Team, The Llama 3 Herd of Models (2024)
+    url: https://arxiv.org/html/2407.21783
+    note: "section 4.1.4: DPO with learning rate 1e-5, beta 0.1, formatting tokens masked, and an NLL term on chosen sequences with coefficient 0.2 to prevent the chosen log-probability from decreasing; step 5; checked 2026-10-28"
+  - title: Razin et al., Unintentional Unalignment, Likelihood Displacement in Direct Preference Optimization (ICLR 2025)
+    url: https://arxiv.org/abs/2410.08847
+    note: the chosen response's likelihood can fall during DPO and move mass to responses with the opposite meaning, driven by pairs with similar embeddings; step 5; checked 2026-10-28
+steps:
+  - title: A pairwise reward model by gradient descent
+    brief: |
+      A Bradley-Terry reward model scores each response with r(x) = w . x and is trained on -log sigmoid(r(chosen) - r(rejected)). Write a softplus and a sigmoid that stay finite for any input, the mean loss, and full-batch gradient descent from w = 0. Only differences between chosen and rejected features enter the loss, so precompute them once; a feature every response shares must receive no gradient at all, which is the reward model's version of being defined only up to a constant.
+    starter: |
+      import math
+
+
+      def softplus(z):
+          """log(1 + e^z), finite for any float z."""
+          raise NotImplementedError
+
+
+      def sigmoid(z):
+          raise NotImplementedError
+
+
+      def dot(u, v):
+          return sum(a * b for a, b in zip(u, v))
+
+
+      def rm_loss(w, pairs):
+          """Mean Bradley-Terry loss over pairs of (chosen features, rejected features), with reward r(x) = w . x."""
+          raise NotImplementedError
+
+
+      def fit_reward(pairs, dim, lr=0.5, steps=300):
+          """Full-batch gradient descent on rm_loss from w = 0; return w."""
+          raise NotImplementedError
+    tests: |
+      import math
+      pairs = [([1.0, 0.0, 0.2], [0.0, 1.0, 0.1]), ([0.8, 0.1, 0.0], [0.2, 0.9, 0.3]), ([0.9, 0.3, 0.5], [0.1, 0.4, 0.6])]
+      assert abs(rm_loss([0.0, 0.0, 0.0], pairs) - math.log(2)) < 1e-12, "an untrained reward model is a coin flip"
+      w = fit_reward(pairs, 3)
+      assert all(dot(w, c) > dot(w, r) for c, r in pairs), "the fitted model ranks every training pair correctly"
+      assert rm_loss(w, pairs) < rm_loss([0.0, 0.0, 0.0], pairs)
+      assert math.isfinite(softplus(1000.0)) and abs(softplus(-1000.0)) < 1e-300 and abs(softplus(1000.0) - 1000.0) < 1e-9
+    hidden: |
+      import math, random
+      rng = random.Random(7)
+      true_w = [1.0, -2.0, 0.5, 0.0]
+      pairs = []
+      for _ in range(200):
+          a = [rng.uniform(-1, 1) for _ in range(3)] + [1.0]
+          b = [rng.uniform(-1, 1) for _ in range(3)] + [1.0]
+          pairs.append((a, b) if dot(true_w, a) >= dot(true_w, b) else (b, a))
+      w = fit_reward(pairs, 4, lr=0.5, steps=200)
+      assert abs(w[3]) < 1e-9, "a feature shared by chosen and rejected gets no gradient: rewards are only defined up to a constant"
+      acc = sum(dot(w, c) > dot(w, r) for c, r in pairs) / len(pairs)
+      assert acc >= 0.95, acc
+      flipped = [(r, c) for c, r in pairs]
+      w2 = fit_reward(flipped, 4, lr=0.5, steps=200)
+      assert all(abs(a + b) < 1e-9 for a, b in zip(w, w2)), "swapping every label negates the fitted reward"
+    solution: |
+      import math
+
+
+      def softplus(z):
+          """log(1 + e^z) without overflow for large |z|."""
+          return max(z, 0.0) + math.log1p(math.exp(-abs(z)))
+
+
+      def sigmoid(z):
+          if z >= 0:
+              return 1.0 / (1.0 + math.exp(-z))
+          e = math.exp(z)
+          return e / (1.0 + e)
+
+
+      def dot(u, v):
+          return sum(a * b for a, b in zip(u, v))
+
+
+      def rm_loss(w, pairs):
+          """Mean Bradley-Terry loss: -log sigmoid(r(chosen) - r(rejected)) with r(x) = w . x."""
+          return sum(softplus(-(dot(w, c) - dot(w, r))) for c, r in pairs) / len(pairs)
+
+
+      def fit_reward(pairs, dim, lr=0.5, steps=300):
+          diffs = [[a - b for a, b in zip(c, r)] for c, r in pairs]
+          w = [0.0] * dim
+          n = len(diffs)
+          for _ in range(steps):
+              g = [0.0] * dim
+              for d in diffs:
+                  coef = -sigmoid(-dot(w, d)) / n
+                  for k in range(dim):
+                      g[k] += coef * d[k]
+              w = [wk - lr * gk for wk, gk in zip(w, g)]
+          return w
+  - title: The DPO loss
+    brief: |
+      DPO replaces the reward model with the policy's own log-ratio against a frozen reference: the margin for a pair is beta times the chosen log-ratio minus the rejected log-ratio, and the loss is softplus of minus the margin. Inputs are summed sequence log-probs, as a trainer would compute them in one forward pass over each response. When the policy equals the reference every margin is 0 and the loss is log 2 at any beta; the tests also feed margins of plus and minus 100,000, which a naive log(sigmoid(m)) turns into nan or inf.
+    starter: |
+      def dpo_loss(pol_c, pol_r, ref_c, ref_r, beta):
+          """Mean DPO loss over a batch, from summed sequence log-probs under the policy and the frozen reference.
+
+          Returns (loss, margins) where margins[i] = beta * ((pol_c - ref_c) - (pol_r - ref_r)) for pair i.
+          """
+          raise NotImplementedError
+    tests: |
+      import math
+      lp = [-12.5, -40.0, -3.25]
+      lr_ = [-15.0, -38.0, -9.0]
+      loss, m = dpo_loss(lp, lr_, lp, lr_, beta=0.1)
+      assert abs(loss - math.log(2)) < 1e-12 and m == [0.0, 0.0, 0.0], "policy equal to reference gives log 2 at any beta"
+      loss, m = dpo_loss([-10.0], [-20.0], [-12.0], [-18.0], beta=0.1)
+      assert abs(m[0] - 0.4) < 1e-12 and abs(loss - math.log1p(math.exp(-0.4))) < 1e-12
+      loss, _ = dpo_loss([-10.0], [-20.0], [-11.0], [-21.0], beta=0.5)
+      assert abs(loss - math.log(2)) < 1e-12, "the same shift on chosen and rejected is no preference at all"
+    hidden: |
+      import math, random
+      loss, m = dpo_loss([0.0], [-1e5], [0.0], [0.0], beta=1.0)
+      assert math.isfinite(loss) and loss < 1e-300 + 1e-12, "a huge positive margin gives a loss near 0, not nan"
+      loss, m = dpo_loss([-1e5], [0.0], [0.0], [0.0], beta=1.0)
+      assert abs(loss - 1e5) < 1e-6, "a huge negative margin gives a loss equal to the margin's size, not inf"
+      rng = random.Random(3)
+      for _ in range(50):
+          c, r, a, b = (rng.uniform(-50, 0) for _ in range(4))
+          beta = rng.uniform(0.01, 2)
+          l1, _ = dpo_loss([c], [r], [a], [b], beta)
+          l2, _ = dpo_loss([r], [c], [b], [a], beta)
+          assert abs(math.exp(-l1) + math.exp(-l2) - 1) < 1e-9, "swapping chosen and rejected: the two sigmoids sum to 1"
+          k = rng.uniform(-5, 5)
+          l3, _ = dpo_loss([c + k], [r + k], [a], [b], beta)
+          assert abs(l1 - l3) < 1e-9, "adding the same log-prob to chosen and rejected changes nothing"
+    solution: |
+      def dpo_loss(pol_c, pol_r, ref_c, ref_r, beta):
+          """Mean DPO loss over a batch, from summed sequence log-probs under the policy and the frozen reference.
+
+          Returns (loss, margins) where margins[i] = beta * ((pol_c - ref_c) - (pol_r - ref_r)) for pair i.
+          """
+          margins = [beta * ((pc - rc) - (pr - rr)) for pc, pr, rc, rr in zip(pol_c, pol_r, ref_c, ref_r)]
+          return sum(softplus(-m) for m in margins) / len(margins), margins
+  - title: The DPO gradient by hand
+    brief: |
+      The policy is now log-linear over a small candidate set: log pi(y) = theta . phi(y) minus logsumexp over the candidates, and the reference is the same family at theta_ref. Derive the gradient of the mean DPO loss with respect to theta and write it out; do not differentiate numerically. Chosen and rejected share a candidate set, so the logsumexp term's gradient appears in both log-probs and cancels in their difference. The tests compare your gradient to central differences.
+    starter: |
+      def log_softmax(xs):
+          m = max(xs)
+          lse = m + math.log(sum(math.exp(x - m) for x in xs))
+          return [x - lse for x in xs]
+
+
+      def logprobs(theta, cands):
+          """A log-linear policy over a fixed candidate set: log pi(y) = theta . phi(y) - logsumexp."""
+          return log_softmax([dot(theta, phi) for phi in cands])
+
+
+      def dpo_grad(theta, theta_ref, examples, beta):
+          """Mean DPO loss over examples and its gradient with respect to theta, derived by hand.
+
+          An example is {"cands": [phi, ...], "chosen": i, "rejected": j}.
+          """
+          raise NotImplementedError
+    tests: |
+      import math
+      cands = [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]]
+      ex = [{"cands": cands, "chosen": 0, "rejected": 1}, {"cands": cands, "chosen": 2, "rejected": 1}]
+      ref = [0.3, -0.2]
+      loss, g = dpo_grad(ref, ref, ex, beta=0.1)
+      assert abs(loss - math.log(2)) < 1e-12
+      assert all(abs(a - b) < 1e-12 for a, b in zip(g, [-0.0375, 0.0375])), g
+      theta = [0.9, -0.4]
+      loss, g = dpo_grad(theta, ref, ex, beta=0.5)
+      h = 1e-6
+      for k in range(2):
+          up, dn = theta[:], theta[:]
+          up[k] += h; dn[k] -= h
+          fd = (dpo_grad(up, ref, ex, 0.5)[0] - dpo_grad(dn, ref, ex, 0.5)[0]) / (2 * h)
+          assert abs(fd - g[k]) < 1e-6, (k, fd, g[k])
+    hidden: |
+      import math, random
+      rng = random.Random(11)
+      for trial in range(20):
+          dim = 4
+          cands = [[rng.uniform(-1, 1) for _ in range(dim)] for _ in range(5)]
+          ex = []
+          for _ in range(6):
+              i, j = rng.sample(range(5), 2)
+              ex.append({"cands": cands, "chosen": i, "rejected": j})
+          theta = [rng.uniform(-2, 2) for _ in range(dim)]
+          ref = [rng.uniform(-2, 2) for _ in range(dim)]
+          beta = rng.uniform(0.05, 1.0)
+          loss, g = dpo_grad(theta, ref, ex, beta)
+          for k in range(dim):
+              up, dn = theta[:], theta[:]
+              up[k] += 1e-6; dn[k] -= 1e-6
+              fd = (dpo_grad(up, ref, ex, beta)[0] - dpo_grad(dn, ref, ex, beta)[0]) / 2e-6
+              assert abs(fd - g[k]) <= 1e-5 * max(1.0, abs(fd)), (trial, k, fd, g[k])
+      big = [[50.0, 0.0], [0.0, 50.0]]
+      loss, g = dpo_grad([10.0, -10.0], [0.0, 0.0], [{"cands": big, "chosen": 0, "rejected": 1}], 1.0)
+      assert math.isfinite(loss) and all(math.isfinite(x) for x in g), "large logits must not overflow"
+    solution: |
+      def log_softmax(xs):
+          m = max(xs)
+          lse = m + math.log(sum(math.exp(x - m) for x in xs))
+          return [x - lse for x in xs]
+
+
+      def logprobs(theta, cands):
+          """A log-linear policy over a fixed candidate set: log pi(y) = theta . phi(y) - logsumexp."""
+          return log_softmax([dot(theta, phi) for phi in cands])
+
+
+      def dpo_grad(theta, theta_ref, examples, beta):
+          """Mean DPO loss over examples and its gradient with respect to theta.
+
+          An example is {"cands": [phi, ...], "chosen": i, "rejected": j}.
+          """
+          loss, g = 0.0, [0.0] * len(theta)
+          n = len(examples)
+          for ex in examples:
+              cands, i, j = ex["cands"], ex["chosen"], ex["rejected"]
+              lp, lq = logprobs(theta, cands), logprobs(theta_ref, cands)
+              m = beta * ((lp[i] - lq[i]) - (lp[j] - lq[j]))
+              loss += softplus(-m) / n
+              # d log pi(i) - d log pi(j) = phi_i - phi_j: the expectation terms cancel within one candidate set.
+              coef = -beta * sigmoid(-m) / n
+              for k in range(len(theta)):
+                  g[k] += coef * (cands[i][k] - cands[j][k])
+          return loss, g
+  - title: Beta sweep under noisy labels
+    brief: |
+      Train from theta_ref with your gradient and sweep beta. The dataset repeats one comparison three times one way and once the other way, which is what tied or noisy labels look like to the loss. At the optimum the implicit margin, beta times the log-ratio difference, equals the log-odds of the label split, so a smaller beta buys the same margin with a larger move away from the reference. The loss's curvature in theta scales with beta squared, so pick a step size per beta that converges in the step budget; a fixed one either crawls at beta 0.05 or overshoots at beta 1.
+    starter: |
+      def kl(theta, theta_ref, cands):
+          """KL(pi_theta || pi_ref) over one candidate set, in nats."""
+          raise NotImplementedError
+
+
+      def train_dpo(theta_ref, examples, beta, steps=400, lr=1.0):
+          """Gradient descent on dpo_grad starting from theta_ref. Choose the step size so every beta converges."""
+          raise NotImplementedError
+
+
+      def beta_sweep(theta_ref, examples, betas, steps=400, lr=1.0):
+          """For each beta, train and return {"beta", "theta", "kl" (mean over examples), "acc" (pairs ranked correctly)}."""
+          raise NotImplementedError
+    tests: |
+      import math
+      cands = [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]]
+      noisy = [{"cands": cands, "chosen": 0, "rejected": 1}] * 3 + [{"cands": cands, "chosen": 1, "rejected": 0}]
+      ref = [0.0, 0.0]
+      rows = beta_sweep(ref, noisy, [0.05, 0.1, 0.5, 1.0])
+      kls = [r["kl"] for r in rows]
+      assert all(a > b for a, b in zip(kls, kls[1:])), ("a larger beta keeps the policy closer to the reference", kls)
+      for r in rows:
+          lp, lq = logprobs(r["theta"], cands), logprobs(ref, cands)
+          delta = (lp[0] - lq[0]) - (lp[1] - lq[1])
+          assert abs(r["beta"] * delta - math.log(3)) < 0.05, ("with a 3:1 label split the optimum margin is log 3", r["beta"], delta)
+    hidden: |
+      import math
+      cands = [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]]
+      clean = [{"cands": cands, "chosen": 0, "rejected": 1}] * 4
+      rows = beta_sweep([0.0, 0.0], clean, [0.1, 1.0], steps=200)
+      for r in rows:
+          loss, _ = dpo_grad(r["theta"], [0.0, 0.0], clean, r["beta"])
+          assert r["acc"] == 1.0 and loss < 0.2, (r["beta"], loss)
+      more = beta_sweep([0.0, 0.0], clean, [1.0], steps=800)[0]
+      assert more["kl"] > rows[1]["kl"], "with no disagreement in the labels DPO keeps moving: KL grows with more steps"
+    solution: |
+      def kl(theta, theta_ref, cands):
+          """KL(pi_theta || pi_ref) over one candidate set, in nats."""
+          lp, lq = logprobs(theta, cands), logprobs(theta_ref, cands)
+          return sum(math.exp(a) * (a - b) for a, b in zip(lp, lq))
+
+
+      def train_dpo(theta_ref, examples, beta, steps=400, lr=1.0):
+          # The loss's curvature in theta scales with beta squared, so a fixed lr either crawls at small beta
+          # or overshoots at large beta; scaling by 1 / beta^2 gives every beta the same number of effective steps.
+          theta = list(theta_ref)
+          step = lr / (beta * beta)
+          for _ in range(steps):
+              _, g = dpo_grad(theta, theta_ref, examples, beta)
+              theta = [t - step * gk for t, gk in zip(theta, g)]
+          return theta
+
+
+      def beta_sweep(theta_ref, examples, betas, steps=400, lr=1.0):
+          """For each beta: train, then report the mean KL from the reference and the pairwise accuracy on examples."""
+          out = []
+          for beta in betas:
+              theta = train_dpo(theta_ref, examples, beta, steps, lr)
+              kls = [kl(theta, theta_ref, ex["cands"]) for ex in examples]
+              acc = 0
+              for ex in examples:
+                  lp = logprobs(theta, ex["cands"])
+                  acc += lp[ex["chosen"]] > lp[ex["rejected"]]
+              out.append({"beta": beta, "theta": theta, "kl": sum(kls) / len(kls), "acc": acc / len(examples)})
+          return out
+  - title: The NLL term and the falling chosen response
+    brief: |
+      Llama 3 adds a negative log-likelihood term on the chosen response with coefficient 0.2 to keep its log-probability from falling. Add that term and its gradient. The test's candidate set has a third response that neither label mentions and whose features point the same way as the chosen-minus-rejected direction; plain DPO widens the margin by moving probability onto that third response, so the chosen response ends with less probability than it started with, and the NLL term reverses that.
+    starter: |
+      def dpo_nll_grad(theta, theta_ref, examples, beta, alpha):
+          """DPO loss plus alpha times the mean negative log-likelihood of the chosen response, and its gradient."""
+          raise NotImplementedError
+
+
+      def train(theta_ref, examples, beta, alpha=0.0, steps=400, lr=1.0):
+          """train_dpo with the NLL term; alpha = 0 must reproduce train_dpo exactly."""
+          raise NotImplementedError
+    tests: |
+      import math
+      cands = [[1.0, 1.0], [1.0, -1.0], [0.0, 3.0]]
+      ex = [{"cands": cands, "chosen": 0, "rejected": 1}]
+      ref = [0.0, 0.0]
+      start = logprobs(ref, cands)[0]
+      plain = train(ref, ex, beta=0.1, alpha=0.0, steps=300, lr=0.5)
+      lp = logprobs(plain, cands)
+      assert lp[0] - lp[1] > 1.0 and lp[0] < start, "plain DPO widens the margin while the chosen response loses probability"
+      reg = train(ref, ex, beta=0.1, alpha=0.2, steps=300, lr=0.5)
+      lp = logprobs(reg, cands)
+      assert lp[0] - lp[1] > 1.0 and lp[0] > start, "with the NLL term the chosen response gains probability"
+    hidden: |
+      import math, random
+      rng = random.Random(5)
+      for trial in range(15):
+          cands = [[rng.uniform(-1, 1) for _ in range(3)] for _ in range(4)]
+          ex = [{"cands": cands, "chosen": i, "rejected": j} for i, j in (rng.sample(range(4), 2) for _ in range(5))]
+          theta = [rng.uniform(-2, 2) for _ in range(3)]
+          ref = [rng.uniform(-2, 2) for _ in range(3)]
+          beta, alpha = rng.uniform(0.05, 1.0), rng.uniform(0.0, 1.0)
+          loss, g = dpo_nll_grad(theta, ref, ex, beta, alpha)
+          base, _ = dpo_grad(theta, ref, ex, beta)
+          nll = sum(-logprobs(theta, e["cands"])[e["chosen"]] for e in ex) / len(ex)
+          assert abs(loss - (base + alpha * nll)) < 1e-9, "the NLL term is the mean over examples, scaled by alpha"
+          for k in range(3):
+              up, dn = theta[:], theta[:]
+              up[k] += 1e-6; dn[k] -= 1e-6
+              fd = (dpo_nll_grad(up, ref, ex, beta, alpha)[0] - dpo_nll_grad(dn, ref, ex, beta, alpha)[0]) / 2e-6
+              assert abs(fd - g[k]) <= 1e-5 * max(1.0, abs(fd)), (trial, k, fd, g[k])
+      cands = [[1.0, 1.0], [1.0, -1.0], [0.0, 3.0]]
+      ex = [{"cands": cands, "chosen": 0, "rejected": 1}]
+      assert train([0.0, 0.0], ex, 0.1, 0.0, 50, 0.5) == train_dpo([0.0, 0.0], ex, 0.1, 50, 0.5), "alpha = 0 is plain DPO"
+    solution: |
+      def dpo_nll_grad(theta, theta_ref, examples, beta, alpha):
+          """DPO loss plus alpha times the mean negative log-likelihood of the chosen response, and its gradient."""
+          loss, g = dpo_grad(theta, theta_ref, examples, beta)
+          if alpha == 0:
+              return loss, g
+          n = len(examples)
+          for ex in examples:
+              cands, i = ex["cands"], ex["chosen"]
+              lp = logprobs(theta, cands)
+              loss += alpha * -lp[i] / n
+              probs = [math.exp(x) for x in lp]
+              for k in range(len(theta)):
+                  expected = sum(p * phi[k] for p, phi in zip(probs, cands))
+                  g[k] += alpha * -(cands[i][k] - expected) / n
+          return loss, g
+
+
+      def train(theta_ref, examples, beta, alpha=0.0, steps=400, lr=1.0):
+          theta = list(theta_ref)
+          step = lr / (beta * beta)
+          for _ in range(steps):
+              _, g = dpo_nll_grad(theta, theta_ref, examples, beta, alpha)
+              theta = [t - step * gk for t, gk in zip(theta, g)]
+          return theta
+---
+The lesson [DPO in practice](/learn/training/post-training/dpo-practice) states the DPO loss and its gradient; this lab makes you derive both and then shows two behaviours that matter when you run DPO on real data. Everything runs on feature vectors and a log-linear policy over a handful of candidate responses, so each quantity is a few lines of arithmetic you can check by hand. No model is trained in the browser.
+
+Step 1 is the reward model DPO removes. Steps 2 and 3 build the DPO loss on summed log-probs and then on a policy whose gradient you derive and check against central differences. Step 4 trains that policy on labels that disagree 3 to 1 and shows that beta sets how far the policy moves to express the same preference. Step 5 builds a case where the chosen response loses probability while every margin grows, and adds the NLL term Llama 3 used against it.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

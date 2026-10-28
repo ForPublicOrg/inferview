@@ -1,0 +1,97 @@
+---
+id: trn-013
+title: Plan an MoE pretraining run on 256 A100s
+subtitle: experts, parallel layout, memory, communication and restart, then 1,024 GPUs
+track: training
+module: distributed
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 50
+core: true
+tags: [mixture-of-experts, expert-parallelism, data-parallelism, zero, all-to-all, checkpointing]
+companies:
+  - name: Meta
+    url: https://prachub.com/interview-questions/design-a-scalable-moe-pretraining-pipeline
+updated: 2026-10-28
+sources:
+  - title: PracHub, Design a scalable MoE pretraining pipeline
+    url: https://prachub.com/interview-questions/design-a-scalable-moe-pretraining-pipeline
+    note: "candidate report of a Meta machine learning engineer onsite question, posted 2025-09-06 and updated 2026-07-30: a bilingual decoder-only MoE on about 1 trillion tokens, 256 A100-80GB GPUs in 32 nodes of 8, NVLink inside nodes and 200 to 400 Gbps across nodes; sections on parallelism, all-to-all overlap, memory, checkpointing and elastic restart, and scaling to 1,024 GPUs. The question here is original material built on that report. Checked 2026-10-28."
+  - title: NVIDIA A100 Tensor Core GPU
+    url: https://www.nvidia.com/en-us/data-center/a100/
+    note: "A100 80GB SXM: 312 TFLOPS BF16 dense (624 with sparsity), 2,039 GB/s HBM2e, 600 GB/s NVLink. Vendor figures. Checked 2026-10-28."
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "16 bytes per parameter for mixed-precision Adam; ZeRO-1 shards optimizer states; expert parallelism routes tokens with all-to-all and is usually combined with data parallelism; 4 to 60 million tokens per batch for recent LLM pretraining; DeepSeek-V3/R1 batch grew from 3,072 to 15,360 sequences; decision order fit, global batch, throughput. Checked 2026-10-28."
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: "16-way PP, 64-way EP over 8 nodes and ZeRO-1 DP without tensor parallelism; each token sent to at most 4 nodes; 20 SMs of communication enough to saturate IB and NVLink; batch size ramped from 3,072 to 15,360 over the first 469B tokens. Checked 2026-10-28."
+  - title: Korthikanti et al., Reducing Activation Recomputation in Large Transformer Models (arXiv 2205.05198)
+    url: https://ar5iv.labs.arxiv.org/html/2205.05198
+    note: "34sbh bytes per layer with the attention scores recomputed, for a GPT-style block with a 4h MLP. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Design the pretraining run for a bilingual MoE model on about a trillion tokens. You have 256 A100-80GB GPUs, 32 nodes of 8, NVLink inside a node and 200 to 400 Gbps between nodes. Give me the model shape, the parallel layout, the memory per GPU, the communication and how it overlaps, checkpointing and restart. Then I give you 1,024 GPUs."
+</Callout>
+
+Constraints the interviewer adds when asked: the run should finish within a month of wall-clock time including failures; the infrastructure team owns the cluster and will not change the network; research wants the largest model the budget allows; and the restart tooling must cope with losing a node without a human resharding checkpoints.
+
+Write the plan as a one-page decision memo: shape, layout, the numbers behind it, what you give up, and the triggers that would make you change it during the run.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask whether 200 to 400 Gbps is per node or per GPU.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what MFU the team has measured for MoE training on this cluster, and on what model.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask how often a node has failed per week on this cluster, and how long a restart takes today.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>A model of about 17B total and 2.6B activated parameters: 28 layers at hidden 2,048, 64 routed experts with top-6 and 2 shared. No tensor or pipeline parallelism: expert parallelism of 8 inside each node, so all-to-all stays on NVLink, and ZeRO-1 data parallelism of 32 across nodes for experts and 256 for everything else. About 14 GB of model state per GPU, leaving room for 4 sequences of 4,096 tokens. The binding constraint is the expert-gradient all-reduce across nodes: about 65 GB per node per step, which hides behind a 2.7 s step only if the 400 Gbps is per GPU, so the batch size follows from the answer to that one question.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>Compute budget.</b> 256 A100s at 312 TFLOP/s dense BF16 are 8.0e16 FLOP/s of peak. At an assumed 30% MFU, which is mine and must be replaced by the team's measured number, that is 2.4e16 FLOP/s. With 6 FLOPs per activated parameter per token, 1e12 tokens buy 2.4e16 x 6.5e5 s / (6 x 1e12) = about 2.6B activated parameters in 7.5 days. That leaves room for failures and a second attempt inside the month, which I want, because MoE runs fail in ways a first attempt finds.</p>
+<p><b>Shape.</b> Each expert is a gated FFN of 3 x 2,048 x 1,408 = 8.65M parameters. Per layer: 64 routed experts (553.6M), 2 shared (17.3M) and attention (16.8M), 587.7M in all; 28 layers give 16.46B, and a 100,000-token bilingual vocabulary with untied embeddings adds 0.41B, about 16.9B total. Activated per token: attention plus 8 experts, 86.0M per layer, 2.41B over 28 layers, plus the 0.2B output projection, about 2.6B.</p>
+<p><b>Layout.</b> EP 8 inside a node puts 8 routed experts of each layer on each GPU, and every node holds all 64. Per GPU that is 1.94B expert parameters and 1.36B replicated ones, 3.30B in total. BF16 weights and gradients cost 4 x 3.30B = 13.2 GB; ZeRO-1 shards the 12 bytes of optimizer state over 32 replicas for experts (0.73 GB) and 256 for the rest (0.06 GB): about 14 GB. Without ZeRO-1 it would be 16 x 3.30B = 52.8 GB, which is what would squeeze out activations.</p>
+<p><b>Activations.</b> With the attention scores recomputed, Korthikanti et al. give 34sbh bytes per layer for a dense block: 34 x 4,096 x 2,048 = 285 MB per sequence. Eight active experts of width 1,408 are a wider MLP than 4h, so I scale it by about 1.4 to 400 MB, 11.2 GB per sequence over 28 layers. Four sequences per GPU is about 45 GB, which with 14 GB of state leaves about 20 GB for all-to-all buffers, the routing imbalance and the allocator.</p>
+<p><b>Batch and step.</b> 4,194,304 tokens per step (1,024 sequences of 4,096, 4 per GPU), the low end of the playbook's 4 to 60 million. A step is 6 x 2.6e9 x 4.19e6 = 6.6e16 FLOPs, 2.7 s at the assumed rate, and 1e12 tokens is 238,000 steps.</p>
+<p><b>All-to-all.</b> Each GPU sends each of its 16,384 tokens to 6 routed experts at 4 KB per copy: 403 MB to dispatch and as much to combine, per layer, and the same again in the backward pass, about 45 GB per GPU per step over 28 layers. On NVLink that is a small fraction of the step. Across nodes at 400 Gbps per node it would be 8 x 45 GB at 50 GB/s, 7.2 s, longer than the step. That is why EP stays inside the node.</p>
+<p><b>Gradient all-reduce across nodes.</b> Replicated parameters are identical on the 8 GPUs of a node, so reduce inside the node first and send 2 x 2.73 GB / 8 per GPU, 5.5 GB per node. Expert gradients are different on every GPU and each is replicated on 32 nodes: 2 x 31/32 x 3.88 GB = 7.5 GB per GPU, 60 GB per node. About 65 GB per node per step. At 400 Gbps per GPU (400 GB/s per node) that is 0.16 s, hidden easily. At 400 Gbps per node it is 1.3 s, and at 200 Gbps per node 2.6 s against a 2.7 s step, which no overlap hides.</p>
+<p><b>The decision with two defensible answers, if the bandwidth is per node.</b> Double the batch to 8.4M tokens: the step doubles to 5.5 s and the 1.3 to 2.6 s of gradient traffic fits behind it, at the cost of half as many optimizer steps, with a ramp from 4M as DeepSeek-V3 ramped its batch so the early steps are not wasted. Or move to EP 16 across node pairs: expert gradients per GPU halve, but half the all-to-all crosses nodes on every layer, forward and backward. I would take the larger batch, because the all-to-all is on the critical path of every layer and the gradient all-reduce is not.</p>
+<p><b>Routing.</b> Dropless routing is affordable because dispatch stays on NVLink; the risk is memory from imbalance, which the 20 GB of headroom is for. Balance with the bias method DeepSeek-V3 uses or a small auxiliary loss, and alarm on max-over-mean load per layer.</p>
+<p><b>Checkpointing and restart.</b> 16.9B x 16 bytes is 270 GB of state per checkpoint, written in a sharded format that stores logical tensors, so a restart at a different data-parallel degree can reshard without a human. EP inside the node makes any node replaceable: the other 31 still hold every expert, so the job can restart at DP 31 with the global batch kept by one more accumulation step on some ranks, or at DP 31 with a smaller batch. Checkpoint interval comes from the measured failure rate and the restart time asked for in hint 3, not from a default.</p>
+<p><b>What I give up.</b> No tensor or pipeline parallelism caps the model at what fits in one GPU's memory with 8 experts per GPU per layer. A research request for 256 experts per layer would put 32 per GPU, about 7.8B expert parameters, and with them 31 GB of weights and gradients before any optimizer state: it forces cross-node EP or a smaller expert, and either reopens this plan.</p>
+<p><b>1,024 GPUs.</b> With the same 4M-token batch each GPU gets one sequence, the step falls to 0.7 s, and the same 65 GB per node of gradient traffic is exposed. Keep 4 sequences per GPU and the batch is 16.8M tokens, inside the playbook's range, but 1e12 tokens become 59,600 steps and the run takes about 2 days. With a fixed token budget, 1,024 GPUs are better spent on a model with about 4 times the activated parameters, or on more tokens if the data exists. That is research's call, written down, because the same cluster serves both answers.</p>
+<p><b>How the recommendation fails.</b> If routing settles into persistent skew, the hottest GPU in each node sets the step time, and in-node EP gives no other node to spread the load to; the fix is expert replication inside the node, which costs memory the plan has already spent on activations.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Infrastructure confirms 200 Gbps per node and refuses to change it. Research refuses a batch above 4M tokens for the first 100B tokens. What do you change, and who signs off on the cost?</li>
+<li>Two weeks in, measured MFU is 18% and the profile shows the all-to-all at 30% of the step despite NVLink. What would you look at, and what would make you reverse the in-node EP decision?</li>
+<li>A node fails every two days on average and a restart takes 40 minutes. How do you set the checkpoint interval, and what does the resharding path need to prove before you rely on it?</li>
+</ul>
+</Fragment>
+</Depth>
+
+The memo writes down three triggers that reopen the plan during the run: measured MFU below 20% after the first 2,000 steps, which invalidates the schedule; exposed gradient communication above 20% of step time, which moves the batch to 8.4M tokens; and max-over-mean expert load above 2 on any layer for more than 1,000 steps, which turns on in-node expert replication at the cost of a smaller micro-batch. The thresholds are mine, chosen so each trigger fires before the month is at risk, and the team should replace them with numbers from its own runs.
+
+## Follow-ups
+
+- *Your plan spends the extra 768 GPUs on a bigger model. Finance asks why the run is not simply four times faster. What do you put in writing, and what result would show you were wrong?*
+- *A colleague proposes TP 2 inside the node to fit 256 experts per layer without cross-node EP. What does it cost per layer, and how do you decide between that and a smaller expert without deciding by rank?*
+- *The bilingual mix is 70/30 by tokens and the smaller language's evaluations plateau at 300B tokens. Do you change the sampling temperature mid-run, and what do you check about the routers before you do?*
+
+## Common mistakes
+
+- Choosing tensor parallelism by habit for a model whose state fits in 14 GB per GPU, and paying collectives on every layer for nothing.
+- Spreading expert parallelism across nodes without computing the all-to-all volume per step against the inter-node bandwidth.
+- Treating 200 to 400 Gbps as a per-GPU figure without asking; the plan changes by a factor of 8.
+- Scaling to 1,024 GPUs by keeping the global batch fixed, which leaves each GPU one sequence and exposes the gradient traffic.
+- Saving ZeRO-1 shards in a rank-specific layout, so losing a node needs a human to reshard before restart.

@@ -1,0 +1,127 @@
+---
+id: trn-010
+title: A compiled training step that loses to eager
+subtitle: rank the defects, then choose a fix
+track: training
+module: gpu-kernels
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [torch-compile, cuda-graphs, recompilation, dynamic-shapes, padding]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: PyTorch 2.14 documentation, torch.compile
+    url: https://docs.pytorch.org/docs/2.14/generated/torch.compile.html
+    note: "reduce-overhead uses CUDA graphs and can cost more memory; dynamic=False always specialises; dynamic=None compiles a more dynamic kernel on recompile; recompile_limit defaults to 8, after which the frame falls back to eager. Checked 2026-10-28."
+  - title: PyTorch 2.14 documentation, CUDA semantics
+    url: https://docs.pytorch.org/docs/2.14/notes/cuda.html
+    note: "CUDA graph capture prohibits dynamic shapes and CPU-GPU synchronising ops; graphs own private memory pools that live until the graph and its tensors are released; empty_cache() releases unused cached memory and does not increase the memory available to PyTorch. Checked 2026-10-28."
+choices:
+  - text: "Calling torch.cuda.empty_cache() every step releases the CUDA graph memory pools, forcing re-capture"
+    correct: false
+    why: "empty_cache() releases only unused cached blocks; pools held by live graphs stay, though the call still costs time every step."
+  - text: "The loss.item() check synchronises every step, and each synchronisation invalidates the compiled graph"
+    correct: false
+    why: "The .item() runs outside the compiled module, so it stalls the CPU each step but does not fail any guard or trigger a recompile."
+  - text: "Padding each batch to its own longest sequence produces new input shapes the graph is specialised on"
+    correct: true
+    why: "Each new length fails the compiled frame's shape guard, so it recompiles and records a new CUDA graph until the limit of 8 sends it back to eager."
+  - text: "Four loader workers cannot keep pace with the compiled step, so the GPU idles between graph replays"
+    correct: false
+    why: "A slow loader would add a steady wait every step, not 30-second spikes that line up with recompiles."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"We turned on torch.compile with reduce-overhead to speed up fine-tuning. The run got slower than eager. Here is the loop and the first 60 steps. What is going on, and what do you change?"
+</Callout>
+
+The loop, PyTorch 2.14, one H100, as a scenario:
+
+```python
+model = build_model().cuda()
+cmodel = torch.compile(model, mode="reduce-overhead", dynamic=False)
+opt = torch.optim.AdamW(model.parameters(), lr=2e-5, fused=True)
+
+def collate(samples):
+    longest = max(len(s) for s in samples)
+    ids = torch.full((len(samples), longest), PAD_ID, dtype=torch.long)
+    for i, s in enumerate(samples):
+        ids[i, : len(s)] = torch.tensor(s[:MAX_LEN])
+    return ids
+
+loader = DataLoader(docs, batch_size=8, shuffle=True, collate_fn=collate, num_workers=4)
+
+for step, ids in enumerate(loader):
+    ids = ids.cuda(non_blocking=True)
+    loss = cmodel(ids, labels=ids).loss
+    loss.backward()
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+    if loss.item() > 20.0:
+        alert(step, loss.item())
+    torch.cuda.empty_cache()
+```
+
+Documents are truncated to `MAX_LEN = 2048` tokens. What the team collected (scenario, abbreviated):
+
+```text
+eager baseline, same loop without torch.compile: 0.61 s/step, steady
+compiled, steps 0-59:
+  step 0     44.2 s   compile
+  steps 1-4   0.48 s
+  step 5     31.7 s   recompile 1
+  steps 6-11  0.47 s
+  step 12    30.9 s   recompile 2
+  ...
+  step 57    29.8 s   recompile 7
+  mean over steps 0-59: 4.2 s/step
+memory_reserved: 52 GB after step 4, 58 GB after step 12, 69 GB after step 57
+```
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the reason logged with each recompile, and for the input shapes of the steps that triggered them.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the length distribution of the documents looks like, in particular what fraction are truncated at 2,048.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask for steps 60 to 200: does the recompile pattern continue, stop, or change?</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>The collate pads each batch to its own longest document. Most batches contain a truncated document and come out at 2,048, but every few steps a batch has none and comes out at a new length. With <code>dynamic=False</code> each new length is a new specialisation: a recompile and, in reduce-overhead mode, a new CUDA graph with its own memory pool, which is why reserved memory climbs. After 8 compiled results the frame falls back to eager. Fix the shapes: pad to a small set of length buckets, or to 2,048 always, and drop the last partial batch. The <code>.item()</code> and <code>empty_cache()</code> calls are real defects of lower rank.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>Why this choice explains the symptom.</b> The spikes are compile time, and they line up with recompiles. A compiled frame is guarded on its input shapes; with <code>dynamic=False</code> the documentation says PyTorch always specialises, so a batch at length 1,873 cannot reuse the graph built for 2,048. Reduce-overhead mode also records a CUDA graph per shape, and CUDA graphs prohibit dynamic shapes by construction. Each graph holds a private memory pool, which matches reserved memory climbing from 52 to 69 GB. Between recompiles the compiled step is faster than eager (0.47 s against 0.61 s), so compilation works; the shapes defeat it.</p>
+<p><b>What happens next, and what to collect.</b> The default <code>recompile_limit</code> is 8. The log shows seven recompiles plus the first compile, so the next new length should send this frame back to eager, after which steps run at about eager speed and the run looks "fixed" while getting nothing from compilation. Ask for steps 60 to 200 to confirm, the logged reason for each recompile, and the document length histogram. Without the histogram, assume truncation dominates, since most batches came out at 2,048.</p>
+<p><b>The fix, with costs.</b> Three defensible options. Pad every batch to 2,048: one shape, one graph, no recompiles, and padding compute proportional to how short the average document is. Pad to buckets, for example multiples of 256 up to 2,048: eight shapes, at most 255 padding tokens per sequence, but eight graphs and eight memory pools, exactly at the recompile limit, so a ninth shape anywhere (a last partial batch of 5, an eval call with a different batch size) falls back to eager. Pack documents into fixed 2,048-token rows: no padding, one shape, but attention must be masked at document boundaries or the model attends across documents, which changes what it learns. With a fine-tuning deadline and an unknown length distribution, pad to 2,048 first and measure the padding fraction; move to packing if padding is more than the compile saving. Add <code>drop_last=True</code> either way.</p>
+<p><b>Failure mode of the fix.</b> Fixed shapes hide a new source of variation until it appears: switching to <code>dynamic=None</code> to "be safe" would compile dynamic kernels but still record a CUDA graph per shape, so memory grows the same way. Watch the recompile count as a run metric, not only step time.</p>
+<p><b>The secondary defects, ranked.</b> Second: <code>loss.item()</code> every step synchronises the CPU with the GPU, so the CPU cannot queue the next step while the current one runs; with CUDA graphs that run-ahead is most of the benefit. Check the loss on the GPU and read it every N steps. Third: <code>torch.cuda.empty_cache()</code> every step releases unused cached blocks, which the allocator must request from the driver again on the next step; it does not free the graphs' pools and does not increase usable memory. Delete it. Fourth, unverified: the loader. Its throughput is not in the evidence; measure the loader alone before ruling it out.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Padding to 2,048 costs 35% extra tokens on this data. The compile saving is 23% per step. Do you keep padding, pack, or drop reduce-overhead, and who signs off on the packing change to the training data?</li>
+<li>A colleague proposes raising <code>recompile_limit</code> to 64 instead of changing the collate. What does each extra shape cost in memory and time, and when would you agree?</li>
+<li>What would you need to see to switch this run back to eager for good?</li>
+</ul>
+</Fragment>
+</Depth>
+
+**Why the wrong choices are tempting.** The <code>empty_cache()</code> call is a real defect, and it is tempting to connect it to CUDA graph memory; but it releases only unused blocks, and the graphs' pools are in use. The <code>.item()</code> call is a real defect too, and synchronisation inside a compiled region does break graphs; this one runs outside the compiled module, so it costs a stall per step and no recompiles. The loader is the usual suspect for a slow step, but a slow loader adds a steady wait, not 30-second spikes on specific steps.
+
+## Follow-ups
+
+- After the fix, steps run at 0.47 s and the GPU timeline shows gaps between steps. What do you look at first?
+- The team wants to keep variable shapes for an evaluation loop that runs every 500 steps. How do you compile training and evaluation so neither recompiles the other?
+
+## Common mistakes
+
+- Blaming `dynamic=False` alone. `dynamic=None` changes the kernels, but reduce-overhead still needs a CUDA graph per shape.
+- Reading the steady-state speed after step 60 as success. It may be the eager fallback.
+- Deleting the `.item()` and `empty_cache()` calls, seeing a small gain, and stopping there.

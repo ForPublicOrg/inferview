@@ -1,0 +1,105 @@
+---
+id: inf-021
+title: Design an end-to-end batching system for LLM queries
+subtitle: a half-price batch endpoint on a fleet that serves interactive traffic
+track: inference
+module: batching
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 50
+core: false
+tags: [batch-api, continuous-batching, capacity-planning, priority-scheduling, prefix-caching, system-design]
+companies:
+  - name: Anthropic
+    url: https://www.aced.io/questions/5807/design-end-to-end-batching-system-for-llm-queries
+updated: 2026-10-28
+sources:
+  - title: aced.io, Design an end-to-end batching system for LLM queries
+    url: https://www.aced.io/questions/5807/design-end-to-end-batching-system-for-llm-queries
+    note: "candidate report: the page lists the prompt under Anthropic with 3 reported interviews, last asked about four months before 2026-10-28, and gives a second phrasing: design an API that efficiently batches requests for sampling from large language models. Checked 2026-10-28."
+  - title: Claude docs, Batch processing (Message Batches API, checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+    note: "vendor documentation: usage at 50 percent of standard prices; a batch holds up to 100,000 requests or 256 MB; most batches complete within 1 hour; batches expire if not complete within 24 hours and expired requests are not billed; results available for 29 days; rate limits apply to requests waiting in batches; the 1-hour prompt cache is suggested for batches with shared context. Checked 2026-10-28."
+  - title: vLLM source, v1/core/sched/scheduler.py (main branch, read 2026-10-28)
+    url: https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/sched/scheduler.py
+    note: "running requests are scheduled first from the step's token budget; under the priority policy the preemption victim is the running request with the largest (priority, arrival time). Checked 2026-10-28."
+  - title: vLLM docs, Optimization and tuning (latest, checked 2026-10-28)
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: "max_num_batched_tokens above 8192 recommended for throughput, around 2048 for inter-token latency; preemption and recompute can hurt end-to-end latency. Checked 2026-10-28."
+  - title: "Orca: A Distributed Serving System for Transformer-Based Generative Models (Yu et al., OSDI 2022)"
+    url: https://www.usenix.org/conference/osdi22/presentation/yu
+    note: "iteration-level scheduling and selective batching; the abstract reports 36.9 times the throughput of FasterTransformer at the same latency on GPT-3 175B. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="As reported by a candidate">
+"Design an end-to-end batching system for LLM queries."
+</Callout>
+
+The same report gives a second phrasing: an API that batches requests for sampling from large language models efficiently. The case, constructed for this problem:
+
+- You run a model API. Interactive traffic is served by 48 replicas of one model on vLLM. Its objectives are p99 time to first token under 1.5 s and p99 inter-token latency under 80 ms.
+- Product wants an asynchronous batch endpoint at half price that completes within 24 hours, the shape of Anthropic's Message Batches API. Finance wants it to run on capacity the interactive load leaves idle, with no new GPUs this year.
+- The interactive load needs about 40 replicas on average over the 12 daytime hours and 18 over the 12 night hours. The busiest night of the last quarter needed 24. A replica restarted with different engine settings takes 6 minutes to serve again.
+- Measured on staging: a replica run for throughput completes about 2,000 batch requests an hour of the expected shape (2,000 prompt tokens, 400 output tokens).
+- Expected demand at launch is 500,000 batch requests a day. Product expects 10% growth a month.
+- Three engineers, ten weeks. The serving engine is a fork you can configure but not change this half.
+
+Design the system from the batch API to the GPUs and back: what a client submits, how work reaches replicas, how a replica batches it, how results return, and what happens to interactive traffic. Choose and defend the capacity you leave for interactive traffic. Write the rollout plan with its rollback triggers, and state what you give up.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask whether "within 24 hours" is a contract term or a target, and what the customer is told when a request expires.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the hourly interactive load for the worst week of the last quarter, not the average day.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask which engine settings can change without a restart, and how long a drained replica takes to serve interactive traffic again.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>A batch API that stores each submission durably, splits it into work units ordered by expiry and grouped by shared prefix, and runs them on interactive replicas drained at night and restarted with throughput settings. Inside every replica, continuous batching does the rest. I would leave 24 replicas for interactive traffic at night, which covers the worst night of the quarter. That leaves 24 replicas for 12 hours, about 576,000 requests a night, against 500,000 at launch. Growth closes that gap in about two months, so the plan carries a written trigger for the next design: co-locating batch work at low priority on interactive replicas. What I give up: batches submitted in the morning finish that night, not within an hour.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>The API.</strong> A client creates a batch with a list of requests, each with its own <code>custom_id</code>, and gets a batch id. The service validates every request before accepting the batch, writes the input to durable storage, and only then returns. It caps a batch by count and bytes and caps each tenant's requests waiting in all its batches, as Anthropic's Message Batches API does. Clients poll status, cancel, and fetch results once every request has ended or the batch has expired at 24 hours. Expired requests are reported per request and not billed. Results are kept for a fixed retention period.</p>
+<p><strong>From batch to work units.</strong> A planner splits each batch into units of about a thousand requests. It orders units by expiry, so the batch closest to its deadline runs first, and groups requests that share a prompt prefix into the same unit. A replica's prefix cache only helps when requests that share a prefix land on it within the cache's lifetime, so grouping turns a shared system prompt into one prefill instead of a thousand.</p>
+<p><strong>Execution.</strong> Workers lease units from a queue and send their requests to batch replicas through the same engine API the interactive path uses. Delivery is at least once. A unit whose lease expires goes back to the queue, and results are written keyed by (batch id, <code>custom_id</code>), so a retried request overwrites rather than duplicates. A request that fails for its own reason, such as an invalid parameter, is recorded as an error and not retried.</p>
+<p><strong>Inside a replica.</strong> The engine already does iteration-level scheduling: requests join and leave the running set every step, which is where batching pays. Interactive replicas run a small token budget per step, which keeps inter-token latency down. Batch replicas restart with a large budget and more running sequences, which the vLLM docs recommend for throughput, since nobody is watching their tokens stream.</p>
+<p><strong>The decision: where batch work runs.</strong> Two answers are defensible.</p>
+<ul>
+<li><em>Drain replicas at night and run them in batch mode.</em> A fleet controller stops routing interactive traffic to a set of replicas after the evening ramp, waits for their streams to finish, restarts them with batch settings, and returns them before the morning ramp. Interactive traffic never shares a step with batch work, so its objectives cannot regress from batch load. The cost: capacity exists only at night, daytime submissions wait up to 12 hours, and a night spike needs 6 minutes per replica to undo.</li>
+<li><em>Co-locate batch work at low priority on every replica.</em> The router sends batch requests to replicas below a load threshold, and the engine's priority policy admits interactive requests first and preempts the lowest-priority, latest-arrived request under memory pressure. This uses daytime idle capacity too. The cost: priority decides admission and the preemption victim, but a batch request that is already running still takes its share of every step's token budget. Its prefill chunks lengthen the steps every interactive stream waits on, and preempted batch requests recompute their prefill, which is GPU time paid twice.</li>
+</ul>
+<p>With an engine I cannot change, three engineers and an interactive objective that finance does not want to trade, I would launch with night drains and keep co-location as the next design.</p>
+<p><strong>The quantity: capacity left for interactive traffic at night.</strong> The worst night of the quarter needed 24 replicas, so I leave 24 and drain 24. Twelve hours at 2,000 requests per replica-hour gives 24 × 12 × 2,000 = 576,000 requests a night. Leaving 20 to 26 is reasonable, depending on how much of the worst night you are willing to answer with the 6-minute restart. Leaving 18, the night average, is not: every night above the average violates the interactive objective for at least 6 minutes while a replica comes back.</p>
+<p><strong>The constraint conflict.</strong> Finance wants every idle GPU-hour used; the interactive objectives want headroom nobody uses on most nights. At 500,000 requests a day the night pool runs at 87% (500,000 / 576,000). At 10% a month, demand is 550,000 after one month and 605,000 after two, past the night pool. The assumption that flips the decision is growth: at the projected rate, night drains alone last about two months.</p>
+<p><strong>Where this design fails.</strong> A night with more interactive traffic than the buffer, a launch in another time zone for instance, shrinks the batch pool by the replicas returned. The units queued behind it are ordered by expiry, so the batches submitted earliest still finish, but a batch submitted at 07:00 that misses one night has 12 hours left and no night in them. The controller computes the projected completion of every batch from the queue and the current pool. When a batch's projection passes its expiry minus two hours, it alerts and moves those units to daytime drains, taken from the 8 replicas the daytime average leaves idle, at the cost of daytime headroom.</p>
+<p><strong>What I give up.</strong> Completion within an hour, which Anthropic's batch documentation says most batches achieve. Daytime idle capacity, except in an emergency. Some night capacity, held for a spike that most nights do not bring.</p>
+<p><strong>Rollout plan.</strong> Weeks 1 to 6: the API, storage, planner, workers and fleet controller, tested with a fake engine whose throughput follows the staging measurement. Weeks 7 and 8: drain 4 replicas a night and run synthetic batches. Week 9: internal tenants. Week 10: general availability with a per-tenant cap on waiting requests. Rollback triggers: interactive p99 time to first token above 1.5 s for 10 minutes during a drain window, which returns every drained replica at once; any result written under another request's <code>custom_id</code>, which halts all batch execution; more than 0.5% of requests in a day expiring, which stops new batch admissions until the cause is known. The decision memo records the growth trigger: when daily demand passes 80% of the night pool's capacity, start the co-location design.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Pushback: sales promised a customer that their batches finish within an hour, because a vendor's documentation says most batches do. Your design finishes at night. What do you offer that customer, what does it cost the interactive objective, and who signs it?</em></li>
+<li><em>Reversal: what would you need to measure before moving from night drains to low-priority co-location?</em> Interactive p99 inter-token latency on a canary replica with batch filler at increasing shares of the token budget, the share at which it crosses 80 ms, and the preemption rate of batch requests at that share.</li>
+<li><em>Interactive night traffic grows 40% after a launch in another region, and your batch capacity halves next week. Which batches expire, who is told before it happens, and what do you change first?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Two tenants submit batches that share a 6,000-token system prompt. Should their requests share prefix-cache blocks on a batch replica, and what in the cache key decides it?*
+- *A worker crashes after the engine returned half a unit's results. What does the restarted worker do, and how does the result store keep each request's result exactly once in the client's view?*
+- *How do you price a batch request that was preempted and recomputed twice?*
+
+## Common mistakes
+
+- Designing only the engine's batching and leaving out the API, the storage and the expiry semantics, or only the API and leaving out what happens on the GPU.
+- Running batch work at low priority on interactive replicas and calling the interactive objectives safe because priority exists, when a running batch request still lengthens every step.
+- Sizing the night pool from the average night.
+- Retrying a request that failed for its own reason until the batch expires.
+- Ordering work by submission time, so one large early batch makes every later batch miss its deadline.
+- Writing results without a key that makes a retried request idempotent.

@@ -1,0 +1,84 @@
+---
+id: trn-014
+title: Derive a column-sharded matmul and its backward pass
+subtitle: which collectives, where, and what they cost against the matmul
+track: training
+module: distributed
+type: concept
+difficulty: hard
+seniority: [staff]
+minutes: 30
+core: true
+tags: [tensor-parallelism, collectives, backward-pass, sequence-parallelism]
+companies:
+  - name: OpenAI
+    url: https://prachub.com/interview-questions/derive-sharded-matrix-multiplication-and-backpropagation
+updated: 2026-10-28
+sources:
+  - title: PracHub, Derive Sharded Matrix Multiplication and Backpropagation
+    url: https://prachub.com/interview-questions/derive-sharded-matrix-multiplication-and-backpropagation
+    note: "candidate report of an OpenAI machine learning engineer onsite question, posted 2026-04-19 and updated 2026-07-16: Y = X @ W with W column-sharded over P devices, full X and the matching upstream-gradient shard on each device; derive forward and backward and the collectives for a replicated dX with dW sharded; follow-ups on sharding the input dimension, composing with data parallelism, overlap, and detecting a duplicated or missing reduction. The question here is original material built on that report. Checked 2026-10-28."
+  - title: Narayanan et al., Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM (arXiv 2104.04473)
+    url: https://arxiv.org/abs/2104.04473
+    note: "tensor model parallelism within a node combined with pipeline parallelism across nodes; 502 petaFLOP/s on 3,072 GPUs, the paper reports. Checked 2026-10-28."
+  - title: Korthikanti et al., Reducing Activation Recomputation in Large Transformer Models (arXiv 2205.05198)
+    url: https://ar5iv.labs.arxiv.org/html/2205.05198
+    note: "sequence parallelism splits the non-tensor-parallel regions along the sequence and replaces each all-reduce with a reduce-scatter and an all-gather; activation memory (sbh/t)(34 + 5as/h) per layer with both. Checked 2026-10-28."
+  - title: Austin et al., How to Scale Your Model, GPUs chapter (JAX scaling book)
+    url: https://jax-ml.github.io/scaling-book/gpus/
+    note: "H100 990 bf16 TFLOP/s dense and 450 GB/s NVLink per direction per GPU, hard to exceed about 370 GB/s in practice; tensor parallelism compute-bound up to about 8-ways, which generally means intra-node or at most 2-node TP. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Y = X @ W. X is B by D, W is D by H, and W is split by output columns over P devices, so each holds a D by H/P shard. Every device has all of X and its shard of the upstream gradient. Derive the forward and backward passes, and tell me every collective you need so that dX ends up replicated and dW stays sharded. Then tell me whether P = 8 is worth it for B = 8,192, D = 8,192 and H = 28,672 on H100s."
+</Callout>
+
+Give the shapes on each device at every step, the collectives with their sizes, the per-device bytes they move, and your choice of P with the arithmetic behind it.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what the next operation after Y expects: the full Y on every device, or Y split by columns.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the layer before X does with dX: whether it needs the whole matrix on every device or could work on a slice of the rows.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask for the interconnect's measured all-reduce bandwidth at this message size, not its datasheet figure.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Forward: device p computes Y_p = X W_p, B by H/P, with no communication; Y stays split by columns. Backward: dW_p = X^T dY_p, D by H/P, also local, which is exactly the sharding required. dX = dY W^T is a sum over the shards, dX = sum over p of dY_p W_p^T, so each device computes a full-size B by D partial and one all-reduce of B x D sums them. One collective in the backward pass, none in the forward unless the next op needs full Y. At the given sizes, each device does about 2,048 FLOPs per byte it sends, close to the H100's ratio of compute to NVLink bandwidth, so P = 8 is worth it only if the all-reduce overlaps with the dW matmul.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>Forward.</b> Column j of Y depends only on column j of W, so Y_p = X W_p is a correct B by H/P block of Y, computed with 2 x B x D x H / P FLOPs and no communication. If the next operation is elementwise, as an MLP's activation function is, it runs on the shard. If it needs full rows of Y, it costs an all-gather of B x H.</p>
+<p><b>dW.</b> dW = X^T dY. Column block p of dW is X^T dY_p, which uses the full X that every device has and the gradient shard it holds: D by H/P, local, sharded as required.</p>
+<p><b>dX.</b> dX = dY W^T = [dY_1 ... dY_P] [W_1 ... W_P]^T = sum over p of dY_p W_p^T. Each device can form only its own term, a full B by D matrix, so the replicated dX needs an all-reduce of B x D elements. With a ring that costs 2 (P - 1) / P x B x D x 2 bytes per device in bf16: 2 x 7/8 x 8,192 x 8,192 x 2 = 235 MB at P = 8.</p>
+<p><b>Is P = 8 worth it.</b> The dX matmul on each device is 2 x B x (H/P) x D = 2 x 8,192 x 3,584 x 8,192 = 481 GFLOPs. Dividing FLOPs by bytes, the ratio simplifies to H / (2 (P - 1)) = 28,672 / 14 = 2,048 FLOPs per byte. The H100 does 990 TFLOP/s against 450 GB/s of NVLink per direction, 2,200 FLOPs per byte, so the all-reduce takes about as long as the matmul that produces it: 481 GFLOPs at 990 TFLOP/s is 0.49 ms, and 235 MB at 450 GB/s is 0.52 ms, more at the 370 GB/s the scaling book says is hard to exceed. Exposed, it nearly doubles this layer's backward time. Overlapped with the dW matmul, which is the same size and needs no communication, it hides. That is the case for P = 8 inside a node and the case against P = 16 across two: the ratio falls to 28,672 / 30 = 956 at P = 16 while one hop moves to a 50 GB/s link.</p>
+<p><b>The decision with two defensible answers: replicate dX or leave it scattered.</b> The question asks for a replicated dX, and the all-reduce gives it. If the layer before this one runs on slices of the sequence, as LayerNorm and dropout do under sequence parallelism, dX can stay split by rows: a reduce-scatter moves half the bytes of the all-reduce and leaves each device B/P rows. The cost is an all-gather of X in the forward pass, since this matmul needs all of X, and a second collective to schedule and overlap. Korthikanti et al. make that trade to cut activation memory by the factor t; it is the right call when activations bind and neutral on bytes, since a reduce-scatter plus an all-gather move what one all-reduce moves.</p>
+<p><b>Row sharding, for contrast.</b> If W is split by input rows, D/P by H, device p needs only columns D/P of X, computes a full-size partial Y, and the forward pass needs an all-reduce of B x H. The backward is then local for both dX (columns of dX) and dW, given a replicated dY. Megatron puts the column-sharded matmul first and the row-sharded one second in an MLP, so the split output of the first feeds the second with no collective in between: one all-reduce in the forward pass and one in the backward per MLP.</p>
+<p><b>How the recommendation fails.</b> Overlapping the dX all-reduce with the dW matmul assumes they run on different hardware resources; on the GPU the collective kernel also takes streaming multiprocessors and memory bandwidth from the matmul, so the overlap is partial and the measured backward time sits between the two estimates. A profile decides how much.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Add data parallelism of 64 on top. Which devices all-reduce dW_p with which, and what is the size of that collective against the tensor-parallel one?</li>
+<li>Your loss matches the single-device run for 200 steps and then drifts. How would you find a duplicated or missing reduction, and what would its signature be in the gradient norms?</li>
+<li>The team wants P = 16 to fit a bigger model without pipeline parallelism. What measurement would make you agree?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Your plan overlaps the dX all-reduce with the dW matmul. The profile shows the overlap recovers a third of the communication time, not all of it. Do you accept the slower layer, cut P to 4 and add pipeline stages, or shard dX by rows, and what risk do you write down for each?*
+- *A colleague argues that the gradient check against a single-device run is enough to prove the sharding correct. What failure would it miss, and what would you add?*
+- *Two senior engineers disagree on whether to put the all-reduce after this matmul or defer it to the start of the previous layer's backward. How do you decide without deciding by rank?*
+
+## Common mistakes
+
+- Putting an all-reduce in the forward pass of a column-sharded matmul, which needs none.
+- All-reducing dW, which is already correct and sharded; an all-reduce there sums unrelated column blocks.
+- Forgetting that each device's dX term is full size, B by D, not B by D/P.
+- Comparing FLOPs with bytes without fixing the precision of both; bf16 halves the bytes and doubles the ratio against fp32 transfers.
+- Claiming tensor parallelism is free inside a node; at P = 8 and these sizes it is near the break-even, and overlap is what makes it pay.

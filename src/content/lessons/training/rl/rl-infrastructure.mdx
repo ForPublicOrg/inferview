@@ -1,0 +1,133 @@
+---
+title: "RL infrastructure: rollouts, staleness and mismatch"
+track: training
+module: rl
+order: 5
+kind: lesson
+level: staff
+minutes: 12
+summary: An RL system samples in an inference engine and trains in a separate stack, so it is off-policy twice over, through numerics that differ between the two and through weights that lag when generation and training overlap; this lesson covers colocated and separate rollout engines, staleness bounds, truncated importance sampling and batch-invariant kernels.
+prerequisites: [training/rl/ppo, training/rl/grpo-family]
+updated: 2026-10-28
+sources:
+  - title: Hugging Face TRL, GRPO Trainer documentation (main branch)
+    url: https://huggingface.co/docs/trl/main/en/grpo_trainer
+    note: "vLLM colocate mode (default) runs inside the trainer process and shares GPU memory; server mode runs on separate GPUs over HTTP, with a warning to keep them distinct to avoid NCCL errors; engines 'in theory mathematically identical' produce different outputs through precision and hardware-specific optimisations, which turns on-policy RL into off-policy and biases the gradient; vllm_importance_sampling_correction defaults to True with sequence-level masked importance sampling (sequence_mask) by default; under TIS ratios outside [clip_min, clip_max] are clipped, clip_max default 3.0; under MIS they are set to zero; metric sampling/sampling_logp_difference/mean. Checked 2026-10-28 against the main-branch docs."
+  - title: Yao et al., On the Rollout-Training Mismatch in Modern RL Systems (NeurIPS 2025, OPT 2025 workshop poster)
+    url: https://neurips.cc/virtual/2025/124259
+    note: "rollout (vLLM) and training (FSDP) stacks assign significantly different token probabilities to the same weights, implicitly turning on-policy RL off-policy; truncated importance sampling restores stable training, including with quantized rollouts. Checked 2026-10-28."
+  - title: Horace He and Thinking Machines Lab, Defeating Nondeterminism in LLM Inference (2025-09-10)
+    url: https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+    note: "the main cause is lack of batch invariance: server load changes batch size, and kernels change reduction order with it; Qwen3-235B-A22B-Instruct-2507 at temperature 0, 1,000 completions of 1,000 tokens gave 80 unique completions, identical for 102 tokens and diverging at the 103rd; batch-invariant kernels made all 1,000 identical; Qwen3-8B, 1,000 sequences: vLLM default 26 s, unoptimised deterministic 55 s, with improved attention kernel 42 s; RLVR on Bigmath with Qwen2.5-VL 8B: without off-policy correction reward collapsed with a KL spike near step 318, with importance weighting KL stayed around 0.001, with bitwise-identical sampler and trainer KL stayed at 0. Checked 2026-10-28."
+  - title: Kimi Team, Kimi K2 (arXiv 2507.20534)
+    url: https://arxiv.org/html/2507.20534
+    note: "1.04T-parameter MoE with 32B activated; colocated RL: training and inference engines on the same workers, each releasing GPU memory when the other runs; distributed checkpoint engine broadcasts parameters and inference engines pull only the shards they need; a full parameter update in less than 30 seconds; on H800 clusters concurrent H2D copies and broadcasts saturate PCIe, so the pipeline falls back from three stages to two; partial rollout pauses long-tail trajectories and resumes them in the next iteration. Checked 2026-10-28."
+  - title: Zheng et al., Group Sequence Policy Optimization (arXiv 2507.18071)
+    url: https://arxiv.org/abs/2507.18071
+    note: "sequence-level likelihoods make it possible to use the inference engine's likelihoods directly, avoiding recomputation in the training engine. Checked 2026-10-28."
+  - title: Prime Intellect, INTELLECT-3 (2025-11-26)
+    url: https://www.primeintellect.ai/blog/intellect-3
+    note: "prime-rl is async-only and RL is always a few steps off-policy; 512 H200 GPUs across 64 nodes. Checked 2026-10-28."
+  - title: Qwen Team, Qwen3 Technical Report (arXiv 2505.09388)
+    url: https://arxiv.org/html/2505.09388
+    note: "reasoning RL used large batches, many rollouts per query and off-policy training to improve sample efficiency. Checked 2026-10-28."
+  - title: PracHub, Architect an asynchronous RL post-training system (question listed 2025-09-06)
+    url: https://prachub.com/interview-questions/architect-an-asynchronous-rl-post-training-system
+    note: "tagged Meta, from a candidate-written Meta machine learning engineer interview report; asks for an asynchronous RLHF or RLAIF system for a chat model already serving traffic, covering actors, reward inference, learners, replay, off-policy corrections, KL control and rollback. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+Every RL system for LLMs is two programs sharing one set of weights: an inference engine that generates rollouts fast, and a trainer that computes gradients. The objective from the PPO lesson assumes the samples came from π_old, the policy being trained. In a real system they come from a different program with different kernels, possibly from weights one or more steps behind. Three decisions follow. Where the engine runs (on the training GPUs or its own). How far behind its weights may lag. And how the loss corrects for the gap, or whether you remove the gap by making the engine and trainer agree bit for bit.
+
+## The mismatch nobody configured
+
+TRL's documentation states it plainly: the inference engine and the training engine are "in theory" mathematically identical, and in practice produce different outputs through precision effects and hardware-specific optimisations. The consequence is that "an otherwise on policy RL problem" becomes off-policy, and the gradient is biased. Yao et al. (NeurIPS 2025 OPT workshop) measured significantly different token probabilities between vLLM rollouts and FSDP training on the same weights.
+
+Part of the gap is ordinary floating-point non-associativity in different kernels. Thinking Machines identified a less obvious part: kernels that are not batch-invariant. A server's batch size depends on load, reductions in matmul, normalisation and attention change their split with batch size, and so one request's logits depend on what else was in the batch. Their measurement: Qwen3-235B-A22B at temperature 0, the same prompt 1,000 times, 1,000 tokens each, gave 80 distinct completions, all identical for 102 tokens and diverging at the 103rd. With batch-invariant kernels all 1,000 were identical.
+
+The RL consequence is in the same post. On an RLVR run with Qwen2.5-VL 8B, with no off-policy correction the reward collapsed partway through, with a spike in the sampler-trainer KL near step 318. With importance weighting the run was smooth and the KL stayed around 0.001. With bitwise-identical sampler and trainer the KL was 0 and the run was smooth too. The cost of identical numerics on Qwen3-8B, 1,000 sequences: 26 seconds with vLLM's defaults, 55 seconds with unoptimised deterministic kernels, 42 seconds with an improved attention kernel.
+
+Your first instrument is the per-token difference between the engine's log-probabilities and the trainer's recomputed ones. TRL logs it as `sampling/sampling_logp_difference/mean`; a growing value means a widening mismatch, and it is the chart to check before blaming the learning rate.
+
+## Correcting it: truncated and masked importance sampling
+
+If the engine sampled token t with probability q and the trainer assigns it probability p, an unbiased correction multiplies that token's loss by p / q. Unbounded, one token the engine sampled at 0.001 and the trainer scores at 0.05 gets a weight of 50 and dominates the batch. Truncated importance sampling caps the weight; masked importance sampling zeroes samples outside a range instead. TRL's GRPO trainer turns correction on by default, uses sequence-level masking by default, and for TIS clips ratios to a configured range with an upper bound of 3.0 by default (main-branch docs, checked 2026-10-28).
+
+```python
+import math
+
+def tis_weights(logp_trainer, logp_engine, cap=3.0):
+    # per-token weight p/q, truncated; multiply the (detached) weight into the token loss
+    return [min(math.exp(lt - le), cap) for lt, le in zip(logp_trainer, logp_engine)]
+
+def admit(sample_version, learner_version, max_staleness):
+    # actors tag every sample with the weights version that produced it
+    return learner_version - sample_version <= max_staleness
+
+print(tis_weights([-2.20, -3.00], [-2.30, -6.91]))  # [1.105..., 3.0]: second token capped
+print(admit(sample_version=41, learner_version=43, max_staleness=1))  # False: drop or reweight
+```
+
+The first token, sampled at q = 0.100 and scored at p = 0.111, gets 1.105. The second, q = 0.001 and p = 0.050, would get 50 and is capped at 3. The cap trades bias for variance: a lower cap ignores more of the mismatch, a higher one lets single tokens move the update.
+
+Two alternatives remove the need. GSPO's sequence-level ratio is robust enough that its authors use the engine's likelihoods directly instead of recomputing them in the trainer. And batch-invariant, matched kernels make the mismatch zero at the cost Thinking Machines measured. Yao et al. went the other way and found TIS kept training stable even with quantized rollouts, which makes cheaper rollouts available once a correction is in place.
+
+## Where the rollout engine runs
+
+**Colocated.** Engine and trainer on the same GPUs, taking turns. TRL's default runs vLLM inside the trainer process sharing GPU memory. Kimi K2 colocates at 1.04T parameters: each engine releases GPU memory while the other runs, and a distributed checkpoint engine broadcasts the new parameters, with each inference engine pulling only the shards it needs. The report gives a full parameter update in less than 30 seconds. On their H800 cluster, concurrent host-to-device copies and broadcasts saturated PCIe, so the three-stage update pipeline fell back to two stages. No GPU sits idle waiting for the other phase, and weight transfer is a local copy, but the phases serialise and memory has to hold the larger of the two working sets.
+
+**Separate.** Engine on its own GPUs, trainer on others. TRL's server mode talks to vLLM over HTTP and warns that sharing GPUs between them causes NCCL errors. Each side is sized and tuned for its own work, and generation and training can overlap. The cost is a cross-cluster weight transfer every update, and idle capacity on one side whenever the other is the bottleneck.
+
+## Staleness: overlapping generation and training
+
+Synchronous on-policy RL waits for every rollout before training and for training before the next rollout. The step takes generation time plus training time plus weight-sync time. If actors generate batch n + 1 with the weights from step n − 1 while the learner trains on batch n, the step takes the larger of the two, and every sample is one version stale.
+
+<Predict id="trn-rl-async-steps" question="Generating a batch takes 300 s and a training step on it takes 100 s; ignore weight sync. Synchronous training does one step per 400 s. How many steps per hour does a pipeline with samples at most one version stale complete?" answer={12} tolerance={0} unit="steps">
+<p>With overlap, each step costs max(300, 100) = 300 s, so 3,600 / 300 = <b>12 steps an hour</b> against 3,600 / 400 = 9. The gain is capped by the slower side: generation is 75% of the synchronous step, so overlap can save at most the 25% that training took. When generation dominates, adding staleness beyond one version adds little throughput and more off-policy error; adding inference capacity is the lever.</p>
+</Predict>
+
+The published systems sit at different points. prime-rl, used for INTELLECT-3, is async-only and "always a few steps off-policy". Qwen3's reasoning RL used off-policy training to improve sample efficiency. Kimi K2 kept colocation and attacked the long tail instead: partial rollout pauses unfinished long trajectories and resumes them in the next iteration, so one slow sample does not hold the batch. With long reasoning outputs the tail sets the step time in a synchronous system, which is why partial rollout and async actors exist.
+
+Mechanically, staleness is a bound you enforce, not a property you hope for. Actors tag each sample with the weight version that produced it; the learner admits samples within the bound and drops or down-weights older ones; the importance weight then covers both the version gap and the numerics gap, because π_old in the ratio is now the engine's log-probability under an older version. Log the staleness histogram per step with the log-probability difference.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+A chat model already serves production traffic. Design the asynchronous RL post-training loop that improves it from human and AI feedback: actors, reward inference, learners, replay, off-policy correction, KL control and rollback. Training gets its own cluster; serving capacity and latency must not change. (Reported for a Meta machine learning engineer onsite in a candidate report on PracHub, listed 6 September 2025; this version is written for this lesson.)
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Separate actor pool on the training cluster, not the serving fleet, running the same engine build as serving; reward inference as its own service with a version; a learner that admits samples at most one or two versions stale and corrects with truncated importance weights from logged engine log-probabilities; KL to the deployed model kept in the loss; versioned checkpoints promoted through the same canary path as any model release, with rollback to the previous version. The serving fleet only contributes prompts and feedback logs.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Actors.</strong> Rollouts run on training-cluster GPUs, colocated with learners if memory allows, separate if the reward models need the space. Each sample carries prompt id, weights version, engine build and per-token log-probabilities.</p>
+<p><strong>Reward.</strong> Reward models served as a versioned service. A reward-model update changes the objective, so its version is recorded per sample and a change resets the staleness clock.</p>
+<p><strong>Learner and replay.</strong> A bounded buffer keyed by version. Samples beyond the staleness bound are dropped, not reweighted, because large importance weights are where the variance is. TIS with a cap; the sampler-trainer log-probability gap logged per step as the first alarm.</p>
+<p><strong>KL control.</strong> In the loss, against the currently deployed model, because the product constraint is not drifting from what users have.</p>
+<p><strong>Rollback.</strong> Promotion is a model release: offline evals, a canary slice, automatic rollback on regression. What you give up: a slower path from training to users than direct weight pushes.</p>
+<p><strong>Failure mode.</strong> Production prompts drift faster than the staleness bound assumes; a week-old prompt mix trains on yesterday's traffic. The buffer needs a prompt-age bound as well as a weights-version bound.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The learner is idle 40% of the time waiting for rollouts. Do you raise the staleness bound or buy inference capacity, and what would you measure to choose?</li>
+<li>Batch-invariant kernels would remove the numerics mismatch at a measured slowdown in rollouts. What evidence from your run justifies paying it, and who signs off on the extra cost?</li>
+<li>The sampler-trainer log-probability gap doubles after an engine upgrade. Roll back the engine, raise the TIS cap, or pause training: which first, and what reverses the decision?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The step-time arithmetic treats generation and training as fixed. With long reasoning outputs, generation time is set by the slowest samples, so averages mislead; measure the distribution of per-sample generation time before choosing a staleness bound.
+
+Importance sampling corrects a distribution gap only where the engine put some probability. Tokens the engine never samples cannot be reweighted into the batch, and a large mismatch shows up as many capped or masked tokens. When the share of capped tokens grows, the correction is hiding a problem the kernels or the engine version should fix.
+
+The published systems report designs, not ablations against each other. Kimi K2's 30-second update is for its cluster and sharding; prime-rl's "a few steps" is not a number. Choose a bound from your own log-probability gap and reward curves, not from theirs.
+
+<SelfRate id="lesson:training/rl/rl-infrastructure" />

@@ -1,0 +1,102 @@
+---
+id: inf-035
+title: How many rank-16 adapters fit on one 80 GB GPU?
+subtitle: next to a 7B base model and the KV cache its traffic needs
+track: inference
+module: fleet
+type: estimate
+difficulty: hard
+seniority: [senior, staff]
+minutes: 25
+core: false
+tags: [lora, multi-adapter, memory, kv-cache, vllm, capacity]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Qwen2.5-7B-Instruct config.json (Hugging Face)
+    url: https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/raw/main/config.json
+    note: "hidden_size 3584, intermediate_size 18944, num_hidden_layers 28, num_attention_heads 28, num_key_value_heads 4, vocab_size 152064, tie_word_embeddings false, torch_dtype bfloat16. Checked 2026-10-28."
+  - title: vLLM source, LoRA config (vllm/config/lora.py, main branch)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/config/lora.py
+    note: "max_lora_rank defaults to 16 and takes one of 1, 8, 16, 32, 64, 128, 256, 320, 512; max_loras (default 1) is the maximum number of LoRAs in a single batch; max_cpu_loras must be at least max_loras; lora_dtype auto defaults to the base model's dtype. Checked 2026-10-28."
+  - title: vLLM source, LoRA linear layers (vllm/lora/layers/base_linear.py, main branch)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/lora/layers/base_linear.py
+    note: "lora_a_stacked is allocated as zeros of shape (max_loras, 1, max_lora_rank, input_size) and lora_b_stacked as (max_loras, 1, output_size, max_lora_rank), in lora_dtype. Checked 2026-10-28."
+  - title: vLLM documentation, LoRA adapters
+    url: https://docs.vllm.ai/en/latest/features/lora.html
+    note: "set --max-lora-rank to the highest rank among your adapters; a value far above it wastes memory and can cause performance issues. Checked 2026-10-28."
+  - title: S-LoRA, Serving Thousands of Concurrent LoRA Adapters (Sheng et al., 2023-11-06, revised 2024-06-05)
+    url: https://arxiv.org/abs/2311.03285
+    note: "the abstract says S-LoRA stores all adapters in main memory and fetches the adapters used by the running queries to the GPU, with one unified pool for adapter weights and KV cache. Checked 2026-10-28."
+range: { low: 350, high: 560, unit: adapters }
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Capacity estimate">
+"Each customer gets a rank-16 LoRA adapter on the same 7B base. How many adapters can one 80 GB GPU hold next to the base model and the KV cache, and is that the number you would configure?"
+</Callout>
+
+Inputs:
+
+- Base: Qwen2.5-7B-Instruct in BF16. From its published config: hidden size 3,584, MLP intermediate size 18,944, 28 layers, 28 query heads and 4 KV heads of dimension 128, vocabulary 152,064, untied input and output embeddings.
+- Adapters: rank 16 on all seven projections of every layer (q, k, v, o, gate, up, down), stored in the base model's dtype (scenario; this is vLLM's default `lora_dtype`).
+- Traffic on this replica at peak: 64 sequences running at once, 4,096 tokens of context on average (scenario, measured).
+- The engine allocates one GPU slot per adapter it can hold, sized for `max_lora_rank`, here 16.
+
+You choose how much of the 80 GB to leave for activations, CUDA graphs and allocator overhead, and how much headroom the KV cache gets above the measured average. Give the number of adapter slots that fit, then say whether you would configure that many.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which projections the adapters were trained on and whether every customer used the same rank.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the distribution of context length per running sequence at peak, not only its mean.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask how many distinct adapters appear in one batch at peak.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>The base is 7.62 billion parameters, 15.2 GB in BF16. The KV cache at the measured peak is 64 x 4,096 tokens at 57,344 bytes per token, 15.0 GB. A rank-16 adapter on all seven projections is 40.4 million parameters, 80.7 MB. Leaving 8 GB for the runtime and no KV headroom, 80 - 8 - 15.2 - 15.0 = 41.7 GB is left, about 516 adapters; with 12 GB reserved and 50% KV headroom it is about 374. Memory is not the binding constraint, though: at most 64 distinct adapters can run in one batch of 64 sequences, so I would configure GPU slots near the measured number of distinct adapters per batch, keep the rest in host memory, and give the freed GPU memory to the KV cache.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Base weights.</strong> Per layer: attention is q and o at 3,584 x 3,584 each, plus k and v at 3,584 x 512 each (4 KV heads x 128), plus the q, k and v biases, 29.4 million. The MLP is 3 x 3,584 x 18,944 = 203.7 million. With two norm vectors, 233.1 million per layer, 6.53 billion for 28 layers. The two embedding matrices are 152,064 x 3,584 = 545 million each. Total 7.62 billion parameters, 15.2 GB at 2 bytes.</p>
+<p><strong>KV cache.</strong> Per token: 2 (K and V) x 28 layers x 4 heads x 128 x 2 bytes = 57,344 bytes. At peak: 64 x 4,096 = 262,144 tokens, 15.0 GB.</p>
+<p><strong>One adapter.</strong> A rank-r adapter on a projection from d_in to d_out adds r x (d_in + d_out) parameters. Per layer: q and o, 2 x (3,584 + 3,584) = 14,336; k and v, 2 x (3,584 + 512) = 8,192; gate, up and down, 3 x (3,584 + 18,944) = 67,584. That is 90,112 per unit of rank per layer, 2.52 million for 28 layers. At rank 16: 40.4 million parameters, 80.7 MB in BF16.</p>
+<p><strong>The count, by your choices.</strong></p>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Runtime reserve</th><th>KV budget</th><th>Left for adapters</th><th>Rank-16 slots</th></tr></thead>
+<tbody>
+<tr><td>6 GB</td><td>15.0 GB (1.0x)</td><td>43.7 GB</td><td>541</td></tr>
+<tr><td>8 GB</td><td>15.0 GB (1.0x)</td><td>41.7 GB</td><td>516</td></tr>
+<tr><td>10 GB</td><td>18.8 GB (1.25x)</td><td>36.0 GB</td><td>445</td></tr>
+<tr><td>12 GB</td><td>22.5 GB (1.5x)</td><td>30.2 GB</td><td>374</td></tr>
+</tbody>
+</table>
+</div>
+<p>Anything from about 350 to 560 is reasonable if the reserve and headroom are stated. Unreasonable: forgetting the KV cache (about 700 slots, and the first long-context burst preempts sequences), counting only the attention projections when the adapters were trained on all seven (the MLP is three quarters of the adapter), or storing adapters in FP32 when the engine uses the base dtype.</p>
+<p><strong>The dominant term and what flips it.</strong> After the base weights, the KV cache is the largest claim, and it scales with context: at 8,192 tokens average the cache is 30.1 GB and the 8 GB row drops to 26.7 GB, 330 slots. The assumption that flips the count most is rank, because slots are sized for <code>max_lora_rank</code>, not for each adapter's own rank. One customer on rank 64 forces <code>max_lora_rank</code> to 64 and every slot to 323 MB, and the 8 GB row falls from 516 slots to 129.</p>
+<p><strong>The decision: is that the number to configure?</strong> Two defensible answers.</p>
+<ul>
+<li><em>Configure the memory maximum, about 500 slots.</em> Any adapter among the 500 most recent serves with no load from host memory. The cost: 41.7 GB that the KV cache could have used, so the replica's concurrency stays at the 64 sequences it was sized for.</li>
+<li><em>Configure slots near the distinct adapters per batch, and the rest in host memory.</em> In vLLM, <code>max_loras</code> is the number of adapters in one batch and <code>max_cpu_loras</code> the number held in host memory; with 64 running sequences, more than 64 GPU slots can never all be in use. Setting, say, 64 GPU slots costs 5.2 GB and adds about 36 GB to the KV cache, 2.4 times what the measured peak uses. The cost: an adapter not in a GPU slot is copied from host memory on first use, which adds latency to that request, and a burst of new tenants pays it repeatedly.</li>
+</ul>
+<p>The conflict is concurrency against first-request latency for the long tail. I take the second, because KV capacity is what the replica sells, and size host memory for the full catalogue (1,000 adapters at 80.7 MB is 81 GB of host RAM). This is the design S-LoRA argues for: all adapters in main memory, the running ones fetched to the GPU.</p>
+<p><strong>How this answer fails.</strong> It assumes one rank. Mixed ranks under one <code>max_lora_rank</code> waste most of each slot, so a fleet with a few high-rank customers should run them on a separate pool with a higher <code>max_lora_rank</code> rather than raise it everywhere.</p>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Pushback: product wants every adapter warm on every replica so no tenant ever sees a load delay. That is 500 slots per replica and half the KV cache. Which do you give up, and what do you put in writing?* Measure the first-request delay from host memory and the hit rate of a 64-slot GPU cache on a day of traffic; write down the extra replicas the warm-everywhere policy costs, and offer warm slots as a paid tier for the tenants who need them.
+- *Reversal: what would you need to see in production to move back to the memory-maximum slot count?* Distinct adapters per batch regularly near the slot count, with host-to-GPU loads showing up in TTFT p99, and KV usage well below its budget at peak.
+- *A customer asks for rank 128. What changes on the fleet, not only on this GPU?* Either one pool's slots grow eightfold over rank 16, or that customer moves to a pool of its own or to a merged model; the choice depends on their traffic, and a merged model is the cheaper answer when one tenant fills replicas by itself.
+
+## Common mistakes
+
+- Sizing slots by each adapter's own rank when the engine sizes every slot for the maximum.
+- Leaving the KV cache out of the budget.
+- Counting attention projections only, when the MLP carries three quarters of an all-projection adapter.
+- Treating "fits in memory" as the configuration, when the batch caps how many adapters can run at once.

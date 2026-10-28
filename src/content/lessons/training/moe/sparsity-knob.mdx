@@ -1,0 +1,119 @@
+---
+title: Sparsity as a design knob
+track: training
+module: moe
+order: 3
+kind: paper
+level: staff
+minutes: 13
+summary: A walkthrough of the Kimi K2 report's sparsity scaling law and attention-head decision as trade-offs between training FLOPs, serving memory and long-context inference cost, ending with what to ask before copying 384 experts with 8 active.
+prerequisites: [training/moe/routing-balance, training/moe/expert-parallelism]
+updated: 2026-10-28
+sources:
+  - title: Moonshot AI, Kimi K2 technical report (arXiv 2507.20534)
+    url: https://arxiv.org/html/2507.20534
+    note: 1.04T total and 32.6B activated parameters (32B in the abstract); 61 layers, 1 dense; hidden 7168, expert hidden 2048; 384 experts, 8 active, 1 shared; 64 attention heads against DeepSeek-V3's 128; no expert grouping; sparsity defined as total over activated experts; sparsity scaling law with activated parameters fixed; at validation loss 1.5, sparsity 48 needs 1.69x, 1.39x and 1.15x fewer FLOPs than sparsity 8, 16 and 32; more sparsity brings more infrastructure complexity; 128 heads at 128k context add 83% inference FLOPs for a 0.5% to 1.2% validation-loss improvement; QK-Clip with tau 100; a 9B-activated, 53B-total vanilla Muon run exceeded max logits of 1000; 15.5T tokens with no loss spike; EP16 as the smallest feasible. Checked 2026-10-28.
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: 671B total, 37B activated; 61 layers, first 3 dense; 1 shared and 256 routed experts, 8 active; 14.8T training tokens; at most 4 nodes per token. Checked 2026-10-28.
+  - title: Qwen Team, Qwen3 Technical Report (arXiv 2505.09388)
+    url: https://arxiv.org/html/2505.09388
+    note: Qwen3-235B-A22B has 94 layers, 64 query heads and 4 KV heads, 128 experts with 8 active and no shared experts. Checked 2026-10-28.
+  - title: Dai et al., DeepSeekMoE (arXiv 2401.06066)
+    url: https://arxiv.org/abs/2401.06066
+    note: fine-grained expert segmentation (mN experts, mK active) at the same computation; 16B model comparable to LLaMA2 7B with about 40% of the computation, as the paper reports. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The problem the paper answers
+
+Fix the work per token, then ask how many experts to spread it over. That is the question Kimi K2's architecture section answers with an experiment, and it is the one most MoE configurations answer by copying a predecessor. The report defines sparsity as total experts divided by activated experts and fits a sparsity scaling law with the number of activated parameters held constant, so every point on the curve costs the same FLOPs per token and differs only in how many parameters sit idle for each token.
+
+Three published designs make the spread concrete. DeepSeek-V3 activates 8 of 256 routed experts, sparsity 32, with 1 shared expert, 128 attention heads, 3 dense layers, 671B total and 37B activated parameters. Kimi K2 keeps DeepSeek-V3's 61 layers, hidden size 7168 and expert size 2048, and changes four things: 384 experts with 8 active (sparsity 48), 64 attention heads, 1 dense layer, and no expert grouping, for 1.04T total and 32.6B activated. Qwen3-235B-A22B activates 8 of 128 (sparsity 16), with no shared expert, 64 query heads and 4 KV heads.
+
+## The mechanism in engineering terms
+
+Sparsity buys quality per FLOP with memory. Each additional expert adds parameters that every token could use and that only a few do, so loss at a fixed FLOP budget falls, and the bill moves to wherever parameters live: optimizer state in training, HBM and interconnect at serving.
+
+The key number in the paper is the one it reports at a fixed validation loss of 1.5: sparsity 48 reaches it with 1.69 times fewer FLOPs than sparsity 8, 1.39 times fewer than sparsity 16 and 1.15 times fewer than sparsity 32. Read as ratios between neighbours, going from 8 to 16 is worth 1.69 / 1.39 = 1.22 times, from 16 to 32 is worth 1.39 / 1.15 = 1.21 times, and from 32 to 48 is worth 1.15 times. Each step returns a little less, and each step costs more parameters.
+
+<Predict id="trn-moe-sparsity-params" question="At 8 active experts of the same size, by what factor does the routed-expert parameter count per MoE layer grow when sparsity goes from 32 (DeepSeek-V3) to 48 (Kimi K2)?" answer={1.5} tolerance={0} unit="x">
+<p>Experts per layer go from 256 to 384: <b>1.5 times</b> the routed parameters, for 1.15 times fewer training FLOPs at the same loss. With three 7168 x 2048 matrices per expert (an assumption about the FFN form; the report gives the dimensions), one expert is 44,040,192 parameters, a layer of 384 is 16.9B, and 60 MoE layers come to 1,014.7B, which accounts for almost all of the 1.04T total.</p>
+</Predict>
+
+The report states the trade in one sentence: more sparsity performs better but brings more infrastructure complexity, and K2 chose 48 to balance performance against cost. It does not quantify that complexity. You can: 1.5 times the expert memory per layer means either 1.5 times the expert-parallel ranks for the same memory per GPU, or 1.5 times the experts on each GPU. K2 kept expert parallelism at 16, which its report calls the smallest feasible, and reports about 30 GB of state per GPU.
+
+## The second knob: attention heads
+
+K2 halves DeepSeek-V3's attention heads from 128 to 64. The report measured both settings with 384 experts: 128 heads improved validation loss by about 0.5% to 1.2% across compute budgets, and at a 128k sequence length increased inference FLOPs by 83%. It calls that overhead a major limitation for agentic applications, where long contexts are the normal case, and keeps 64.
+
+This decision is the mirror of the sparsity one. Sparsity is a knob whose cost lands in memory and whose benefit arrives at every context length. Attention heads are a knob whose cost scales with context length, because the attention score computation grows with the number of heads times the square of the sequence, while the expert FFNs do not depend on context at all. A model that will mostly serve short prompts could take the 0.5% to 1.2%; a model built for long agent sessions pays the 83% on every long request.
+
+## Training cost against serving cost
+
+With the standard 6 x activated parameters x tokens approximation (it ignores attention FLOPs, which matter more at long context), K2's pretraining is about 6 x 32.6e9 x 15.5e12 = 3.03e24 FLOPs and DeepSeek-V3's is about 6 x 37e9 x 14.8e12 = 3.29e24. Similar budgets, so the question is what each design costs to serve.
+
+Weights are the first serving cost. At one byte per parameter, K2's weights are about 1.04 TB against 671 GB for DeepSeek-V3, before any KV cache. The second is what a decode step reads. Activated parameters set the FLOPs per token, but a batch of tokens touches many experts at once, and each touched expert's weights are read from HBM.
+
+<Predict id="trn-moe-touched-experts" question="Assume each token picks 8 of 384 experts uniformly and independently. In a decode batch of 64 tokens, how many distinct experts does one MoE layer touch, in expectation?" answer={284} tolerance={6} unit="experts">
+<p>The chance a given expert is missed by one token is 376/384; by all 64 tokens it is (376/384)^64 = 0.26. So 384 x (1 - 0.26) = <b>about 284 experts</b>, 74% of the layer. For DeepSeek-V3's 256 experts the same batch touches about 222, 87% of the layer. At serving batch sizes, decode reads most of the total parameters per step, not the activated ones, so the memory-bandwidth cost of a decode step tracks total size much more closely than the activated count suggests.</p>
+</Predict>
+
+Real routing is not uniform, which helps a little (fewer distinct experts) and hurts more (hot experts on one GPU set the step time). The conclusion holds: higher sparsity is cheaper to train to a given loss and more expensive to hold and stream at serving time.
+
+## What changed in practice
+
+The paper moved the default from "copy the predecessor's expert count" to "fit sparsity at fixed activated parameters and stop where infrastructure cost overtakes the FLOP saving". It also made attention width a serving decision rather than a quality decision: the head count was chosen by inference FLOPs at the target context length.
+
+Two other choices travel with the configuration and are easy to miss. The run used the MuonClip optimizer, with QK-Clip at a threshold of 100, after a mid-scale vanilla Muon run with 9B activated and 53B total parameters saw maximum attention logits above 1000; the report shows 15.5T tokens with no loss spike. And K2 dropped DeepSeek-V3's expert grouping, which DeepSeek-V3 uses alongside its limit of 4 nodes per token; the report lists the difference without arguing it.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Research wants Kimi K2's 384 experts with 8 active for our next pretraining run at about 30B activated parameters, because the paper shows fewer FLOPs at the same loss. Serving runs on a fixed fleet of 8-GPU nodes and the product is a coding agent with long sessions. The serving lead wants 128 experts. You have a week to decide, and the training budget is fixed. What do you choose?"**
+</Callout>
+
+<p class="tiny">The team, fleet and budget are a scenario.</p>
+
+<Depth>
+<Fragment slot="short">
+<p>Pick by the binding cost. If serving memory per replica is the constraint, sparsity 48 means 1.5 times the weights of sparsity 32 for 1.15 times fewer training FLOPs, and the fixed fleet pays that every day; I would choose between 16 and 32 and spend the saved memory on KV cache for long sessions. If training compute is the constraint and the fleet can grow, take 48. Either way, take K2's 64-head choice, because the product is long-context.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The paper's evidence is about training FLOPs at a fixed loss with activated parameters held constant. It says nothing about serving cost, and our serving fleet is the fixed constraint. Put numbers on both sides: from sparsity 32 to 48 the training saving is 1.15 times at loss 1.5; the routed weights grow 1.5 times, and at decode batch sizes most of them are streamed every step.</p>
+<p>The long sessions decide where the memory goes. Every gigabyte of expert weights on a node is a gigabyte not available for KV cache, which bounds concurrent long sessions per replica. Measure the session-length distribution and compute replicas needed at each sparsity before deciding.</p>
+<p>Two defensible answers: sparsity 32 (DeepSeek-V3's point) if serving replicas are the cost that dominates over the model's life; sparsity 48 if the model will be distilled or quantised before serving, or the fleet can grow. Sparsity 16 (Qwen3's point) is defensible if serving must fit fewer nodes per replica.</p>
+<p>How the recommended answer fails: the 1.15 times saving was measured with K2's optimizer, data and loss target. If our run would reach a lower loss, the gap between 32 and 48 could be larger than the paper's, and we would have left training efficiency on the table. A small sparsity sweep at our activated size is the cheap check.</p>
+<p>Write down the decision memo: chosen sparsity, the training FLOPs it costs relative to 48, replicas per thousand concurrent sessions at each option, and the measurement that would reopen it.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Research shows a small-scale sweep where sparsity 48 beats 32 by more than the paper's 1.15 times. What would you need to see at full scale before reversing to 48, and who pays the serving cost?</li>
+<li>The serving lead says quantising experts to 4 bits makes the memory argument go away. Which part of your answer survives, and what do you measure before agreeing?</li>
+<li>You chose 64 heads for long context, and the eval team reports a regression on short reasoning benchmarks. Do you trade back toward 128 heads, and how do you decide without a full retrain?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## What to ask before copying the configuration
+
+Which loss did the law use, and at what scale? The FLOP ratios are reported at a validation loss of 1.5 with activated parameters fixed; the paper's figure is the evidence, not a guarantee at your loss target or tokenizer.
+
+What is your expert-parallel domain? 384 experts at EP16 assumes enough memory per GPU for 24 experts per layer plus their optimizer state, and an interconnect that tolerates the exchange.
+
+What do your sessions look like? The 64-head choice rests on 128k contexts and agentic use. A short-context product changes the inference side of that trade.
+
+Which optimizer and balancing scheme? The run used MuonClip and reports no loss spikes; the parts of the report read for this lesson do not describe K2's load-balancing mechanism, so a copy has to choose its own.
+
+## When this is wrong
+
+The uniform-routing estimate of touched experts is an upper bound on distinct experts and a lower bound on imbalance. Measure real routing on your traffic before sizing serving replicas from it.
+
+The 6ND approximation understates training cost at long context, where attention FLOPs grow with sequence length and do not shrink with sparsity.
+
+And the sparsity law is one lab's fit on one recipe. Its direction (more experts at fixed activated parameters lowers loss) agrees with DeepSeekMoE's fine-grained segmentation result; its magnitude at your scale is a measurement you have not made yet.
+
+<SelfRate id="lesson:training/moe/sparsity-knob" />

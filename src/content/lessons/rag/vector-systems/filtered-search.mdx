@@ -1,0 +1,148 @@
+---
+title: "Playbook: filtered vector search"
+track: rag
+module: vector-systems
+order: 2
+kind: playbook
+level: staff
+minutes: 12
+summary: Pre-filtering, post-filtering, iterative scans, filter-aware graph traversal and partitions each fail at a different selectivity, so the choice is made per filter from the selectivity distribution, the correlation between filter and query, and how many tenants there are.
+prerequisites: [rag/vector-systems/hnsw-by-hand, rag/retrieval-foundations/permissions-freshness]
+updated: 2026-10-28
+sources:
+  - title: pgvector README (checked 2026-10-28)
+    url: https://github.com/pgvector/pgvector
+    note: "filtering applied after the approximate index scan; a condition matching 10% of rows with hnsw.ef_search 40 returns about 4 rows on average; B-tree on the filter column gives exact search and suits conditions matching a low percentage of rows; partial indexes for a few distinct values, partitioning for many; iterative scans strict_order and relaxed_order; hnsw.max_scan_tuples 20,000 by default, approximate, not counting the initial scan; hnsw.scan_mem_multiplier 1 by default"
+  - title: pgvector CHANGELOG (checked 2026-10-28)
+    url: https://github.com/pgvector/pgvector/blob/master/CHANGELOG.md
+    note: "0.8.0 (2024-10-30) added iterative index scans"
+  - title: Qdrant docs, Indexing (checked 2026-10-28)
+    url: https://qdrant.tech/documentation/concepts/indexing/
+    note: "filterable HNSW benefits from filter-aware edges only when built after the payload indexes exist; a payload index created after ingestion needs an HNSW rebuild; HNSW m 16 and ef_construct 100 in the config example; full_scan_threshold 10000 KB, 1 KB = 1 vector of 256 dimensions; planner uses full scan when the estimated matching points fall below the threshold; ACORN (v1.16.0) explores neighbours of neighbours when direct neighbours are filtered out, improving accuracy at a cost in performance; is_tenant (v1.11.0)"
+  - title: "Couzon and Ghafouri, Filtered vector search and ACORN (Qdrant, 2026-08-07, Qdrant v1.18.2)"
+    url: https://qdrant.tech/articles/filtered-vector-search-acorn/
+    note: "vendor's own benchmark on one laptop-class machine, 1M deep-image-96 vectors, 500 queries per filter, recall@10 against brute force, hnsw_ef 64; about 21 links per node on layer 0 at m 16; filtering out 96% leaves under one link per node; extra edges cost build time 116 s without, 507 to 652 s with; edges are per payload field, not per combination; values shared by more than (points / average links) x 4 get no edges, about 19% at 21 links; ACORN applies below max_selectivity, default 0.4, off by default; result tables reproduced in the lesson"
+  - title: Qdrant docs, Multitenancy (checked 2026-10-28)
+    url: https://qdrant.tech/documentation/guides/multiple-partitions/
+    note: "payload_m with m 0 disables the global index and builds per-tenant links for indexed payload fields; is_tenant co-locates a tenant's vectors (v1.11.0); tiered multitenancy with tenant promotion (v1.16.0), suggested promotion at about 20,000 points"
+  - title: "Patel, Kraft, Guestrin and Zaharia, ACORN: Performant and Predicate-Agnostic Search Over Vector Embeddings and Structured Data (arXiv 2403.04871, 2024-03-07)"
+    url: https://arxiv.org/abs/2403.04871
+    note: "predicate subgraph traversal on HNSW; ACORN-gamma collects M x gamma candidate edges per node with gamma = 1/s_min and falls back to pre-filtering below s_min; ACORN-1 builds plain HNSW and expands to two-hop neighbours at query time; time-to-index at most about 11x HNSW and index size at most about 1.3x for ACORN-gamma; ACORN-1 at most 5x lower QPS than ACORN-gamma with 9 to 53x less time-to-index; 2 to 1,000x higher QPS at 0.9 recall than prior methods; post-filtering cost ranges from O(log n + K) when passing vectors are near the query to O(n) when they are far; negative correlation is the hardest case for post-filtering"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+Where the predicate runs relative to the graph walk: before it (scan the passing rows exactly), after it (walk, then discard), during it (a walk that knows the predicate), or nowhere at query time because the data was partitioned by it. Every engine implements several of these and a planner chooses between them, so the decision for a team is which mechanisms to make available, which indexes to build before ingestion, and which queries to route by hand when the planner's estimate is wrong.
+
+The answer is per filter, not per system. A tenant predicate on every query, a document-type filter with a dozen values and a free-form date range in a third of queries each land in a different place, and a design that picks one mechanism for all three gets at least one of them wrong.
+
+## The inputs that change it
+
+**Selectivity, as a distribution.** The fraction of rows a filter passes, measured over real queries rather than averaged. A filter that passes 30% for most users and 0.01% for a few is two filters for this purpose.
+
+**Correlation between filter and query.** The ACORN paper bounds post-filtering between O(log n + K), when the passing vectors sit near the query, and O(n) when they are far, and names negative correlation as the hardest case. Qdrant's own benchmark (below) shows the effect at the same 10% selectivity: plain HNSW with a post-filter reached 20.6% recall@10 when the filter was independent of position and 88.4% when it was correlated.
+
+**Predicate shape.** An equality on a low-cardinality field known when the index is built can get index-time help. A range, a regular expression, or an AND of fields the index has never seen together cannot.
+
+**Tenants.** How many there are, how skewed their sizes are, and whether every query carries the tenant predicate. A predicate that is always present and always an equality is better handled by layout than by search.
+
+**Write and rebuild budget.** Index-time mechanisms cost build time and require the filter field to be indexed before the graph is built; Qdrant's docs say a payload index created after ingestion needs an HNSW rebuild before its filter-aware edges exist.
+
+## Why the graph breaks under a filter
+
+A filter does not just remove results; it removes nodes from the walk. Qdrant measured about 21 links per node on layer 0 at its default m of 16, on a 1M-vector collection.
+
+<Predict id="rag-vs-filter-links" question="Links per node that survive the filter, on average?" answer={0.84} tolerance={0.05} unit="links">
+<Fragment slot="prompt">
+<p>Layer 0 averages 21 links per node. A filter keeps 4% of rows, independent of position. A filter-aware walk may only step to nodes that pass.</p>
+</Fragment>
+<p><b>About 0.84.</b> 21 x 0.04 = 0.84 passing neighbours per node, so a walk restricted to passing nodes reaches a node with no passing neighbour most of the time and stops. That is why a post-filter starves and a naive filter-aware walk strands: the subgraph induced by the predicate is not connected. Every option below is a different way of reconnecting it, or of not needing it.</p>
+</Predict>
+
+## The options and when each wins
+
+**Exact scan of the passing rows.** Find the rows that pass with an ordinary index, then compute every distance. Recall is perfect and the cost is proportional to the passing set, so it wins whenever that set is small. pgvector's README recommends a B-tree on the filter column for conditions that match a low percentage of rows. Qdrant's planner does this automatically when its estimate of matching vectors falls below `full_scan_threshold`, 10,000 KB in the config example, where 1 KB is one 256-dimension vector. The cutoff in your system is a latency budget divided by the cost of one distance computation, and you should know it as a row count.
+
+**Post-filter, with oversampling.** Walk with a larger candidate list and discard failures. It wins when the filter passes a large fraction or correlates positively with the query, and it costs nothing at build time. pgvector applies filters after the index scan; its README's arithmetic (10% at `ef_search` 40 gives about 4 rows) is the reason the candidate list has to grow as the filter narrows.
+
+**Iterative scan.** A post-filter that keeps going. Since pgvector 0.8.0 (October 2024), `hnsw.iterative_scan` continues the scan until enough rows pass or `hnsw.max_scan_tuples` (20,000 by default) stops it; `relaxed_order` returns slightly out-of-order results with better recall. It extends the post-filter band downward without a rebuild, and its floor is set by the scan cap: at 20,000 visited tuples and a filter keeping 0.05%, the expected number of passing rows is 10.
+
+**Filter-aware traversal, built at query time.** ACORN-1 builds an ordinary HNSW and, at query time, looks past filtered-out neighbours to their neighbours before discarding, which reconnects the predicate subgraph without index changes. Qdrant added it in version 1.16 as a per-query option that applies only when the planner estimates the filter passes no more than `max_selectivity` of points, 0.4 by default, and is off by default. The cost is latency: in Qdrant's benchmark, turning it on took a 10% filter from 1.7 ms to 4.3 ms.
+
+**Filter-aware traversal, built at index time.** Two forms. ACORN-γ collects M x γ candidate edges per node during construction, with γ set to 1 over the smallest selectivity it will serve, and falls back to pre-filtering below that; the paper reports time-to-index up to about 11 times HNSW's and index size up to about 1.3 times, and 2 to 1,000 times the throughput of prior methods at 0.9 recall. Qdrant's filterable HNSW instead adds edges between points that share a value of an indexed payload field. Its costs and limits are documented: build time went from 116 s to between 507 and 652 s in the benchmark; edges are built per field, not per combination, so an AND of two fields lands on intersections no edge set covers; and a value shared by more than (points / average links) x 4 points gets no edges, about 19% of the collection at 21 links.
+
+**Partitions.** Make the predicate disappear. pgvector's README recommends partial indexes when filtering on a few distinct values and partitioning when filtering on many. Qdrant's multitenancy guide sets `payload_m` with `m` = 0, which disables the global graph and builds links per tenant for indexed payload fields, and from version 1.16 can promote a tenant that grows (the guide suggests about 20,000 points) to a dedicated shard. A partition turns a 0.1% predicate into a 100% scan of a small index; its cost is one index per value to build, vacuum and monitor.
+
+The benchmark behind several of the figures above is Qdrant's own, published 7 August 2026 against version 1.18.2: 1M 96-dimension vectors, 500 queries per filter, recall@10 against brute force, `hnsw_ef` 64, one laptop-class machine queried serially.
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Filter keeps</th><th>Plain graph, post-filter</th><th>Plain graph with ACORN</th><th>Filterable HNSW</th></tr></thead>
+<tbody>
+<tr><td>20%</td><td>62.9% at 1.6 ms</td><td>98.9% at 4.4 ms</td><td>94.8% at 1.2 ms</td></tr>
+<tr><td>10%</td><td>20.6% at 1.7 ms</td><td>98.1% at 4.3 ms</td><td>99.0% at 1.1 ms</td></tr>
+<tr><td>1%</td><td>0.1% at 1.6 ms</td><td>67.7% at 4.7 ms</td><td>99.8% at 1.0 ms</td></tr>
+<tr><td>10%, correlated</td><td>88.4% at 1.7 ms</td><td>98.6% at 3.5 ms</td><td>99.0% at 1.2 ms</td></tr>
+<tr><td>4%, AND of two fields</td><td>not reported</td><td>95.2% at 7.7 ms</td><td>63.7% at 1.2 ms</td></tr>
+<tr><td>1%, AND of two fields</td><td>not reported</td><td>72.7% at 6.8 ms</td><td>70.8% at 1.5 ms</td></tr>
+</tbody>
+</table>
+</div>
+
+Two readings matter. Index-time edges win on single fields and lose on intersections, which is the per-field limit showing up as recall. And the combination of the planner with ACORN reached 99.9% to 100% recall on every single-field filter and 100% at 3.7 ms on the 1% intersection, because the planner sent the narrowest cases to an exact scan. No single mechanism covered the table; the routing did.
+
+## A worked decision
+
+Scenario: document search over 40M chunks for 3,000 tenants, with the largest tenant at 15% of rows. Every query carries a tenant predicate. Most add a document-type filter with 12 values, and about a third add a date range. The engine is Qdrant 1.18, run by a team of three, and the collection takes most of a weekend to rebuild.
+
+Tenant: layout, not search. A keyword payload index with `is_tenant` before ingestion, `payload_m` set and `m` = 0 so each tenant gets its own links, and the largest tenants promoted to dedicated shards. The 15% tenant has 6M chunks, far above the promotion guideline. After this, no query walks another tenant's nodes.
+
+Document type: index-time edges. Twelve values known in advance, equality only, present on most queries; create the payload index before the first ingest so the graph is built with it. A type that covers more than about 19% of a tenant's rows will get no extra edges, and does not need them, because a post-filter at that selectivity returns full pages.
+
+Date range: query time. Ranges combined with type are intersections, which per-field edges do not cover, so queries with a date range turn on ACORN and let the planner choose an exact scan when the estimate is under the full-scan threshold. The latency cost is paid only by the third of queries that carry a range.
+
+The same design on Postgres: list partitions per tenant (separate tables for the largest), partial HNSW indexes per document type within large partitions, iterative scans with `relaxed_order` for date ranges, and a B-tree path for narrow ranges, chosen by the application when it can count the passing rows cheaply.
+
+What this gives up: a weekend rebuild every time a new filter field needs index-time edges, and a few milliseconds on range queries. Written down: the list of fields with index-time edges and the date each was added, so a rebuild is planned rather than discovered.
+
+## What to measure after deciding
+
+Recall@10 against exact filtered search, on real (user, query, filter) triples sampled from logs, bucketed by the filter's actual selectivity: below 0.1%, 0.1 to 1%, 1 to 10% and above 10%. Random filters understate the correlated case and miss the negatively correlated one, which is where post-filters fail.
+
+Per bucket, also measure the short-page rate (queries returning fewer than k rows), p95 latency and the vectors visited per query. The short-page rate is the user-visible symptom and should alert on its own. After any change to payload indexes, measure build time and index size against the previous build, and rerun the buckets; a field indexed after ingestion silently has no edges until the next rebuild.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your 200M-vector collection takes a weekend to rebuild. Product adds a new filter field roughly every month and wants filtered recall@10 above 0.9 within a week of launch. The p95 budget is 80 ms and today's filtered queries run at 20 ms. Do you rely on index-time filter edges or query-time traversal, and how do you keep recall from regressing as fields accumulate?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Query-time traversal for every new field from day one, because it needs no rebuild and the budget has room for its latency; index-time edges added at a scheduled rebuild for the fields that turn out to carry most of the traffic. The planner's exact path covers the narrow end. Recall is held by a per-field, per-selectivity-bucket check on logged queries, run after every launch and every rebuild.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Constraints. A monthly field with a weekend rebuild means index-time edges for a new field arrive at the earliest at the next rebuild, after the one-week deadline. So the launch path has to be query-time: ACORN-style two-hop expansion, or an iterative scan, plus an exact scan for narrow estimates. In Qdrant's benchmark ACORN roughly tripled latency at 10% selectivity (1.7 ms to 4.3 ms) on one laptop-class machine; at 20 ms today with an 80 ms budget, I would measure the same ratio on our collection before promising it.</p>
+<p>Which fields earn index-time edges. Equality fields with modest cardinality that appear on a large share of queries, measured over the first month of traffic. Ranges and fields mostly used in combinations do not benefit, because edges are built per field and the benchmark shows them losing on intersections. Each rebuild batches the fields promoted that month.</p>
+<p>Guarding against regression. Every field gets a bucketed recall check on sampled real queries, with alerts on the short-page rate. What I give up: some p95 headroom on new fields for up to a month, and rebuild weekends on a schedule. Written down: the promotion rule for index-time edges, the rebuild calendar, and the recall floor per bucket that blocks a launch.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Query-time traversal pushes one field's p95 to 95 ms. Which do you cut, recall or the field's launch date, and what do you write down?</em> Raise the planner's exact-scan threshold for that field if its passing sets are small; otherwise ship it with a stated lower recall floor until the next rebuild, signed off by the product owner.</li>
+<li><em>What would make you stop adding index-time edges altogether?</em> Build time and index size growing faster than the recall they buy on the bucketed check, or most traffic moving to multi-field filters.</li>
+<li><em>Two engineers disagree: one wants one partition per value of the new field, the other wants traversal. How do you decide?</em> Count the field's values and the distribution of rows per value; partitions win for a few large values that are always filtered on, traversal for many values or optional use, and the bucketed recall and maintenance cost settle the rest.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The Qdrant tables are the vendor's own, on 96-dimension vectors and one machine queried serially; the ordering of mechanisms is informative, the milliseconds are not transferable. The ACORN results are the paper's, on its datasets and against the baselines it chose. Both measure recall against exact filtered search, which says nothing about whether the filtered results are relevant; a filter that is wrong for the user's intent produces perfect recall of the wrong rows.
+
+Planners estimate selectivity from statistics and samples. When a filter's estimate is badly off, as with a user-specific ACL list or a freshly added field, the planner routes to the wrong mechanism and nothing in the result says so. That is why the application, which often knows the passing count from its own tables, should route the cases it can count. And none of this is a security control: a filter that enforces permissions has to be exact for the rows it returns, which the retrieval-foundations lesson on permissions covers.
+
+<SelfRate id="lesson:rag/vector-systems/filtered-search" />

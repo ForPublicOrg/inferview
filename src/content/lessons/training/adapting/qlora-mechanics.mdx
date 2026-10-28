@@ -1,0 +1,104 @@
+---
+title: QLoRA mechanics
+track: training
+module: adapting
+order: 2
+kind: lesson
+level: senior
+minutes: 12
+summary: QLoRA stores the frozen base in 4-bit NormalFloat with quantised quantisation constants, computes in BF16, trains LoRA adapters on every linear layer and pages optimizer state to CPU memory, which shrinks the terms that do not grow with tokens and leaves activation memory, which does, exactly where it was.
+prerequisites: [training/adapting/lora-practice]
+updated: 2026-10-28
+sources:
+  - title: "QLoRA: Efficient Finetuning of Quantized LLMs (Dettmers et al., arXiv 2305.14314, 2023-05-23)"
+    url: https://arxiv.org/abs/2305.14314
+    note: "Abstract: 65B model fine-tuned on a single 48GB GPU; Guanaco reported at 99.3% of ChatGPT's performance level after 24 hours on one GPU; NF4, double quantisation, paged optimizers; more than 1,000 models fine-tuned. Body (HTML version): NF4 storage with block size 64, BF16 compute, weights dequantised for forward and backward; double quantisation with 8-bit float second-level constants and block size 256, from 32/64 = 0.5 to 8/64 + 32/(64 x 256) = 0.127 bits per parameter, a 0.373-bit saving, about 3 GB for 65B; paged optimizers use NVIDIA unified memory to evict optimizer state to CPU RAM and page it back for the update, and matched regular optimizer speed for 65B on 48GB GPUs at batch 16; LLaMA 7B on FLAN v2 at batch 1: LoRA input gradients 567 MB, LoRA parameters 26 MB, 4-bit base 5,048 MB, input gradients about 18 MB per sequence with gradient checkpointing; Figure 6 measured at batch 1, sequence length 512, with gradient checkpointing; 33B 'does not quite fit' on 24 GB without paged optimizers; LoRA on query and value only does not match 16-bit fine-tuning, on all linear layers it does; Appendix B.2: r 64, alpha 16, all linear layers, max grad norm 0.3, constant schedule, 65B batch 64 and learning rate 1e-4 on the 'All' mix with 384 source and 128 target tokens. Checked 2026-10-28."
+  - title: huggyllama/llama-65b config.json
+    url: https://huggingface.co/huggyllama/llama-65b/raw/main/config.json
+    note: "hidden_size 8,192, intermediate_size 22,016, 80 layers, 64 attention heads, vocab 32,000, max_sequence_length 2,048. Checked 2026-10-28."
+  - title: "PEFT documentation, LoRA package reference (main branch)"
+    url: https://huggingface.co/docs/peft/main/en/package_reference/lora
+    note: "init_lora_weights='loftq' is a quantisation-error-minimising initialisation used with loftq_config. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What QLoRA quantises, and what it does not
+
+QLoRA's headline is a 65B model fine-tuned on one 48 GB GPU. Three changes produce it, and each targets a memory term that does not grow with the number of tokens in a step:
+
+1. The frozen base weights are stored in 4-bit NormalFloat (NF4), quantised in blocks of 64 with one scale per block.
+2. The per-block scales are themselves quantised ("double quantisation"): 8-bit floats in blocks of 256, with one 32-bit constant per block of scales.
+3. Optimizer state can be paged to CPU memory through NVIDIA unified memory when the GPU runs short, and paged back for the update.
+
+Everything that does compute stays in higher precision. The storage type is NF4, the compute type is BF16: each base weight block is dequantised to BF16 for the forward and backward matmuls, the LoRA adapters live in higher precision and are the only parameters that receive gradients, and activations are BF16. Nothing in QLoRA makes activations smaller. That one sentence predicts where it breaks.
+
+## The storage arithmetic
+
+NF4 is 4 bits per weight. With a 32-bit scale per 64 weights, the scales add 32 / 64 = 0.5 bits per weight. Double quantisation stores those scales as 8-bit floats, 8 / 64 = 0.125 bits per weight, plus one 32-bit constant per 256 scales, 32 / (64 x 256) = 0.002 bits. The total for constants falls from 0.5 to 0.127 bits per weight, a saving of 0.373 bits.
+
+For LLaMA 65B (80 layers, hidden size 8,192, MLP size 22,016, vocabulary 32,000), the linear layers inside the blocks hold 80 x (4 x 8,192^2 + 3 x 8,192 x 22,016) = 64.76B parameters. At 4.127 bits that is 33.4 GB. Double quantisation's 0.373 bits on those parameters is 3.0 GB, the paper's "about 3 GB". Keeping the embedding and output head in BF16 (an assumption here; check what your quantisation config skips) adds 2 x 32,000 x 8,192 x 2 bytes = 1.05 GB. Base model: 34.5 GB, against 130.6 GB for the same 65.28B parameters in BF16.
+
+## The adapter and its optimizer state
+
+QLoRA's Guanaco runs used rank 64 with `alpha` 16 on every linear layer, and the paper's own ablation says adapters on all linear layers are what make 4-bit fine-tuning match 16-bit full fine-tuning; query-and-value-only adapters do not. On LLaMA 65B that adapter is:
+
+- attention, four projections of 8,192 to 8,192: 4 x 64 x 16,384 = 4.19M per layer
+- MLP, three projections between 8,192 and 22,016: 3 x 64 x 30,208 = 5.80M per layer
+- 80 layers: 0.80B parameters, 1.2% of the model
+
+With BF16 adapter weights and gradients and FP32 Adam moments, that is 2 + 2 + 8 = 12 bytes per parameter, 9.6 GB, of which the Adam moments are 6.4 GB. Keeping an FP32 master copy of the adapter adds 4 bytes per parameter. Either way the adapter's training state is about a quarter the size of the 4-bit base, which is why rank was not the lever for memory and why the paper could put adapters on every layer.
+
+## Activations: the term QLoRA leaves alone
+
+The paper's own measurement for LLaMA 7B on FLAN v2 at batch 1: LoRA input gradients took 567 MB and the LoRA parameters 26 MB, next to a 5,048 MB 4-bit base. With gradient checkpointing the input gradients fell to about 18 MB per sequence. The authors' conclusion is that activation gradients, not adapters, dominate the trainable side of the budget, and their Figure 6 was measured at sequence length 512, batch 1, with checkpointing on. Longer sequences and larger batches are outside that figure.
+
+With checkpointing at every layer boundary, the stored activations are one hidden-state vector per token per layer: 80 x 8,192 x 2 bytes = 1.31 MB per token for 65B. The logits for the loss add vocabulary x 4 bytes in FP32, 0.128 MB per token. Neither depends on how the weights are stored. During the backward pass one layer at a time is recomputed, and its working set (attention and MLP intermediates for every token in the micro-batch) comes on top; it also scales with tokens.
+
+<Predict id="trn-qlora-tokens" question="LLaMA 65B under QLoRA on one 48 GB GPU (use 48 x 10^9 bytes). Base 34.46 GB, rank-64 adapter with 0.80B parameters whose BF16 weights and gradients stay on the GPU (4 bytes per parameter) while its Adam moments are paged to CPU. Reserve 2 GB for the recompute working set and runtime. Each token in a micro-batch costs 1,310,720 bytes of checkpoints plus 128,000 bytes of FP32 logits. How many tokens fit in one micro-batch?" answer={5800} tolerance={300} unit="tokens">
+Fixed: 34.46 + 0.80 x 4 = 37.66 GB, plus 2 GB reserve: 39.66 GB. Left: 8.34 GB. Per token: 1,438,720 bytes. 8.34 x 10^9 / 1,438,720 = about 5,800 tokens, under three sequences of 2,048. Keep the Adam moments on the GPU instead and the fixed part grows by 6.4 GB, leaving room for about 1,350 tokens, less than one 2,048-token sequence. The paper's 65B runs used 512-token examples (384 source, 128 target) on the main mix, which fit.
+</Predict>
+
+## Paged optimizers: a spike absorber, not free memory
+
+Paged optimizers move optimizer state to CPU RAM when the GPU runs out and fetch it back when the optimizer step needs it, the same mechanism as virtual-memory paging between RAM and disk. The paper reports regular-speed training for 65B on 48 GB GPUs at batch 16 with paging enabled, and names the purpose as handling memory spikes, such as a batch of unusually long sequences under group-by-length batching. If the steady state does not fit, every step pays a round trip of the paged state over the host link; for the 65B adapter above that is 6.4 GB each way per step. A run tuned to rely on paging every step is slower than one sized to fit, and the profile to request before trusting it is the per-step time with and without paging.
+
+## Where QLoRA stops helping
+
+- **Long sequences and big batches.** Checkpointed activations grow linearly with tokens per micro-batch; at 8,192 tokens they are 10.7 GB for 65B, a third of the whole 4-bit base. Gradient accumulation, not a larger micro-batch, is how the paper's 65B runs reached their batch sizes on one GPU.
+- **Large vocabularies.** The FP32 logits term is vocabulary x 4 bytes per token. At 32,000 it is small; a model with a vocabulary several times larger multiplies it by the same factor, and chunked loss computation matters more than weight format.
+- **Throughput.** Every matmul dequantises its weight block first. QLoRA buys memory with compute; the abstract's claims are about memory and quality, not speed.
+- **Merging.** The adapter learned a correction to the dequantised NF4 weights, not to the original BF16 weights. Merging it into the original BF16 checkpoint gives a model the adapter was never trained against, and requantising the merged weights to 4-bit adds fresh quantisation error to the adapter's contribution. Serving the adapter unmerged on top of the same NF4 base reproduces training exactly. PEFT's `loftq` initialisation exists to reduce the quantisation error the adapter starts from.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+A team fine-tunes a 65B model with QLoRA on one 48 GB GPU and wants to raise sequence length from 2,048 to 8,192 for a long-document task. Procurement can deliver one 80 GB GPU in three weeks; the product deadline is in four. What do you recommend for the next three weeks, and what changes when the larger GPU arrives?
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>At 8,192 tokens the checkpointed activations alone are 10.7 GB for one sequence, and the base plus adapter weights and gradients already take about 37.7 GB, so one sequence at 8,192 does not fit on 48 GB even with the Adam state paged out. For three weeks I would train at 4,096 tokens with gradient accumulation and paged Adam, and measure step time. When the 80 GB GPU arrives, move to 8,192 without paging. The cost of waiting is three weeks of evidence at the target length.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>The budget at 8,192 tokens, batch 1.</strong> Base 34.5 GB, adapter weights and gradients 3.2 GB, Adam moments 6.4 GB, checkpoints 10.7 GB, logits 1.0 GB: 55.8 GB before the recompute working set. Paging the moments brings it to 49.4 GB, still over 48. The term that blocks it is the one QLoRA does not touch.</p>
+<p><strong>Two defensible plans.</strong> Train at 4,096 now: 5.9 GB of checkpoints and logits, 43.6 GB with paged moments, plus a few GB of working set. It fits, and the cost is that the model never sees 8,192-token documents during the three weeks, so long-range behaviour is unmeasured until the GPU arrives. Or reduce what is checkpointed (for example, offload checkpoints to CPU memory) and train at 8,192 now; the cost is step time dominated by host transfers and a configuration the team has not run before, three weeks from a deadline.</p>
+<p><strong>The conflict.</strong> Deadline against the quality evidence at the target length. I would take the 4,096 plan, because a slow, unfamiliar setup risks the deadline, and write down that long-document quality is unverified until week four.</p>
+<p><strong>How this fails.</strong> If quality on long documents depends on seeing full-length examples, a week is too little time to retrain and evaluate at 8,192 before the deadline. The mitigation is an evaluation at 8,192 on the 4,096-trained adapter in week one, so the size of the risk is known early.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The 4,096 run's step time doubles once paging starts on long batches. Do you cap sequence length below 4,096 or accept the slowdown, and what do you tell the product owner about the date?</em></li>
+<li><em>The serving team wants the adapter merged into the BF16 base for latency. What do you need to measure before agreeing, and what would make you refuse?</em></li>
+<li><em>When would you skip QLoRA and run 16-bit LoRA across several GPUs instead?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The memory arithmetic counts the terms named here and assumes checkpointing at every layer boundary; real frameworks add allocator fragmentation, temporary dequantised blocks, communication buffers and the CUDA context, which is what the reserve stands in for, and the reserve has to be measured. The 99.3% figure is the paper's own result on its chatbot benchmark, judged as the paper describes, and does not transfer to a different task. NF4's design assumes normally distributed weights; models or layers whose weights are far from that distribution lose more to quantisation, and the only check is a comparison against a 16-bit adapter run on the same data. Newer GPUs with native low-precision formats change the compute side of the trade, not the activation term.
+
+<SelfRate id="lesson:training/adapting/qlora-mechanics" />

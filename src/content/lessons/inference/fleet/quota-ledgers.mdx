@@ -1,0 +1,182 @@
+---
+title: "Credit and quota ledgers"
+track: inference
+module: fleet
+order: 3
+kind: lesson
+level: senior
+minutes: 13
+summary: Token credits are an append-only ledger of grants, debits, holds, refunds and expirations; consumption order, hold sizing for requests whose cost is unknown, the billing provider's correction window and a reconciliation job decide whether it leaks revenue or blocks paying users.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: "OpenAI L5 Interview Guide (Hello Interview, 2026)"
+    url: https://www.hellointerview.com/guides/openai/l5
+    note: "Candidate reports, checked 2026-10-28. Lists a staff coding question titled 'Design a credit tracking service for user token balances' and says live coding rounds often cover practical implementations such as credit-tracking services, with several behaviours to implement."
+  - title: "PracHub: Perplexity interview questions"
+    url: https://prachub.com/companies/perplexity-ai
+    note: "Candidate reports, checked 2026-10-28. 'Design a CreditTracker with expirations', Software Engineer coding round, dated 10 August 2025, beginning add_credit(start_time, end_time, credit)."
+  - title: "PracHub: Track Expiring GPU Credits"
+    url: https://prachub.com/interview-questions/track-expiring-gpu-credits
+    note: "Candidate report tagged OpenAI, onsite, posted 9 March 2026: event replay and time-window accounting with priority-based consumption and out-of-order events."
+  - title: "Stripe docs: Billing credits"
+    url: https://docs.stripe.com/billing/subscriptions/usage-based/billing-credits
+    note: "Checked 2026-10-28. Grant states pending, granted, depleted, expired, voided; credits do not expire unless expires_at is set; multiple grants apply by priority, then earliest expires_at, then promotional category, then earliest effective_at, then earliest created; ledger balance versus available balance; a grant is backed by an immutable, append-only ledger; voiding an invoice reinstates applied credits, which expire immediately if the grant is past expiry; a credit note does not restore grants; at most 100 unused grants per customer."
+  - title: "Stripe docs: Record usage for billing"
+    url: https://docs.stripe.com/billing/subscriptions/usage-based/recording-usage
+    note: "Checked 2026-10-28. Meter events are processed asynchronously; Stripe recommends Metronome rather than Billing Meters for most new integrations."
+  - title: "Stripe docs: Record usage for billing with the API"
+    url: https://docs.stripe.com/billing/subscriptions/usage-based/recording-usage-api
+    note: "Checked 2026-10-28. Each meter event has an identifier for deduplication; timestamps within the past 35 calendar days and no more than 5 minutes in the future; acceptance does not guarantee invoicing; live-mode limit 1,000 calls per second per account and one concurrent call per customer per meter; API v2 meter event streams up to 10,000 events per second; invalid events reported asynchronously through v1.billing.meter.error_report_triggered."
+  - title: "Stripe docs: Configure an invoice finalisation grace period"
+    url: https://docs.stripe.com/billing/subscriptions/usage-based/configure-grace-period
+    note: "Checked 2026-10-28. Default finalisation grace period 1 hour, configurable up to 72 hours; usage reported after finalisation can appear in meter summaries but is not added to the finalised invoice or the next one; threshold invoices include only usage received before they are created."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Balance is a query, not a column
+
+A token-credit system that stores one balance per customer and decrements it fails on the first requirement that is not a decrement: a grant that expires, a request whose cost is unknown when it starts, a refund for a failed request, an event that arrives after a later one. Each of those is an entry in a ledger, and the balance is derived from the entries. Stripe's billing credits are built this way; its docs describe each credit grant as backed by an immutable, append-only ledger, and they distinguish a ledger balance from an available balance, the second net of expired credits and unrecorded transactions.
+
+Getting it wrong costs in both directions. Debits that never post, or usage reported too late to invoice, are lost revenue. Holds that are too large, or expirations applied in the wrong order, reject requests from customers who have paid. The exercise is common enough in interviews to have several candidate reports: Hello Interview's OpenAI L5 guide lists a credit-tracking service for token balances, and PracHub lists a CreditTracker with expirations tagged Perplexity (August 2025) and an expiring GPU-credit tracker with out-of-order events tagged OpenAI (March 2026). Those are candidate reports, not company statements.
+
+The ledger has five entry types: grants (amount, effective time, expiry, priority, category), debits, holds and their captures or releases, refunds, and expirations. The decisions are the consumption order, how big a hold is, what happens when a grant expires under an in-flight request, and when usage must reach the billing system.
+
+## Consumption order: soonest expiring first
+
+When several grants are live, the order in which a debit draws from them decides how many credits expire unused. Drawing from the grant that expires soonest is the order that minimises waste for a fixed usage pattern: any debit taken from a later-expiring grant while an earlier one has credit can be swapped onto the earlier grant without making anything worse.
+
+<Predict id="inf-fleet-expiry" question="Grants: G1 has 100 credits usable from day 0 until day 10; G2 has 50 from day 2 until day 5; G3 has 100 from day 15 until day 30. Usage is 60 credits on day 3, 70 on day 8 and 100 on day 20. Consuming soonest-expiring first, how many credits expire unused?" answer={20} tolerance={0} unit="credits">
+<p>Day 3: G2 expires first, so take its 50, then 10 from G1, leaving 90. Day 5: G2 expires empty. Day 8: take 70 from G1, leaving 20. Day 10: G1 expires with <b>20</b>. Day 20: take all 100 from G3. Consuming in the order grants were created instead takes day 3 from G1 (40 left), lets G2 expire with all 50, and on day 8 finds only 40 credits live, so 30 of the 70 are uncovered: 50 expired and a 30-credit shortfall from the same grants and the same usage.</p>
+</Predict>
+
+Expiry is not the only key. Stripe applies grants by priority first (a lower number wins), then earliest expiry, then promotional before paid, then earliest effective date, then earliest creation. Priority exists because a business may want paid credits, which are deferred revenue, or contract-specific credits used in a fixed order regardless of expiry. The tie-breakers matter for one reason: two replays of the same events must produce the same allocation, or reconciliation cannot compare them. Write the full sort key down and never let it depend on storage order.
+
+## Out-of-order events and replay
+
+Usage events arrive late and out of order. A gateway retries a report; a region's queue drains after a partition; a debit stamped 23:59 arrives after a grant that started at 00:00. If the ledger applies events in arrival order, the allocation depends on network timing. The robust model stores events and computes balances by replaying them in event-time order; the PracHub variant with out-of-order events tests exactly this.
+
+```python
+import heapq
+
+class CreditLedger:
+    def __init__(self):
+        self.grants, self.debits = [], []
+
+    def grant(self, gid, amount, start, expires):        # usable on [start, expires)
+        self.grants.append((start, expires, amount, gid))
+
+    def debit(self, amount, at):                          # events may arrive out of order
+        self.debits.append((at, amount, len(self.debits)))
+
+    def replay(self, until):
+        """Replays every event up to `until`, soonest-expiring grant first.
+        Returns (remaining, expired, short): short is usage no grant covered."""
+        events = [(s, 0, gid, amt, exp) for s, exp, amt, gid in self.grants]
+        events += [(t, 1, seq, amt, None) for t, amt, seq in self.debits]
+        events.sort(key=lambda e: e[:3])                  # grants before debits at equal times
+        live, left, expired, short = [], {}, 0, 0
+
+        def expire(now):
+            nonlocal expired
+            while live and live[0][0] <= now:
+                _, gid = heapq.heappop(live)
+                expired += left.pop(gid)
+
+        for t, kind, key, amt, exp in events:
+            if t > until:
+                break
+            expire(t)
+            if kind == 0:
+                left[key] = amt
+                heapq.heappush(live, (exp, key))
+                continue
+            while amt and live:
+                gid = live[0][1]
+                take = min(amt, left[gid])
+                left[gid] -= take
+                amt -= take
+                if left[gid] == 0:
+                    heapq.heappop(live)
+                    left.pop(gid)
+            short += amt
+        expire(until)
+        return sum(left.values()), expired, short
+
+book = CreditLedger()
+book.grant("G1", 100, start=0, expires=10)
+book.grant("G2", 50, start=2, expires=5)
+book.grant("G3", 100, start=15, expires=30)
+for at, amount in [(20, 100), (3, 60), (8, 70)]:         # arrives out of order
+    book.debit(amount, at)
+print(book.replay(until=25))                              # (0, 20, 0)
+```
+
+Replaying from the first event costs O(n log n) per query, so the total over a customer's lifetime grows with the square of its event count. Production ledgers checkpoint: they materialise per-grant balances at a watermark and replay only events after it. An event older than the watermark forces a replay from its timestamp, which is why the watermark trails real time by the lateness the system accepts, and why events later than that are handled as adjustments rather than rewrites.
+
+## Holds for requests whose cost is unknown
+
+A model request's cost is known only when it finishes, because output length is decided by the model. Admitting it against the balance needs a hold: an entry that reduces the available balance now and is captured at the actual cost, or released, when the request ends. The size of the hold is the policy decision.
+
+Take scenario prices of 1 credit per input token and 5 per output token, a customer with 100,000 credits, and requests of 2,000 input tokens with `max_tokens` 8,000 whose outputs average 600 tokens. A hold at the maximum cost is 2,000 + 5 × 8,000 = 42,000 credits, so the customer can have two requests in flight. Their actual cost is 2,000 + 5 × 600 = 5,000, so the balance would cover twenty. Three policies, each with a cost:
+
+- **Hold the maximum.** The ledger never goes negative, and customers near their limit are throttled to a fraction of what they paid for. Reasoning models with large output budgets make the gap wider.
+- **Hold an estimate** such as the customer's 95th-percentile cost for that model, and allow the capture to exceed the hold. Concurrency matches real usage; the ledger can go negative by up to the in-flight overshoot, which the business either writes off or recovers from the next grant.
+- **No holds, post-paid with a credit limit.** The simplest path; exposure is the credit limit plus everything in flight when it is reached.
+
+Whichever policy wins, holds need a lifetime. A gateway that crashes between hold and capture leaves credit reserved; a hold expires after a TTL longer than the longest legitimate request, and a capture that arrives after its hold expired still posts as a debit. Captures are keyed by request id so a retried capture posts once.
+
+Expiry under a hold needs a rule too. A request that starts at 23:59 against a grant expiring at midnight can either be allocated to that grant at hold time and honoured past expiry, or allocated at capture time against whatever is live then. The first is kinder to the customer and makes the allocation depend on start time; the second is simpler and can turn a covered request into an overage. Pick one, write it into the terms, and make replay implement the same rule.
+
+## Refunds
+
+A refund reverses a debit, so it must know which grants the debit drew from; store the allocation with each debit rather than recomputing it. Returning credits to a grant that has since expired is a policy choice with a precedent: when a Stripe invoice that used credits is voided, the credits go back to their grant and, if it is past its expiry, expire immediately. Stripe also notes that issuing a credit note does not restore grants; restoring them takes a new grant. A refund that silently extends an expired grant is a revenue leak that reconciliation will find months later.
+
+## Reporting usage to billing inside its window
+
+The ledger decides what a customer may use; the billing system decides what the customer pays for usage beyond their credits. Usage reaches billing as events, and every billing system has a correction window. Stripe's, as of the check date: a meter event's timestamp must be within the past 35 days and no more than 5 minutes in the future; acceptance does not guarantee invoicing; invoices finalise one hour after creation by default, configurable to at most 72 hours; usage reported after finalisation can appear in meter summaries but is added neither to the finalised invoice nor to the next one. Late usage is not rejected; it is unbilled, and nothing errors. Validation failures arrive asynchronously as `v1.billing.meter.error_report_triggered` events, so a pipeline that only checks the HTTP response misses them. Stripe's docs now recommend Metronome over Billing Meters for most new integrations; the constraints below are Billing Meters'.
+
+Throughput bounds the event design. Live-mode meter event calls are limited to 1,000 per second per account and one concurrent call per customer per meter, with API v2 streams accepting 10,000 events per second. A fleet completing a scenario 3,000 requests per second cannot report one event per request on v1. Aggregating per customer per minute turns 20,000 active customers into 20,000 / 60 = 333 events per second, each with an identifier derived from customer, meter and minute, so a retried report deduplicates.
+
+The ledger therefore closes a billing period on a schedule: at period end it stops attributing usage to the period, flushes aggregates, and must have them accepted before finalisation, which with the default grace leaves an hour minus the pipeline's own lag.
+
+## Reconciliation
+
+Three records describe the same usage: serving logs (tokens per request id), the ledger (debits per request id) and the billing system's meter summaries. A daily job compares them per customer and hour, and each mismatch has a known cause: a completed request with no debit is an expired hold whose capture was lost; two debits for one request id is a deduplication failure; billed usage below ledger overage is a late or rejected meter event. The job's output is adjustments, entered as new ledger entries, never edits to old ones, and an alert when an unexplained difference exceeds a stated share of revenue.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Enterprise customers buy annual token credits; sales also hands out promotional credits that expire in 30 days. Customers complain that agent jobs are rejected while their dashboards show a large balance, and finance reports that last month's overage revenue was lower than the serving logs imply. You have one sprint before quarter close. What do you change first, and what do you give up?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Both symptoms point at the hold and reporting paths, not the balance. Rejections with a large displayed balance are holds sized at maximum cost for long-output agent jobs; missing revenue is usage reported after invoice finalisation. Before quarter close I fix reporting first, because lost revenue cannot be recovered after finalisation, and switch holds to an estimate with a bounded overdraft second.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Revenue first: compare serving logs with meter summaries per customer and hour to confirm the gap is late events, then aggregate per customer per minute with deterministic identifiers, flush before finalisation, raise the grace period for metered invoices if the pipeline's lag needs it, and subscribe to the asynchronous error events. Usage already past finalisation needs a manual invoice item, which finance has to approve.</p>
+<p>Holds second: size them at each customer's high-percentile cost per model instead of `max_tokens`, cap overdraft at a stated amount per customer, and show available and ledger balance separately so the dashboard explains a rejection. Consumption order is checked last: if promotional credits are being consumed after annual credits, they expire unused and customers are right to complain.</p>
+<p>What I give up: the ledger can go negative by the overdraft cap, which finance has to accept as exposure in writing, and the hold change ships with less testing than the reporting fix. If the sprint can only hold one, it is reporting.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Finance refuses any overdraft. Customers keep getting rejected. What do you offer instead, and who decides between rejection and exposure?</em></li>
+<li><em>A region's usage queue was down for six hours and drains after finalisation. How much revenue can you still bill, and through what path?</em></li>
+<li><em>Two engineers disagree on allocating holds at start time or capture time. What would you measure to decide, and what would make you reverse it?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The ledger described here is per customer and assumes one writer per customer at a time. Organisations with shared pools across many API keys and regions need either a single owner per pool, which adds a cross-region hop to every admission, or per-region allotments that are rebalanced periodically, which strands credit in idle regions. Rate limits are the same problem at a shorter time scale and usually live in a separate, approximate system for that reason.
+
+Soonest-expiring-first minimises waste for the customer, which is not always what the contract says. Some contracts require committed spend to be drawn before promotional credit, or forbid using one product's credits on another; the sort key encodes the contract, and the minimal-waste order is a default, not a rule.
+
+Replay assumes events carry trustworthy timestamps. Clock skew across regions can reorder a debit before the grant it depends on; ledgers either stamp events at one authority or accept the skew and reconcile.
+
+<SelfRate id="lesson:inference/fleet/quota-ledgers" />

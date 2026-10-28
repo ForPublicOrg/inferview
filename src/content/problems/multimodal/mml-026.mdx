@@ -1,0 +1,137 @@
+---
+id: mml-026
+title: Image requests take twice the latency budget
+subtitle: rank the causes from a profile and the serving code
+track: multimodal
+module: generation
+type: debug
+difficulty: hard
+seniority: [senior]
+minutes: 30
+core: false
+tags: [diffusion, sampling-steps, classifier-free-guidance, latency, profiling]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: "AI engineering interview questions, Multimodal AI section (amitshekhariitbhu, GitHub; synthesised question bank)"
+    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
+    note: "Lists the question of a diffusion model that takes too long per image and how to speed up sampling. A synthesised bank naming no company, so no company is tagged. Checked 2026-10-28."
+  - title: "Esser et al., Scaling Rectified Flow Transformers for High-Resolution Image Synthesis (arXiv 2403.03206, 2024-03-05)"
+    url: https://arxiv.org/abs/2403.03206
+    note: "Table 6, depth-38 rectified-flow model, relative CLIP score drop against 50 steps: 2.71% at 5 steps, 0.14% at 10, 0.08% at 20; timestep shift 3.0 used at 1024 px. Checked 2026-10-28."
+  - title: "Ho and Salimans, Classifier-Free Diffusion Guidance (arXiv 2207.12598, 2022-07-26)"
+    url: https://arxiv.org/abs/2207.12598
+    note: "Each sampling step evaluates the model twice, once with and once without the condition. Checked 2026-10-28."
+  - title: "NVIDIA H100 product page, specifications"
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: "BF16 Tensor Core 1,979 TFLOPS with sparsity (dense is half); 3.35 TB/s memory bandwidth. Checked 2026-10-28."
+choices:
+  - text: The sampler reads a key the config does not set, so every request runs 50 guided steps where 28 were intended
+    correct: true
+    why: The config sets steps, the code reads num_steps with a default of 50, and the profile's 100 denoiser calls are exactly 50 steps with two passes each; at 45 ms a call that is 4.5 of the 5.3 seconds.
+  - text: Guidance runs the conditional and unconditional passes as two batch-1 calls, which leaves the GPU idle half the time
+    correct: false
+    why: It is a real inefficiency, but at 4,096 tokens per pass each call is already compute-bound, so merging them saves launch and memory overhead, not half the time, and the profile cannot show utilisation either way.
+  - text: The decoder runs in float32 at full resolution, and that one decode is what pushes each request past the target
+    correct: false
+    why: The decode is real waste at 0.42 s, but removing it entirely still leaves 4.8 s against a 2.5 s target.
+  - text: The empty negative prompt is encoded again on every request, so text encoding stalls the GPU before the first step
+    correct: false
+    why: Encoding the constant negative prompt per request is a real defect, but both encoder calls together are 0.31 s of 5.3 s.
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Debugging round">
+"Our image endpoint misses its latency target by a factor of two. Find out why, get it under the target without a quality drop anyone can see, and tell me how you would prove the second part."
+</Callout>
+
+The service, as a scenario: an 8B rectified-flow transformer at 1024 × 1024 on one H100 per request. Product's target is a p50 of 2.5 s. The model card from research says 28 steps at guidance 5.0 with timestep shift 3.0. This is the serving code:
+
+```python
+cfg = load_yaml("model.yaml")   # model.yaml -> sampler: {steps: 28, guidance: 5.0, shift: 3.0}
+pipe = Pipeline.load(cfg["model"], dtype="bf16")
+pipe.vae.to("float32")
+
+def generate(prompt, width=1024, height=1024, seed=None):
+    s = cfg["sampler"]
+    steps = s.get("num_steps", 50)
+    emb = pipe.encode_text(prompt)
+    neg = pipe.encode_text("")
+    x = pipe.noise(width, height, seed)
+    ts = pipe.timesteps(steps, shift=s.get("shift", 1.0))
+    for t, t_next in zip(ts, ts[1:]):
+        v_c = pipe.denoise(x, t, emb)
+        v_u = pipe.denoise(x, t, neg)
+        v = v_u + s["guidance"] * (v_c - v_u)
+        x = x + (t_next - t) * v
+    return pipe.vae.decode(x)
+```
+
+One profiled request, typical of the p50:
+
+```
+request 7f3a   1024x1024   total 5.27 s
+  encode_text        2 calls    0.31 s
+  denoise          100 calls    4.52 s    (45 ms each)
+  vae.decode         1 call     0.42 s
+  other                         0.02 s
+```
+
+You have no GPU utilisation data, no record of what latency was at launch, and no quality evaluation at any step count other than the model card's. The profile and the trace are synthetic.
+
+Which defect explains most of the missed target?
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask research which step count and guidance setting their quality sign-off was run at.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request a per-call breakdown of the denoiser: how many calls per request, and how that number relates to the configured settings.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask whether there is a fixed prompt set with fixed seeds that the quality sign-off used, and who reviewed it.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>The code reads <code>num_steps</code>, the config sets <code>steps</code>, so every request runs the default 50 steps, 100 denoiser calls with guidance. Fixing the key gives 56 calls, about 2.5 s of denoiser, still over budget with the decode and encoders. Then measure 20 steps against 28 on a fixed prompt set with fixed seeds; if it holds, 40 calls is about 1.8 s, and a bf16 decode and a cached negative embedding bring the request under 2.5 s. Proof is a paired comparison written down before the change ships, plus a canary on latency and complaint rate.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Rank by the profile.</strong> 100 denoiser calls × 45 ms = 4.5 s of 5.3 s. Guidance needs two calls per step, so 100 calls means 50 steps; the config says 28. The line that disagrees is <code>s.get("num_steps", 50)</code>: the key is wrong and the default hides it. Nothing errors, and the images look good because 50 steps is more than the model was signed off at.</p>
+<p><strong>Fix in order of evidence needed.</strong></p>
+<ol>
+<li>Read <code>steps</code> and fail loudly on a missing key. 56 calls × 45 ms = 2.52 s, plus 0.31 + 0.42 + 0.02 = 3.27 s. No quality evidence needed: 28 is the signed-off setting.</li>
+<li>Encode the empty negative prompt once at startup: saves about half of 0.31 s, assuming the two calls cost the same. No quality risk.</li>
+<li>Decode in bf16: saves part of 0.42 s, by an amount to measure; check reconstruction on images with small text, where a lower-precision decoder shows first. Small quality risk.</li>
+<li>Cut 28 steps to 20: 40 calls × 45 ms = 1.8 s. The Stable Diffusion 3 paper's depth-38 model loses 0.08% CLIP score at 20 steps against 50, which says where to look, not what your model does. Needs the paired evaluation.</li>
+</ol>
+<p>With steps 1, 2 and 4 and the decoder unchanged, the request is about 1.8 + 0.16 + 0.42 + 0.02 ≈ 2.4 s; with a faster decode it has margin. Merging the two guidance passes into one batch of two is worth trying last: at 4,096 tokens per pass the weight multiplies do about 4,096 FLOP per byte of weights, above the H100's roughly 295 FLOP per byte of dense compute to bandwidth, so each call is already compute-bound and the gain is overhead, not half.</p>
+<p><strong>Proving no visible drop.</strong> A fixed prompt set covering the product's traffic (including text-in-image, faces and hands), fixed seeds so both arms start from the same noise, CLIP score for adherence, and a blind side-by-side preference by people who did not choose the change. Decide the acceptance rule before looking: for example, preference for 28 steps not above 55% overall or on any named slice. With 400 pairs, the 95% interval on a 50% preference rate is about ±1.96 × √(0.25/400) ≈ ±4.9 points, so a 55% threshold is detectable at that size. Then canary 20 steps behind a flag with the complaint rate and the regenerate-click rate as rollback triggers.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The paired evaluation passes overall but people prefer 28 steps on the text-in-image slice at 58%. Do you ship 20 steps for everything except prompts you classify as text-heavy, and what does misclassification cost?</li>
+<li>Research says guidance 5.0 was tuned at 50 steps. Do you re-tune it at 20 steps, and what does that do to your proof?</li>
+<li>What would you need to see in the canary to go back to 28 steps?</li>
+</ul>
+</Fragment>
+</Depth>
+
+**Why each wrong option is tempting.** Batching the two guidance passes is the standard LLM-serving reflex, and at small resolutions it would help; at 4,096 tokens it is not where the time goes. The float32 decode is visible in the profile and easy to fix, but it is 8% of the request. The negative prompt being re-encoded is a real waste and the first thing many engineers spot in the code, because it is the most obviously redundant line; it costs 0.15 s.
+
+**What you do without the missing evidence.** No utilisation data means the batching claim cannot be tested from this profile; collect a GPU trace for one request before spending time on it. No launch-latency record means you cannot say when the regression arrived; the config history will show whether the key was ever right. No quality evaluation below 28 steps means step 4 waits for the paired comparison, while steps 1 and 2 ship today.
+
+## Follow-ups
+
+- *Your verification for the 20-step change needs two days of reviewers' time and product wants it this week. Ship the key fix and the cached negative now and hold step 4, or ship all of it with a canary as the evaluation? Which risk do you accept in writing?*
+- *The key bug means production has served 50-step images since launch, and users are used to them. Is moving to the signed-off 28 a quality regression you need to evaluate too?*
+- *Two senior engineers disagree: one wants a distilled 4-step model instead of tuning steps, the other says the evaluation cost of distillation is too high this quarter. How do you decide without deciding by rank?*
+- *Move this to a shared GPU pool where requests of different resolutions arrive together. What changes in how you batch?*
+
+## Common mistakes
+
+- Cutting the step count first, without noticing the service already runs more steps than configured.
+- Reading 100 denoiser calls as 100 steps and forgetting that guidance doubles the calls.
+- Treating CLIP score at 20 steps as proof of no visible drop; it does not see rendered text or hands.
+- Lowering the guidance weight to save time; both passes run at any weight unless guidance is switched off.
+- Fixing the key silently with another default, so the next typo fails the same way.

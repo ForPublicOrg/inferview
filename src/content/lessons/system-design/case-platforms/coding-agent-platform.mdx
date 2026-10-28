@@ -1,0 +1,144 @@
+---
+title: "A coding-agent platform: session log, sandboxes and credential paths"
+track: system-design
+module: case-platforms
+order: 1
+kind: lesson
+level: staff
+minutes: 12
+summary: A hosted coding-agent platform keeps the session as a durable event log outside a stateless harness, starts sandboxes only when a tool needs one, and keeps every credential out of reach of the code the model writes.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Anthropic Engineering, Scaling Managed Agents (2026-04-08)
+    url: https://www.anthropic.com/engineering/managed-agents
+    note: session as an append-only log outside harness and container; interfaces execute, provision, wake, getSession, emitEvent, getEvents; containers provisioned only when a tool call needs one; p50 time-to-first-token dropped roughly 60 percent and p95 over 90 percent; git token used at sandbox initialisation and wired into the remote; MCP OAuth tokens in a vault behind a proxy; checked 2026-10-28
+  - title: Anthropic Engineering, how we contain Claude (2026-05-25)
+    url: https://www.anthropic.com/engineering/how-we-contain-claude
+    note: hook in a committed .claude/settings.json ran before the trust prompt; red-team exercise with ~/.aws/credentials exfiltrated in 24 of 25 retries; Cowork upload through allowlisted api.anthropic.com fixed with an in-VM proxy that forwards only the VM's own session token; users approved roughly 93 percent of permission prompts; the OS-level sandbox cut permission prompts by 84 percent; checked 2026-10-28
+  - title: Claude docs, Managed Agents vaults (beta header managed-agents-2026-04-01)
+    url: https://platform.claude.com/docs/en/managed-agents/vaults
+    note: mcp_oauth, static_bearer and environment_variable credentials; placeholder substituted at egress; allowed_hosts and injection_location; SigV4 signatures break; exchanged tokens arrive unredacted; vaults workspace-scoped; at most 20 credentials per vault; first matching vault wins; environment-variable credentials not yet supported with self-hosted sandboxes; checked 2026-10-28
+  - title: Claude docs, pricing (Managed Agents and model pricing)
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: session runtime $0.08 per session-hour while running; Claude Sonnet 5.5 $2 per MTok input, $2.50 5-minute cache write, $0.10 cache hit, $10 output; checked 2026-10-28
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision: what survives a crash, and what generated code can reach
+
+A hosted coding agent runs code the model writes, against a repository the customer owns, holding credentials for the customer's code host and tools. Two questions decide the architecture. Where does a session's state live, so that a crashed process does not lose an hour of work? And which process can read each credential, given that a file in the repository will at some point tell the model to send it somewhere?
+
+Anthropic's first version of Managed Agents put everything in one container: the loop that calls the model, the filesystem the agent edits, and the credentials. A dead container lost the session, debugging meant opening a shell in a container that held customer data, and customers who wanted the agent inside their own network had to peer networks or run the harness themselves. The rebuild split the system into three parts with narrow interfaces. That split is the reference design for this case.
+
+## Three components and their contracts
+
+**The session** is an append-only event log stored outside both the harness and the sandbox. The harness writes durable events with `emitEvent(id, event)` and reads positional slices back with `getEvents()`. This is a write-ahead log: the log is the source of truth, and everything else is derived from it. The difference from a database WAL is what reads it. The harness builds the model's context from the log and may filter or transform events on the way, for example to keep the prompt prefix stable for the prompt cache. Compaction and context trimming become views over the log rather than destructive edits, so a bad compaction can be redone.
+
+**The harness** is the loop that calls the model and routes tool calls. It holds no state that the log does not hold, so a crashed harness is replaced rather than repaired: `wake(sessionId)` starts a new one, `getSession(id)` hands it the log, and it continues from the last event. Harness workers become stateless compute behind a queue of sessions, scaled on queue depth.
+
+**The sandbox** is where code runs and files change. Every kind of tool, whether a container, a custom tool or an MCP server, sits behind one call, `execute(name, input)`, which returns a string. Containers start through `provision({resources})` only when a tool call needs one, so a session that only plans, reads an issue or answers a question never pays the container start. Anthropic reports that this change cut p50 time to first token by roughly 60 percent and p95 by over 90 percent. The p95 gain is larger because cold container starts sat in the tail.
+
+The interfaces matter more than what runs behind them. A sandbox can be the vendor's container, a VM in the customer's VPC or a self-hosted runner, and the harness does not change, because it only sees `execute` and `provision`.
+
+## Where the credentials go
+
+In the single-container design generated code ran next to credentials, so a prompt injection could read a token able to start unrestricted sessions. The rebuild has one rule: no token is reachable from the sandbox that runs generated code. Three paths implement it.
+
+- **Code host.** The repository token is used during sandbox initialisation to clone and is wired into the local git remote. The agent pushes through the remote and never handles the token as a value.
+- **MCP tools.** OAuth tokens live in a vault. The model calls MCP tools through a proxy that receives a session-scoped token, fetches the real credential from the vault and calls the service. The harness never sees the credential either.
+- **Everything else** (CLIs, SDKs, raw HTTP). A vault `environment_variable` credential puts an opaque placeholder in the sandbox's environment. An egress proxy replaces it with the real secret on the way out, only for hosts in the credential's `allowed_hosts`, and only in the request locations `injection_location` enables (headers, body or both).
+
+Egress substitution has documented limits that decide whether it fits a given tool:
+
+- A client that computes a signature from the secret, such as AWS SigV4, signs the placeholder and produces an invalid signature.
+- A client that exchanges the secret for a session token (an OAuth client-credentials grant) receives that token inside the sandbox, unredacted. The vault docs say to do the exchange yourself and store the result.
+- A placeholder in a disabled location is sent literally, and the third party rejects it with its own authentication error.
+- Body injection is the wider surface, because request bodies are assembled from content the agent is working with. Header-only is the narrower setting.
+- `allowed_hosts` on the credential controls where the secret is substituted, not where traffic may go. The environment's network policy must also allow the host.
+
+Two properties matter for multi-tenancy. Vaults are workspace-scoped: any API key with workspace access can reference any vault in it when creating a session. Mapping end users to vaults, and checking that a session is created for the user whose vault it names, is your platform's job. And when a session references several vaults holding a credential for the same MCP server, the first vault with a match wins, so vault order is a policy decision.
+
+```python
+# Egress substitution reduced to its rules. Runs as is.
+PH = "vault:NOTION_API_KEY"
+SECRETS = {PH: ("ntn_real", {"api.notion.com"}, {"header"})}
+
+def egress(host, headers, body, env_allowed):
+    if host not in env_allowed:
+        raise PermissionError(f"egress to {host} denied by environment policy")
+    for ph, (value, hosts, where) in SECRETS.items():
+        if host in hosts and "header" in where:
+            headers = {k: v.replace(ph, value) for k, v in headers.items()}
+        if host in hosts and "body" in where:
+            body = body.replace(ph, value)
+    return headers, body  # anything not substituted leaves as the literal placeholder
+
+env = {"api.notion.com", "api.github.com"}
+print(egress("api.notion.com", {"Authorization": f"Bearer {PH}"}, "{}", env))
+print(egress("api.github.com", {"Authorization": f"Bearer {PH}"}, "{}", env))
+```
+
+The second call shows the property that matters: code in the sandbox can refer to the secret by name, but only an allowed host ever receives its value.
+
+## What failed in production and in red-team exercises
+
+Anthropic's containment post lists failures across Claude Code and Cowork. Each maps to a control a hosted platform needs from the first release.
+
+**Project configuration that ran before trust.** A hook in a committed `.claude/settings.json` executed at startup, before the user accepted the trust prompt. The fix deferred parsing and executing project-local configuration until after trust. On a hosted platform the repository is always untrusted input: anything it can configure (hooks, setup scripts, agent instruction files, MCP server declarations) runs inside the sandbox with the sandbox's privileges, never in the harness or the provisioner.
+
+**Credentials read and posted.** In an internal red-team exercise in February 2026, a phishing email led an employee to run Claude Code with a prompt asking it to read `~/.aws/credentials`, encode the contents and POST them out. Claude completed the exfiltration in 24 of 25 retries. The instruction came from the model's own user, so no model-level defence applied; only filesystem boundaries and egress control could stop it. On a hosted platform built as above there is no credential file in the sandbox to read.
+
+**An allowlisted domain used for upload.** A malicious file in a Cowork workspace carried hidden instructions and the attacker's API key. Claude uploaded workspace files through the Files API to the attacker's account; the egress allowlist permitted `api.anthropic.com`, so the request passed. The fix was an in-VM proxy that forwards only requests carrying the VM's own session token and blocks headers that enable server-side fetch. The general rule: a host allowlist does not stop exfiltration to any multi-tenant API on the list, because the attacker can bring their own credential for it. Every allowlisted host that accepts writes (a code host, object storage, a model provider) needs the same binding: the proxy forwards only credentials the platform issued to this session.
+
+Human approval is a weaker backstop than it looks. Users approved roughly 93 percent of permission prompts, and moving Claude Code into an OS-level sandbox cut prompts by 84 percent. A control that is approved almost every time is rarely read.
+
+## Cost per task
+
+Managed Agents bills tokens at model rates plus session runtime at $0.08 per session-hour, metered only while the session is `running`. Time spent idle, waiting for the user or a tool confirmation, is not billed.
+
+<Predict id="sys-platforms-task-cost" question="A coding task on Claude Sonnet 5.5 reads 2,000,000 tokens from the prompt cache, writes 150,000 tokens to the 5-minute cache, produces 40,000 output tokens and runs for 20 minutes. At $0.10, $2.50 and $10 per million tokens and $0.08 per session-hour, what does the task cost in dollars?" answer={1.00} tolerance={0.08} unit="USD">
+Cache reads 2.0 × $0.10 = $0.20. Cache writes 0.15 × $2.50 = $0.375. Output 0.04 × $10 = $0.40. Runtime one third of an hour × $0.08 = $0.027. The total is about $1.00, and runtime is under 3 percent of it. Output and cache writes are three quarters of the bill, so a harness change that adds verbose planning or breaks the cached prefix moves cost far more than sandbox time does. The number the business tracks is cost per successful task: at a 60 percent success rate (a scenario figure) each merged fix costs $1.00 / 0.6 = $1.67, because failed attempts are paid in full.
+</Predict>
+
+Under this pricing, lazy provisioning is mainly a latency decision. It becomes a cost decision when you run your own fleet: a warm pool sized for p95 start time is paid for all day, and its size is set by how many sessions need a sandbox in their first turn.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+"Design a hosted platform that runs coding agents against customers' private repositories. The security review is in six weeks, the first enterprise customer will not allow any long-lived credential inside a container, and sessions run up to two hours."
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>The session is an append-only event log in a durable store, and the harness is stateless and restartable from it. Sandboxes start on the first tool call that needs one. No credential is inside a sandbox: the repository token is used at clone time and held by the git remote, MCP tokens sit in a vault behind a proxy, and other secrets are placeholders substituted at egress for allowed hosts only. Every allowlisted host that accepts writes is bound to platform-issued identities. The cost is a proxy on every outbound call and a set of tools that cannot work this way (signed requests, token exchanges).</p>
+</Fragment>
+<Fragment slot="long">
+<p>Two hours of work cannot depend on one process, so the log is the session. The harness writes each model response, tool call and tool result as an event before acting on it. On a crash the scheduler wakes a new harness, which rebuilds context from the log. Tool calls with side effects (push, open a pull request, comment) carry an idempotency key derived from the session id and event index, because a resumed harness may re-issue the last call.</p>
+<p>The trust boundary is the sandbox wall. The repository, its config files and anything fetched from the network are untrusted, so hooks and setup scripts run inside the sandbox only. The sandbox has no route out except through the egress proxy, which enforces a per-environment host list, substitutes vault placeholders, refuses requests to write-capable hosts unless they carry this session's platform-issued identity, and strips headers that make a server fetch on the caller's behalf.</p>
+<p>The decision with two defensible answers is where secret-dependent tools run. Option one, egress substitution: the tool runs in the sandbox with a placeholder; this works for clients that send the secret verbatim and supports arbitrary CLIs with no per-tool work. Option two, a broker: the tool runs outside the sandbox as an MCP server or platform service, and the sandbox calls it by name; this supports signed requests and token exchanges, but each tool is engineering work. I would ship substitution for header-authenticated APIs and brokers for cloud SDKs, and write that line into the security review.</p>
+<p>Failure mode of this design: the log now holds every tool result, including file contents and anything the agent printed. It becomes the most sensitive store on the platform and needs per-tenant encryption keys, retention and deletion, which the security review will ask about first.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Security calls the egress proxy a single point of failure for every session and wants it removed.</em> What fails closed and what fails open when the proxy is down, and which of those will you accept in writing?</li>
+<li><em>A customer wants the sandbox in their VPC and the harness in yours.</em> Which interface crosses the boundary, and what does the customer's network team have to allow?</li>
+<li><em>What would you need to see to move a tool from egress substitution to a broker?</em> For example, a client that starts signing requests, or a token exchange appearing after a dependency upgrade.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The event-log design assumes context can be rebuilt by replaying events. A harness that keeps in-process state outside the log, such as a language server's index or a long-running test watcher, loses it on a crash. That state is either rebuilt from the sandbox or moved into the sandbox, where it lives as long as the sandbox does.
+
+The vault docs say environment-variable credentials are not yet supported with self-hosted sandboxes, and the documented path is to run your own proxy that does the substitution. A customer who insists on sandboxes in its own network inherits that proxy and its correctness.
+
+Lazy provisioning helps only when a meaningful share of sessions never needs a sandbox, or needs one late. If every session starts by cloning and building the repository, only a warm pool reduces latency, and then the pool is the cost line to defend.
+
+The containment numbers come from Anthropic's telemetry and red-team exercises on its own products. They describe those products and those users, not a rate to plan around on a different platform.
+
+<SelfRate id="lesson:system-design/case-platforms/coding-agent-platform" />

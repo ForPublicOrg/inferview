@@ -4,7 +4,9 @@ import * as fb from './firebase.ts';
 import { firebaseConfigured, type SessionUser } from './firebase.ts';
 
 export type Item = { s: 'seen' | 'done'; r?: Rating; due?: string; i?: number; n: number; at: number };
-export type Progress = { v: 1; streak: { count: number; last: string }; items: Record<string, Item> };
+/** A lab or multistage problem in progress: the step reached (1-based), the editor contents, and when either last changed. */
+export type LabState = { step: number; code: string; at: number };
+export type Progress = { v: 1; streak: { count: number; last: string }; items: Record<string, Item>; labs?: Record<string, LabState> };
 export type AuthState =
   | { status: 'unconfigured' }
   | { status: 'loading' }
@@ -18,7 +20,15 @@ export const PROGRESS_EVENT = 'inferview:progress';
 export const AUTH_EVENT = 'inferview:auth';
 export const MAX_IMPORT_BYTES = 1_000_000;
 export const MAX_ITEMS = 5000;
-const KEY_RE = /^(lesson:[a-z0-9-]+\/[a-z0-9-]+|problem:[a-z]{3}-\d{3})$/;
+const KEY_RE = /^(lesson:[a-z0-9-]+\/[a-z0-9-]+\/[a-z0-9-]+|problem:[a-z]{3}-\d{3}|lab:[a-z0-9-]+\/\d{1,2})$/;
+// Lesson keys before lessons moved into module folders; each old lesson became the module's "overview" lesson.
+const LEGACY_LESSON_RE = /^lesson:([a-z0-9-]+)\/([a-z0-9-]+)$/;
+// Lab slugs, plus "problem:<id>" for the stage reached in a multistage problem.
+const LAB_SLUG_RE = /^([a-z0-9]+(-[a-z0-9]+)*|problem:[a-z]{3}-[0-9]{3})$/;
+/** Matches the per-lab cap in firestore.rules. */
+export const MAX_LAB_CODE = 20_000;
+export const MAX_LAB_STEP = 10;
+const MAX_LABS = 100;
 const SYNC_DELAY_MS = 1500;
 
 export function emptyProgress(): Progress {
@@ -39,11 +49,23 @@ function isItem(x: unknown): x is Item {
   return true;
 }
 
-/** Returns a clean copy when `x` has exactly the Progress shape, otherwise null. Never evaluates input. */
+function isLabState(x: unknown): x is LabState {
+  if (!x || typeof x !== 'object' || Array.isArray(x)) return false;
+  const o = x as Record<string, unknown>;
+  if (Object.keys(o).some((k) => k !== 'step' && k !== 'code' && k !== 'at')) return false;
+  if (typeof o.step !== 'number' || !Number.isInteger(o.step) || o.step < 1 || o.step > MAX_LAB_STEP) return false;
+  if (typeof o.code !== 'string' || o.code.length > MAX_LAB_CODE) return false;
+  return typeof o.at === 'number' && Number.isFinite(o.at) && o.at >= 0;
+}
+
+/**
+ * Returns a clean copy when `x` has exactly the Progress shape, otherwise null. Never evaluates input.
+ * Old two-part lesson keys are renamed to their module's overview lesson, keeping the newer entry on a clash.
+ */
 export function validateProgress(x: unknown): Progress | null {
   if (!x || typeof x !== 'object' || Array.isArray(x)) return null;
   const o = x as Record<string, unknown>;
-  if (Object.keys(o).some((k) => !['v', 'streak', 'items'].includes(k))) return null;
+  if (Object.keys(o).some((k) => !['v', 'streak', 'items', 'labs'].includes(k))) return null;
   if (o.v !== 1) return null;
   const st = o.streak as Record<string, unknown> | undefined;
   if (!st || typeof st !== 'object' || Object.keys(st).some((k) => k !== 'count' && k !== 'last')) return null;
@@ -54,15 +76,30 @@ export function validateProgress(x: unknown): Progress | null {
   const entries = Object.entries(items as Record<string, unknown>);
   if (entries.length > MAX_ITEMS) return null;
   const clean: Record<string, Item> = {};
-  for (const [k, v] of entries) {
+  for (const [raw, v] of entries) {
+    const legacy = raw.match(LEGACY_LESSON_RE);
+    const k = legacy ? `lesson:${legacy[1]}/${legacy[2]}/overview` : raw;
     if (!KEY_RE.test(k) || !isItem(v)) return null;
     const item: Item = { s: v.s, n: v.n, at: v.at };
     if (v.r !== undefined) item.r = v.r;
     if (v.due !== undefined) item.due = v.due;
     if (v.i !== undefined) item.i = v.i;
-    clean[k] = item;
+    const cur = clean[k];
+    if (!cur || item.at > cur.at) clean[k] = item;
   }
-  return { v: 1, streak: { count: st.count, last: st.last }, items: clean };
+  const out: Progress = { v: 1, streak: { count: st.count, last: st.last }, items: clean };
+  if (o.labs !== undefined) {
+    if (!o.labs || typeof o.labs !== 'object' || Array.isArray(o.labs)) return null;
+    const labEntries = Object.entries(o.labs as Record<string, unknown>);
+    if (labEntries.length > MAX_LABS) return null;
+    const labs: Record<string, LabState> = {};
+    for (const [slug, v] of labEntries) {
+      if (!LAB_SLUG_RE.test(slug) || !isLabState(v)) return null;
+      labs[slug] = { step: v.step, code: v.code, at: v.at };
+    }
+    out.labs = labs;
+  }
+  return out;
 }
 
 function readLocal(): Progress {
@@ -136,6 +173,20 @@ export function complete(key: string, gradable: boolean): void {
   persist(p);
 }
 
+export function getLab(slug: string): LabState | undefined {
+  return getProgress().labs?.[slug];
+}
+
+/** Saves the lab's step and code. Returns false, saving nothing, when the code is over the size cap. */
+export function saveLab(slug: string, step: number, code: string): boolean {
+  if (!LAB_SLUG_RE.test(slug) || code.length > MAX_LAB_CODE) return false;
+  const p = structuredClone(getProgress());
+  const s = Math.min(Math.max(1, Math.trunc(step)), MAX_LAB_STEP);
+  p.labs = { ...p.labs, [slug]: { step: s, code, at: Date.now() } };
+  persist(p);
+  return true;
+}
+
 export function rate(key: string, r: Rating): string | null {
   if (!KEY_RE.test(key)) return null;
   const p = structuredClone(getProgress());
@@ -177,8 +228,8 @@ export function upcomingKeys(p: Progress = getProgress(), today = localDate(), d
 }
 
 /**
- * Per-item merge keeping the newer `at`. The streak with the later `last` wins and ties keep the higher count;
- * when the other streak ended the day before, the newer day continues it.
+ * Per-item and per-lab merge keeping the newer `at`. The streak with the later `last` wins and ties keep the higher
+ * count; when the other streak ended the day before, the newer day continues it.
  */
 export function mergeProgress(a: Progress, b: Progress): Progress {
   const items: Record<string, Item> = { ...a.items };
@@ -193,7 +244,16 @@ export function mergeProgress(a: Progress, b: Progress): Progress {
   if (older.last && newer.last && daysBetween(older.last, newer.last) === 1) {
     streak = { count: Math.max(newer.count, older.count + 1), last: newer.last };
   }
-  return { v: 1, streak, items };
+  const out: Progress = { v: 1, streak, items };
+  if (a.labs || b.labs) {
+    const labs: Record<string, LabState> = { ...a.labs };
+    for (const [k, v] of Object.entries(b.labs ?? {})) {
+      const cur = labs[k];
+      if (!cur || v.at > cur.at) labs[k] = v;
+    }
+    out.labs = labs;
+  }
+  return out;
 }
 
 export function exportJSON(): string {

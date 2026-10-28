@@ -1,0 +1,174 @@
+---
+title: "The loop's cost: quadratic tokens, budgets and stuck detection"
+track: agents
+module: agent-loop
+order: 1
+kind: lesson
+level: senior
+minutes: 16
+summary: Every agent turn re-sends the history, so a run's input tokens grow with the square of its length; a production loop prices that curve, keeps the prefix cacheable, and ends every run through a step, spend or wall-clock budget with a status the caller can act on.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: OpenAI, Unrolling the Codex agent loop (Michael Bolin, 2026-01-23)
+    url: https://openai.com/index/unrolling-the-codex-agent-loop/
+    note: "The loop is quadratic in the JSON sent to the Responses API; Codex does not use previous_response_id, to keep requests stateless and support Zero Data Retention; with cache hits sampling is linear rather than quadratic; cache misses from changing tools, model, sandbox configuration, approval mode or working directory; an MCP tool-ordering bug; notifications/tools/list_changed mid-conversation causes an expensive miss; configuration changes are appended as new messages; auto_compact_limit triggers /responses/compact. Checked 2026-10-28."
+  - title: Claude Agent SDK, How the agent loop works
+    url: https://code.claude.com/docs/en/agent-sdk/agent-loop
+    note: "A turn is one round trip with tool calls; max_turns must count each tool turn plus one for the final text-only response, or the run ends with error_max_turns and no result field; max_turns and max_budget_usd default to no limit; spend is compared with the cap after each response, so a run can pass the cap by one response; every result subtype carries total_cost_usd, num_turns and session_id. Checked 2026-10-28."
+  - title: openai-agents-python, Running agents (docs/running_agents.md on main)
+    url: https://github.com/openai/openai-agents-python/blob/main/docs/running_agents.md
+    note: "max_turns counts agent-loop turns (LLM calls); MaxTurnsExceeded; max_turns=None disables the limit; error_handlers keyed max_turns return a controlled final output; tool_not_found_behavior raises ModelBehaviorError by default and return_error_to_model is opt-in; cancel(mode=after_turn) leaves a resumable RunState. Checked 2026-10-28."
+  - title: openai-agents-python, src/agents/run_config.py (main, package version 0.24.0)
+    url: https://github.com/openai/openai-agents-python/blob/main/src/agents/run_config.py
+    note: "DEFAULT_MAX_TURNS = 10. Checked 2026-10-28."
+  - title: LangGraph docs, Graph API, Recursion limit
+    url: https://docs.langchain.com/oss/python/langgraph/graph-api
+    note: "GraphRecursionError past recursion_limit, counted in super-steps; the docs say the default is 1000 from version 1.0.6; the RemainingSteps managed value lets a graph degrade before the limit. Checked 2026-10-28."
+  - title: langgraph source, libs/langgraph/langgraph/_internal/_config.py (main, package version 1.2.18)
+    url: https://github.com/langchain-ai/langgraph/blob/main/libs/langgraph/langgraph/_internal/_config.py
+    note: "DEFAULT_RECURSION_LIMIT reads LANGGRAPH_DEFAULT_RECURSION_LIMIT with a fallback of 10007, which disagrees with the docs. Checked 2026-10-28."
+  - title: Claude API pricing
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: "Claude Opus 5.5 per million tokens: $4 base input, $5 five-minute cache write, $8 one-hour cache write, $0.20 cache hits and refreshes (0.05x base on Opus 5.5 and Sonnet 5.5, 0.1x on other models), $20 output; 286-token tool use system prompt on Opus 5.5 (tool_choice auto or none). Checked 2026-10-28."
+  - title: Claude API, Handle tool calls
+    url: https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls
+    note: "is_error on tool_result; instructive error text instead of a generic failure; for invalid or incomplete calls Claude will retry 2 to 3 times with corrections before apologizing. Checked 2026-10-28."
+  - title: "Yao et al., ReAct: Synergizing Reasoning and Acting in Language Models (ICLR 2023, arXiv 2210.03629 v3)"
+    url: https://arxiv.org/abs/2210.03629
+    note: "Step caps of 7 (HotpotQA) and 5 (FEVER) because more steps did not improve ReAct; correct trajectories with 7 and 5 steps were 0.84% and 1.33% of the correct ones; a frequent ReAct error repeats the previous thoughts and actions. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import AgentsLoopCost from '../../../../components/widgets/AgentsLoopCost.astro';
+
+## Every turn re-sends the history
+
+A model call is stateless unless the provider keeps the state for you. An agent loop therefore sends the system prompt, the tool definitions and every earlier turn on every call, and appends one more tool call and result before the next. OpenAI's write-up of the Codex loop states the consequence directly: the loop is "quadratic in terms of the amount of JSON sent" over a conversation. Codex accepts that rather than use the Responses API's `previous_response_id`, to keep every request stateless and to support Zero Data Retention customers, whose data the provider does not store between calls.
+
+With a prefix of P tokens and A tokens added per turn, call k sends P + A(k − 1) tokens, and a run of n calls sends nP + A·n(n − 1)/2. The second term grows with the square of the run length, and it dominates once A(n − 1)/2 exceeds P.
+
+<Predict id="agent-loop-economics-tokens" question="A run makes 30 model calls with an 8,000-token prefix and 3,000 tokens added per turn. How many input tokens does it send in total?" answer={1545000} tolerance={60000} unit="tokens">
+<p>30 × 8,000 + 3,000 × (30 × 29 / 2) = 240,000 + 1,305,000 = <b>1,545,000 input tokens</b>. The last call carries 8,000 + 3,000 × 29 = 95,000 tokens, so the run is billed for about 16 times its final context. Doubling the run to 60 calls sends 60 × 8,000 + 3,000 × 1,770 = 5,790,000 tokens, 3.7 times as many.</p>
+</Predict>
+
+## Pricing the run, and what the cache changes
+
+At Claude Opus 5.5 list prices (checked 2026-10-28: $4 per million input tokens, $20 per million output tokens), those 1,545,000 input tokens cost $6.18. Thirty replies of 400 output tokens add 12,000 × $20 / 1,000,000 = $0.24, so the uncached run costs $6.42.
+
+Prompt caching changes the price of the repeated part, not the count. Each call reads the previous call's prompt from cache and writes only the new tokens. Call 1 writes the 8,000-token prefix at the five-minute write price of $5 per million; calls 2 to 30 read 5,000 + 3,000k tokens for k = 1 to 29, which sums to 1,450,000 tokens at $0.20 per million ($0.29), and write 3,000 new tokens each, so writes total 95,000 tokens ($0.475). With the same $0.24 of output the cached run costs $1.005, and output is now about a quarter of the bill. Opus 5.5 prices cache hits at 0.05 times base input, half the 0.1 multiplier the pricing page applies to most other models, so the same run elsewhere pays proportionally more for reads. This is what the Codex post means by "linear rather than quadratic" with cache hits: the billed token count is unchanged, and the price per repeated token falls by a factor of 20.
+
+<AgentsLoopCost />
+
+The cached figure assumes every call hits. A five-minute write expires if more than five minutes pass between two calls, which a slow build, a long test suite or a human approval step easily causes. A miss at call 25, whose prompt is 8,000 + 3,000 × 24 = 80,000 tokens, rewrites all 80,000 at $5 per million: $0.40, against $0.0304 for the hit (77,000 read at $0.20 plus 3,000 written at $5, per million). One miss adds $0.37, more than a third of the whole cached run. When tool calls routinely outlast the TTL, the one-hour write at $8 per million becomes the cheaper choice; the break-even depends on how many long pauses a run contains, which you can count in your traces.
+
+## Cache hygiene is a prefix contract
+
+Caching matches exact prefixes, so anything that changes an early byte invalidates everything after it. The Codex post lists what caused misses in Codex: changing the tools available mid-conversation, changing the target model, and changing the sandbox configuration, approval mode or working directory. Its first MCP support enumerated tools in an inconsistent order, which missed the cache. An MCP server's `notifications/tools/list_changed` is the hard case: honouring it mid-conversation rewrites the tool block and costs an expensive miss.
+
+Codex's fix is to append rather than edit. A changed permission mode becomes a new developer message in the same format as the original, a changed working directory a new user message, and the earlier messages stay byte-identical. The same discipline applies to every loop: sort tool definitions deterministically, keep timestamps and request ids out of the system prompt, and treat a tool-list change as a decision with a price. The tool-use system prompt itself is 286 tokens on Opus 5.5; it rides in the cached prefix, but an uncached loop pays it at the full input rate on every call.
+
+## Three budgets that end runs cleanly
+
+A step budget bounds the number of model calls, and frameworks disagree about its default and its unit. The OpenAI Agents SDK raises `MaxTurnsExceeded` past `max_turns`, counts turns as LLM calls, and defaults to `DEFAULT_MAX_TURNS = 10` in source on main (package version 0.24.0). LangGraph raises `GraphRecursionError` past `recursion_limit`, counted in graph super-steps; its docs say the default is 1000 from version 1.0.6, while the source on main falls back to 10007, so set the value yourself. The Claude Agent SDK has no default limit, and its `max_turns` counts each turn that calls tools plus one for the final text-only response. A task that needs three tool turns needs `max_turns=4`; at 3 the run ends with `error_max_turns` and no `result` field, so the caller gets no answer even though the work is done.
+
+Choose the cap from successful runs. The ReAct authors capped HotpotQA at 7 steps and FEVER at 5 because more steps did not improve results, and correct trajectories at those lengths were 0.84% and 1.33% of all correct ones. The same procedure works on your own traces: plot the step count of runs that succeeded, put the cap past that tail, and treat runs beyond it as failures to diagnose.
+
+A spend budget is separate because late calls cost more than early ones. In the uncached example the last call costs 95,000 × $4 / 1,000,000 + $0.008 = $0.388, 9.7 times the first call's $0.040. The Claude Agent SDK's `max_budget_usd` compares spend with the cap after each response arrives, so a run can pass the cap by the cost of one response. Size the headroom to the uncached cost of the largest call you allow, because a cache miss is always possible.
+
+A wall-clock budget protects a waiting user and anything the run holds open. None of the three frameworks above takes a deadline as a run option; you enforce it around the run. The OpenAI SDK's `cancel(mode="after_turn")` stops at a turn boundary and leaves a `RunState` that can resume, which is the shape you want from all three budgets.
+
+Ending cleanly means three things. The run returns a status that names the budget, so dashboards count stops by reason. It returns what it has: the OpenAI SDK's `error_handlers={"max_turns": ...}` turns the exception into a controlled final output, LangGraph's `RemainingSteps` lets a graph route to a best-effort answer before the limit, and in your own loop the cleanest form is to offer no tools on the last affordable call so the model must answer. And it can continue: every Agent SDK result subtype carries `session_id`, `num_turns` and `total_cost_usd`, so a capped run can resume with a larger budget after someone approves the spend.
+
+## Stuck detection and the tool error contract
+
+Budgets bound a loop; a detector ends it early. The simplest detector counts `(tool name, canonical JSON of the arguments)` per run and stops when a key repeats past a threshold. ReAct's error analysis names the pattern it catches, a model that "repetitively generates the previous thoughts and actions". Polling tools repeat legitimately, so the threshold is per tool, and a detector on exact arguments misses a model that rephrases its query each time; [Debugging a looping agent from its trace](/learn/agents/agent-loop/looping-agents) covers the signatures it misses.
+
+Most loops start at the tool boundary. A tool that returns `"failed"` gives the model nothing to change, and a model told to finish a task tries again. The contract that prevents this has three parts. Errors carry a class: retryable with a reason the model can act on ("missing required field order_id"), or terminal ("refund exceeds the remaining balance"), which ends the run with a message for the user instead of going back to the model. Transient faults (timeouts, 5xx) are retried inside the tool with backoff, because a retry through the model at call 25 re-sends 80,000 tokens to repeat one HTTP request. And the result is marked as an error in the protocol, with `is_error: true` on a Claude `tool_result`. Anthropic's tool docs say that for an invalid or incomplete call Claude "will retry 2–3 times with corrections" before giving up, so a tool that rejects valid arguments burns those calls on every request. Unknown tool names need a decision too: the OpenAI SDK raises `ModelBehaviorError` by default and returns the error to the model only if you opt in through `tool_not_found_behavior`.
+
+This loop puts the pieces together. The model is a stand-in so the code runs anywhere; `call_ceiling_usd` is the uncached cost of the largest call the run allows.
+
+```python
+import json
+from collections import Counter
+
+class Terminal(Exception):
+    """A tool failure no retry can fix: permission denied, invalid business state."""
+
+def run(model, tools, task, max_calls=12, max_usd=1.50, call_ceiling_usd=0.40, max_repeat=3):
+    msgs, spent, seen = [{"role": "user", "content": task}], 0.0, Counter()
+    for call in range(1, max_calls + 1):
+        # Reserve the last call for the answer: no tools offered, so the reply must be text.
+        final = call == max_calls or spent + call_ceiling_usd > max_usd
+        reply, usd = model(msgs, {} if final else tools)
+        spent += usd
+        out = {"calls": call, "usd": round(spent, 2)}
+        if reply["type"] == "text":
+            return {**out, "status": "budget_final" if final else "done", "answer": reply["text"]}
+        key = (reply["name"], json.dumps(reply["args"], sort_keys=True))
+        seen[key] += 1
+        if seen[key] > max_repeat:
+            return {**out, "status": "stuck", "repeated": key}
+        fn = tools.get(reply["name"])
+        try:
+            result = fn(**reply["args"]) if fn else {"error": f"no tool {reply['name']}; tools: {sorted(tools)}"}
+        except Terminal as e:
+            return {**out, "status": "tool_terminal", "reason": str(e)}
+        except (TypeError, ValueError) as e:
+            result = {"error": str(e), "retryable": True}
+        msgs += [{"role": "assistant", "call": reply}, {"role": "tool", "content": json.dumps(result)}]
+
+# Stub model: asks for a lookup every call; `vary` changes the argument each time.
+def stub(vary):
+    def model(msgs, tools):
+        if not tools:
+            return {"type": "text", "text": "Partial answer: no matching order yet."}, 0.03
+        return {"type": "tool", "name": "lookup", "args": {"page": len(msgs) if vary else 1}}, 0.03
+    return model
+
+tools = {"lookup": lambda page: {"page": page, "rows": []}}
+print(run(stub(False), tools, "find the order"))   # stuck at call 4
+print(run(stub(True), tools, "find the order"))    # budget_final at call 12
+print(run(stub(True), tools, "find the order", max_calls=40, max_usd=0.60))  # budget_final at call 8
+```
+
+The spend check runs before the call with the worst-case price, so the call that would break the budget becomes an answer call instead of an overshoot. The third run stops at call 8 because $0.21 spent plus the $0.40 ceiling passes $0.60. The second run shows the gap the detector leaves: the arguments change every call, so only the budget ends it. The [code problem for this module](/problems/agt-003) asks for this loop against hidden tests that inject tool errors, and [agt-006](/problems/agt-006) prices a run against a stated cap.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your support agent's median run costs $0.40 and its 99th percentile costs $9. Finance wants a hard monthly ceiling by the end of the quarter; product says long runs are the complex tickets customers pay for. You have one sprint. What budget policy do you ship, and what do you give up?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Split the tail before capping it. Runs that are long because the ticket is hard look different in the trace from runs that are long because the loop is stuck (repeated calls, error results) or because the cache broke. I ship the stuck detector and the tool error contract first, then a per-run spend cap set past the successful-run tail, with a resumable stop that asks a human to approve more spend. The monthly ceiling is that cap times the run count, and what we give up is that some legitimate hard tickets pause for approval.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The arithmetic of the tail first. With the uncached shape from this lesson (8,000-token prefix, 3,000 tokens per turn, Opus 5.5 prices), a run costs about 0.006n² + 0.034n dollars for n calls, so $0.40 is about 6 calls and $9 is about 36: six times the calls for 22 times the cost. I would pull the 1% tail and label each run: succeeded and long, stuck, or cache-broken. Each label has a different fix.</p>
+<p>Stuck runs get the detector and the error contract: per-tool repeat thresholds, transient errors retried inside the tool, terminal errors ended with a message. Cache-broken runs get prefix hygiene and, if long tool calls are common, the one-hour cache write. Those two changes shrink the tail without refusing any customer.</p>
+<p>Then the cap. Step and spend caps sit past the tail of successful runs, measured from traces, and the last affordable call offers no tools so the run ends with an answer. The stop is resumable: the run keeps its session, and a support lead or the customer approves a second budget. The monthly ceiling is the per-run cap times projected runs plus approved extensions, which finance sees as a separate line.</p>
+<p>What we give up: some complex tickets stop at the cap and wait for approval, which adds latency for exactly the customers product cares about. I would write that down with the expected count from the labelled tail and review it after two weeks of data.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Finance rejects approved extensions as an unbounded line. Which cap do you lower, steps or spend, and what share of successful long runs do you accept losing in writing?</em></li>
+<li><em>After the change the 99th percentile drops to $3, but resolution on complex tickets falls by two points. What would you need to see to remove the cap rather than tune it?</em></li>
+<li><em>The tool team says the error contract needs a schema change in five services. Which service do you change first, and how do the traces decide it?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The quadratic model assumes the client re-sends the whole history. Server-held state (`previous_response_id`, a Conversations API id) moves the storage, not the processing, so it changes the wire size more than the bill. Compaction breaks the curve on purpose: Codex calls `/responses/compact` when `auto_compact_limit` is exceeded and the Agent SDK compacts near the context limit, replacing history with a summary at the price of one cache miss and whatever the summary drops. A loop with compaction is closer to a sawtooth than a parabola.
+
+The cache arithmetic is per provider and per model. Write prices, read multipliers, minimum cacheable lengths and TTLs differ, and the Opus 5.5 read price used here is half the multiplier of most other models on the same page. Recompute with the model you run, from its current pricing page.
+
+The repeat detector is a heuristic with both kinds of error. It stops legitimate polling unless thresholds are per tool, and it misses loops whose arguments change every call. Treat it as one signal beside result repetition and error rate per run, not as the only guard.
+
+And a step budget is a property of the task distribution. When the product starts sending harder tasks, the successful-run tail moves and a cap that was safe last quarter starts cutting off good runs; re-derive it from traces on a schedule rather than when someone complains.
+
+<SelfRate id="lesson:agents/agent-loop/loop-economics" />

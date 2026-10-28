@@ -1,0 +1,142 @@
+---
+title: Tensor and sequence parallelism
+track: training
+module: distributed
+order: 4
+kind: lesson
+level: senior
+minutes: 13
+summary: Tensor parallelism splits each MLP and attention block into a column-parallel matmul followed by a row-parallel one, which costs two all-reduces per block in each direction on the critical path, so it stays inside the NVLink domain, and sequence parallelism shards the remaining norm and dropout regions at no extra traffic.
+prerequisites: [training/distributed/collectives, training/distributed/step-memory]
+updated: 2026-10-28
+sources:
+  - title: Narayanan et al., Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM (arXiv 2104.04473)
+    url: https://arxiv.org/abs/2104.04473
+    note: composes tensor, pipeline and data parallelism; 1 trillion parameters on 3,072 GPUs at 502 petaFLOP/s, 52% of theoretical peak per GPU; SC 2021. Checked 2026-10-28.
+  - title: Korthikanti et al., Reducing Activation Recomputation in Large Transformer Models (arXiv 2205.05198)
+    url: https://arxiv.org/html/2205.05198
+    note: four all-reduces per forward and backward pass with tensor parallelism; with sequence parallelism, four all-gathers and four reduce-scatters at the same bandwidth; g is an all-gather in forward and reduce-scatter in backward, g-bar the reverse; activation memory sbh(10 + 24/t + 5as/(ht)) with TP, sbh(34/t + 5as/(ht)) with TP and SP; all configurations use t = 8. Checked 2026-10-28.
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: column-linear and row-linear splits; MLP column then row, attention split by heads; TP degree should not exceed the number of attention heads; significant drops from TP=8 to TP=16 and a steeper decline from TP=16 to TP=32, the biggest drop when moving from NVLink inside a node to EFA between nodes; cross-node TP typically around 43% degradation against 14% for PP from p = 8 to 16; TP+SP has two all-gathers and two reduce-scatters per block, equivalent to two all-reduces; SP cuts the maximum activation to b x s x h / tp. Checked 2026-10-28.
+  - title: Liang et al., TorchTitan (arXiv 2410.06511v3)
+    url: https://arxiv.org/html/2410.06511v3
+    note: TP and SP via DTensor ColwiseParallel and RowwiseParallel, bundled under the TP degree; AsyncTP via SymmetricMemory needs H100 or newer with NVSwitch; Llama 3.1 70B on 256 GPUs with FSDP 32 and TP 8, 897 to 1,010 tokens/s per GPU with AsyncTP (+12.59%). Checked 2026-10-28.
+  - title: Dubey et al., The Llama 3 Herd of Models (arXiv 2407.21783)
+    url: https://arxiv.org/html/2407.21783
+    note: TP 8 in all three 405B configurations; parallelism dimensions ordered TP, CP, PP, DP to match bandwidth and latency needs. Checked 2026-10-28.
+  - title: NVIDIA A100 Tensor Core GPU
+    url: https://www.nvidia.com/en-us/data-center/a100/
+    note: 312 TFLOPS dense BF16; NVLink 600 GB/s. Checked 2026-10-28.
+  - title: PracHub, Derive Sharded Matrix Multiplication and Backpropagation (posted 2026-04-19)
+    url: https://prachub.com/interview-questions/derive-sharded-matrix-multiplication-and-backpropagation
+    note: candidate report naming OpenAI, machine learning engineer onsite; Y = X @ W with W column-sharded over P devices, derive forward and backward and the collectives for a replicated dX with dW kept sharded. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Two ways to split a matmul
+
+ZeRO shards storage but still computes every layer in full on every GPU. Tensor parallelism shards the computation of a single layer. Everything follows from the two ways to split Y = X W over t GPUs.
+
+**Column-parallel.** Split W by output columns, W = [W_1 ... W_t]. Each GPU holds the full input X and computes Y_i = X W_i, a slice of the output's columns. The forward pass needs no communication. In the backward pass, each GPU computes dW_i = X^T dY_i locally, but dX = sum over i of dY_i W_i^T: every GPU holds one term of the sum, so a full dX needs an all-reduce.
+
+**Row-parallel.** Split W by input rows, and the input X by the matching columns. Each GPU computes X_i W_i, a full-sized partial result, and Y is their sum: an all-reduce in the forward pass. The backward pass is local, because each GPU's dX_i = dY W_i^T needs only the replicated dY.
+
+The pairing is the trick. Put a column-parallel matmul first and a row-parallel one second, and the first's column-sharded output is exactly the row-sharded input the second wants. Any elementwise operation between them, GeLU or the SwiGLU gate, works on the shards without communication. The MLP block becomes: column-parallel up-projection, local activation, row-parallel down-projection, one all-reduce at the end of the forward pass and one at the start of the backward pass. The Megatron operators name this as f (identity forward, all-reduce backward) at the block entry and g (all-reduce forward, identity backward) at the exit.
+
+Attention fits the same pattern because heads are independent. The QKV projection is column-parallel by heads, each GPU runs attention for its heads, and the output projection is row-parallel. The Playbook notes the consequence: the tensor-parallel degree should not exceed the number of attention heads, and with grouped-query attention, fewer key-value heads than GPUs means key-value heads are replicated.
+
+Per transformer layer that is two all-reduces forward and two backward, the four Korthikanti et al. count, each on a tensor of size s x b x h. Every one sits on the critical path: the next matmul cannot start until it finishes.
+
+## The cost, computed
+
+Take a scenario layer with h = 8192, a 4h MLP, s = 4096 tokens, b = 1, BF16 activations and t = 8. Each all-reduce moves an s x b x h tensor of 2 x 4096 x 8192 = 67.1 MB.
+
+<Predict id="trn-dist-tp-bytes" question="With a ring all-reduce over t = 8 GPUs, how many MB does each GPU send per layer for the four all-reduces of one forward and backward pass, on 67.1 MB tensors?" answer={469.8} tolerance={3} unit=" MB">
+<p>Per all-reduce, 2 x 7/8 x 67.1 MB = 117.4 MB. Four of them: <b>469.8 MB</b> per GPU per layer. Compare the compute: a layer has about 12h^2 = 805M parameters, so forward plus backward is 6 x 805M x 4096 tokens = 1.98e13 FLOPs, 2.47e12 per GPU at t = 8. At the A100's 312 TFLOP/s peak that is 7.9 ms. At NVIDIA's quoted 600 GB/s NVLink figure the traffic takes 0.78 ms, about a tenth of compute. Over a 50 GB/s inter-node link it takes 9.4 ms, more than the compute.</p>
+</Predict>
+
+That arithmetic is the whole placement rule. Stretch TP to 16 across two nodes and the compute per GPU halves to 4.0 ms while the traffic, now partly on the slower link, becomes 4 x 67.1 MB x 2 x 15/16 = 503 MB, about 10.1 ms at 50 GB/s. The ratio of communication to compute goes from 0.1 to above 2.
+
+The Playbook measured this. It reports significant drops in throughput moving from TP=8 to TP=16 and an even steeper decline from TP=16 to TP=32, with the biggest drop at the step from NVLink inside a node to EFA between nodes, and cites around 43% degradation for cross-node tensor parallelism against 14% for pipeline parallelism stretched from one node to two. Llama 3's 405B run used TP 8 in every configuration it published and ordered its dimensions TP innermost so that the most frequent communication rides the fastest links.
+
+## Sequence parallelism: the regions TP left alone
+
+Tensor parallelism shards the activations inside the matmuls, but the layer norms, dropouts and residual adds between blocks still run on the full s x b x h tensor on every GPU. That is the 10 in Korthikanti's per-layer formula with TP, sbh(10 + 24/t + 5as/(ht)): bytes no TP degree reduces.
+
+Sequence parallelism shards those regions along the sequence dimension instead. Layer norm and dropout are per token, so each GPU can process s/t tokens of them independently. The transitions change: entering a TP region, the GPUs all-gather the sequence shards into the full tensor (Korthikanti's g, a reduce-scatter in backward); leaving it, they reduce-scatter the partial sums back into sequence shards (g-bar, an all-gather in backward). Each all-reduce of plain TP has become a reduce-scatter and an all-gather, which is the same traffic, so SP is free in bandwidth.
+
+The memory win is the 10 becoming 10/t: the formula becomes sbh(34/t + 5as/(ht)), and the Playbook states the maximum activation size drops to b x s x h / tp. At t = 8 the linear part goes from 10 + 3 = 13 to 4.25 bytes per sbh, a 3 times cut in that term. TorchTitan bundles TP and SP under one degree for that reason; there is no setting in which you want TP without SP.
+
+## The interview derivation, in code
+
+The reported OpenAI question asks for Y = X @ W with W column-sharded over P devices: the forward pass, the backward pass, and the collectives for a replicated dX with dW left sharded. The derivation above answers it; the code checks it with numpy on simulated devices.
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(0)
+B, D, H, P = 4, 6, 8, 4                       # H divisible by P
+X = rng.standard_normal((B, D))
+W = rng.standard_normal((D, H))
+dY = rng.standard_normal((B, H))              # upstream gradient
+
+W_sh = np.split(W, P, axis=1)                 # device p holds W[:, p*H/P:(p+1)*H/P]
+dY_sh = np.split(dY, P, axis=1)               # and the matching slice of dY
+
+Y_sh = [X @ Wp for Wp in W_sh]                # forward: no communication, Y is column-sharded
+dW_sh = [X.T @ dYp for dYp in dY_sh]          # dW stays sharded: local
+dX_partial = [dYp @ Wp.T for dYp, Wp in zip(dY_sh, W_sh)]
+dX = sum(dX_partial)                          # all-reduce (sum) gives every device the full dX
+
+assert np.allclose(np.concatenate(Y_sh, axis=1), X @ W)
+assert np.allclose(np.concatenate(dW_sh, axis=1), X.T @ dY)
+assert np.allclose(dX, dY @ W.T)
+print("forward: none; dW: none; dX: one all-reduce of", dX.nbytes, "bytes per device")
+```
+
+If the next layer wants the full Y, the forward pass adds an all-gather of the Y shards. If the next layer is row-parallel, it consumes the shards directly and the all-gather disappears, which is the column-then-row pairing again. The standard debugging check for this code in a real framework is the one the asserts encode: compare every sharded result, concatenated, against an unsharded reference on a small shape, and count collectives per step against the derivation, since a duplicated all-reduce doubles the gradient silently.
+
+## What has changed recently
+
+Two developments shift where TP sits. First, communication overlap inside TP: TorchTitan's AsyncTP overlaps the tensor-parallel collectives with the matmuls they feed, and the paper reports Llama 3.1 70B on 256 GPUs going from 897 to 1,010 tokens per second per GPU, 12.59%, with FSDP 32 and TP 8. It requires H100-class GPUs with NVSwitch. Second, large MoE models have dropped TP entirely: DeepSeek-V3 trained with pipeline, expert and ZeRO-1 data parallelism and calls TP costly. Megatron-LM's 2021 composition, TP inside the node and pipeline across, at 502 petaFLOP/s on 3,072 GPUs, remains the dense-model baseline those choices are measured against.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"A 70B dense model trains with TP 8 inside H100 nodes and FSDP across them. Extending to 32K context, one sequence's activations no longer fit at TP 8 even with selective recomputation. The team proposes TP 16 across two nodes. You have two weeks before the long-context stage must start and a fixed GPU count. Do you accept, and if not, what instead?"**
+</Callout>
+
+<p class="tiny">The model, cluster and timeline are a scenario.</p>
+
+<Depth>
+<Fragment slot="short">
+<p>No, not as the first choice. TP 16 puts four per-layer all-reduces on the inter-node link, where the scenario arithmetic says communication exceeds compute; the Playbook measured its biggest drop exactly at that step. Context parallelism 2 shards the sequence instead, and its K/V traffic overlaps with attention compute that grows quadratically with length. Full recomputation is the fallback if CP is not ready in two weeks.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The memory problem is per sequence, so the levers are those that divide s x b x h: more TP, CP, or recomputation. TP 16 halves activations and model states per GPU, but every layer then waits on collectives that cross nodes. By the computed ratio, communication goes from about a tenth of compute to more than twice it, with no overlap inside a plain TP block.</p>
+<p>CP 2 halves the sequence on each GPU. Its communication is K/V exchange per attention layer, which can overlap with the attention computation, and attention compute at 32K is large, so it hides better than TP's. The cost is engineering: the attention kernel must support the ring or all-gather pattern and causal load balancing, and two weeks may be tight if the stack does not have it. Full recomputation is available in any stack and costs up to 30 to 40% compute by the Playbook's figure. My plan: CP 2 if the stack supports it today, measured over 200 steps; otherwise full recomputation for the stage, with the throughput loss written into the schedule. Failure mode of CP here: with grouped-query attention, K/V are small and CP is cheap; with many K/V heads it is not, so check the head configuration first.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Your measurement shows TP 16 at 25% lower throughput and CP 2 at 12% lower, but CP 2 needs a kernel change that has not been tested at scale. Which ships for a stage that cannot be restarted cheaply?</li>
+<li>The infrastructure team says AsyncTP will make TP 16 across nodes acceptable. What would you need to see to believe it?</li>
+<li>What changes in this decision on a system whose NVLink domain spans 72 GPUs instead of 8?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The cost arithmetic uses peak FLOP/s and headline bandwidth. Achieved matmul throughput at small per-GPU shapes falls as t grows, because each GPU's matmul gets thinner, so TP efficiency drops before communication dominates. Measure tokens per second per GPU at each TP degree rather than extrapolating from the ratio.
+
+The 8-GPU node is a property of the hardware, not of tensor parallelism. Systems whose NVLink domain spans many more GPUs move the boundary where TP's per-layer collectives leave the fast fabric, and the published TP 8 configurations are a consequence of 8-GPU nodes.
+
+Sequence parallelism as described here shards only the non-attention regions. It does not split attention's own sequence dimension; for that, and for sequences whose attention activations dominate, context parallelism is the next lesson.
+
+The column-then-row pattern assumes the block is a sequence of matmuls with elementwise operations between them. MoE layers break it: experts are routed, not split, and expert parallelism replaces TP for them.
+
+<SelfRate id="lesson:training/distributed/tensor-sequence" />

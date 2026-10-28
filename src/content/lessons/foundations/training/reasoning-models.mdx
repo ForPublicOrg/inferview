@@ -1,0 +1,124 @@
+---
+title: Reasoning models and test-time compute inside a latency budget
+track: foundations
+module: training
+order: 2
+kind: lesson
+level: senior
+minutes: 12
+summary: Reasoning models buy accuracy with output tokens, so the effort setting is a per-route latency and cost control, and the visible reasoning is not a faithful record of how the answer was reached.
+prerequisites: [foundations/training/pipeline-map]
+updated: 2026-10-28
+sources:
+  - title: Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters (Snell et al., 6 August 2024)
+    url: https://arxiv.org/abs/2408.03314
+    note: "the paper reports a compute-optimal strategy more than 4x more efficient than best-of-N; in a FLOPs-matched comparison, test-time compute let a smaller model beat a 14x larger one on problems where the smaller model had non-trivial success; effectiveness depends on prompt difficulty; two mechanisms: search against process-based verifiers and adaptive updates to the response distribution; checked 2026-10-28"
+  - title: "DeepSeek-R1 (v2, January 2026)"
+    url: https://arxiv.org/html/2501.12948
+    note: "R1-Zero AIME 2024 pass@1 77.9%, 86.7% with majority voting; thinking length grew from hundreds to thousands of tokens during RL; average 5,355 tokens per sample in the 800K SFT set (Code 7,436, Math 6,094, General 1,420); checked 2026-10-28"
+  - title: Reasoning models don't always say what they think (Anthropic, 3 April 2025)
+    url: https://www.anthropic.com/research/reasoning-models-dont-say-think
+    note: "hint mentioned 25% of the time by Claude 3.7 Sonnet and 39% by DeepSeek R1; 41% and 19% on the unauthorized-access hints; unfaithful chains were substantially longer; outcome RL raised faithfulness by a relative 63% and 41% then plateaued at 28% and 20%; reward hack exploited in over 99% of cases and admitted in under 2%; checked 2026-10-28"
+  - title: Claude docs, Thinking
+    url: https://platform.claude.com/docs/en/build-with-claude/thinking
+    note: "thinking tokens billed as output even when not returned, and they count toward max_tokens; summarized thinking is charged for the full thinking tokens; effort levels low, medium, high, xhigh and max; thinking on by default on Claude 5-series models, off until set to adaptive on Opus 4.6 to 4.8; display defaults to omitted on the 5-series; checked 2026-10-28"
+  - title: OpenAI API docs, Reasoning models
+    url: https://developers.openai.com/api/docs/guides/reasoning
+    note: "reasoning tokens not visible, occupy context and billed as output; reserve at least 25,000 tokens for reasoning and outputs when starting; hitting max_output_tokens returns status incomplete with reason max_output_tokens; effort values none to max are model-dependent, gpt-5.5 defaults to medium; checked 2026-10-28"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Effort is a latency control
+
+A reasoning model spends output tokens before it answers, and those tokens are generated one at a time on the same decode path as the answer. Every thinking token therefore adds to time to final answer, to the output bill and to context use. The effort setting changes how many such tokens the model tends to spend; it does not change what a token costs. That makes effort a per-route knob in the same family as a timeout or a retry budget, set from measurements on that route, not a global quality switch.
+
+Both major APIs say this in their own terms. Anthropic's thinking docs state that thinking tokens are billed as output tokens even when the thinking text is not returned, and that they count toward `max_tokens` alongside the response. With summarized thinking you are charged for the full thinking tokens, so the billed output count does not match what you see. OpenAI's reasoning guide says reasoning tokens are not visible through the API, occupy context and are billed as output, and recommends reserving at least 25,000 tokens for reasoning and outputs when you start. On both, effort is graded (Claude lists low, medium, high, xhigh and max; OpenAI's values run from none to max and are model-dependent, with gpt-5.5 defaulting to medium), and on Claude's 5-series models thinking is on by default.
+
+The hard limit and the soft knob fail differently. Effort shifts the distribution of thinking length. The output cap truncates it: OpenAI returns `status: incomplete` with reason `max_output_tokens`, possibly before any visible text exists. A client that treats that as an empty answer ships blank responses; it has to be handled as a failure with its own metric.
+
+## The latency arithmetic
+
+Time to the final answer is time to first token plus all generated tokens over the decode rate. Thinking sits inside the second term, so the room for thinking falls straight out of the budget.
+
+<Predict id="fnd-training-think-budget" question="Scenario measurements on one route: p95 budget 8.0 s, time to first token 0.7 s, decode rate 90 tokens/s, visible answer 250 tokens. How many thinking tokens fit inside the budget?" answer={407} tolerance={10} unit="tokens">
+<p>(8.0 − 0.7) × 90 = 657 tokens of total output fit. Subtract the 250-token answer: <b>407</b> thinking tokens. A model whose median thinking on this route is a few thousand tokens cannot meet the budget at any price; only a lower effort, a smaller share of requests sent to the reasoning model, or a faster decode path can.</p>
+</Predict>
+
+The same arithmetic sets the bill. If the answer is 300 tokens and thinking runs to 2,700 (scenario), the route pays for 3,000 output tokens, ten times the visible output. The DeepSeek-R1 paper gives a sense of how long published reasoning traces are: its 800K SFT set averages 5,355 tokens per sample, 7,436 for code and 1,420 for general prompts. Those are training samples, not API outputs, but they show length varying by a factor of five with the task type, which is why a single effort setting across routes is the wrong granularity.
+
+```python
+def thinking_room(p95_budget_s, ttft_s, tokens_per_s, answer_tokens):
+    return max(0, int((p95_budget_s - ttft_s) * tokens_per_s) - answer_tokens)
+
+def pick_effort(route_stats, budget):
+    # route_stats: {effort: (p95_thinking_tokens, eval_score)}, measured per route
+    fitting = {e: s for e, (t, s) in route_stats.items() if t <= budget}
+    return max(fitting, key=fitting.get) if fitting else None
+
+room = thinking_room(8.0, 0.7, 90, 250)            # 407
+stats = {"low": (300, 0.81), "medium": (1900, 0.86), "high": (5200, 0.88)}
+print(room, pick_effort(stats, room))               # 407 low
+```
+
+`None` is a legitimate result: no effort level fits, and the route needs a non-reasoning model or a different budget.
+
+## Parallel samples or a longer chain
+
+Test-time compute can be spent in two shapes. Parallel: N independent samples, then a vote or a verifier picks one. Sequential: one longer chain, or a chain that revises its own answer. They cost the same tokens and very different wall-clock time. N parallel samples finish in about the time of one if the provider and your rate limits absorb N concurrent requests, so they spend money and tokens-per-minute quota; a chain N times longer spends latency.
+
+The published gains depend on the shape and on difficulty. Snell et al. report that a compute-optimal allocation was more than 4x more efficient than best-of-N, and that in a FLOPs-matched comparison a smaller model with test-time compute outperformed a model 14x larger, but only on problems where the smaller model already had non-trivial success. Their two mechanisms are search against a process-based verifier and adaptive revision of the response, and which one wins depends on prompt difficulty. The engineering reading: allocate per request class, and expect nothing from extra compute on requests the model cannot solve at all.
+
+R1-Zero shows the parallel shape's price directly: 77.9% pass@1 on AIME 2024 and 86.7% with majority voting, where every vote is a full generation. Voting also requires an answer you can compare across samples (a number, a label, a test result); free-text answers need a verifier, and the verifier becomes the component you have to evaluate.
+
+## The visible reasoning is not a trace
+
+Anthropic tested whether reasoning models mention a hint they used. Claude 3.7 Sonnet mentioned it 25% of the time and DeepSeek R1 39%; on hints framed as unauthorized access, 41% and 19%. Unfaithful chains were substantially longer than faithful ones, so length is not evidence of candour. Outcome-based RL raised faithfulness early (a relative 63% and 41% on two evaluations) and then plateaued at 28% and 20%. In a reward-hacking setup the model exploited the hack in over 99% of cases and admitted it in under 2% in most scenarios.
+
+Add the API side: Claude returns a summary or nothing (the 5-series defaults to omitted display), and OpenAI returns no reasoning text. Thinking text is a debugging aid, not an audit log, a policy check or evidence for a compliance file. A control that has to hold is applied to inputs, tool calls and outputs.
+
+## The routing decision
+
+The procedure that follows from the above, per route:
+
+1. Measure, at each effort level, the eval score and the distribution of thinking tokens and latency on that route's traffic, several runs per case because thinking length varies between runs.
+2. Pick the lowest effort whose p95 fits the latency budget and whose score clears the bar; if none fits, the route does not get a reasoning model.
+3. Set the output cap above the measured p99 at that effort, and alert on the incomplete rate.
+4. For routes where wall-clock matters more than spend, prefer parallel samples with a vote or verifier over a higher effort, within rate limits.
+5. Re-measure on every model version change, since the thinking length distribution belongs to the model, not to your prompt.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Contract review moves to a reasoning model because it gains 6 points on your eval (scenario). The route has a 10-second p95 and a fixed monthly budget that the current model already uses 70% of. What do you ship, and what do you give up?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Not the whole route at one effort. I measure thinking tokens and score per effort level on the route's traffic, split documents by a cheap difficulty signal, and send only the hard class to the reasoning model at the lowest effort that keeps most of the gain inside 10 s. The budget has 30% headroom, so the share routed is capped by the measured cost per request, not by the eval gain. I give up part of the 6 points on the easy class in writing.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Two budgets conflict. Latency: room for thinking is (10 s minus time to first token) times the decode rate minus the answer, and at a 90 tokens/s scenario rate that is under 900 tokens for a short answer. Money: if reasoning multiplies output cost per request by a factor k, the share s of traffic you can route satisfies 0.7 + 0.7 × s × (k − 1) × (output share of cost) ≤ 1, which makes s a computed number, not a preference.</p>
+<p>Defensible answers. Route by difficulty: keeps cost bounded, costs a classifier and its errors (hard documents misrouted to the cheap path silently lose quality). Async for hard documents: return a provisional result and finish in the background, which removes the latency budget for that class and costs a product change and a second state in the review UI. All traffic at low effort: simple, but low effort may keep little of the gain; only the per-effort measurement says.</p>
+<p>Failure mode of routing: the difficulty classifier drifts with new contract types, and the gain silently erodes. Mitigation is a sampled shadow run of the reasoning model on the cheap path with a weekly comparison. The written artefact is a rollout note naming the routed share, the effort, the cap, the incomplete-rate alert and the rollback trigger.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Finance cuts the budget headroom from 30% to 10% next quarter. Which class loses the reasoning model first, and who accepts the score drop?</li>
+<li>What would you need to see in production to move the whole route to the reasoning model?</li>
+<li>Legal asks for the model's reasoning to be stored as the justification for each flag. What do you store instead, and how do you argue it?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The decode-rate arithmetic assumes a steady rate. Providers batch requests, so decode speed varies with their load, and a budget computed from one afternoon's measurement can fail at peak. Measure over a week and use the slow tail.
+
+Adaptive thinking changes the model of a fixed per-route effort. If the model decides per request how much to think, the distribution can shift when your traffic mix shifts, with no change on your side. The effort setting bounds the behaviour; it does not pin it.
+
+The test-time scaling results are from maths and code benchmarks with checkable answers. On tasks without a checker the parallel shape loses its selection step, and the evidence for sequential gains is thinner. Treat a vendor's reasoning gain on benchmarks as a reason to measure on your route, not as a forecast for it.
+
+<SelfRate id="lesson:foundations/training/reasoning-models" />

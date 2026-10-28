@@ -1,0 +1,74 @@
+---
+id: fnd-031
+title: Bitwise-identical sampler and trainer for RL
+track: foundations
+module: sampling
+type: concept
+difficulty: hard
+seniority: [staff]
+minutes: 25
+core: false
+tags: [determinism, reinforcement-learning, inference, kernels]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Thinking Machines Lab, Defeating Nondeterminism in LLM Inference (10 Sept 2025)
+    url: https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+    note: "batch-invariant RMSNorm, matmul and attention; one matmul configuration loses about 20% against cuBLAS; Qwen3-8B, 1,000 sequences of 90 to 110 tokens: 26 s default vLLM, 55 s unoptimised deterministic, 42 s with improved attention; RLVR on BigMath from Qwen 2.5-VL instruct 8B with rollouts up to 4,096 tokens: without importance weighting reward collapses with a loss spike near step 318, with importance weighting KL near 0.001 with occasional spikes, bitwise-identical sampler and trainer KL flat at 0; checked 2026-10-28"
+  - title: vLLM docs, SamplingParams
+    url: https://docs.vllm.ai/en/latest/api/vllm/sampling_params.html
+    note: with batch invariance enabled and unseeded random sampling, vLLM warns results may not be batch invariant; checked 2026-10-28
+---
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+Scenario: an RL team trains a policy with verifiable rewards. Rollouts are generated on a shared vLLM fleet that also serves internal evals; training runs on a separate cluster with its own kernels. After a reward collapse on their last run, the team lead asks platform to make the sampler and the trainer bitwise identical, using batch-invariant kernels on both sides. You own the fleet. State what that costs in serving throughput and who pays it, and say what you would accept instead, if anything. The next training run starts in three weeks.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what fraction of a training step's wall-clock time is rollout generation today.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask whether the last run used any correction for the mismatch between sampler and trainer probabilities, and what the KL between them looked like before the collapse.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask which other workloads share the rollout replicas, and whether batch-invariant kernels can be enabled per replica.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>The published cost is roughly 1.6x on generation time: Thinking Machines measured 26 s against 42 s for one offline Qwen3-8B workload with batch-invariant kernels, and about 20% on matmul alone against cuBLAS, which the trainer pays too if it adopts the same kernels. If rollouts are 60% of a step, steps get about 37% longer. Their RL run also shows the cheaper option works: with importance weighting the sampler-trainer KL stayed near 0.001 and training was smooth; only without any correction did reward collapse. I would ship importance weighting on a dedicated rollout pool first, and offer bitwise identity as an experiment on that pool, not on the shared fleet.</p>
+</Fragment>
+<Fragment slot="long">
+<p>On-policy RL assumes the rollouts came from the policy being updated. Different kernels on the sampler and trainer compute slightly different probabilities for the same tokens, so the rollouts are slightly off-policy. The Thinking Machines experiment (RLVR on BigMath, Qwen 2.5-VL instruct 8B, rollouts up to 4,096 tokens) shows the three regimes: no correction, reward collapse with a loss spike near step 318; importance weighting, KL near 0.001 with occasional spikes and smooth training; bitwise-identical sampler and trainer, KL flat at 0. So the collapse the team saw is evidence that they need a correction, not that they need bitwise identity.</p>
+
+<p>Bitwise identity costs throughput where it runs. The fleet pays it on generation, and on a shared fleet the evals pay it too unless the kernels are scoped to replicas. The trainer pays it on its matmuls. It also freezes a lot: same kernels, same parallelism layout and the same numerics path on two different systems, maintained across engine upgrades.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Which number would you ask the RL team for before quoting any cost?</em> The share of step time spent generating rollouts.</li>
+<li><em>What does the trainer pay?</em> Its matmuls lose about 20% against cuBLAS with the published batch-invariant kernel.</li>
+</ul>
+</Fragment>
+</Depth>
+
+The two defensible answers, with their costs.
+
+**Bitwise identity.** Batch-invariant RMSNorm, matmul and attention on both sides, so the probability the trainer computes for a sampled token is exactly the one the sampler used. Cost, from the one published measurement: on a 1,000-sequence offline workload with Qwen3-8B, generation took 42 s instead of 26 s, which is 1.62x; unoptimised kernels took 55 s, 2.1x. The matmul alone loses about 20% against cuBLAS. To turn that into a step time you need the rollout share, which the hints ask for. Take 60% as a scenario value: a step goes from 0.4 + 0.6 = 1.0 to 0.4 + 0.6 x 1.62 = 1.37, so 37% longer, before the trainer's own matmul slowdown. Who pays: the RL team in wall-clock or GPUs, and, if the kernels apply fleet-wide, every eval that shares the replicas, whose throughput drops by the same ratio for no benefit.
+
+**Correct the mismatch instead.** Keep fast kernels, log the sampler's per-token log-probabilities with each rollout, and weight the trainer's update by the ratio of trainer to sampler probability. The same experiment shows smooth training with KL near 0.001. Cost: the logged log-probabilities, a correction term whose variance grows when the two systems disagree more, and occasional spikes to watch for.
+
+What I would accept: importance weighting as the default this run, on a rollout pool split from the shared fleet so eval capacity is not touched, with KL between sampler and trainer logged per step and an alert on spikes. Alongside it, one replica with batch-invariant kernels running a small fraction of rollouts, so the team gets a measured throughput number on their model and context lengths before committing. The 1.62x figure comes from an 8B model on short outputs; the cost on long rollouts with a different attention path is unmeasured.
+
+The failure mode of this answer is that importance weighting hides a growing mismatch: an engine upgrade on the rollout pool can raise the KL enough to make the correction noisy, and the training curve degrades slowly rather than collapsing visibly. Pinning the rollout pool's engine version for the duration of a run, and treating a KL step change as a release blocker, is what covers it.
+
+## Follow-ups
+
+- *The team lead says a 37% longer step is acceptable and they want identity anyway, because it removes a whole class of debugging. Your fleet budget cannot absorb it this quarter. Which half do you fund, and what risk do they accept in writing?*
+- *What would you need to see in the per-step KL, over how many runs, to reverse your recommendation and fund bitwise identity?*
+- *Platform wants to upgrade the engine mid-quarter for an unrelated security fix. The RL run is two weeks from finishing. Do you upgrade the rollout pool, and who signs off?*
+
+## Common mistakes
+
+- Treating the collapse as proof that bitwise identity is required, when the published comparison shows a cheaper correction that also trains smoothly.
+- Enabling batch-invariant kernels fleet-wide, so eval and other tenants pay the throughput cost for a property only RL uses.
+- Quoting the 26 s against 42 s figure as a serving benchmark for a different model and context length without measuring.
+- Setting a seed and calling the sampler deterministic; a seed pins the draws, not the logits.

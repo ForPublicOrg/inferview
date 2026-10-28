@@ -1,0 +1,204 @@
+---
+title: Stop reasons and the stream event contract
+track: apis
+module: api-anatomy
+order: 1
+kind: lesson
+level: senior
+minutes: 12
+summary: A streamed response is a typed sequence of events, and the stop reason, not the HTTP status, decides whether the client continues, retries or surfaces an error.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Claude docs, handling stop reasons (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
+    note: the seven stop_reason values and their handling; pause_turn after the server-tool loop limit (default 10 per request); refusal is an HTTP 200 with stop_details; empty end_turn of 2 to 3 tokens; max_tokens with a cut-off tool_use block; model_context_window_exceeded without a beta header on Sonnet 4.5 and newer
+  - title: Claude docs, streaming messages (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/build-with-claude/streaming
+    note: event order; ping events; cumulative usage in message_delta; new event types may be added; input_json_delta as partial JSON parsed at content_block_stop; one complete key and value at a time; signature_delta before content_block_stop; error events after HTTP 200; recovery for Claude 4.5 and earlier versus 4.6 and later; tool use and thinking blocks cannot be partially recovered
+  - title: Claude docs, API errors (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/errors
+    note: the SDK checks that non-streaming requests are not expected to exceed 10 minutes; prefill on Claude 4.6 and later returns 400 invalid_request_error; modified thinking blocks return 400; errors after a 200 on a stream do not follow the HTTP error path
+  - title: Claude docs, refusals and fallback (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback
+    note: server-side fallback (beta) adds a fallback content block with no deltas; message_start names the requested model when the decline comes mid-output; instrument refusals as their own signal
+  - title: Claude docs, migrating to API version 2026-10-21 (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/migration-2026-10-21
+    note: temperature, top_p and top_k return 400 even at default values; document blocks in assistant messages and citations in user messages return 400; new SDK major versions send the key as Authorization Bearer instead of X-Api-Key
+  - title: OpenAI API docs, migrate to the Responses API (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/guides/migrate-to-responses
+    note: Responses recommended for new projects; stored by default; previous_response_id does not carry instructions and earlier input is still billed; stream event names; function_call items correlated by call_id
+  - title: OpenAI API docs, reasoning models (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/guides/reasoning
+    note: reasoning tokens billed as output; status incomplete with incomplete_details.reason max_output_tokens, possibly before any visible output; reserve at least 25,000 tokens when starting out
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision on every 200
+
+An HTTP status tells the client whether the request was accepted. For a 200, the client still has to decide what the response means, and on Claude that decision is keyed on `stop_reason`. The value arrives in a `message_delta` event near the end of a stream and is `null` in `message_start`, so a client that branches early is branching on nothing.
+
+| `stop_reason` | What happened | What the client does |
+|---|---|---|
+| `end_turn` | The model finished | Use it, unless the content is empty |
+| `stop_sequence` | One of your `stop_sequences` fired | Read `stop_sequence` to see which one |
+| `tool_use` | The model is calling client tools | Run them, reply with `tool_result` blocks only |
+| `pause_turn` | A server-tool loop hit its iteration limit (default 10 per request) | Send the assistant content back unchanged to continue |
+| `max_tokens` | The output budget ran out | Treat as truncated; continue or raise the limit |
+| `model_context_window_exceeded` | The response filled the context window | Treat as truncated |
+| `refusal` | A safety classifier declined | Retry on a fallback model; read `stop_details` |
+
+Four rows carry production failures.
+
+**`max_tokens` on a tool call.** If the last block is a `tool_use` cut off by the limit, the arguments are incomplete. The documented fix is to retry with a higher `max_tokens`. Executing what arrived is the bug: a refund tool with a truncated amount field is a schema error at best.
+
+**`refusal` is a success.** It is an HTTP 200 with `stop_details` naming a policy category, and `stop_details` is `null` for every other stop reason. Anthropic's fallback page makes the operational point directly: monitoring built on error rates or 5xx counts never sees a refusal, so emit one event per refusal and one per fallback-served response and alert on the gap.
+
+**An empty `end_turn`.** The stop-reasons page documents responses of exactly 2 to 3 tokens with no content and `stop_reason: "end_turn"`. The usual causes are text blocks added straight after `tool_result` blocks, or sending Claude's completed response back unchanged. Retrying the same request reproduces it; the fix is in how the client builds the turn.
+
+**`pause_turn` is not an error and not a tool call.** It only happens when server tools such as web search run inside the request, and the response may hold a `server_tool_use` block with no matching result. The client appends the assistant content as-is and sends another request.
+
+OpenAI's Responses API reports the same truncation differently: `status` is `incomplete` and `incomplete_details.reason` is `max_output_tokens`. On reasoning models this can happen before any visible output, because reasoning tokens are billed as output and spend the budget first. OpenAI's reasoning guide suggests reserving at least 25,000 tokens for reasoning and output when starting out. A client that checks only for a non-empty string will report an empty answer as a model failure and retry it with the same budget.
+
+## The event order and where it breaks
+
+A Claude stream is server-sent events in a fixed grammar: one `message_start`; then for each content block a `content_block_start`, one or more `content_block_delta` events and a `content_block_stop`, each carrying the block's `index`; then one or more `message_delta` events; then `message_stop`. The traps are in what the grammar allows.
+
+- **`ping` events can appear anywhere**, in any number. An inter-event idle timeout should count them; a parser should drop them.
+- **New event types may be added** under Anthropic's versioning policy, and the streaming docs say to handle unknown types gracefully. A `switch` that raises on an unknown type turns an additive provider change into your outage.
+- **Tool arguments arrive as `input_json_delta` fragments**, partial JSON strings that are not parseable until `content_block_stop`. Current models emit one complete key and value at a time and then chunk it, so there can be visible pauses between events during tool use. A tight idle timeout tuned on text streams will fire there first.
+- **Thinking blocks end with a `signature_delta`** sent just before `content_block_stop`. The block has to be sent back exactly as received; the errors page lists a 400 for thinking blocks that were edited, reordered, filtered out or reconstructed.
+- **Usage in `message_delta` is cumulative.** Each event carries the running total, not an increment.
+- **Errors can arrive after the 200.** During high load the stream can carry an `error` event with `overloaded_error`, the in-stream form of a 529. The HTTP layer has already reported success, so handling has to live inside the read loop.
+- **The serving model can change mid-stream.** With server-side fallback (beta), a decline mid-output closes the open block and inserts a `fallback` block as a `content_block_start` and `content_block_stop` pair with no deltas. `message_start` already named the requested model, so the model that answered is in the fallback block's `to.model`. An assembler that assumes every block has a delta, or tags telemetry from `message_start`, mislabels those responses.
+
+<Predict id="api-cumulative-usage" question="A stream carries three message_delta events with usage.output_tokens of 180, 410 and 512. A billing job adds the output_tokens of every message_delta. How many output tokens does it record?" answer={1102} unit="tokens">
+<p><b>1,102</b>: 180 + 410 + 512. The response generated 512, so the job overstates output by 590 tokens, a factor of 2.15 on this response. The error grows with the number of <code>message_delta</code> events, so it shows up unevenly across features and is easy to misread as a pricing change. Take the last value; never sum.</p>
+</Predict>
+
+## An assembler that survives a broken stream
+
+The official Python and TypeScript SDKs accumulate events for you, including partial tool input. Writing your own is for a gateway that proxies raw events, a language without an official SDK, or telemetry that needs per-event timing. If you do, the contract above fits in one function: buffer deltas per block index, parse tool JSON only at the block's stop, replace usage instead of adding it, ignore event types you do not know, and on an `error` event hand the caller the text that can be recovered.
+
+```python
+import json
+
+class StreamError(Exception):
+    def __init__(self, error, partial_text):
+        super().__init__(error["type"])
+        self.error, self.partial_text = error, partial_text
+
+def assemble(events):
+    """Fold parsed Claude stream events into a message; raise StreamError mid-stream."""
+    msg, blocks, parts = None, {}, {}
+    for ev in events:
+        kind = ev["type"]
+        if kind == "message_start":
+            msg = dict(ev["message"], content=[])
+        elif kind == "content_block_start":
+            blocks[ev["index"]] = dict(ev["content_block"])
+            parts[ev["index"]] = []
+        elif kind == "content_block_delta":
+            d = ev["delta"]
+            if d["type"] == "signature_delta":
+                blocks[ev["index"]]["signature"] = d["signature"]
+            else:  # text_delta, input_json_delta, thinking_delta
+                field = {"text_delta": "text", "input_json_delta": "partial_json",
+                         "thinking_delta": "thinking"}.get(d["type"])
+                if field:
+                    parts[ev["index"]].append(d[field])
+        elif kind == "content_block_stop":
+            b, joined = blocks[ev["index"]], "".join(parts.pop(ev["index"]))
+            if b["type"] == "tool_use":
+                b["input"] = json.loads(joined or "{}")   # valid JSON only now
+            elif b["type"] in ("text", "thinking"):
+                b[b["type"]] = joined
+        elif kind == "message_delta":
+            msg.update(ev["delta"])                     # stop_reason, stop_details
+            msg["usage"] = {**msg.get("usage", {}), **ev["usage"]}  # cumulative: replace
+        elif kind == "error":
+            done = [b.get("text", "") for i, b in sorted(blocks.items())
+                    if b["type"] == "text" and i not in parts]
+            open_text = ["".join(p) for i, p in sorted(parts.items())
+                         if blocks[i]["type"] == "text"]
+            raise StreamError(ev["error"], "".join(done + open_text))
+        # ping, and any event type added later, carry nothing to assemble
+    msg["content"] = [blocks[i] for i in sorted(blocks)]
+    return msg
+
+def next_action(msg):
+    reason, content = msg["stop_reason"], msg["content"]
+    if reason == "max_tokens" and content and content[-1]["type"] == "tool_use":
+        return "retry with a higher max_tokens"      # the tool call is cut off
+    return {
+        "end_turn": "use" if any(b.get("text") for b in content) else "inspect the empty turn",
+        "stop_sequence": "use",
+        "tool_use": "run the tools and send tool_result blocks",
+        "pause_turn": "send the assistant content back unchanged",
+        "max_tokens": "treat as truncated",
+        "model_context_window_exceeded": "treat as truncated",
+        "refusal": "retry on a fallback model",
+    }.get(reason, "surface: unknown stop reason")
+```
+
+Deltas go into a list per block and are joined once at the stop, so assembly stays linear in the length of the answer; concatenating into a growing string on every delta, or re-parsing the accumulated JSON on every fragment, makes a long answer quadratic on the client while time to first token stays flat. A `fallback` block passes through because it has a start and a stop and nothing in between. An unknown stop reason is surfaced rather than treated as success, which is the conservative reading of an additive change. Only text is returned on error, for the reason in the next section.
+
+## Resuming a broken stream
+
+The recovery depends on the model generation. For Claude 4.5 and earlier, the streaming docs describe putting the partial response at the start of a new assistant message and streaming the rest. Claude 4.6 and later reject that: a request whose last message is a prefilled assistant turn returns a 400 `invalid_request_error`. The documented replacement is a new user message that contains the partial response and asks the model to continue from where it left off.
+
+Two limits shape the decision. Tool use and thinking blocks cannot be partially recovered, so a resume starts from the most recent text block and discards any half-streamed tool call. And a resume is a new request: the full prompt is billed as input again, with the partial text added on top, in exchange for not regenerating the output that already streamed. Restarting from scratch costs the whole output again and replaces text the user may already be reading. Surfacing the error with the partial text and a retry control costs nothing and shifts the decision to the user.
+
+Which one wins is per feature. A chat answer the user is reading favours resume. A structured output parsed as a whole favours restart, because a continuation that rephrases its first sentence breaks the parse. Anything that ends in a side-effecting tool call favours restart or surface, never execution of a fragment.
+
+## What API version 2026-10-21 changed for clients
+
+New SDK major versions send `anthropic-version: 2026-10-21`; raw HTTP clients set the header themselves. The migration guide lists three breaking changes for the Messages API, and none is in the event stream:
+
+- `temperature`, `top_p` and `top_k` return a 400 even at their default values. A request without them samples at the defaults, including a `temperature` of 1.0. On models that accepted other values, such as Claude Sonnet 4.6, a request that lowered temperature for more consistent output loses that effect and no other setting replaces it; the guide's option is to keep that request on `2023-06-01`.
+- `document` blocks placed directly in `assistant` messages return a 400.
+- `text` blocks with non-empty `citations` in `user` messages return a 400.
+
+The change that breaks infrastructure rather than requests is in the SDKs: they now send the API key as `Authorization: Bearer` instead of `X-Api-Key`. A gateway, log scrubber or test stub that reads `X-Api-Key` stops seeing the key. The API accepts either header, so the failure is entirely on your side of the wire.
+
+The version header is a per-request choice, which makes it a rollout lever: pin it per request path, move the paths that never set sampling parameters first, and keep the ones that depend on a lowered temperature on `2023-06-01` until their evals pass at the default.
+
+OpenAI's Responses API, which its migration guide recommends for new projects, streams a different vocabulary: `response.created`, `response.output_text.delta`, `response.function_call_arguments.delta` and `.done`, `response.completed` and `error`. Tool calls are `function_call` items matched to `function_call_output` items by `call_id`, not content blocks matched by index. Responses are stored by default unless `store: false` is set, and chaining with `previous_response_id` neither carries the previous top-level `instructions` forward nor stops earlier input from being billed. A gateway that serves both providers needs its own internal event model; mapping one provider's events onto the other's names leaks assumptions such as "tool input is complete at block stop".
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Our support assistant streams answers that can end in a refund tool call. Streams break a few times a day mid-answer, and the SDK upgrade to API version 2026-10-21 ships in the same sprint. Design the stream handling and the recovery policy, and tell me what you will not ship this sprint."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Branch on <code>stop_reason</code>, never on the HTTP status alone. Assemble per block index, parse tool JSON at block stop, replace usage, drop pings and unknown events, and handle in-stream errors inside the loop. On a break, resume text with a "continue" user message on Claude 4.6 and later, and never execute a tool call that did not reach <code>content_block_stop</code>: restart that turn. Ship the version upgrade on the paths that set no sampling parameters first.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The two constraints conflict. Recovery wants to reuse what streamed; correctness forbids acting on a partial tool call. The resolution is per block type: text is resumable, tool input and thinking are not, so a break inside a tool block restarts the turn and a break inside text resumes it.</p>
+<p>The refund tool gets an idempotency key derived from the conversation and the tool-use id, so a restart that produces the same call does not refund twice. A refund call that arrives after a <code>max_tokens</code> stop is never run; the turn is retried with a higher limit.</p>
+<p>Telemetry: time to first token and total stream time as separate series, a counter per stop reason including <code>refusal</code>, and the serving model from the fallback block when one appears. The sprint ships the assembler, the per-block recovery rule and the version upgrade for paths without sampling parameters. It does not ship resume for structured outputs; those restart, at the cost of re-billing their output, until a join check for continued text exists.</p>
+<p>Failure mode of this design: a "continue" turn is a prompt, not a protocol. The model can repeat or rephrase the last sentence, and on a long answer the user sees a seam. Detect overlap between the partial text and the continuation's opening and trim it; if the overlap check fails, show the seam rather than rewrite the user's view.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Pushback:</em> resume re-bills the whole prompt as input. On a long-context feature, restart can cost less than resume. At what ratio of prompt length to streamed output do you switch, and who owns that number?</li>
+<li><em>Reversal:</em> what would you need to see in the resume telemetry to stop resuming chat answers and restart them instead?</li>
+<li><em>Operating:</em> the gateway team reads <code>X-Api-Key</code> for per-team cost attribution and cannot change before your deadline. Do you send the header yourself, delay the upgrade, or split traffic, and what do you write down?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The event grammar, stop reasons and version changes here were read from the provider docs on 28 October 2026. The versioning policy allows new event types and new stop reasons, and server-side fallback is in beta, so the assembler's tolerance for unknowns matters more than its coverage of today's list.
+
+Most clients should not write an assembler. The SDK helpers handle accumulation, partial JSON and in-stream errors; the cases for hand-rolling are a gateway, an unsupported language, or per-event telemetry. The stop-reason handling is the part every client owns either way.
+
+Streaming itself is optional. Batch jobs and anything parsed as a whole gain nothing from incremental delivery. When such a request might run past the SDK's 10-minute check on non-streaming requests, let the SDK consume the stream and return the final message: the long-request protection without the per-event code.
+
+<SelfRate id="lesson:apis/api-anatomy/stream-contract" />

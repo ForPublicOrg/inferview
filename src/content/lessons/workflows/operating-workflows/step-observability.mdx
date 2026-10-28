@@ -1,0 +1,213 @@
+---
+title: Observability per step
+track: workflows
+module: operating-workflows
+order: 1
+kind: lesson
+level: senior
+minutes: 13
+summary: A workflow trace is a tree of workflow, agent, model and tool spans; this lesson places each span by the OpenTelemetry GenAI conventions, adds the per-step metrics the conventions do not cover, links engine run ids to trace ids, and writes the alerts for a five-step workflow.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: OpenTelemetry semantic conventions for GenAI agent and framework spans (main branch, read 2026-10-28)
+    url: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-agent-spans.md
+    note: status Development; invoke_workflow is INTERNAL, named invoke_workflow plus the workflow name, not reported for standalone agent invocations or when the workflow is an internal detail of an agent or tool, reported when an application-defined workflow is nested; invoke_agent is CLIENT for remote agents and INTERNAL in process; gen_ai.workflow.name must be low cardinality
+  - title: OpenTelemetry semantic conventions for generative client AI spans (main branch, read 2026-10-28)
+    url: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md
+    note: a span covers the logical operation including automatic retries; execute_tool is INTERNAL; content capture is off by default, with external storage and references recommended in production
+  - title: OpenTelemetry semantic conventions for GenAI client inference (main branch, read 2026-10-28)
+    url: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/client-inference.md
+    note: inference span named by operation and model, CLIENT kind; usage attributes for input, output, cache-read and reasoning tokens; inference duration and token metrics
+  - title: OpenTelemetry semantic conventions for GenAI metrics (main branch, read 2026-10-28)
+    url: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-metrics.md
+    note: gen_ai.invoke_workflow.duration histogram with recommended bucket boundaries from 1 s to 7,200 s
+  - title: Temporal docs, Python SDK observability
+    url: https://docs.temporal.io/develop/python/observability
+    note: TracingInterceptor creates spans for client calls, activities and workflow invocations; workflow-side spans are completed spans with no duration; custom search attributes set with upsert_search_attributes
+  - title: Duolingo, Making production-ready agents the default (4 August 2026)
+    url: https://blog.duolingo.com/production-ready-ai-agent-platform/
+    note: MCP tool calls as Temporal activities make each call's inputs, outputs, failures and retries visible in the Temporal UI; an internal LLM gateway gives cost and usage tracking
+  - title: Anthropic, How we built our multi-agent research system (13 June 2025)
+    url: https://www.anthropic.com/engineering/multi-agent-research-system
+    note: full production tracing; monitoring agent decision patterns and interaction structures without monitoring the contents of individual conversations
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The span tree, and which spans to leave out
+
+A workflow with model steps leaves two records: the engine's (Temporal's event history, a LangGraph checkpoint list, an Inngest run log) and the spans the framework and model client emit. The job is to make them agree: one trace per run, one span per step that matters, and attributes that take on-call from an alert to the failing step without reading user content.
+
+The OpenTelemetry GenAI conventions give the span vocabulary. Every part of it was still marked Development when read on 28 October 2026, so attribute names can change between releases; pin the semantic-conventions version your instrumentation emits and record it as a resource attribute.
+
+The four span types a workflow uses:
+
+| Span | `gen_ai.operation.name` | Kind | Name |
+|---|---|---|---|
+| Workflow run | `invoke_workflow` | INTERNAL | `invoke_workflow` plus `gen_ai.workflow.name` |
+| Agent invocation | `invoke_agent` | CLIENT for a remote agent service, INTERNAL in process | `invoke_agent` plus `gen_ai.agent.name` when available |
+| Model call | `chat` (or the provider's documented name) | CLIENT, or INTERNAL for a model in the same process | operation plus `gen_ai.request.model` |
+| Tool call | `execute_tool` | INTERNAL | `execute_tool` plus `gen_ai.tool.name` |
+
+The rule that matters most for workflow authors is the one about when not to emit `invoke_workflow`. The conventions say it SHOULD be reported for operations that run composable processes (graphs, orchestrators) coordinating several agents or model calls, SHOULD NOT be reported for a standalone agent invocation, and SHOULD NOT be reported when the workflow is an internal implementation detail of another operation, such as an agent or tool that starts a runner under the hood to delegate to a sub-agent. Workflows defined by the application SHOULD be reported even when nested, for example a sub-graph used as a node of another graph.
+
+So the test is ownership. If your code defines the graph, it gets a workflow span at any depth. If a framework starts a runner inside a tool call to implement delegation, the tool span covers it, and a second `invoke_workflow` would double the run in every dashboard that counts workflows. The conventions name `*Graph*.invoke(...)` in LangGraph and `Runner.run(starting_agent=...)` with handoffs or sub-agents in the OpenAI Agents SDK as workflow entry points, which is the same distinction made per framework.
+
+`gen_ai.workflow.name` MUST have low cardinality, and the conventions advise against type names such as `StateGraph`. Use the team's name for the workflow (`refund_triage`), never the run id.
+
+## A five-step refund workflow as a tree
+
+Take a refund triage workflow with five steps: load the order, classify the request with a model, extract the claimed amount and reason with a second model call and schema validation, wait for a human approval when the amount is over a limit, then issue the refund through the payment provider.
+
+```
+invoke_workflow refund_triage                 INTERNAL   whole run, can last days
+  execute_tool load_order                     INTERNAL
+  chat classifier-model                       CLIENT     tokens, finish reason
+  chat extractor-model                        CLIENT     attempt 1, failed validation
+  chat extractor-model                        CLIENT     attempt 2, valid
+  (approval wait: no span; a durable timer in the engine)
+  execute_tool issue_refund                   INTERNAL   idempotency key as attribute
+```
+
+Three details in that tree are where per-step observability goes wrong.
+
+**Retries hide inside spans.** The conventions say a span covers the logical operation including any automatic retries. A model client that retries a 429 internally shows one `chat` span for two or three HTTP attempts. An application-level retry, such as re-asking after a schema validation failure, is a new call and a new span. An engine-level retry (a Temporal activity attempt) is a new attempt in the engine's history. Three retry layers have three different visibilities, so "retries per step" needs a counter you emit yourself at each layer, labelled by layer, not a span count.
+
+**Waiting is not a span.** The approval wait can last days. Temporal's tracing interceptor creates workflow-side spans as completed spans with no duration, because an open span cannot survive replay. The wait shows up as a gap; measure it from the engine (approval requested to signal received) and record it as a metric.
+
+**The workflow span outlives the sampler.** A tail-sampling buffer holds spans for a bounded time before deciding, and a run that starts on Monday and finishes on Thursday will not fit. For long runs, decide per step, and always keep runs that failed, were retried by the engine or were escalated.
+
+## Linking the engine to the trace
+
+The engine knows the run; the tracing backend knows the spans. On-call needs to cross in both directions.
+
+From trace to engine: put the workflow id and run id on the workflow span and on every step span as your own attributes (`app.workflow.id`, `app.workflow.run_id`). Do not reuse `gen_ai.conversation.id` for this. The conventions populate it only when the library or application has a real conversation identifier, and say a new UUID, a trace id or a hash of the request SHOULD NOT be used as a fallback.
+
+From engine to trace: store the trace id on the run. In Temporal that is a custom search attribute set at start or with `workflow.upsert_search_attributes`, which makes "find the run for this trace" and "find every run with a refund error" one visibility query each. Temporal's `TracingInterceptor` serialises span context through the server so one workflow execution gives one trace across client, workflow and activities.
+
+Duolingo's agent platform gets per-call visibility from the engine instead: MCP tool calls run as Temporal activities through the OpenAI Agents SDK plugin, so each call's inputs, outputs, failures and retries appear in the Temporal UI. Tool arguments and results then live in workflow history, which makes this a data-retention decision as much as an observability one.
+
+## The metrics the conventions do not give you
+
+The conventions define inference duration, token usage (input, output, cache read, cache write, reasoning) and `gen_ai.invoke_workflow.duration`, a histogram whose recommended buckets run from 1 second to 7,200 seconds. They define no cost attribute and nothing about validation, review or approval. Those are yours:
+
+| Metric per step | Source | Why it is its own series |
+|---|---|---|
+| Latency | inference and tool spans | p95 of the whole run is dominated by the approval wait; per-step latency is the only useful latency |
+| Tokens by type | usage attributes | cache-read and reasoning tokens are priced differently from plain input and output |
+| Cost | tokens times a price table keyed by model and date | prices change; recompute from tokens rather than storing one cost number |
+| Attempts by layer | your counters | client, application and engine retries cost different amounts and mean different things |
+| Validation failures | your validator | the first sign of a model or prompt change, before any user notices |
+| Review rate | your router | the fraction sent to a human is both a cost line and a quality signal |
+| Oldest waiting run | engine visibility query | a backlog shows in age before it shows in throughput |
+
+Duolingo routes model traffic through an internal LLM gateway for cost and usage tracking; a gateway is the natural home for the price table because it sees every call, whichever framework made it.
+
+## Monitoring structure without reading content
+
+The conventions keep content capture off by default. Instructions, inputs and outputs are opt-in, and for production the documented pattern is to store content externally and put references on the spans (`gen_ai.input.messages_ref`), so content gets its own access controls.
+
+Anthropic describes the same stance for its research system: it monitors agent decision patterns and interaction structures without monitoring the contents of individual conversations. For a workflow, structure means the branch each run took, the tools called and their order, model calls per step, finish reasons and validator verdicts. Those are low-cardinality labels; a spike in "extractor needed a second attempt" is visible without anyone opening a transcript.
+
+## Writing the alerts
+
+Alerts on rates need a band that accounts for volume. Suppose, as a scenario, the refund workflow sent 6% of runs to human review over the last four weeks and runs 500 times an hour at peak.
+
+<Predict id="wfl-review-band" question="Using a three-standard-deviation band on a binomial proportion, what is the upper alert bound for the hourly review rate, in percent?" answer={9.2} tolerance={0.3} unit="%">
+<p>The standard deviation of the proportion is the square root of 0.06 times 0.94 over 500, which is 0.0106. Three of those is 0.0319, so the band is 2.8% to 9.2%. At 50 runs an hour the same calculation gives 0.0336 and an upper bound of 16.1%, with the lower bound below zero. At low volume an hourly window cannot see the review rate double; use a longer window or alert on daily counts.</p>
+</Predict>
+
+The alert set for the five-step workflow, each routed to a named owner:
+
+1. Validation failures on the extractor step above their band for two consecutive windows. This is the earliest model-regression signal and goes to the workflow owner.
+2. Review rate outside its band in either direction. A drop to zero is as suspicious as a spike: it usually means the router broke, not that the model improved.
+3. Engine-level attempts for `issue_refund` above one in any run. Every extra attempt on a money-moving step should reach a person, and the idempotency key attribute on that span is what shows the provider deduplicated it.
+4. Age of the oldest run waiting on approval above the approval SLA. Queue depth can stay flat while one run sits for days.
+5. Cost per completed run above its band, computed from tokens. This catches a prompt change that doubles context before the monthly invoice does.
+
+## Code: one step, instrumented
+
+A step wrapper that emits a model span per application attempt and keeps content off the span. It needs `pip install opentelemetry-sdk` and prints spans to the console.
+
+```python
+import json
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExporter
+from opentelemetry.trace import SpanKind, Status, StatusCode
+
+provider = TracerProvider()
+provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer("refund-workflow")
+
+def fake_model(prompt, attempt):
+    text = "not json" if attempt == 1 else '{"amount": 42.0, "reason": "damaged"}'
+    return {"text": text, "input_tokens": 812, "output_tokens": 19}
+
+def extract(run_id, prompt, model="extractor-v3", max_attempts=3):
+    for attempt in range(1, max_attempts + 1):
+        with tracer.start_as_current_span(f"chat {model}", kind=SpanKind.CLIENT) as span:
+            span.set_attribute("gen_ai.operation.name", "chat")
+            span.set_attribute("gen_ai.request.model", model)
+            span.set_attribute("app.workflow.run_id", run_id)
+            span.set_attribute("app.step", "extract")
+            span.set_attribute("app.attempt", attempt)
+            out = fake_model(prompt, attempt)
+            span.set_attribute("gen_ai.usage.input_tokens", out["input_tokens"])
+            span.set_attribute("gen_ai.usage.output_tokens", out["output_tokens"])
+            try:
+                return json.loads(out["text"])
+            except json.JSONDecodeError:
+                span.set_attribute("app.validation", "invalid_json")
+                span.set_status(Status(StatusCode.ERROR))
+    raise RuntimeError("extract failed validation on every attempt")
+
+with tracer.start_as_current_span("invoke_workflow refund_triage") as root:
+    root.set_attribute("gen_ai.operation.name", "invoke_workflow")
+    root.set_attribute("gen_ai.workflow.name", "refund_triage")
+    root.set_attribute("app.workflow.run_id", "run-0001")
+    print(extract("run-0001", "Customer says the parcel arrived damaged."))
+```
+
+Attempt 1 returns invalid JSON and attempt 2 a valid object; the token counts are made up. The prompt is never an attribute; the validator's verdict is.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Twelve teams run forty workflows on your platform. Legal will not allow prompts or outputs in the tracing backend, on-call must find the failing step of a stuck refund within fifteen minutes, and the tracing budget is fixed for the year. What do you instrument, and what do you give up?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>One trace per run with a workflow span and a span per model and tool call, following the GenAI conventions, with no content on any span. Run id and trace id are linked both ways: run id as a span attribute, trace id as an engine search attribute. Per-step counters for attempts by layer, validation failures, review rate and oldest waiting run carry the alerting. Content lives in a separate store with its own access controls, referenced from spans, for the workflows whose owners need it. I give up full traces for every run: sampling keeps every failed, retried or escalated run and a fraction of the rest.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Every workflow uses the same four span types, so one dashboard serves all forty, and workflow spans go on application-defined graphs only.</p>
+<p>The fifteen-minute target is a lookup problem, not a volume problem. On-call starts from an alert naming the workflow and step, opens the engine's view of the run by the run id on the alert, and jumps to the trace through the stored trace id. The engine shows which step is waiting and on what; the trace shows what each completed step cost and returned in structural terms (branch, validator verdict, finish reason).</p>
+<p>Legal's constraint changes where content goes, not whether debugging is possible. Most stuck-run causes are structural: a validator that rejects every attempt, an approval signal that never arrived, a provider returning errors. For the cases that need content, a separate store with per-team access, short retention and references on spans lets an authorised engineer open one run's content without the tracing backend holding any.</p>
+<p>Budget: sample by run outcome. Failed, engine-retried and escalated runs are kept; successful runs are sampled per workflow, with metrics computed before sampling. I give up comparing a failing run with an arbitrary successful one from the same hour.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The tracing vendor bills by span count and model-call spans are most of it. Which do you cut, and what blind spot do you accept in writing?</em> Model spans from successful runs go first, kept only as aggregated metrics; the accepted blind spot is per-run latency outliers in successful runs, which the per-step histogram still shows in aggregate.</li>
+<li><em>A framework upgrade starts emitting a second workflow span under every agent tool call. How do you notice, and who fixes it?</em> Runs per workflow name jump in the tracing backend while engine run counts do not; a daily check comparing the two catches it, and the platform team pins or filters the instrumentation.</li>
+<li><em>What would you need to see before allowing content into traces?</em> A tracing backend that meets the content store's retention and access rules, approved by the same reviewer.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The conventions are a moving target. Development status means the span names, attributes and the workflow-span rule above can change, and frameworks adopt releases at different speeds, so two services can emit different shapes for the same operation. The tables here are the main-branch text on 28 October 2026; check the version your instrumentation library pins.
+
+A span tree assumes a request-shaped workflow. A batch stage that processes ten thousand documents in one engine step needs per-item metrics with a batch id, and spans only for samples and failures.
+
+Token-based cost is an estimate. Batch discounts, cached-input pricing, committed-use contracts and retries inside a gateway move the bill away from tokens times list price; reconcile against the invoice and treat the in-trace number as a leading indicator.
+
+Structure-only monitoring has a ceiling. A model that starts giving confident wrong refund reasons with valid JSON and an unchanged branch mix passes every structural alert. That failure needs evals on sampled content, under the content access controls described here; the [evals track](/learn/evals/agent-evals) covers the graders.
+
+<SelfRate id="lesson:workflows/operating-workflows/step-observability" />

@@ -1,0 +1,119 @@
+---
+id: rag-019
+title: Enterprise search with answers, under a latency, freshness and cost cap
+subtitle: 5 million documents, 300 QPS, 5-minute freshness, $0.002 a query
+track: rag
+module: retrieval-foundations
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 55
+core: false
+tags: [enterprise-search, hybrid-search, bm25, pgvector, freshness, acl, evaluation, cost]
+companies:
+  - name: OpenAI
+    url: https://prachub.com/interview-questions/design-an-ml-search-system-with-rag
+updated: 2026-10-28
+sources:
+  - title: PracHub, Design an ML search system with RAG (posted 2025-07-15, updated 2026-03-29, checked 2026-10-28)
+    url: https://prachub.com/interview-questions/design-an-ml-search-system-with-rag
+    note: "candidate report, unverified: OpenAI, Machine Learning Engineer, technical screen. Constraints as reported: 5M documents averaging 2 KB from PDFs, web pages and support tickets; searchable within 5 minutes end to end; 300 QPS; multi-tenant with per-document ACLs for users, groups and roles; p95 end-to-end latency of 1.2 s or less; at most $0.002 per query; short keyword-style queries; offline NDCG@k, recall@k and faithfulness, and online A/B tests. The worked design here is original."
+  - title: OpenAI API pricing (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/pricing
+    note: "standard tier per 1M tokens: gpt-5-mini $0.25 input and $2.00 output; gpt-5-nano $0.05 input and $0.40 output; text-embedding-3-small $0.02"
+  - title: OpenAI API docs, embeddings guide (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/guides/embeddings
+    note: text-embedding-3-small returns 1,536 dimensions by default; inputs up to 8,192 tokens
+  - title: PostgreSQL 18 documentation, 12.3 Controlling Text Search (checked 2026-10-28)
+    url: https://www.postgresql.org/docs/current/textsearch-controls.html
+    note: "ts_rank and ts_rank_cd do not use any global information; ranking consults the tsvector of each matching document, which can be I/O bound"
+  - title: "BEIR (Thakur et al., NeurIPS 2021 Datasets and Benchmarks)"
+    url: https://arxiv.org/abs/2104.08663
+    note: the paper reports BM25 as a robust zero-shot baseline, and re-ranking and late-interaction models as the best zero-shot performers at a high computational cost
+  - title: pgvector README (v0.8.7, checked 2026-10-28)
+    url: https://github.com/pgvector/pgvector
+    note: "filtering is applied after an approximate index scan; iterative scans; halfvec; HNSW default m 16 and ef_search 40"
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt, as a candidate report describes it">
+"Design an ML-powered enterprise search system with RAG. 5 million documents averaging 2 KB, from PDFs, web pages and support tickets. Updates searchable within 5 minutes end to end. 300 QPS. Multi-tenant, with per-document ACLs over users, groups and roles. p95 end-to-end latency at most 1.2 seconds, and at most $0.002 per query. Queries are short and keyword-like. Cover offline evaluation with NDCG@k and recall@k, and an online A/B test."
+</Callout>
+
+Those constraints are the report's. The operating constraints below are a scenario, given by the interviewer:
+
+- The team is four engineers with ten weeks to a first tenant in production. The company already runs Postgres 17 with pgvector 0.8.7.
+- The product lead wants a generated answer on every query. Finance treats $0.002 as a hard cap on the average cost of a query, including generation.
+
+Write the design, choose and defend the numbers it depends on, and end with a decision memo on the answer-on-every-query request, a rollout plan with rollback triggers, and what you give up.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask whether 300 QPS is the peak or the daily average, and what fraction of queries are questions rather than lookups of a known item.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the peak rate of document changes per minute, and how many of them change only an ACL.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask whether "end to end" in the latency target means the full answer, the first answer token, or the ranked results.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>The corpus is small: 5 million documents of about 2 KB are 10 GB of text, roughly one chunk each, and 30.7 GB of float32 vectors, so one Postgres cluster with pgvector and read replicas holds the whole index and the ACL join. Retrieval is hybrid, because keyword-like queries over tickets carry identifiers that dense retrieval misses, then a small reranker over a shortlist, then generation streamed from a small model. The cost cap decides the generation budget: with gpt-5-mini, 4,300 input and 250 output tokens cost about $0.0016, leaving about $0.0004 for everything else. I define the 1.2-second target as ranked results plus the first answer token, and stream the rest. I would not generate on every query; I would generate when the query looks like a question and on request otherwise.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Ingestion and freshness.</strong> Change events from each source go to a queue partitioned by tenant, with a separate high-priority lane for ACL-only changes, which need no parsing or embedding. A worker parses, chunks, embeds with text-embedding-3-small and writes the chunk rows and the document's principals in one transaction, so a document is never searchable with a stale ACL. The 5-minute target is measured from the source event to the row being visible on the replica that serves queries, per tenant, at the 99th percentile, because the average hides the tenant that just bulk-imported its archive.</p>
+<p><strong>Retrieval.</strong> Two candidate lists merged by rank fusion: a lexical list for identifiers and exact phrases, and an HNSW list over halfvec embeddings. Both filter by tenant first and by the user's resolved principals, as a GIN-indexed array overlap; with iterative scans on, because pgvector filters after the approximate scan and a user who can read a small share of the tenant would otherwise get a handful of candidates. A cross-encoder reranks a shortlist; BEIR reports rerankers as the strongest zero-shot option and as costly, so the shortlist size is a budget, not a constant.</p>
+<p><strong>Lexical ranking in Postgres.</strong> Postgres's own <code>ts_rank</code> uses no global statistics, so it has no IDF: a ticket that repeats "error" can outrank the one that contains the rare error code. Either rank with a BM25 implementation inside Postgres, or run a search engine beside it. The second adds a datastore with its own sync lag inside the 5-minute window and its own copy of the ACLs.</p>
+<p><strong>Generation.</strong> The prompt carries the top chunks with their document ids, and the answer must cite them. Responses whose citations do not resolve to a retrieved chunk are not shown as answers. The answer streams after the result list renders.</p>
+<p><strong>Evaluation.</strong> Offline: a judged query set per tenant segment, sampled from logs and labelled by people for relevance, with NDCG@10 for the ranked list and recall@50 for the candidate stage, since the reranker cannot recover what the candidates missed; faithfulness of answers is checked against the cited chunks. Online: an A/B test assigned by user with analysis clustered by tenant, because users in one tenant share a corpus and are not independent; the primary metric is sessions that end in a click or an accepted answer, with p95 latency and cost per query as guardrails that stop the test.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Finance halves the cap to $0.001 a query. Your generation alone costs more than that with gpt-5-mini. Which half do you cut: the model, the context, or the share of queries that get an answer, and what quality loss do you accept in writing?</em></li>
+<li><em>One tenant imports 2 million PDFs on a Monday morning. What happens to every other tenant's 5-minute freshness, and what in your design stops it?</em></li>
+<li><em>What would you need to see in production to move lexical search out of Postgres into a separate search engine?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+### The numbers you were asked to choose
+
+**Corpus and index.** 5,000,000 x 2 KB = 10 GB of text. At an assumed 4 characters per token, a 2 KB document is about 500 tokens, which fits in one chunk, so about 5 million chunks; measure with the real tokenizer, since PDFs with tables run higher. Vectors: 5,000,000 x 1,536 x 4 bytes = 30.7 GB in float32, 15.4 GB in halfvec. Embedding the corpus once: 2.5 billion tokens x $0.02 per million = $50 at OpenAI's list price. Both numbers say the same thing: this corpus does not need a dedicated vector database for size. Chunking each document into several small chunks is defensible for long PDFs and multiplies every number above.
+
+**The cost cap.** At gpt-5-mini's list prices, 8 chunks of 500 tokens plus 300 tokens of instructions is 4,300 input tokens: 4,300 x $0.25 / 1,000,000 = $0.00108. 250 output tokens: 250 x $2.00 / 1,000,000 = $0.0005. Together $0.00158, leaving $0.00042 for query embedding, the reranker and the infrastructure. With gpt-5-nano the same answer costs 4,300 x $0.05 / 1,000,000 + 250 x $0.40 / 1,000,000 = $0.000315. If 300 QPS were sustained all day, that would be 25.9 million queries and up to $51,840 a day at the cap, which is the number finance will ask about. Both models are defensible: mini buys answer quality and spends about four fifths of the cap on generation; nano leaves room for a larger rerank shortlist. Choose on faithfulness and acceptance measured on your judged set, not on the price alone.
+
+**The latency budget.** 1.2 seconds cannot hold a fully generated 250-token answer plus retrieval without a measured output rate that says so. A reasonable split, to be replaced by measurements: about 150 ms for retrieval and fusion, about 150 ms for reranking a shortlist of 50, and the rest for the model's time to first token. Unreasonable: a reranker shortlist sized for quality without a latency measurement, or an SLO defined on the full answer that the product then misses on every long question.
+
+### Two defensible answers to the product lead
+
+| | Answer on every query | Answer when the query is a question, or on request |
+|---|---|---|
+| What users get | One behaviour everywhere | A ranked list first for lookups, an answer when asked |
+| Cost | Generation on 100% of queries; the cap forces the small model or short context | Generation on the share classified as questions; the larger model fits |
+| Risk | Answers on lookups where a link was the better result, and generation tokens spent on them | A classifier that misroutes questions to the list, which users see as a missing feature |
+
+**Decision memo.** Ship the second for the first tenant: results within the latency budget for every query, generated answers for queries classified as questions and on a button for the rest, gpt-5-mini with 8 chunks. Measure the classifier's misroutes on the judged set before launch. Revisit answer-on-every-query after the first A/B test, with its cost per query measured rather than estimated.
+
+**What you give up.** Answers on queries that did not look like questions, and one consistent behaviour. Building BM25 inside Postgres rather than beside it gives up a search engine's tooling for analyzers and synonyms in exchange for one datastore, one ACL model and no second sync inside the freshness window.
+
+**Rollout.** Weeks 1 to 4: ingestion with the ACL lane, freshness measured per tenant, lexical and vector retrieval with the ACL filter, a judged set of a few hundred queries from the first tenant's logs. Weeks 5 to 7: reranker, generation with citation checks, offline NDCG@10 and recall@50 against the judged set. Weeks 8 to 10: the first tenant behind a flag, then the A/B test.
+
+**Rollback triggers.** A returned document that the user's ACL does not allow, found by the audit sample, turns answers off for the tenant. Freshness p99 above 5 minutes for any tenant for an hour pauses onboarding. Cost per query above $0.002 averaged over a day switches generation to the button only. Any guardrail breach stops the A/B test.
+
+**The failure mode of this design.** It keeps everything in one Postgres cluster, so ingestion and queries share it. A large import writes millions of rows, fills WAL and replication lag grows, and replica lag counts against the 5-minute window for every tenant and makes queries read a stale ACL on the replica. The ACL lane does not help if the replica itself is behind. Rate-limit ingestion per tenant, alert on replica lag as part of freshness, and route a user's queries to the primary for a short window after an ACL change that removes access.
+
+## Follow-ups
+
+- *Traffic grows tenfold. What breaks first, and what do you change: replicas, the reranker, or the share of queries that generate?*
+- *Two senior engineers disagree: one wants a separate search engine for BM25 now, the other wants it in Postgres. How do you decide without deciding by rank?* Build both on the first tenant's judged set and compare NDCG@10, freshness p99 and the number of components that hold ACLs.
+- *The A/B shows answers raise accepted sessions but a faithfulness audit finds unsupported claims in some answers. Do you ship, and who signs off?*
+
+## Common mistakes
+
+- Sizing for a dedicated vector database before computing that the index is tens of gigabytes.
+- Using `ts_rank` and calling it BM25.
+- Putting ACL changes in the same queue as re-embedding, behind a bulk import.
+- Defining the latency target on the full generated answer without a measured output rate.
+- Running the A/B test with analysis by user when users in a tenant share a corpus.

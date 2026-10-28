@@ -1,0 +1,509 @@
+---
+id: rnd-038
+title: The assistant's rate limiter, tested and defended
+subtitle: write the tests that catch it, then fix it for a fleet
+track: rounds
+module: ai-collab-coding
+type: code
+difficulty: hard
+seniority: [senior, staff]
+minutes: 50
+core: false
+tags: [ai-assisted-coding, rate-limiting, testing, injectable-clock, concurrency, redis]
+companies:
+  - name: Snowflake
+    url: https://prachub.com/interview-questions/design-and-implement-a-rate-limiter-with-an-ai-assistant-then-defend-and-test-it
+updated: 2026-10-28
+sources:
+  - title: PracHub, Design and implement a rate limiter with an AI assistant, then defend and test it (posted 2026-09-07, updated 2026-09-24)
+    url: https://prachub.com/interview-questions/design-and-implement-a-rate-limiter-with-an-ai-assistant-then-defend-and-test-it
+    note: "candidate report, linked from an interview experience: a Snowflake machine learning engineer onsite, design-and-build, AI assistant allowed. Asks the candidate to review the assistant's output for races, time-handling errors and unbounded memory, write deterministic boundary tests with a controlled clock and a concurrency test that fails on over-admission, then defend atomic check-and-update across servers and the behaviour when the store is unavailable. The exercise here is original."
+  - title: Redis docs, Scripting with Lua (checked 2026-10-28)
+    url: https://redis.io/docs/latest/develop/programmability/eval-intro/
+    note: "Redis guarantees a script's atomic execution and blocks all server activity while it runs; every key a script touches must be passed as a key argument for cluster deployments; with effects replication, the default since Redis 5.0, scripts may call TIME"
+  - title: Python docs, time.monotonic and time.time (checked 2026-10-28)
+    url: https://docs.python.org/3/library/time.html
+    note: "monotonic: the reference point of the returned value is undefined, so only the difference between two calls is valid. time(): can return a lower value than a previous call if the system clock has been set back"
+  - title: Python docs, collections.deque (checked 2026-10-28)
+    url: https://docs.python.org/3/library/collections.html
+    note: "deques append and pop from either end in approximately O(1); lists incur O(n) memory movement for pop(0) and insert(0, v)"
+  - title: Cloudflare blog, How we built rate limiting capable of scaling to millions of domains (2017-06-07)
+    url: https://blog.cloudflare.com/counting-things-a-lot-of-different-things/
+    note: "vendor measurement: the two-counter sliding-window approximation wrongly allowed or rate limited 0.003% of 400 million requests from 270,000 distinct sources"
+  - title: RFC 6585, section 4, 429 Too Many Requests
+    url: https://www.rfc-editor.org/rfc/rfc6585#section-4
+    note: "a 429 response MAY include a Retry-After header; the RFC does not define how the server identifies the user or counts requests"
+code:
+  starter: |
+    import time
+    from collections import deque
+
+
+    class StoreUnavailable(Exception):
+        """The shared store did not answer in time."""
+
+
+    class MemoryStore:
+        """Stands in for the store every server shares (Redis, in the round).
+
+        read and write are separate round trips. atomic(key, fn) is one round trip that runs
+        fn(value) -> (new_value, result) on the store with nothing else in between, the way a
+        Lua script runs in Redis; it stores new_value and returns result. While down is True,
+        every call raises StoreUnavailable. calls counts round trips.
+        """
+
+        def __init__(self):
+            self.data, self.calls, self.down = {}, 0, False
+
+        def _trip(self):
+            if self.down:
+                raise StoreUnavailable("store timed out")
+            self.calls += 1
+
+        def read(self, key):
+            self._trip()
+            return self.data.get(key)
+
+        def write(self, key, value):
+            self._trip()
+            self.data[key] = value
+
+        def atomic(self, key, fn):
+            self._trip()
+            value, result = fn(self.data.get(key))
+            self.data[key] = value
+            return result
+
+
+    class AssistantDraft:
+        """The assistant's answer to "a sliding-window rate limiter shared by every server, with an injectable clock".
+        Kept as it was written: the visible tests run your suite against it."""
+
+        def __init__(self, store, limit, window, clock=time.time):
+            self.store, self.limit, self.window, self.clock = store, limit, window, clock
+
+        def allow(self, key):
+            now = self.clock()
+            log = self.store.read(key) or []
+            log = [t for t in log if t > time.time() - self.window]
+            if len(log) < self.limit:
+                log.append(now)
+                self.store.write(key, log)
+                return True
+            return False
+
+
+    class SlidingWindowLimiter:
+        """Your fix. Same constructor and allow(key) -> bool as the draft; see the question for the rules."""
+
+        def __init__(self, store, limit, window, clock=time.time):
+            raise NotImplementedError
+
+        def allow(self, key):
+            raise NotImplementedError
+
+
+    def boundary_suite(make):
+        """Your tests. make(limit, window, clock) returns a limiter on a fresh, healthy store.
+        Raise AssertionError if that limiter breaks the rules; return None if it keeps them."""
+        raise NotImplementedError
+  tests: |
+    now = [0.0]
+    lim = SlidingWindowLimiter(MemoryStore(), limit=3, window=10, clock=lambda: now[0])
+    assert [lim.allow("u") for _ in range(4)] == [True, True, True, False]
+    now[0] = 10.0
+    assert lim.allow("u"), "the requests from t=0 have left the window"
+    store = MemoryStore()
+    a = SlidingWindowLimiter(store, limit=2, window=10, clock=lambda: 0.0)
+    b = SlidingWindowLimiter(store, limit=2, window=10, clock=lambda: 0.0)
+    assert [a.allow("k"), b.allow("k"), a.allow("k"), b.allow("k")] == [True, True, False, False], "two servers share one limit"
+    assert boundary_suite(lambda limit, window, clock: SlidingWindowLimiter(MemoryStore(), limit, window, clock)) is None, "your suite passes your fix"
+    try:
+        boundary_suite(lambda limit, window, clock: AssistantDraft(MemoryStore(), limit, window, clock))
+        caught = False
+    except AssertionError:
+        caught = True
+    assert caught, "your suite fails the assistant's draft"
+  hidden: |
+    import random, time
+    from collections import deque
+
+    def _fails(make):
+        try:
+            boundary_suite(make)
+        except AssertionError:
+            return True
+        return False
+
+    class _ListLog:
+        """Correct, single store, a different shape: a plain list, rewritten per call inside atomic."""
+        def __init__(self, store, limit, window, clock):
+            self.store, self.limit, self.window, self.clock = store, limit, window, clock
+        def allow(self, key):
+            now = self.clock()
+            def step(log):
+                log = [t for t in (log or []) if now < t + self.window]
+                if len(log) < self.limit:
+                    return log + [now], True
+                return log, False
+            return self.store.atomic(key, step)
+
+    class _EdgeInclusive(_ListLog):
+        def allow(self, key):
+            now = self.clock()
+            def step(log):
+                log = [t for t in (log or []) if now <= t + self.window]
+                if len(log) < self.limit:
+                    return log + [now], True
+                return log, False
+            return self.store.atomic(key, step)
+
+    class _CountsDenied(_ListLog):
+        def allow(self, key):
+            now = self.clock()
+            def step(log):
+                log = [t for t in (log or []) if now < t + self.window]
+                ok = len(log) < self.limit
+                return log + [now], ok
+            return self.store.atomic(key, step)
+
+    class _OneOver(_ListLog):
+        def allow(self, key):
+            now = self.clock()
+            def step(log):
+                log = [t for t in (log or []) if now < t + self.window]
+                if len(log) <= self.limit:
+                    return log + [now], True
+                return log, False
+            return self.store.atomic(key, step)
+
+    class _SharedKeys(_ListLog):
+        def allow(self, key):
+            return _ListLog.allow(self, "all")
+
+    class _FixedWindow(_ListLog):
+        def allow(self, key):
+            now = self.clock()
+            def step(state):
+                start, count = state or (now, 0)
+                if now >= start + self.window:
+                    start, count = now, 0
+                if count < self.limit:
+                    return (start, count + 1), True
+                return (start, count), False
+            return self.store.atomic(key, step)
+
+    def _mk(cls):
+        return lambda limit, window, clock: cls(MemoryStore(), limit, window, clock)
+
+    assert not _fails(_mk(_ListLog)), "your suite rejects a correct limiter with a different internal shape"
+    assert _fails(_mk(_EdgeInclusive)), "a request still counting at exactly t + window"
+    assert _fails(_mk(_CountsDenied)), "denied requests recorded in the log"
+    assert _fails(_mk(_OneOver)), "limit + 1 admitted"
+    assert _fails(_mk(_SharedKeys)), "one window shared by every key"
+    assert _fails(_mk(_FixedWindow)), "a fixed window that resets instead of sliding"
+
+    class _Racy(MemoryStore):
+        """Runs the queued callbacks (other servers' requests) between a read and whatever the caller does next."""
+        def __init__(self):
+            super().__init__()
+            self.queue = []
+        def _between(self):
+            while self.queue:
+                self.queue.pop(0)()
+        def read(self, key):
+            value = super().read(key)
+            value = list(value) if value is not None else None
+            self._between()
+            return value
+        def write(self, key, value):
+            self._between()
+            super().write(key, value)
+        def atomic(self, key, fn):
+            self._between()
+            return super().atomic(key, fn)
+
+    def _race(limit, servers, rounds, seed):
+        rng = random.Random(seed)
+        store = _Racy()
+        now = [0.0]
+        fleet = [SlidingWindowLimiter(store, limit, 10, lambda: now[0]) for _ in range(servers)]
+        admitted = []
+        for r in range(rounds):
+            now[0] = r * 0.25
+            order = list(range(servers))
+            rng.shuffle(order)
+            first, rest = order[0], order[1:]
+            def run(i):
+                if fleet[i].allow("k"):
+                    admitted.append(now[0])
+            store.queue = [lambda i=i: run(i) for i in rest]
+            run(first)
+        return admitted
+
+    for seed in range(5):
+        got = _race(limit=3, servers=4, rounds=200, seed=seed)
+        assert all(sum(1 for u in got if t <= u < t + 10) <= 3 for t in got), "servers together admitted more than the limit in one window"
+        assert len(got) >= 3 * (200 * 0.25 // 10), "the shared limit still admits at the limit"
+
+    store = MemoryStore()
+    now = [0.0]
+    lim = SlidingWindowLimiter(store, 5, 10, lambda: now[0])
+    before = store.calls
+    for i in range(50):
+        now[0] = i * 0.5
+        lim.allow("k")
+    assert store.calls - before <= 50, "one round trip per request while the store is healthy"
+
+    store = MemoryStore()
+    now = [0.0]
+    lim = SlidingWindowLimiter(store, 3, 10, lambda: now[0])
+    store.down = True
+    seen = []
+    for i in range(120):
+        now[0] = i * 0.5
+        try:
+            ok = lim.allow("k")
+        except Exception:
+            ok = "raised"
+        seen.append((now[0], ok))
+    assert all(ok in (True, False) for _, ok in seen), "allow raised while the store was down"
+    got = [t for t, ok in seen if ok is True]
+    assert all(sum(1 for u in got if t <= u < t + 10) <= 3 for t in got), "one server admitted more than the limit during the outage"
+    store.down = False
+    now[0] = 1000.0
+    assert [lim.allow("fresh") for _ in range(4)] == [True, True, True, False] and store.data.get("fresh") is not None, "after the outage the shared store decides again"
+
+    store = MemoryStore()
+    now = [0.0]
+    lim = SlidingWindowLimiter(store, 50_000, 60, lambda: now[0])
+    t0 = time.perf_counter()
+    n = 0
+    for i in range(200_000):
+        now[0] = i / 1024
+        n += lim.allow("hot")
+    elapsed = time.perf_counter() - t0
+    assert n == 165_680, f"an exact sliding window admits 165,680 of these requests, not {n}"
+    assert elapsed < 3.0, f"200,000 requests on one hot key took {elapsed:.1f} s"
+  solution: |
+    import time
+    from collections import deque
+
+
+    class StoreUnavailable(Exception):
+        """The shared store did not answer in time."""
+
+
+    class MemoryStore:
+        """Stands in for the store every server shares (Redis, in the round).
+
+        read and write are separate round trips. atomic(key, fn) is one round trip that runs
+        fn(value) -> (new_value, result) on the store with nothing else in between, the way a
+        Lua script runs in Redis; it stores new_value and returns result. While down is True,
+        every call raises StoreUnavailable. calls counts round trips.
+        """
+
+        def __init__(self):
+            self.data, self.calls, self.down = {}, 0, False
+
+        def _trip(self):
+            if self.down:
+                raise StoreUnavailable("store timed out")
+            self.calls += 1
+
+        def read(self, key):
+            self._trip()
+            return self.data.get(key)
+
+        def write(self, key, value):
+            self._trip()
+            self.data[key] = value
+
+        def atomic(self, key, fn):
+            self._trip()
+            value, result = fn(self.data.get(key))
+            self.data[key] = value
+            return result
+
+
+    class AssistantDraft:
+        """The assistant's answer to "a sliding-window rate limiter shared by every server, with an injectable clock".
+        Kept as it was written: the visible tests run your suite against it."""
+
+        def __init__(self, store, limit, window, clock=time.time):
+            self.store, self.limit, self.window, self.clock = store, limit, window, clock
+
+        def allow(self, key):
+            now = self.clock()
+            log = self.store.read(key) or []
+            log = [t for t in log if t > time.time() - self.window]
+            if len(log) < self.limit:
+                log.append(now)
+                self.store.write(key, log)
+                return True
+            return False
+
+
+    class SlidingWindowLimiter:
+        """Exact sliding-window log. The whole check-and-record runs inside one atomic call, so servers sharing the
+        store cannot interleave between the count and the append. When the store is down it denies: the downstream
+        falls over above its limit, and no server can see what the others admitted."""
+
+        def __init__(self, store, limit, window, clock=time.time):
+            self.store, self.limit, self.window, self.clock = store, limit, window, clock
+
+        def _decide(self, log, now):
+            # A request admitted at t counts for requests in [t, t + window), so drop t once t + window <= now.
+            if log is None:
+                log = deque()
+            while log and log[0] + self.window <= now:
+                log.popleft()
+            if len(log) < self.limit:
+                log.append(now)
+                return log, True
+            return log, False
+
+        def allow(self, key):
+            now = self.clock()
+            try:
+                return self.store.atomic(key, lambda log: self._decide(log, now))
+            except StoreUnavailable:
+                return False
+
+
+    def boundary_suite(make):
+        def at(limit, window):
+            now = [0.0]
+            return make(limit, window, lambda: now[0]), now
+
+        # The limit is exact: limit admitted, the next one denied, at one instant.
+        lim, now = at(3, 10)
+        assert [lim.allow("a") for _ in range(4)] == [True, True, True, False], "limit, then deny"
+
+        # Keys are independent.
+        assert lim.allow("b"), "another key has its own window"
+
+        # The edge: a request admitted at t stops counting at exactly t + window, not after.
+        lim, now = at(1, 10)
+        assert lim.allow("a")
+        now[0] = 9.5
+        assert not lim.allow("a"), "still inside the window"
+        now[0] = 10.0
+        assert lim.allow("a"), "the request from t=0 stops counting at t=10"
+
+        # Denied requests do not count: a client retrying while limited is admitted once the window moves.
+        lim, now = at(2, 10)
+        assert lim.allow("a") and lim.allow("a")
+        for t in (1, 2, 3, 4, 5, 6, 7, 8, 9):
+            now[0] = float(t)
+            assert not lim.allow("a")
+        now[0] = 10.0
+        assert lim.allow("a"), "denied retries must not extend the window"
+
+        # The window slides; it does not reset at fixed boundaries.
+        lim, now = at(2, 10)
+        assert lim.allow("a")
+        now[0] = 9.0
+        assert lim.allow("a")
+        now[0] = 10.0
+        assert lim.allow("a"), "t=0 has left the window"
+        now[0] = 10.5
+        assert not lim.allow("a"), "t=9 and t=10 are both inside [0.5, 10.5]"
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The round, as a candidate report describes it">
+A candidate report on PracHub describes a Snowflake onsite round for a machine learning engineer: design a rate limiter, have an AI assistant write it while you direct, review its output for races and time-handling errors, show how you test it, then defend how it works across servers and what it does when its store is down. This version starts after the assistant has answered.
+</Callout>
+
+You asked for "a sliding-window rate limiter shared by every server, with an injectable clock". The assistant produced `AssistantDraft` (in the editor, with the store it talks to) and these two tests, which pass:
+
+```python
+def test_limits_burst():
+    lim = AssistantDraft(MemoryStore(), limit=5, window=1.0)
+    assert [lim.allow("u") for _ in range(6)] == [True] * 5 + [False]
+
+def test_window_slides():
+    lim = AssistantDraft(MemoryStore(), limit=1, window=0.05)
+    assert lim.allow("u") and not lim.allow("u")
+    time.sleep(0.06)
+    assert lim.allow("u")
+```
+
+The limiter protects a downstream service that falls over when it receives more than its limit. The store stands in for Redis: `read` and `write` are separate round trips, and `atomic(key, fn)` is one round trip that runs `fn` on the store with nothing in between, the way a Lua script runs.
+
+**The rules.** A request admitted at time t counts against requests at times in `[t, t + window)`. A request is admitted when fewer than `limit` admitted requests count against it. Denied requests are not recorded. Keys are independent. Every server holds its own `SlidingWindowLimiter` on the same store, and together they never admit more than `limit` in any window for one key; in this problem the servers' clocks agree.
+
+**Write two things.**
+
+1. `boundary_suite(make)`. `make(limit, window, clock)` returns a limiter on a fresh, healthy store. The suite raises `AssertionError` when the limiter breaks the rules and returns `None` when it keeps them. It is run against the assistant's draft, against correct limiters whose internals differ from yours, and against several limiters that are wrong in ways an assistant plausibly writes.
+2. `SlidingWindowLimiter`, the fix, with the draft's constructor and `allow(key)`.
+
+**Operating constraints.** While the store is healthy, a request costs one round trip. When the store raises `StoreUnavailable`, `allow` returns a boolean and never raises, and no single server admits more than `limit` for one key in any window; what it does inside that bound is your decision. One hot key can carry a limit of 50,000 per window, and the hidden tests time 200,000 requests against it.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which clock production passes in, then run the assistant's two tests with that clock instead of the default.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask how many servers share one key at peak and which single-round-trip operations the store offers.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask the downstream's owner which hurts more during a store outage: rejecting every request, or admitting up to the limit on each server. Then time one request against a full window of 50,000 entries.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>The draft has three defects, and its tests can see none of them. It prunes with `time.time()` while recording `self.clock()`, so with any injected clock other than wall time it prunes everything and never limits. It reads the log, decides, then writes it back in a second round trip, so two servers can both read four entries against a limit of five and both admit. And it rebuilds the whole log on every request, which is linear in the limit. The fix runs the prune, the count and the append inside one atomic call over a deque. When the store is down I would deny for this downstream, because it falls over above its limit; a per-server local log is the defensible alternative when rejecting everyone costs more than a bounded overload.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Why the assistant's tests pass.</strong> Both use the default clock, which is `time.time`, the same clock the prune uses, so the two clocks agree and the bug is invisible. Production that injects `time.monotonic` gets a reference point that Python documents as undefined: the prune compares wall-clock seconds since 1970 against monotonic timestamps and drops every entry. The first boundary test with an injected clock fails on it.</p>
+<p><strong>Atomicity.</strong> A separate read and write leave a gap in which another server's request runs. The hidden test drives that gap deterministically: four servers, one store, other servers' requests queued to run between a read and the next call. The draft over-admits; the atomic version cannot, because there is no gap. In Redis this is one `EVALSHA` of a script that trims a sorted set by score, counts it and adds the new member; Redis runs the script with all other server activity blocked, which is also its cost on a hot key.</p>
+<p><strong>The outage decision.</strong> Deny, or decide locally. Both keep the per-server bound the tests check. Denying protects the downstream completely and turns a store outage into a full outage of the limited endpoint. A local log keeps traffic flowing and lets the fleet admit up to N times the limit for N servers, which is the overload the limiter exists to prevent.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Your atomic script serialises every request for the hottest key on one Redis shard. At what request rate does that shard become the limit, and do you shard the key, move to the approximate counter, or accept it?</em></li>
+<li><em>You chose to deny during outages. The store fails over for 20 seconds every few weeks and the product team calls each one a full outage of the API. What evidence would make you switch to local decisions, and who signs off on the overload risk?</em></li>
+<li><em>Two senior engineers disagree: one wants the exact log, the other Cloudflare's two-counter estimate. How do you decide without deciding by rank?</em></li>
+<li><em>What changes to run this against a real Redis cluster with real clients?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+### The suite
+
+The suite is graded the way a reviewer grades a test: it must pass every correct limiter and fail every wrong one. The cases that kill the plausible mutants are boundary cases on a clock you control:
+
+- the limit is exact: `limit` admitted at one instant, the next denied;
+- the edge: a request admitted at t still counts at `t + window - 0.5` and stops counting at exactly `t + window`. This kills a prune written with `>=` where the rules need `>`;
+- a client that keeps retrying while limited is admitted once the window moves. This kills a limiter that records denied requests, which locks a retrying client out for as long as it retries;
+- two requests at 0 and 9 with a limit of 2 and a window of 10: at 10 one is admitted, at 10.5 one is denied. This kills a fixed window that resets at 10 and admits twice the limit across the boundary;
+- a second key has its own window.
+
+Use clock values whose arithmetic is exact in binary floating point, such as halves and whole seconds. A suite that probes `t + 0.1 + 0.2` against `t + 0.3` tests the floating point, not the limiter, and fails correct implementations that compute the edge in a different order.
+
+### The fix
+
+`SlidingWindowLimiter` keeps one `deque` of admitted timestamps per key. `_decide` pops from the left while `log[0] + window <= now`, admits and appends if fewer than `limit` remain, and returns the log and the decision; `allow` passes `_decide` to `store.atomic`. Each timestamp is appended once and popped once, so the cost per request is amortised constant. On the laptop that checked this problem, CPython 3.12 ran the hidden test's 200,000 requests in about 0.1 s; a version that rebuilds the list on every request had processed 36,608 requests after 30 s.
+
+The quantity left to you is what a server admits during an outage. The reference denies. The other reasonable choices are a local log per key at `limit / N` for a fleet of N servers the limiter knows about, which keeps the fleet near the global limit if the load balancer spreads each key's traffic evenly, or at the full limit, which the tests allow but which lets the fleet admit N times the limit. The full limit per server is reasonable only when N is small and the downstream tolerates N times its limit for the length of an outage.
+
+The constraint conflict is protection against availability. Denying keeps the downstream inside its limit and makes a store outage a full outage of the limited endpoint. Local decisions keep traffic flowing and spend the downstream's headroom to do it.
+
+**What the reference gets wrong.** It denies only after the store call fails, and a store that hangs fails only at the client's timeout, so during an outage every request waits out that timeout before it is denied. Put a circuit breaker in front of the store call, so that after a few consecutive failures requests are denied at once and the store is probed occasionally. If you choose local logs instead, bound them with an LRU cap: an outage under traffic keyed by client IP otherwise grows one log per IP, and an evicted key comes back with an empty log. Either way, the exact log costs memory proportional to the limit for every active key: 50,000 timestamps for the hot key here. Cloudflare's two-counter estimate costs two integers per key; Cloudflare measured it wrongly allowing or limiting 0.003% of 400 million requests from 270,000 sources, a vendor's own number from 2017. If the downstream's limit is a capacity cliff rather than a fairness target, that error is the cost of the cheaper structure.
+
+## Follow-ups
+
+- *What do denied clients receive?* A 429 with `Retry-After` set to when the oldest counted request leaves the window, which RFC 6585 permits but does not require, plus jitter so the clients denied together do not return together.
+- *The limit changes per tier without a deploy.* Read the limit inside the script from a config key, and decide whether a lowered limit applies to requests already counted.
+- *A client sends from several API keys.* Which key you limit on is a product decision the code cannot make; state it.
+- *Run it on Redis.* One Lua script per request: `ZREMRANGEBYSCORE key -inf now-window`, `ZCARD`, then `ZADD` and `PEXPIRE` if admitted, with the key passed in `KEYS` so it routes in a cluster. Read the time with `TIME` inside the script, so a server whose clock is ahead cannot prune entries the others still count. Make sorted-set members unique (timestamp plus a request id), or two requests in the same millisecond collapse into one entry.
+
+## Common mistakes
+
+- Trusting the assistant's tests because they pass. Both use the default clock, which hides the clock bug, and neither runs two servers.
+- Wrapping `allow` in a `threading.Lock`. That serialises one process; the race is between servers.
+- Fixing the race with a lock key in the store (set if absent, read, write, delete): four round trips per request and a lock that outlives a crashed server.
+- Failing open during an outage for a downstream that falls over above its limit.
+- Writing boundary tests with `time.sleep` and the wall clock, which are slow and flaky and cannot hit the edge exactly.

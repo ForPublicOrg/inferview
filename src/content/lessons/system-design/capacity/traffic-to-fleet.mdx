@@ -1,0 +1,157 @@
+---
+title: Traffic to GPU fleet
+track: system-design
+module: capacity
+order: 3
+kind: lesson
+level: senior
+minutes: 14
+summary: A fleet size is peak arrival rate divided by what one node completes per second at the target latency, plus a reserve for failures, and the throughput term comes from a load test, not a spec sheet.
+prerequisites: [system-design/capacity/latency-budgets]
+updated: 2026-10-28
+sources:
+  - title: Llama 3.1 70B Instruct config.json (mirror of Meta's gated repository)
+    url: https://huggingface.co/unsloth/Meta-Llama-3.1-70B-Instruct/blob/main/config.json
+    note: 80 layers, hidden size 8192, 64 attention heads, 8 key-value heads, intermediate size 28672, vocabulary 128256, bfloat16; checked 2026-10-28
+  - title: NVIDIA H100 product page
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: H100 SXM with 80 GB at 3.35 TB/s; the 1,979 teraFLOPS BF16 and 3,958 FP8 Tensor Core figures are marked with sparsity; NVLink 900 GB/s; checked 2026-10-28
+  - title: NVIDIA NIM, LLM benchmarking metrics
+    url: https://docs.nvidia.com/nim/benchmarking/llm/latest/metrics.html
+    note: e2e latency = TTFT + generation time; ITL = (e2e − TTFT) / (output tokens − 1); total TPS rises with concurrency until the GPUs saturate and can then fall, while TPS per user falls as concurrency rises; compare results only when metric definitions align; checked 2026-10-28
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import SystemDesignCostCalc from '../../../../components/widgets/SystemDesignCostCalc.astro';
+
+A fleet size is the peak arrival rate divided by the requests one node completes per second at the latency target, rounded up, plus a reserve for the failures you promise to survive. Three of those four inputs come from the traffic model and the product. The fourth, throughput per node at the target latency, is a load-test number, and memory and bandwidth arithmetic only bounds it from above. The fleet is usually decided by output length and by the concurrency the latency target allows, not by memory.
+
+## The worked case
+
+The scenario: 2,000,000 requests a day, 1,800 input tokens and 250 output tokens on average, a peak hour at 2.5 times the daily average, served by Llama 3.1 70B in BF16 on nodes of eight H100 SXM GPUs with tensor parallelism across the node. The target is a P95 inter-token latency of 40 ms. Model shapes come from the published `config.json`, GPU figures from NVIDIA's product page, and traffic numbers are scenario inputs.
+
+```python
+import math
+
+# Llama 3.1 70B Instruct, config.json
+layers, hidden, heads, kv_heads, inter, vocab = 80, 8192, 64, 8, 28672, 128256
+head_dim = hidden // heads                                   # 128
+attn = 2 * hidden * hidden + 2 * hidden * kv_heads * head_dim  # q, o and k, v
+mlp = 3 * hidden * inter                                     # gate, up, down
+params = layers * (attn + mlp) + 2 * vocab * hidden          # untied embeddings
+weights = params * 2                                         # BF16 bytes
+kv_per_token = 2 * layers * kv_heads * head_dim * 2          # K and V, BF16
+
+# One node: 8 x H100 SXM, 80 GB and 3.35 TB/s each; keep 10% back.
+kv_memory = 8 * 80e9 * 0.9 - weights
+avg_seq = 1_800 + 250                                        # scenario: tokens in + out
+print(f"params {params / 1e9:.2f}B, weights {weights / 1e9:.1f} GB, KV {kv_per_token:,} B/token")
+print(f"sequences that fit: {kv_memory / (kv_per_token * avg_seq):.0f} at {avg_seq} tokens, "
+      f"{kv_memory / (kv_per_token * 8192):.0f} at 8192")
+
+# Bandwidth floor on one decode step: read all weights plus every live KV cache once.
+for batch in (64, 128, 256):
+    step = (weights + batch * (1_800 + 125) * kv_per_token) / (8 * 3.35e12)
+    print(f"batch {batch}: decode step >= {step * 1e3:.1f} ms")
+
+# Scenario load test on one node: chosen concurrency, mean TTFT (s), mean ITL (s).
+conc, ttft, itl = 128, 0.5, 0.026
+time_in_system = ttft + (250 - 1) * itl
+per_node_rps = conc / time_in_system                         # Little's law
+peak_rps = 2_000_000 / 86_400 * 2.5
+nodes = peak_rps / per_node_rps
+print(f"{time_in_system:.2f} s per request, {per_node_rps:.1f} rps per node, "
+      f"peak {peak_rps:.1f} rps, {nodes:.2f} nodes, so {math.ceil(nodes)} plus 1 spare")
+```
+
+```text
+params 70.55B, weights 141.1 GB, KV 327,680 B/token
+sequences that fit: 647 at 2050 tokens, 162 at 8192
+batch 64: decode step >= 6.8 ms
+batch 128: decode step >= 8.3 ms
+batch 256: decode step >= 11.3 ms
+6.97 s per request, 18.4 rps per node, peak 57.9 rps, 3.15 nodes, so 4 plus 1 spare
+```
+
+## Memory is a ceiling, not the plan
+
+The KV cache is 2 × 80 layers × 8 KV heads × 128 × 2 bytes = 320 KiB per token. After a 10 percent reserve and 141.1 GB of weights, a node has 435 GB for it.
+
+<Predict id="sys-capacity-kv-seqs" question="How many sequences of 2,050 tokens fit in 435 GB of KV memory at 327,680 bytes per token?" answer={647} tolerance={10} unit="sequences">
+<p><b>647</b>: 2,050 × 327,680 bytes is 0.672 GB per sequence, and 435 / 0.672 = 647. An engine that reserves the full 8,192-token context per sequence fits 162, a quarter as many, which is why the allocator is part of the capacity plan.</p>
+</Predict>
+
+Memory says at most 647 concurrent sequences of average length. It does not say they decode fast enough. Every decode step reads all 141 GB of weights and every live sequence's KV cache from HBM, and at 8 × 3.35 TB/s the step cannot finish faster than 6.8 ms at a batch of 64 or 11.3 ms at 256. That is a floor on inter-token latency, so the floor alone already uses more than a quarter of a 40 ms target at a batch of 256; real steps add compute, communication between the eight GPUs, and prefill work for arriving requests interleaved with decode. Peak FLOPS is the wrong spec to read here: NVIDIA's 1,979 teraFLOPS BF16 figure is marked with sparsity, and decode at these batch sizes is limited by bandwidth before compute.
+
+## Throughput at the target is measured
+
+NVIDIA's benchmarking notes describe the curve a load test produces: total tokens per second rises with concurrency until the GPUs saturate, while tokens per second per user falls. The plan reads one point off that curve, the highest concurrency whose latency still meets the target. A load test on one node (scenario numbers, the shape is what matters):
+
+| Concurrent requests | Mean TTFT | Mean ITL | P95 ITL |
+|---|---|---|---|
+| 64 | 0.4 s | 19 ms | 24 ms |
+| 128 | 0.5 s | 26 ms | 33 ms |
+| 192 | 0.8 s | 34 ms | 45 ms |
+| 256 | 1.3 s | 43 ms | 58 ms |
+
+128 is the highest row under a 40 ms P95. Little's law converts it to throughput: each request spends 0.5 + 249 × 0.026 = 6.97 s in the system, so 128 in flight completes 18.4 requests a second. Peak demand is 2,000,000 / 86,400 × 2.5 = 57.9 requests a second, and 57.9 / 18.4 = 3.15 nodes, so four.
+
+## The reserve is a separate decision
+
+Four nodes carry the peak with nothing to spare. The reserve is set by what failure the product promises to absorb at peak without breaking the latency target. One node lost: five nodes, and the remaining four carry 73.6 requests a second against 57.9. One zone lost when the fleet spans two zones: each zone carries the whole peak alone, so eight. Those are different products with different bills, and the choice is written down with its cost, not folded into a utilisation percentage that nobody can trace back to a failure.
+
+## Which assumption dominates
+
+Re-running the same arithmetic with one input changed:
+
+| Change from the base case | Nodes before rounding |
+|---|---|
+| Base case | 3.15 |
+| Output 500 tokens instead of 250 | 6.09 |
+| Peak 4 times average instead of 2.5 | 5.04 |
+| Operate at 64 concurrent for a tighter ITL target | 4.64 |
+| Input 6,000 tokens, mean TTFT 0.9 s | 3.33 |
+| Operate at 192 concurrent and accept 45 ms P95 ITL | 2.79 |
+
+Output length dominates, because time in the system is mostly generation and Little's law scales the fleet with it. Peak ratio is second and is a property of the traffic, not the system. Input length moves the plan little at this ratio of input to output, because prefill is a small share of time in the system here; at 30,000-token inputs it would not be. The KV ceiling never binds in this case: 128 in flight against room for 647. It binds with long contexts, a smaller GPU, or an engine that reserves the full window.
+
+<SystemDesignCostCalc note="defaults are the worked case; the replica count is nodes before the failure reserve" defaults={{ qpd: 2000000, prefix: 0, dyn: 1800, out: 250, peak: 2.5, ttft: 0.5, mspt: 26, conc: 128, head: 100 }} />
+
+Change output tokens from 250 to 500 and watch the replica count double while the memory picture does not move.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+"Launch is in six weeks and procurement can deliver four of these nodes. Product has just raised the average answer to 500 tokens and will not move the 40 ms P95 inter-token target. What do you launch with?"
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>At 500 output tokens the peak needs 6.09 nodes before any reserve, so four nodes carry about two thirds of the peak. The options are to cap answers near 300 tokens at launch, admit only what four nodes can serve and queue or shed the rest, or spill the overflow to a hosted model. I would launch with admission control and a hosted spillover for the peak hours, because it keeps the latency promise and the answer length, and it costs per-token spend on a second model whose answers differ from the first.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Four nodes at 128 concurrent each hold 512 in flight. At 500 tokens each request spends 0.5 + 499 × 0.026 = 13.47 s in the system, so four nodes complete 38.0 requests a second against a peak of 57.9, and there is no spare.</p>
+<p>Option one: run at 192 concurrent. That breaks the 40 ms target at 45 ms P95, which product has ruled out. Option two: cap output at launch; at 300 tokens four nodes complete 61.9 requests a second, just over the 57.9 peak, still without a spare. Option three: admission control at the gateway with a hosted model for overflow; the hosted model needs its own eval, and users see two models' styles.</p>
+<p>The failure mode of spillover is that the overflow path becomes the main path during an incident on the fleet, so the hosted model's rate limits are sized for the full peak, not the overflow, or the plan states which traffic is shed first.</p>
+<p>Written down: a launch plan that states the four-node capacity, the spillover trigger, the shed order, and the date the fifth to seventh nodes arrive.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The hosted spillover costs more per day in the peak week than two extra nodes for a month. Which do you cut, and what risk do you sign?</em></li>
+<li><em>What would you need to see in the first two weeks to drop the spillover and run four nodes with a 300-token cap instead?</em></li>
+<li><em>An engineer proposes FP8 weights to fit more concurrency per node. What do you measure before you accept the plan change?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Little's law needs a stable system. At arrival rates near capacity the queue in front of the engine grows, TTFT rises, time in the system rises with it, and the node completes fewer requests at the latency target than the table says. Plan from a load test that includes the arrival pattern, not from a closed-loop test with a fixed number of clients.
+
+Averages hide the mix. If a tenth of requests produce 2,000 tokens, they hold slots eight times longer than the 250-token average and set the queueing behaviour; size from the distribution of output lengths, or separate long jobs onto their own pool.
+
+Prefix sharing and speculative decoding change the throughput curve, and tensor parallelism across eight GPUs is one choice among several. Each changes the load-test row, which is why the plan cites the measured row and its date rather than a figure carried over from another engine or model.
+
+<SelfRate id="lesson:system-design/capacity/traffic-to-fleet" />

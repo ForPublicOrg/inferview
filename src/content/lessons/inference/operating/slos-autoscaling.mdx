@@ -1,0 +1,155 @@
+---
+title: SLOs, GPU autoscaling and cold starts
+track: inference
+module: operating
+order: 1
+kind: lesson
+level: senior
+minutes: 14
+summary: A model replica takes minutes to become ready, so the SLOs are written in time to first token and per-token latency, the autoscaler acts on batch occupancy or a forecast rather than GPU utilisation, and the warm floor is sized for the load that arrives during one reaction time.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Google Cloud, Best practices for autoscaling LLM inference workloads with GPUs on GKE
+    url: https://docs.cloud.google.com/kubernetes-engine/docs/best-practices/machine-learning/inference/autoscaling
+    note: "Queue size for throughput and cost, batch size for latency-sensitive workloads where queue-based scaling is not fast enough; GPU utilisation does not measure how much work is done while the GPU is active; GPU memory usage scales up only for servers that preallocate (TGI, vLLM) and does not scale down; start the queue threshold at 3 to 5 and raise it; below 10, tune HPA scale-up; set the batch-size target slightly beneath the measured peak; HPA tolerance 0.1; stabilisation defaults 5 minutes down and 0 up. Page last updated 2026-10-26; checked 2026-10-28."
+  - title: Kubernetes docs, Horizontal Pod Autoscaling
+    url: https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/
+    note: "Default sync period 15 seconds; desiredReplicas = ceil(currentReplicas x currentMetricValue / desiredMetricValue). Checked 2026-10-28."
+  - title: Google SRE workbook, Implementing SLOs
+    url: https://sre.google/workbook/implementing-slos/
+    note: "SLI as good events over total events; error budget is 100% minus the SLO; multiple latency thresholds (90% faster than 100 ms and 99% faster than 400 ms); a four-week rolling window as a general-purpose interval; measure at the load balancer or the client rather than the server. Checked 2026-10-28."
+  - title: vLLM docs, Metrics design
+    url: https://docs.vllm.ai/en/latest/design/metrics.html
+    note: "TTFT measured from frontend arrival, which starts when tokenisation begins; inter-token latency is the gap between streamed outputs and approximates TPOT only when each output carries one token; per-request TPOT = (e2e - TTFT) / (output tokens - 1); a preemption during decode lands in the inter-token interval. Checked 2026-10-28."
+  - title: vLLM source, vllm/v1/metrics/loggers.py (main)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/v1/metrics/loggers.py
+    note: "Metric names and help strings: num_requests_running, num_requests_waiting, num_requests_waiting_by_reason (capacity or deferred), kv_cache_usage_perc (1 means 100 percent), num_preemptions. Checked 2026-10-28."
+  - title: NVIDIA NIM benchmarking, Metrics
+    url: https://docs.nvidia.com/nim/benchmarking/llm/latest/metrics.html
+    note: "TTFT includes queuing, prefill and network latency, and longer prompts increase it. Checked 2026-10-28."
+  - title: Google Cloud blog, Data loading best practices for AI/ML inference on GKE (2024-11-14)
+    url: https://cloud.google.com/blog/products/containers-kubernetes/improve-data-loading-times-for-ml-inference-apps-on-gke
+    note: "Inference server containers often over 10 GB; weights can be hundreds of GB; caching a 16 GB image on a secondary boot disk reduced load time by up to 29x against a registry pull (Google's own measurement, no absolute times given). Checked 2026-10-28."
+  - title: GKE docs, Accelerate model loading with Run:ai Model Streamer
+    url: https://docs.cloud.google.com/kubernetes-engine/docs/how-to/persistent-volumes/run-ai-model-streamer
+    note: "Up to six times faster weight loading than conventional methods (vendor claim); sample log streams 15.0 GiB in 13.4 s; the sample manifest allows a 10-minute startup probe. Page last updated 2026-10-26; checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+Two numbers decide whether a self-hosted chat endpoint meets its latency objectives under a traffic ramp: the signal the autoscaler acts on, and the capacity already running when the ramp starts. A stateless web tier makes both easy because a new pod is ready in seconds. A model replica is not. It needs a GPU node, a container image that Google describes as often over 10 GB for servers such as vLLM, TGI and Triton, and weights that can run to hundreds of gigabytes, all before the engine accepts its first request. Google's own Run:ai Model Streamer manifest gives the startup probe ten minutes. Whatever the cold start is in your environment, every request that arrives during it is served by replicas that already exist.
+
+## SLIs in tokens, and where to measure them
+
+The SRE workbook's SLI is good events over total events, and its latency SLOs use more than one threshold ("90% of requests are faster than 100 ms, and 99% of requests are faster than 400 ms"). A streaming model endpoint needs three such SLIs, kept separate because different engine settings move each one.
+
+**Time to first token.** NVIDIA's NIM benchmarking docs list what it contains: queuing, prefill and network latency, so it rises with prompt length and with load. That makes it the first SLI to break under a ramp, and it also makes a single TTFT threshold unfair across traffic: a shift in the prompt-length mix burns budget without any regression. Write the TTFT SLO per prompt-length class, at minimum one class for ordinary chat turns and one for long-document requests.
+
+**Per-token latency.** vLLM exports two histograms that look interchangeable and are not. `vllm:inter_token_latency_seconds` records the gap between consecutive streamed outputs; vLLM's design doc says it approximates time per output token only when each output carries exactly one token, which stops being true with speculative decoding. `vllm:request_time_per_output_token_seconds` is per request: (end-to-end latency minus TTFT) divided by (output tokens minus 1). The per-request mean hides stalls. vLLM counts a preemption during decode in the inter-token interval, so a request that is evicted and recomputed shows one gap of seconds inside an otherwise healthy mean. A chat SLO that users would recognise therefore has two parts: mean TPOT under a threshold, and no single gap over a stall threshold.
+
+**Success.** The request completed without an error and without a truncation the client did not ask for.
+
+Where you measure decides what the SLI includes. vLLM starts its TTFT clock at frontend arrival, which its docs say currently begins at tokenisation, so the engine histogram excludes the gateway, TLS, any queue in front of the engine, and the network. The workbook's advice is to measure at the load balancer or the client rather than the server. Use the gateway's measurement for the SLO and the engine's histograms to explain it; when the two diverge, the time is being spent in front of the engine.
+
+The workbook's error budget is 100% minus the SLO, over a window it suggests as four weeks rolling. Four weeks is 40,320 minutes, so a 99.9% TTFT objective allows 40.3 minutes of total failure, and a 99% objective allows 403 minutes. The useful form for a model service is the request count: at 99%, one request in a hundred may miss, and the error budget policy says what happens when they do, typically freezing engine upgrades and configuration changes until the burn stops.
+
+## Choosing the scaling signal
+
+Google's GKE guidance for LLM inference compares the candidates directly. GPU utilisation "does not measure how much work is being done while the GPU is active", and Google finds it hard to map a latency or throughput target onto a utilisation threshold. GPU memory usage is worse for vLLM and TGI: both preallocate the KV cache, so memory scales the deployment up and never scales it down. CPU and memory are not recommended as the only indicators.
+
+That leaves two server metrics, both exported by vLLM.
+
+| Signal | vLLM metric | GKE's recommendation | What it costs you |
+|---|---|---|---|
+| Queue size | `vllm:num_requests_waiting` | Throughput and cost, when the latency target is met at the maximum batch | Fires only after the replica is saturated, so TTFT absorbs the whole reaction time |
+| Batch size | `vllm:num_requests_running` | Latency-sensitive workloads where queue-based scaling is not fast enough | The right target depends on request sizes and hardware, so it must be measured |
+
+For thresholds, Google suggests starting the queue target at 3 to 5 and raising it until latency reaches the objective, and tuning the HPA's scale-up policy when the target is below 10. For batch size it suggests ramping load until the batch stops growing and setting the target slightly beneath that peak.
+
+Two details from vLLM's source change how you wire this. `vllm:num_requests_waiting` is the sum of `vllm:num_requests_waiting_by_reason` over two reasons: `capacity`, waiting for scheduling room, and `deferred`, held by transient constraints such as a LoRA adapter budget or a KV transfer. Only the first is fixed by another replica, so scale on `reason="capacity"`. And `vllm:kv_cache_usage_perc` is a fraction, with the help string "1 means 100 percent usage" (vLLM's design doc describes it once as a percentage, so check the unit before writing an alert). KV usage near 1 with a rising `vllm:num_preemptions` counter is the engine telling you the batch target is set above what memory can hold for your lengths.
+
+A chat SLO on TTFT rules out queue size as the only trigger: by the time the queue is long enough to act on, every queued request has already paid the wait. Batch size per replica fires while there is still room.
+
+## How the HPA turns a target into replicas
+
+The Kubernetes HPA evaluates every 15 seconds by default and computes `desiredReplicas = ceil(currentReplicas × currentMetricValue / desiredMetricValue)`. GKE's guidance adds that the HPA ignores deviations within a 0.1 tolerance around the target, and that the default stabilisation windows are 5 minutes for scale-down and none for scale-up.
+
+The tolerance matters more for GPUs than for web pods. Suppose a load test shows one replica holds 48 concurrent sequences at the ITL objective and you set the running-requests target to 80% of that, 38.4. The HPA does nothing until the average passes 38.4 × 1.1 = 42.2, so each replica has 48 − 42.2 = 5.8 sequences of room left when scaling starts. That room is the only buffer for the whole reaction time.
+
+The reaction time is the sum of everything between the load changing and a new replica serving: the metrics pipeline (scrape interval plus any averaging window, which you set), the HPA sync, node provisioning if the pool has no free GPU node, image pull, weight load and engine start-up. Measure each part separately, because each has its own fix. Google reports that caching a 16 GB image on a secondary boot disk cut its load time by up to 29 times against a registry pull, and that the Run:ai Model Streamer loads weights up to six times faster than conventional methods; both are Google's own figures without absolute times. Use them to decide which part to attack first, not to estimate your own cold start.
+
+## Sizing the warm floor
+
+The base fleet comes from Little's law. In the scenario for this section, a chat service peaks at 40 requests per second with a mean end-to-end time of 12 s, so 480 requests are in flight; at 38.4 usable sequences per replica that is 480 / 38.4 = 12.5, so 13 replicas at peak.
+
+The warm floor comes from the ramp. The scenario's measured reaction time is 10.25 minutes: 15 s of HPA sync, 60 s of metrics averaging, and 9 minutes from scale-up decision to a ready replica.
+
+<Predict id="inf-operating-warm-floor" question="During a launch, arrivals climb by 2 requests per second every minute. Reaction time is 10.25 minutes, mean end-to-end time 12 s, usable concurrency 38.4 sequences per replica. How many replicas of spare capacity must already be serving when the climb starts so that no request queues before new replicas arrive?" answer={7} tolerance={1} unit="replicas">
+<p>In 10.25 minutes the arrival rate rises by 2 × 10.25 = 20.5 requests per second. At 12 s each, that is 20.5 × 12 = 246 more sequences in flight, and 246 / 38.4 = 6.4, so <b>7 replicas</b> beyond what the starting load needs. The HPA's own buffer does not cover it: at a starting load of 20 requests per second the fleet is 7 replicas (240 / 38.4 = 6.25, rounded up), and 7 × 5.76 = 40 sequences of room is a sixth of what the ramp brings.</p>
+</Predict>
+
+The result gives three options, each with a stated cost. Lowering the batch-size target until the per-replica room covers the ramp means running every replica well below its measured capacity all day. Holding a scheduled floor ahead of known ramps (business hours, a launch, a regional morning) costs idle GPUs only around those ramps, and requires a forecast. Shortening the reaction time with warm GPU nodes, cached images and streamed weights cuts the floor in proportion: halve the reaction time and the 7 replicas become 4 (2 × 5.125 × 12 / 38.4 = 3.2, rounded up).
+
+For a chat service the usual answer is all three in that order of preference: a forecast-driven `minReplicas` for the predictable shape, a batch-size target for the unpredictable remainder, and admission control at the gateway for the spike that exceeds both, so the overflow gets a 429 with `Retry-After` rather than a 40-second TTFT. Scale-down is the mirror: remove a replica only when the remaining room still covers one reaction time of ramp, which usually means a scale-down stabilisation window longer than the 5-minute default.
+
+```python
+import math
+
+def replicas(rps, e2e_s, usable_conc):
+    return math.ceil(rps * e2e_s / usable_conc)            # Little's law
+
+def scheduled_floor(forecast_rps, reaction_min, e2e_s, usable_conc):
+    """Per minute: the replicas needed for the worst load in the next reaction window."""
+    w = math.ceil(reaction_min)
+    return [replicas(max(forecast_rps[t:t + w + 1]), e2e_s, usable_conc)
+            for t in range(len(forecast_rps))]
+
+# Scenario forecast: flat at 20 rps, then a climb of 2 rps per minute to 40 rps.
+forecast = [20.0] * 15 + [20.0 + 2 * m for m in range(1, 11)] + [40.0] * 15
+floor = scheduled_floor(forecast, reaction_min=10.25, e2e_s=12, usable_conc=38.4)
+print(floor[0], floor[5], floor[13], floor[-1])            # 7 8 13 13
+print(replicas(20, 12, 38.4), replicas(40, 12, 38.4))      # 7 13
+```
+
+The schedule starts adding replicas at minute 5 and holds the peak fleet of 13 from minute 13, two minutes before the climb begins at minute 15 and eleven minutes before arrivals reach 40 at minute 24. That lead is the reaction time, which is why shortening the cold start pays twice: fewer spare replicas, held for less time.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your chat service misses its TTFT SLO every weekday morning for about ten minutes. Finance has asked for a 25% cut in GPU spend this quarter, and a new replica takes nine minutes to serve. What do you change, and what do you give up?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>The morning miss is a reaction-time problem, not a capacity problem: the fleet reaches the right size, ten minutes late. I would replace the reactive trigger for the morning ramp with a forecast-driven floor that leads the ramp by one reaction time, scale on running requests per replica rather than queue length, and pay for the floor by scaling down harder overnight and shortening the cold start. What I give up is some idle capacity before each ramp, and the risk that a forecast miss lands on the reactive path.</p>
+</Fragment>
+<Fragment slot="long">
+<p>First I would confirm the diagnosis from the engine: if `vllm:num_requests_waiting` with reason capacity rises in the same ten minutes and running requests per replica sit at the measured maximum, the replicas are saturated and the miss is lateness. If waiting is flat and TTFT still misses, the time is spent in front of the engine and autoscaling is the wrong fix.</p>
+<p>Then the arithmetic: reaction time times ramp slope times mean end-to-end time, divided by usable sequences per replica, is the warm capacity the morning needs. A scheduled `minReplicas` that rises one reaction time before the historical ramp covers it; the HPA on running requests handles deviations from the forecast.</p>
+<p>The 25% comes from three places, and I would quantify each before committing: the overnight trough (the floor can fall to what one reaction time of the steepest overnight ramp needs), the cold start (each minute removed shrinks every warm floor), and the batch-size target, which a load test can show is set more conservatively than the ITL objective requires. I would write down the trade: an unforecast spike above the floor gets 429s at the gateway for lower tiers rather than slow first tokens for everyone.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The forecast was wrong on a holiday and you held twelve idle replicas for two hours; finance asks you to drop the schedule. What do you answer?</em> The cost of the miss is bounded (two hours of a known fleet size), while dropping the schedule restores a daily SLO miss; I would add a calendar override, not remove the floor.</li>
+<li><em>Two senior engineers disagree: one wants queue-based scaling because it maximises throughput, the other wants batch size. How do you decide without deciding by rank?</em> Replay a week of arrivals against both policies in a load test and compare TTFT budget burned against GPU-hours; the SLO decides which cost is acceptable.</li>
+<li><em>What would make you move this service to a hosted API instead?</em> If the warm floor needed for the ramp costs more than paying per token for the ramp's traffic, overflow to a hosted model during ramps is cheaper than holding GPUs for them, provided the data policy allows it.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Little's law gives averages over a stable period. Output lengths are heavy-tailed, so the number of sequences in flight during a ramp can sit above arrival rate times mean time, and the long requests are also the ones that hold the most KV cache. The 80% target is the margin for that; check it against the 99th percentile of in-flight sequences in production, not the mean.
+
+Usable concurrency per replica is a measurement, not a constant. It moves with prompt and output lengths, the prefix-cache hit rate, the engine version and settings such as the batched-token budget. A batch-size target set from last quarter's load test is wrong after any of them changes, and the symptom is preemptions at a running count that used to be safe.
+
+The HPA averages the metric across pods. With prefix-aware or adapter-sticky routing, one replica can be saturated while the average is comfortable, and the requests routed to it miss the SLO with no scale-up. Alert on the per-replica maximum as well as the mean.
+
+If you call a hosted API instead of running GPUs, the cold start belongs to the provider, but the SLIs do not: TTFT and per-token latency still have to be measured at your client, and rate limits replace replicas as the capacity you plan for a ramp.
+
+<SelfRate id="lesson:inference/operating/slos-autoscaling" />

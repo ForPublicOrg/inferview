@@ -52,7 +52,7 @@ Two decisions from the review:
 - The first-run path lands on a gradable problem (the agent debug round), not on the most commoditised lesson. The wedge is the rounds nobody drills, so the first click shows one.
 - The daily problem is always a gradable type (`code`, `estimate` with tolerance, or `debug` with a hypothesis pick). A streak built on "I read and rated myself" is not the LeetCode streak.
 
-A skill-graph home page was prototyped twice (a wired 9-by-5 grid, then one row of five round blocks per track) and rejected both times as too much to read. The landing stays a plain list of nine tracks with a daily problem; the graph data (skills, prerequisites, round types) is kept in the research notes for a possible readiness readout later.
+A skill-graph home page was prototyped twice (a wired 9-by-5 grid, then one row of five round blocks per track) and rejected both times as too much to read. The landing stays a plain list of tracks (nine then, fifteen now) with a daily problem; the graph data (skills, prerequisites, round types) is kept in the research notes for a possible readiness readout later.
 
 ### Design principles
 
@@ -84,23 +84,31 @@ Copy and UI pass the anti-slop filter (`~/.claude/skills/antislop*`, from miqdad
 6. Interview question with the three-depth answer and self-rating
 7. "When this is wrong" and "what I would say in the room"
 
-## 3. Curriculum: 9 tracks, 45 modules
+## 3. Curriculum: 15 tracks, 98 modules
 
-Ordered for an experienced engineer who knows software but not ML. Track 1 is skippable after a placement check. Evals sits at position 3, right after the API basics it needs, because it is the most rewarded skill and the one nobody else teaches for free. Each module ships lessons, one to three widgets and two to four real interview questions. Full lesson lists are in `research/brief.json`.
+Ordered for an experienced engineer who knows software but not ML. Evals sits third because the other tracks depend on it; workflows sits before agents because most production systems are workflows with model steps. The full curriculum (every lesson with kind and level, every problem with id, type and difficulty, the teardowns, the labs, the level bar, Core 100 and the crunch path) is `research/curriculum-v2.json`, with a readable copy in `research/curriculum-v2.md`. The table in `SPEC.md` section 4 lists the module slugs.
 
-| # | Track | Modules | Signature widget |
-|---|---|---|---|
-| 1 | LLM foundations for software engineers | Tokens and tokenization; embeddings and similarity; attention and the transformer in one sitting; next-token prediction and sampling; training stages and adapting models; model landscape and selection | Tokenizer playground with real and toy strips; live attention heatmap on GPT-2 small; sampling lab |
-| 2 | Building with model APIs | API anatomy, streaming and reliability; prompting that survives production; structured outputs and tool calling; context engineering and caching; frameworks vs no framework | Streaming and retry simulator; prompt-cache break-even calculator |
-| 3 | Evals and observability (flagship) | Eval thinking and error analysis; golden sets and metrics; LLM-as-judge, calibrated; evaluating agents and public benchmarks; evals in CI, monitoring, feedback loops | Trace-coding workbench; judge TPR/TNR calculator; recall@k, NDCG and pass^k calculators |
-| 4 | Retrieval and RAG | Retrieval foundations; ingestion and chunking; hybrid search, reranking, query transformation; advanced RAG patterns; debugging a broken RAG system | RAG pipeline builder and failure-stage debugger (in-browser MiniLM embeddings) |
-| 5 | Agents and protocols | The agent loop; tool design, MCP and A2A; memory, state, durable execution; multi-agent systems and failure modes; computer use, coding agents, autonomy controls | Agent trace stepper with fault injection; error-compounding calculator |
-| 6 | Security, safety and guardrails | Threat modelling LLM systems; red-team game; guardrails, permissions, isolation; hallucination, safety, responsible AI | Prompt-injection game against a scripted target with layered defences |
-| 7 | Inference, serving and cost | Anatomy of inference; batching and PagedAttention; making it faster and cheaper; gateways, routing, FinOps; deploying and operating LLM services | Continuous-batching and PagedAttention simulator; KV-cache, GPU memory and cost calculators |
-| 8 | AI system design | Delivery framework and rubric; capacity and cost workshop; retrieval-centric case studies; agentic case studies; real-time and specialised case studies | Whiteboard with rubric and live cost, latency and quality gauges |
-| 9 | Coding rounds, behavioural and customer craft | Hand-write it (attention, BPE, sampler); LLM-app coding problems; take-home and debug rounds; AI-collaborative coding round; customer craft and product sense; behavioural, stories, company loops | Pyodide runner with hidden tests and mock LLM; customer-discovery conversation simulator |
+| # | Track | What it covers |
+|---|---|---|
+| 1 | LLM foundations | Tokens, embeddings, attention, sampling, training stages, model landscape |
+| 2 | Building with model APIs | API anatomy, prompting, structured outputs, context engineering, frameworks |
+| 3 | Evals and observability | Eval thinking, golden sets, LLM judges, agent evals, evals in CI |
+| 4 | AI workflows and durable execution | Patterns, replay engines, retries and budgets, approvals and handoffs, batch pipelines, operating workflows |
+| 5 | Retrieval and RAG | Retrieval foundations, ingestion, hybrid search, advanced RAG, debugging, vector systems, search quality |
+| 6 | Agents and protocols | The agent loop, tools with MCP and A2A, memory and state, multi-agent systems, coding agents |
+| 7 | Harness engineering and agentic coding tools | Harness anatomy, tool interfaces, context management, cache and cost, permissions and sandboxing, verification, long-running and parallel agents, evaluating harnesses; teardowns of the public coding agents |
+| 8 | Prompt injection, guardrails and model safety | Threat modelling, red teaming, injection defences, guardrails, hallucination |
+| 9 | Implementing security for AI systems | Secure architecture, permissions and identity, sandboxing and secrets, MCP security, output and data handling, supply chain, security operations, governance |
+| 10 | Inference, serving and cost | Inference anatomy, batching, speed and cost techniques, gateways and FinOps, operating, fleet management |
+| 11 | LLMOps, fine-tuning and AI product economics | Prompt lifecycle, releases and experiments, monitoring and feedback, data curation, fine-tuning, economics and model selection, platform strategy |
+| 12 | Training, post-training and infrastructure | Compute and scaling, GPU kernels, distributed training, numerics, reliability, pretraining data, mixture of experts, post-training, RL, distillation and merging, adapting |
+| 13 | Long context, architectures, multimodal and voice | Long context, architectures beyond the dense transformer, vision-language, speech and voice, generation |
+| 14 | AI system design | Framework and rubric, capacity, retrieval cases, agent cases, real-time cases, platform cases |
+| 15 | Coding rounds, work samples, behavioural and customer craft | Hand-write it, LLM-app coding, take-home and debug, codebase rounds, AI-collaborative coding, customer craft, deep dives, behavioural |
 
-Problem types, each tagged with difficulty, seniority, track, company, provenance and last-verified date: `concept` (quiz, predict-then-reveal), `code` (Pyodide, hidden tests), `debug` (trace or broken pipeline), `design` (rubric self-score), `take-home` (spec plus eval-report rubric), `behavioural` (story bank plus rubric), `estimate` (napkin math with tolerance).
+Lesson kinds: lesson, playbook (a procedure to run), paper (a walkthrough of one paper with its numbers), teardown (how a public system works, drawn from public sources, with a Diagram, a Trace and a section on what is not public). Every lesson and problem carries a level, senior or staff; nothing is written for a reader who has not shipped software.
+
+Problem types, each tagged with difficulty, seniority, track, company and sources: concept, estimate, debug, code (Pyodide with visible and hidden tests), design, behavioural, mcq, critique, workflow, replay (an incident timeline with graded checkpoints), multistage (timed stages that build on your own code), repo (a bug fix across files), worksample and presentation. Labs are multi-step builds graded in the browser.
 
 ## 4. Retention mechanics, by priority
 
@@ -153,17 +161,26 @@ license: CC-BY-SA-4.0
 
 ### Done, 28 Oct 2026: the first full build
 
-The site described in `SPEC.md` exists in this folder: Astro 5 static site, content schema with build-time validation, the component set (predict, three-depth answer, self-rating, choices, Pyodide code runner, estimate check), progress store with Google sign-in and Firestore sync, daily problem, review scheduling, catalog with filters, search. All nine tracks have one lesson per module and a problem bank; the exact counts are computed at build time and shown on the landing page. Each track's research notes with sources are in `research/tracks/`.
+The site described in `SPEC.md` exists in this folder: Astro 5 static site, content schema with build-time validation, the component set (predict, three-depth answer, self-rating, choices, Pyodide code runner, estimate check), progress store with Google sign-in and Firestore sync, daily problem, review scheduling, catalog with filters, search. Nine tracks with one lesson per module.
 
-Every track went through an independent fact and code review before this build; findings and the fixes applied are recorded in the build log of that session, not in the repository.
+### Done, 28 Oct 2026: curriculum v2
+
+The first build read as too easy and too thin, so the curriculum was rebuilt from a gap study (`research/gaps/`) and a level audit of the existing files. What changed:
+
+- 15 tracks and 98 modules, each module a set of ordered lessons instead of one overview. Six tracks are new: workflows, harness engineering, security implementation, LLMOps, training, and long context with multimodal and voice.
+- 369 lessons: 269 lessons, 37 playbooks, 24 paper walkthroughs and 39 teardowns of public systems (Claude Code, Codex CLI, Cursor, Copilot's cloud agent, OpenHands, Aider, Cline, Gemini CLI, Goose, Jules, Devin, vLLM, DeepSeek V3 and R1, Llama 3 405B training, and others). Teardowns state what is not public rather than guessing.
+- 613 problems with no easy ones, 20 of the old problems retired as below the bar. New types: replay, multistage, repo, worksample and presentation. Code problems run hidden tests. Core 100 and a 25-problem crunch path are curated from the curriculum.
+- 34 labs with a step runner, and a mock interview loop at `/mock` with role presets and shareable seeds.
+- A 52-rule level bar (`levelBar` in the curriculum file) that every author and reviewer worked against; the documented corrections (`corrections`) fix errors the gap study found in common sources.
+
+Every module was written by one or two authoring agents, each track reviewed by a separate model against the level bar and the sources, and the findings applied; `npm run build`, `npx astro check`, the link check, `npm run labs` and `npm run code` all pass.
 
 ### Next
 
-- Create the Firebase project and the Vercel project (both need the owner's accounts): `docs/firebase-setup.md`, `docs/deploy-vercel.md`. Until then sign-in shows "not configured" and progress stays in the browser.
-- Second lesson per module where the module's lesson list in `research/brief.json` has more than the core lesson covers.
-- The mock LLM for trace-coding problems, the RAG failure-stage debugger and the design whiteboard with rubric (ideas kept from the earlier roadmap; none exists yet).
+- Create the Firebase project and the Vercel project (both need the owner's accounts): `docs/firebase-setup.md`, `docs/deploy-vercel.md`. Until then no sign-in control renders and progress stays in the browser.
 - Streak forgiveness (one missed day a week) needs a field in the progress shape and a rules change; the site makes no such promise today.
 - A privacy-respecting counter before any usage number appears on the site.
+- The curriculum file gives the lesson and the teardown in harness/long-running-parallel the same slug; the teardown on disk is `anthropic-long-running-harness`. Rename the curriculum entry to match.
 
 ## 7. Decisions and open questions
 

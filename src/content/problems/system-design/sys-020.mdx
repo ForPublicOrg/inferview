@@ -1,0 +1,103 @@
+---
+id: sys-020
+title: Review a multi-tenant chat backend design
+subtitle: billing, moderation and isolation in one document
+track: system-design
+module: framework
+type: critique
+difficulty: hard
+seniority: [senior, staff]
+minutes: 35
+core: true
+tags: [multi-tenancy, billing, metering, moderation, isolation, prefix-caching, design-review]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: techinterview.org, OpenAI interview process 2026, team by team (2026-05-04, updated 2026-07-13)
+    url: https://www.techinterview.org/post/3233474915/openai-interview-process-2026-team-by-team/
+    note: 'prep site citing unnamed candidate reports, so no company tag here: applied-track candidates design multi-tenant chat backends, conversation state management, content moderation pipelines and billing systems for token-based pricing. The design document below is constructed for this problem. Checked 2026-10-28.'
+checklist:
+  - Finds that usage events are emitted only on completed responses, so streams cut by disconnect, timeout or moderation are never billed
+  - Finds that usage events carry no idempotency key while the consumer is at-least-once, so retries and redeliveries double-bill
+  - Finds that invoices price usage at invoice time, so a mid-month price change is applied retroactively
+  - Finds that the shared prefix cache is keyed on the prompt hash without the tenant, which lets one tenant observe another's cached prefixes through latency
+  - Finds that tenant isolation in the conversation store rests on an application-level filter alone, and proposes an enforced boundary such as row-level security keyed to the request's tenant
+  - Finds that request-count rate limits do not bound token cost or GPU time, so one tenant's long contexts degrade every tenant
+  - Finds that a FIFO queue shared by all tenants cannot meet the enterprise latency commitment under load, and proposes priority or reserved capacity with its cost
+  - Finds that moderation fails open when the moderation service is unavailable, and states what the tenant contract would have to say for that to be acceptable
+  - Finds that the "latest" model alias changes tenant behaviour without notice, and proposes pinned versions with a deprecation window
+  - Ranks the findings into launch blockers and follow-ups, with a reason for each blocker, instead of listing them flat
+  - Judges asynchronous output moderation acceptable if the tenant is the publisher of the output, has contracted to moderate it, and the platform enforces its own policy on input before generation
+  - Judges 30-day retention of conversation content acceptable if tenants can set it shorter and the retained logs are excluded from training by contract and by access control
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Design review, 35 minutes">
+"This design document was approved by two reviewers last week. Launch is in four weeks. Find what is wrong with it, decide which findings block the launch, and say what you would accept with a written risk."
+</Callout>
+
+The document, constructed for this problem:
+
+> **Chat platform v1: design**
+>
+> **Goal.** Offer our hosted models to business customers (tenants) as a chat API and an embeddable chat widget. Tenants pay per token. Enterprise tenants get a p95 time-to-first-token commitment in their contract.
+>
+> **Request path.** The API gateway authenticates the tenant's API key and applies a per-tenant rate limit (requests per minute, by plan). The chat service loads the conversation from the store, builds the prompt (tenant system prompt, history, new message), and enqueues the request on the shared inference queue. Workers take requests in arrival order and stream tokens back over SSE.
+>
+> **Models.** Tenants choose a model by name. Each model name has a `latest` alias, which is the default; we move it when we release a new version so tenants get improvements automatically.
+>
+> **Prefix caching.** To cut prefill cost, workers cache KV for prompt prefixes in a shared cache keyed by a hash of the prefix tokens. Tenant system prompts are long and stable, so we expect high hit rates.
+>
+> **Conversation store.** One Postgres cluster, a `messages` table partitioned by month, with a `tenant_id` column. All queries go through our data-access library, which adds `WHERE tenant_id = :tenant` from the request context. Content is retained 30 days for abuse investigation and debugging.
+>
+> **Moderation.** Input is checked synchronously before enqueueing. Output is checked asynchronously after the response is sent, to keep streaming latency low; flagged outputs go to a review queue and repeat offenders are suspended. If the moderation service is unavailable, requests proceed and are checked later, so that a moderation outage does not cause a platform outage.
+>
+> **Metering and billing.** When the gateway sees a response complete, it emits a usage event (tenant, model, input tokens, output tokens) to the event bus. A consumer aggregates events into a daily usage table; the consumer is at-least-once. On the first of the month, invoicing multiplies each tenant's monthly token totals by the current price table.
+>
+> **Capacity.** We size the GPU pool for projected peak requests per second across all tenants with 30% headroom.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what fraction of streams in the current internal pilot ended by client disconnect, timeout or cancellation.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the distribution of input tokens per request by tenant, not requests per second.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the enterprise contract and the tenant terms say about moderation responsibility and model changes.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Four findings block launch: the prefix cache shared across tenants without the tenant in the key, tenant isolation that rests on one library filter, billing that misses cut streams and double-counts redelivered events, and an enterprise latency commitment that a FIFO queue and request-count limits cannot keep. The retroactive pricing, the fail-open moderation, the asynchronous output check and the "latest" default are fixable inside four weeks or acceptable with a written condition. The four-week date forces the split; the cost of holding every finding is a missed launch, the cost of holding none is a cross-tenant incident or a billing restatement.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Isolation.</strong> The prefix cache key is the prefix hash alone. Two tenants with identical prefixes share entries, which is the intent; it also means one tenant can probe whether a guessed prefix is cached by measuring time to first token, and a cached prefix can contain another tenant's system prompt or conversation text. The key gets the tenant ID, and the hit rate drops to within-tenant reuse, which is most of the expected benefit anyway since system prompts are per tenant. The conversation store has one boundary, a library that adds a filter; any query written outside it, an analytics job or a debugging script, reads every tenant. Row-level security keyed to a session variable set from the authenticated tenant makes the database enforce it, at the cost of a session-setup step on every connection and policies to maintain.</p>
+<p><strong>Billing.</strong> Usage is emitted on completion. A stream cut by a disconnect, a timeout or moderation consumed GPU time and is never billed, and in an embeddable widget users close tabs constantly. The event also has no idempotency key while the consumer is at-least-once, so a redelivery bills twice. Emit usage from the worker, which knows the tokens it actually processed, on every terminal state, with a request ID as the idempotency key and a unique constraint on it in the aggregate. Pricing at invoice time with the current table applies a mid-month price change to the whole month; price at event time or snapshot the table per billing period.</p>
+<p><strong>Capacity and the enterprise commitment.</strong> Rate limits in requests per minute do not bound cost: one tenant sending 100,000-token contexts at its allowed request rate consumes GPU time that a request-count plan never priced. A single FIFO queue gives enterprise requests the same wait as everyone else's, so the p95 commitment is broken by whichever tenant bursts. Limits move to tokens per minute, input and output, and enterprise traffic gets either priority in the queue or reserved capacity. Two defensible answers: priority scheduling uses the pool efficiently and can starve lower plans under sustained load; reserved capacity isolates enterprise latency and leaves GPUs idle when enterprise traffic is low. With four weeks and a contractual number, I pick reserved capacity for enterprise and accept the idle cost until there is traffic data to size priority scheduling.</p>
+<p><strong>Moderation.</strong> Fail-open means a moderation outage removes moderation for its duration, which is a policy decision written as an availability decision. It becomes fail-closed for the widget, where outputs reach end users of the tenant directly, and fail-open with a written risk for API tenants whose terms make them responsible for output moderation. The asynchronous output check is acceptable under the same condition; for the widget, a chunked check with a hold-back buffer adds a chunk of latency and is the price of enforcing policy on a stream.</p>
+<p><strong>Model versions.</strong> A <code>latest</code> default means a tenant's behaviour changes on our release schedule, with no chance to run their own evals. Default to a pinned version, offer <code>latest</code> as an opt-in, and give a deprecation window before a pinned version retires.</p>
+<p><strong>Where this review fails.</strong> The ranking assumes the pilot's disconnect rate is high enough to matter for billing. If cut streams are a fraction of a percent of tokens, the metering change is a follow-up, not a blocker, and spending a week of the four on it delays the isolation fixes. Hint 1's measurement decides it, and the review says so instead of asserting the rank.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Pushback: the two approving reviewers say row-level security will slow every query and the library filter has never failed. You have four weeks. What evidence do you ask for, and what do you accept in writing if you lose?</em></li>
+<li><em>Reversal: what would the first month of production data have to show for you to move enterprise from reserved capacity to priority scheduling?</em></li>
+<li><em>Finance and the platform team disagree on whether usage should be billed for streams cut by moderation. How do you settle it without deciding by rank?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *A tenant asks for a per-conversation cost breakdown in real time. What in the metering design has to change?*
+- *An enterprise tenant requires that no conversation content is retained. Which parts of this design break, and what do you lose for debugging and abuse investigation?*
+- *How would you test tenant isolation continuously after launch rather than once in review?*
+
+## Common mistakes
+
+- Listing every flaw at the same weight, with no decision about what blocks the launch.
+- Treating the shared prefix cache as a pure performance feature and missing the cross-tenant side channel.
+- Accepting the library filter as isolation because every current query uses it.
+- Reading "billing on completion" as correct because it is how a non-streaming API usually meters.
+- Calling fail-open moderation an availability choice without asking who carries the policy risk under the tenant contract.

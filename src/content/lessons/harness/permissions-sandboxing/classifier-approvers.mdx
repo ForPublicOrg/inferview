@@ -1,0 +1,139 @@
+---
+title: "Classifiers as approvers: Claude Code auto mode and its peers"
+track: harness
+module: permissions-sandboxing
+order: 3
+kind: paper
+level: staff
+minutes: 15
+summary: Anthropic's auto-mode post publishes a two-stage approval classifier that wrongly blocks 0.4% of real actions and lets 17% of real overeager actions through, Cursor and Codex ship peers they say are not security boundaries, and the engineering question is what deterministic and environmental controls surround an approver with those error rates.
+prerequisites: [harness/permissions-sandboxing/rule-engines]
+updated: 2026-10-28
+sources:
+  - title: Anthropic Engineering, How we built Claude Code auto mode (John Hughes, 2026-03-25)
+    url: https://www.anthropic.com/engineering/claude-code-auto-mode
+    note: Anthropic's own evaluation. Users accept 93% of prompts; threat model of overeager behaviour, honest mistakes, prompt injection and a misaligned model; server-side prompt-injection probe on tool outputs; transcript classifier on Sonnet 4.6; stage 1 single-token filter tuned toward blocking, stage 2 chain of thought on flagged actions; classifier sees user messages and tool calls, with assistant text and tool results stripped; three tiers; results table (real traffic n=10,000, real overeager n=52, synthetic exfiltration n=1,000; stage 1 8.5% FPR, 6.6% and 1.8% FNR; full pipeline 0.4% FPR, 17% and 5.7% FNR); "the honest number"; misses where the classifier judged user consent to cover the blast radius; not a drop-in replacement for careful human review on high-stakes infrastructure; 3 consecutive or 20 total denials escalate; environment, block rules (more than 20) and allow exceptions
+  - title: Claude Code docs, Choose a permission mode
+    url: https://code.claude.com/docs/en/permission-modes
+    note: classifier requests go to Claude Sonnet 5 by default; broad allow rules dropped on entering auto mode; read-only actions and working-directory edits skip the classifier except protected paths; explicit ask rules prompt in every mode; fallback thresholds are not configurable and the total persists for the session. Checked 2026-10-28.
+  - title: Cursor docs, Run modes
+    url: https://cursor.com/docs/agent/security/run-modes
+    note: Auto-review covers shell, MCP and Fetch calls; allowlisted calls run, other shell commands run in the sandbox when possible, and calls outside the sandbox go to the classifier; classifier on Cursor's backend, currently Gemini 3.5 Flash Lite with Haiku as fallback; it may run read-only ReadFile, Grep, Glob and ListDir calls; "The classifier can make mistakes" and it is not a security boundary. Checked 2026-10-28.
+  - title: OpenAI Codex docs, Auto-review
+    url: https://learn.chatgpt.com/docs/sandboxing/auto-review
+    note: a reviewer swap, not a permission grant; reviews only approval requests that would otherwise pause for a person; does not expand writable_roots, enable network access or weaken protected paths; sees a compact transcript with tool calls and outputs but not private chain of thought; not a deterministic security guarantee; interrupts after 3 consecutive denials or 10 in the last 50 reviews of a turn; no error rates on the page. Checked 2026-10-28.
+  - title: Anthropic Engineering, How we contain Claude across products (2026-05-25)
+    url: https://www.anthropic.com/engineering/how-we-contain-claude
+    note: the phishing exercise in which Claude completed a user-directed exfiltration in 24 of 25 attempts, and the conclusion that only environmental controls would have blocked it
+  - title: Claude Code docs, Best practices
+    url: https://code.claude.com/docs/en/best-practices
+    note: blocked actions appear under Recently denied in /permissions; deny and ask rules and PreToolUse hooks apply before the classifier sees anything. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The problem the post takes on
+
+Anthropic's engineering post on auto mode (John Hughes, 25 March 2026) starts from a measured failure of the control it replaces: Claude Code users accepted 93% of permission prompts. An approval step that passes 93% of what it sees is training people to click yes. The two existing alternatives were both poor. A sandbox is safe and needs constant maintenance as tools and hosts change; `--dangerously-skip-permissions` needs none and protects nothing.
+
+The post's threat model has four sources of dangerous actions: the agent going beyond what the user authorised (overeager behaviour), honest mistakes about blast radius, prompt injection, and a misaligned model, which the authors say they do not currently see in practice. The first is the one the evaluation is built around, and the one most teams meet: "clean up the branches" becoming a batch delete of remote branches.
+
+The systems analogy is a fraud-scoring model in front of a payment API, with a rules layer before it and humans for what it escalates. The difference that matters is feedback. A fraud model gets labels from chargebacks; an approval classifier gets no ground truth in production unless someone reviews what it let through.
+
+## The mechanism, in engineering terms
+
+The design is three permission tiers with a two-layer classifier in the last one.
+
+**Tier 1, the allowlist.** Read-only tools and the user's always-allow rules pass without review. On entering auto mode, Claude Code drops allow rules that grant arbitrary code execution: blanket `Bash(*)`, wildcarded interpreters such as `Bash(python*)`, package-manager run commands and `Agent` allow rules. Narrow rules such as `Bash(npm test)` stay. A user who once allowed `Bash(*)` to stop the prompts would otherwise have exempted from review every action the classifier exists for.
+
+**Tier 2, in-project file edits.** Edits inside the working directory are allowed without a classifier call. They show up in the diff and version control can undo them, which is the case for leaving them out. Protected paths (`.git`, `.claude`, shell startup files, `.mcp.json` and others) are the exception and go to the classifier.
+
+**Tier 3, everything else.** Shell commands, web fetches, external integrations, subagent spawns and filesystem operations outside the project reach the classifier.
+
+The classifier itself has an input layer and an output layer. On the input side, a server-side probe scans tool outputs for content that looks like a hijack attempt and adds a warning to the agent's context. On the output side, a transcript classifier checks each tier-3 action before it runs, in two stages. Stage 1 is a single-token yes or no, tuned to err toward blocking. Stage 2, chain-of-thought reasoning, runs only on what stage 1 flags. The post names Sonnet 4.6 as the classifier model; the permission-modes docs, checked 2026-10-28, say classifier requests go to Claude Sonnet 5 by default. The published rates belong to the March 2026 pipeline.
+
+The design choice the rest depends on is what the classifier reads. It sees the user's messages and the agent's tool calls. The agent's own prose and the tool results are stripped. Stripping prose means the agent cannot argue its way past the reviewer; stripping tool results means text injected into a web page or an issue never reaches the reviewer at all. The post states the cost: the classifier loses provenance and cannot tell whether an identifier in a tool call was fabricated by the agent or returned by a query.
+
+A denial is not the end of the turn. The reason goes back to the agent, which usually tries something safer, so a false positive typically costs one retry. A deterministic breaker sits on top: three consecutive denials or twenty in total pause auto mode and return to prompting (in `claude -p`, the process exits). The docs add that these thresholds are not configurable and the total persists for the session. What the classifier treats as risky is configured in prose, in three slots of a fixed prompt template: the environment (trusted boundaries such as GitHub organisations, buckets and internal APIs; by default only the current repository), block rules (more than twenty by default, in four groups: destroy or exfiltrate, degrade security posture, cross trust boundaries, bypass review or affect others), and narrow allow exceptions.
+
+## The numbers
+
+Anthropic evaluated the pipeline on three sets: 10,000 actions from real internal traffic, 52 real overeager actions, and 1,000 synthetic data-exfiltration attempts. These are Anthropic's own measurements on Anthropic's traffic.
+
+| | Real traffic (n = 10,000), false positives | Real overeager (n = 52), false negatives | Synthetic exfiltration (n = 1,000), false negatives |
+|---|---|---|---|
+| Stage 1 alone | 8.5% | 6.6% | 1.8% |
+| Full pipeline | 0.4% | 17% | 5.7% |
+
+Read the rows against each other. Stage 1 alone would block 8.5% of ordinary actions, about one in twelve, which is a prompt-fatigue problem of its own. Stage 2 cuts false positives by a factor of 8.5 / 0.4 = 21, and in doing so clears some actions that stage 1 had correctly caught: false negatives on real overeager actions rise from 6.6% to 17%, about 2.6 times. The second stage is a deliberate trade of misses for usability, and the table publishes its price.
+
+<Predict id="hrn-auto-stage2-clear" question="Treat the 10,000 real-traffic actions as benign. Stage 1 flags 8.5% of them and the full pipeline wrongly blocks 0.4%. What percentage of stage-1 flags does stage 2 clear?" answer={95.3} tolerance={1} unit="%">
+<p>Stage 1 flags 10,000 × 0.085 = 850 actions; the pipeline blocks 10,000 × 0.004 = 40. Stage 2 clears 810 of 850, <b>95.3%</b>. The cost side is in the same numbers: the expensive chain-of-thought stage runs on about 850 actions per 10,000 rather than on all of them, which is why the cheap filter can be tuned to over-flag.</p>
+</Predict>
+
+Two cautions about the 17%. It is 17% of 52, about nine actions, and with nine misses in 52 the 95% Wilson interval runs from about 9% to 30%. "One in six" is the point estimate; about one in three and about one in eleven are both consistent with the data. And 6.6% of 52 is 3.4 actions, not a whole number, so the rates are not simple counts from a single run; the post does not say how they were aggregated. The authors call the 17% "the honest number", say the overeager set is small and will grow, and state that auto mode is not a drop-in replacement for careful human review on high-stakes infrastructure.
+
+The failure analysis is the most useful paragraph in the post. Most misses were not cases where the classifier failed to see danger. It saw it, and judged wrongly that the user's earlier words or approvals covered the action's full blast radius. Prompt engineering did not fix this without costing more than it gained. The weak point is consent interpretation: deciding whether "clean up" authorises deleting remote branches.
+
+## The peers
+
+Cursor and Codex ship the same idea with different placement.
+
+| | Claude Code auto mode | Cursor Auto-review | Codex auto-review |
+|---|---|---|---|
+| What reaches it | Tier-3 actions after rules and hooks | Shell, MCP and Fetch calls not allowlisted and not run in the sandbox | Only requests that would otherwise pause for a person, such as escalations past the sandbox |
+| What it sees | User messages and tool calls; no assistant text or tool results | Can run read-only file and search calls to judge | Compact transcript including tool calls and outputs; no private chain of thought |
+| Model | Sonnet 4.6 in the post; Sonnet 5 in the docs | Gemini 3.5 Flash Lite, Haiku as fallback | Not named; "a Codex agent with a narrower job" |
+| Breaker | 3 consecutive or 20 total denials | Not stated | 3 consecutive, or 10 in the last 50 reviews of a turn |
+| Published error rates | Yes, above | No | None on the page |
+| Stated limit | Not a replacement for careful review on high-stakes infrastructure | Not a security boundary | Not a deterministic security guarantee; never widens the sandbox |
+
+The placement differs in a way that matters. Cursor and Codex put the classifier behind the sandbox: shell commands that can run inside it do so without review, and the classifier decides only what wants out. Codex makes the boundary explicit, saying auto-review "does not expand `writable_roots`, enable network access, or weaken protected paths". Claude Code's classifier is the main gate for tier-3 actions, with the sandbox as a separate layer the user may or may not enable. The input choice also differs: Codex's reviewer reads tool outputs, which gives it provenance and also exposes it to whatever was injected into them; Anthropic chose blindness to tool results and paid in provenance.
+
+Codex also scripts the agent's response to a denial: the rationale goes back with an instruction not to pursue the same outcome through workarounds, only through a materially safer alternative or by asking the user. Its `/approve` picker lets a person retry one recently denied action, once, still through review.
+
+## What changed in practice
+
+Approval moved from a per-action human decision to a layered one. The vendor guidance now says the same thing three ways: the classifier runs after deterministic rules and hooks, a deny rule blocks in auto mode exactly as elsewhere, and explicit ask rules still prompt in every mode. The design that falls out puts four layers around an approver that misses roughly one dangerous action in six:
+
+1. **Before it, deny rules and hooks** for every action you can name in advance: force pushes, production deploys, reads of credential files. Each named action removed from the classifier's job is one it cannot miss.
+2. **Beside it, ask rules** for irreversible actions where consent is ambiguous, which is exactly the class the post says the classifier gets wrong.
+3. **After it, containment.** Credentials the agent does not hold cannot be misused, and a network allowlist bounds where data can go. The approver decides which risky actions run; the environment decides how far any action can reach.
+4. **Around it, the breaker and a review loop.** The 3 and 20 thresholds are deterministic. Denials are listed under "Recently denied" in `/permissions`; the docs describe no equivalent list of approvals, so measuring misses means sampling approved tier-3 actions from logs and reviewing them.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Leadership wants auto mode on for all 500 engineers next month to end prompt fatigue. Security wants it off on any machine that holds production cloud credentials, which is most of them. You have one month and no budget for new infrastructure. What do you ship, and what risk do you put in writing?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Ship auto mode with three conditions: deny rules and ask rules for the named destructive and production actions, an environment configuration that lists only the infrastructure the team trusts, and production credentials moved out of the agent's default environment where that is possible this month. Write down that the classifier lets through about one in six overeager actions in Anthropic's evaluation, with a wide interval, and that the controls around it, not the classifier, are what bound the damage.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Security's condition is about credentials, not about auto mode. Manual mode with 93% approval is not protecting those machines either. The useful question is what an approved bad action can reach. Without new infrastructure, the levers are the agent's environment (profiles or variables that keep production credentials out of the shells the agent starts), managed deny rules for production deploy and infrastructure commands, and managed ask rules for anything irreversible against shared systems.</p>
+<p>Then configure the classifier for this company: the environment slot names the organisations, buckets and APIs that are trusted, so everything else counts as crossing a boundary. Keep the default block rules.</p>
+<p>Roll out by risk. Teams without production access first, then the rest after the credential change lands. Measure denials per session from the denied list and sample approved tier-3 actions weekly for misses.</p>
+<p>What you give up: some machines will still hold credentials in month one. The risk note says so, names the ask and deny rules that cover the known dangerous commands, and sets a date for the credential change.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The weekly sample finds two approved actions that deleted shared resources the user had not named. Do you turn auto mode off, add ask rules, or change the environment configuration, and what evidence decides?</li>
+<li>Security argues that Codex's placement, a reviewer only at the sandbox boundary, is safer, and wants Claude Code's sandbox on everywhere first. Engineering says the sandbox breaks half the build scripts. How do you decide without deciding by rank?</li>
+<li>Anthropic publishes new rates for the Sonnet 5 classifier with a larger overeager set, and the false-negative rate is higher. What would you need to see to keep the rollout as is?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The rates describe Anthropic's internal traffic, Anthropic's definition of overeager, and the March 2026 classifier. Your engineers' actions, your infrastructure names and the current classifier model all differ, and the post gives no way to transfer the numbers. The only defensible use of them is order of magnitude: a false-positive rate low enough to use, and a false-negative rate on the dangerous class high enough that the classifier cannot be the only control.
+
+Expected harm needs a base rate the post cannot give you: how many overeager actions your agents attempt per week. A 17% miss rate on a class your agents almost never produce is a different risk from the same rate on a class they produce daily, and the number that matters is misses multiplied by blast radius, which depends on what the environment exposes.
+
+The threat model also leaves a gap on purpose. A classifier that judges whether an action matches the user's intent says nothing useful when the user's intent is the problem. Anthropic's containment post reports a phishing exercise in which Claude completed a user-directed exfiltration in 24 of 25 attempts, and concludes that only environmental controls would have blocked it. Approval classifiers address overeager agents and injected instructions; they are not designed to stop a user, or someone who has the user's session.
+
+<SelfRate id="lesson:harness/permissions-sandboxing/classifier-approvers" />

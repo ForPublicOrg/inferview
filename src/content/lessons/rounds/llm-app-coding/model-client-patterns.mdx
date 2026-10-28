@@ -1,0 +1,289 @@
+---
+title: Model-client patterns the coding rounds test
+track: rounds
+module: llm-app-coding
+order: 3
+kind: lesson
+level: senior
+minutes: 21
+summary: Coding rounds that touch a model API test five client patterns (error classification, concurrency bounded by token limits, incremental stream parsing, time-window batching and a health-checked provider pool), each small enough to write and test in thirty minutes.
+prerequisites: [rounds/llm-app-coding/integration-rounds]
+updated: 2026-10-28
+sources:
+  - title: Claude API docs, Errors
+    url: https://platform.claude.com/docs/en/api/errors
+    note: "400, 401, 402, 403, 404, 409, 413, 429, 500, 504, 529 and their types; the SDK retries connection errors, rate limits and 5xx twice by default with exponential backoff, honouring retry-after; errors can arrive mid-stream after a 200; Messages API request limit 32 MB, Batch API 256 MB; streaming or batches for requests over 10 minutes; checked 2026-10-28"
+  - title: Claude API docs, Rate limits
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: "token bucket, continuously replenished; RPM, ITPM and OTPM per model; 60 RPM may be enforced as 1 request per second; only uncached input tokens count toward ITPM on most models; ITPM estimated at request start and adjusted; max_tokens does not count toward OTPM; Claude Opus 5.5 Start tier 1,000 RPM, 2,000,000 ITPM, 400,000 OTPM, Scale tier 10,000 RPM, 10,000,000 ITPM, 2,000,000 OTPM; 2,000,000 ITPM at an 80 percent cache hit rate admits 10,000,000 input tokens a minute; Claude Haiku 3.5 counts cache reads toward ITPM; many providers use a combined TPM limit; spend-cap 429 has no retry-after and error_code enforced_spend_limit_reached; a spend limit you set returns 400; Message Batches API has its own limits, shared across models: Start tier 200,000 and Scale tier 500,000 batch requests in the processing queue, 100,000 per batch; checked 2026-10-28"
+  - title: Claude API docs, Streaming messages
+    url: https://platform.claude.com/docs/en/build-with-claude/streaming
+    note: "event order message_start, content blocks with start, deltas and stop, message_delta, message_stop; ping events; usage in message_delta is cumulative; input_json_delta partial_json parsed at content_block_stop; overloaded_error as an error event; new event types may be added; recovery by capturing the partial response, with a user-message continuation on Claude 4.6 and later; tool use and thinking blocks cannot be partially recovered; checked 2026-10-28"
+  - title: Claude API docs, Batch processing
+    url: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+    note: "50 percent of standard prices; 100,000 requests or 256 MB per batch; most batches finish within 1 hour; expire if not complete within 24 hours; results available for 29 days; results in any order, matched by custom_id; errored, canceled and expired requests are not billed; checked 2026-10-28"
+  - title: openai/openai-python README
+    url: https://github.com/openai/openai-python
+    note: "2 retries by default with short exponential backoff for connection errors, 408, 409, 429 and 5xx; stream consumption is not retried automatically; default timeout 10 minutes; checked 2026-10-28"
+  - title: PracHub, Anthropic software engineer interview, web crawler question (candidate report, interview September 2025)
+    url: https://prachub.com/interview-experiences/anthropic-software-engineer-interview-experience-a-web-crawler-question-that-turned-into-a-late-multithreading-push
+    note: "single-hostname crawler, then how to make it multithreaded; thread pool named as the right direction; checked 2026-10-28"
+  - title: PracHub, Implement resilient LLM provider pool (Perplexity, technical screen, 13 August 2025)
+    url: https://prachub.com/interview-questions/implement-resilient-llm-provider-pool
+    note: "candidate report via a vendor, filed as ML system design, page updated 17 May 2026: design of a client library routing across LLM providers with per-provider rate limits, active and passive health checks, timeouts, circuit breakers with half-open probes, cost- and latency-aware balancing, retry and fallback, streaming support; checked 2026-10-28"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import CodeRunner from '../../../../components/CodeRunner.astro';
+
+export const retryStarter = String.raw`def classify(status, headers, body):
+    """Return ("retry", wait or None), ("stop", None), ("shrink", None) or ("stream", None)."""
+    if status is None or status >= 429:
+        return "retry", None
+    return "stop", None
+
+def call_with_retry(send, sleep, rng, max_attempts=3, base=0.5, cap=8.0):
+    for attempt in range(max_attempts):
+        status, headers, body = send()
+        if status == 200:
+            return body
+        action, wait = classify(status, headers, body)
+        if action != "retry" or attempt == max_attempts - 1:
+            raise RuntimeError(action + " after HTTP " + str(status))
+        if wait is None:
+            wait = rng.uniform(0, min(cap, base * 2 ** attempt))
+        sleep(wait)
+`;
+
+export const retryTests = String.raw`import random
+spend = {"error": {"type": "rate_limit_error", "details": {"error_code": "enforced_spend_limit_reached"}}}
+assert classify(429, {"retry-after": "7"}, {}) == ("retry", 7.0), "a 429 with retry-after waits exactly that long"
+assert classify(429, {}, spend)[0] == "stop", "the spend-cap 429 keeps failing until access resumes"
+assert classify(529, {}, {}) == ("retry", None) and classify(None, {}, {}) == ("retry", None), "overloaded and connection errors back off with jitter"
+assert classify(400, {}, {})[0] == "stop" and classify(401, {}, {})[0] == "stop", "a bad request or key fails the same way every time"
+assert classify(413, {}, {})[0] == "shrink", "too large: resending the same bytes fails again"
+assert classify(504, {}, {})[0] == "stream", "a request that timed out while processing moves to streaming or batch"
+waits = []
+replies = iter([(529, {}, {}), (429, {"retry-after": "2"}, {}), (200, {}, {"ok": True})])
+assert call_with_retry(lambda: next(replies), waits.append, random.Random(0)) == {"ok": True}
+assert 0 <= waits[0] <= 0.5 and waits[1] == 2.0, "full jitter on the first wait, retry-after on the second"
+`;
+
+export const retrySolution = String.raw`def classify(status, headers, body):
+    """Return ("retry", wait or None), ("stop", None), ("shrink", None) or ("stream", None)."""
+    if status == 429:
+        details = (body or {}).get("error", {}).get("details", {})
+        if details.get("error_code") == "enforced_spend_limit_reached":
+            return "stop", None
+        after = headers.get("retry-after")
+        return "retry", None if after is None else float(after)
+    if status is None or status in (500, 529):
+        return "retry", None
+    if status == 413:
+        return "shrink", None
+    if status == 504:
+        return "stream", None
+    return "stop", None
+
+def call_with_retry(send, sleep, rng, max_attempts=3, base=0.5, cap=8.0):
+    for attempt in range(max_attempts):
+        status, headers, body = send()
+        if status == 200:
+            return body
+        action, wait = classify(status, headers, body)
+        if action != "retry" or attempt == max_attempts - 1:
+            raise RuntimeError(action + " after HTTP " + str(status))
+        if wait is None:
+            wait = rng.uniform(0, min(cap, base * 2 ** attempt))
+        sleep(wait)
+`;
+
+export const poolCode = String.raw`class MicroBatcher:
+    """Collect items; flush when max_items are waiting or the oldest has waited max_wait."""
+    def __init__(self, flush, max_items, max_wait):
+        self.flush, self.max_items, self.max_wait = flush, max_items, max_wait
+        self.items, self.first_at = [], None
+
+    def add(self, item, now):
+        if not self.items:
+            self.first_at = now
+        self.items.append(item)
+        if len(self.items) >= self.max_items:
+            self._send()
+
+    def tick(self, now):
+        if self.items and now - self.first_at >= self.max_wait:
+            self._send()
+
+    def _send(self):
+        batch, self.items = self.items, []
+        self.flush(batch)
+
+
+class Breaker:
+    """Opens after threshold consecutive failures; after cooldown lets one probe through."""
+    def __init__(self, threshold, cooldown):
+        self.threshold, self.cooldown = threshold, cooldown
+        self.failures, self.opened_at, self.probing = 0, None, False
+
+    def allow(self, now):
+        if self.opened_at is None:
+            return True
+        if not self.probing and now - self.opened_at >= self.cooldown:
+            self.probing = True
+            return True
+        return False
+
+    def record(self, ok, now):
+        if ok:
+            self.failures, self.opened_at, self.probing = 0, None, False
+            return
+        self.failures += 1
+        if self.probing or self.failures >= self.threshold:
+            self.opened_at, self.probing = now, False
+
+
+def pick(pool, now):
+    """pool: (name, breaker) pairs in preference order."""
+    for name, breaker in pool:
+        if breaker.allow(now):
+            return name
+    return None
+`;
+
+export const poolTests = String.raw`sent = []
+mb = MicroBatcher(sent.append, max_items=3, max_wait=50)
+mb.add("a", now=0); mb.add("b", now=10); mb.add("c", now=20)
+assert sent == [["a", "b", "c"]], "a full batch goes at once"
+mb.add("d", now=30); mb.tick(now=70)
+assert len(sent) == 1, "40 ms after the first item: keep waiting"
+mb.tick(now=80)
+assert sent[-1] == ["d"], "50 ms after the first item: send what is there"
+br = Breaker(threshold=3, cooldown=30)
+for t in (0, 1, 2):
+    br.record(False, t)
+assert not br.allow(10), "open: fail fast during the cooldown"
+assert br.allow(32) and not br.allow(33), "half-open: exactly one probe"
+br.record(False, 34)
+assert not br.allow(60), "a failed probe reopens for a full cooldown"
+assert br.allow(64)
+br.record(True, 65)
+assert br.allow(66) and br.allow(67), "a successful probe closes it"
+pool = [("primary", Breaker(2, 30)), ("fallback", Breaker(2, 30))]
+pool[0][1].record(False, 0); pool[0][1].record(False, 1)
+assert pick(pool, 5) == "fallback" and pick(pool, 31) == "primary", "fail over while open; probe the primary after the cooldown"
+`;
+
+## Five patterns, each small enough for one round
+
+When a coding round puts a model API in the loop, the model is the least interesting part. What is tested is the client: which failures it retries, how much it sends at once, how it reads a stream, how it groups work, and what it does when a provider is sick. Two candidate reports show the range. Perplexity's technical screen in August 2025, reported on PracHub and filed there as ML system design, asked for the design of a client library that routes across several LLM providers with per-provider rate limits, health checks, circuit breakers with half-open probes, and fallback. Anthropic's screen in September 2025, also via PracHub, was a crawler that ended on "now make it multithreaded".
+
+This lesson writes each pattern once against the Claude API's documented behaviour, checked on 28 October 2026, with the OpenAI Python SDK where it differs. Two of the patterns have full problems in this module: [rnd-006](/problems/rnd-006) parses a stream with awkward chunk boundaries, and [rnd-008](/problems/rnd-008) runs a model call over thousands of documents with a resumable checkpoint.
+
+## Classify before you retry
+
+A retry policy is a function from a failed response to an action, and most bugs are a missing branch. The Claude error reference gives enough to write the function:
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Response</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td>429 with <code>retry-after</code></td><td>wait exactly that long, then retry</td></tr>
+<tr><td>429 with <code>error.details.error_code</code> = <code>enforced_spend_limit_reached</code></td><td>stop: the monthly spend cap was reached, there is no <code>retry-after</code>, and retries fail until access resumes</td></tr>
+<tr><td>500, 529, connection error</td><td>retry with backoff and jitter</td></tr>
+<tr><td>504 <code>timeout_error</code></td><td>the request ran too long: move it to streaming or a batch rather than resend it</td></tr>
+<tr><td>413 <code>request_too_large</code></td><td>shrink or split; the same bytes fail again (32 MB for Messages)</td></tr>
+<tr><td>400, 401, 402, 403, 404</td><td>stop; this includes a spend limit you set yourself, which returns 400</td></tr>
+<tr><td>409 <code>conflict_error</code></td><td>resolve the conflict first; a blind retry repeats it</td></tr>
+</tbody>
+</table>
+</div>
+
+Both official Python SDKs already retry. The Anthropic SDK retries connection errors, rate limits and 5xx twice by default, with exponential backoff that honours `retry-after`. The OpenAI SDK retries connection errors, 408, 409, 429 and 5xx twice by default, and does not retry the consumption of a stream, because replaying a request could duplicate output the application already received. A hand-written retry loop around either is therefore a second layer, and its attempts multiply with the SDK's: three attempts around an SDK that makes three is nine requests per call. Pick one layer: set `max_retries=0` and own the policy, or keep the SDK's and add only what it lacks, such as the spend-cap stop.
+
+The cell's `classify` retries everything at 429 and above and ignores `retry-after`, a policy that passes a happy-path test and little else. Fix it so the tests pass; `call_with_retry` takes `sleep` and `rng` as arguments so no test waits.
+
+<CodeRunner id="lesson-rounds-client-classify" title="Classify, then retry" starter={retryStarter} tests={retryTests} solution={retrySolution} gradable={false} />
+
+## Bound concurrency by the token limit, not the thread count
+
+The Claude API rate-limits with a token bucket that refills continuously, along three dimensions per model: requests, input tokens and output tokens per minute. Four documented details change how a client should bound itself:
+
+- On most models only uncached input counts toward ITPM; cache reads do not.
+- ITPM is estimated when the request starts and corrected as it runs, so a client-side budget should reserve its estimate up front too.
+- `max_tokens` does not count toward OTPM; only generated tokens do.
+- Limits may be enforced over shorter intervals: 60 RPM can mean one request per second, so a burst that fits the minute can still draw a 429.
+
+The concurrency a client needs follows from the limit and the latency, not from a guess about threads.
+
+<Predict id="rounds-client-inflight" question="How many requests in flight saturate the input-token limit?" answer={100} tolerance={1}>
+<Fragment slot="prompt">
+<p>Claude Opus 5.5 on the Start tier allows 1,000 RPM, 2,000,000 ITPM and 400,000 OTPM (rate-limits page, checked 28 October 2026). Scenario inputs: each request sends 10,000 uncached input tokens, generates 1,500 output tokens, and takes 30 seconds end to end.</p>
+</Fragment>
+<p>Input tokens allow 2,000,000 / 10,000 = 200 requests a minute. Output allows 400,000 / 1,500, about 267, and requests allow 1,000, so input binds. At 200 a minute, which is 3.33 a second, and 30 seconds each, the client holds 3.33 × 30 = <b>100</b> requests in flight. A semaphore of 100 with a token budget in front of it matches the limit; a pool of 500 workers only converts the surplus into 429s, and the short-interval enforcement means even 100 should ramp up rather than start at once.</p>
+</Predict>
+
+The code is a semaphore around the call plus a reservation against an input-token budget that refills over time; the Anthropic crawler report's "thread pool" is the same bound in a different runtime. The bound does not stay put: when prompt caching lifts the effective input limit, the binding constraint moves to output tokens or requests, and the bound has to be recomputed from whichever dimension now binds.
+
+## Parse the stream as events
+
+A Claude stream is a sequence of server-sent events in a documented order: `message_start`; then for each content block a `content_block_start`, its deltas and a `content_block_stop`; then one or more `message_delta` events; then `message_stop`. `ping` events can appear anywhere. Four rules follow from the docs, and each is a test in rnd-006:
+
+1. Tool arguments arrive as `input_json_delta` fragments in `partial_json`. They are not valid JSON one at a time; accumulate per block index and parse at `content_block_stop`.
+2. The usage counts in `message_delta` are cumulative. Summing them over-counts output tokens.
+3. An `error` event, such as `overloaded_error`, can arrive after the HTTP status was 200. The status code check has already passed by then, so the stream loop needs its own error path.
+4. New event types may be added. Ignore unknown types instead of raising.
+
+Recovery is where the version matters. The streaming docs describe capturing the partial response and continuing; for Claude 4.6 and later the continuation is a new user message that contains the partial text and asks the model to continue, rather than a prefilled assistant turn. Text can be resumed this way. Tool-use and thinking blocks cannot be partially recovered, so a stream that dies inside a tool call is re-requested from the start of that turn.
+
+## Batch inside a window, or hand the batch to the provider
+
+Two different things are called batching. A **micro-batcher** groups items that arrive close together into one call: an embedding request for 64 texts, or one classification prompt over 20 short items. It flushes when it holds `max_items` or when the oldest item has waited `max_wait`, so the latency it adds is bounded by `max_wait`. The bug is a batcher that only flushes on size and holds the last item of a quiet period indefinitely.
+
+A **provider batch** is an asynchronous job. The Message Batches API charges 50 percent of standard prices, takes up to 100,000 requests or 256 MB per batch, finishes most batches within an hour, and expires work not done within 24 hours. Results come back in any order and are matched by `custom_id`, and errored, canceled or expired requests are not billed. It is the right tool when the deadline is hours away, and the wrong one when it is minutes: "most within an hour" is a description, not a promise.
+
+## Keep the provider pool honest
+
+The Perplexity question asks for the design of the whole library. Its core is a circuit breaker per provider: after a threshold of consecutive failures the breaker opens and calls fail fast; after a cooldown exactly one probe goes through; a success closes the breaker, and a failure reopens it for another full cooldown. The pool tries providers in preference order and takes the first whose breaker allows a call. That is passive health checking, driven by real traffic. Active checks, a cheap request on a timer, find a recovered provider when no traffic is going to it, and they cost requests against the same rate limit.
+
+Failover has a cost that is specific to model APIs. On the Claude API, cache reads do not count toward ITPM on most models; the rate-limits page's example has a 2,000,000 ITPM limit admitting 10,000,000 input tokens a minute at an 80 percent cache hit rate. A fallback provider starts with a cold cache, so the same traffic arrives there as uncached input, five times what the primary counted in that example. A fallback sized from the primary's counted tokens will hit its own limit within minutes of a failover. The other cost is behavioural: a different model answers differently, so the prompt and any output parser have to be tested against the fallback before the day it is needed.
+
+The cell runs a micro-batcher, a breaker and the pool's selection with an injected clock in milliseconds. Try one break: remove `self.probing = True` from `allow`, and the half-open test fails because every caller after the cooldown is let through at once.
+
+<CodeRunner id="lesson-rounds-client-pool" title="Micro-batcher, breaker and pool selection" starter={poolCode} tests={poolTests} gradable={false} />
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+"Every night we classify 400,000 documents with Claude Opus 5.5; the organisation is on the Scale tier. The job can start at 22:00 and the results must be ready by 08:00. Each document is about 4,000 input tokens, none cached, and 500 output tokens. Finance wants the batch discount on all of it; the product owner wants 08:00 guaranteed. Design the client."
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Submit everything as batches at 22:00 and keep the synchronous path as the guarantee. On the Scale tier, input tokens bind the synchronous path at 10,000,000 / 4,000 = 2,500 documents a minute, so all 400,000 take 160 minutes. The rule for the night: work still unfinished in batches must stay below what the synchronous path can do before 08:00, with a margin. When it would cross, cancel the batches, whose requests not yet sent to the model are not billed, and run those synchronously.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Limits first, from the Scale tier row for Opus 5.5. Output allows 2,000,000 / 500 = 4,000 documents a minute and requests allow 10,000, so input binds at 2,500 a minute. The batch queue allows 500,000 requests in processing, so four batches of 100,000 can all be submitted at 22:00. Batches have their own limits, separate from the Messages API's, so the synchronous path keeps its full capacity in reserve.</p>
+<p>The cut-over: the latest moment the synchronous path can still finish everything is 08:00 minus 160 minutes, 05:20. I would not plan to the minute; with a margin of 2× the cut-over is 02:40. Every few minutes the job compares unfinished batch work with 2,500 × minutes left before 08:00, halved for the margin. Most nights, if batches finish "within 1 hour" as the docs say most do, the cut-over never fires and finance gets the discount on everything.</p>
+<p>What I give up: on a slow night the discount is lost on whatever the cut-over takes, and the 2× margin is a guess until a month of completion times replaces it. The failure mode is the synchronous rate itself: daytime traffic still running at 22:00 draws on the same organisation limits, so the 2,500 a minute is read from the rate-limit response headers each night, not assumed, and the cut-over time moves with it.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>A prompt change puts 3,000 of the 4,000 input tokens in a cached prefix. Redo the synchronous rate. Which limit binds now, and how far does the cut-over move?</li>
+<li>Finance asks you to drop the margin to squeeze out more discount. What would you need to see over a month of batch completion times to agree, and who signs off on a missed 08:00?</li>
+<li>The model is retired in sixty days and the replacement classifies 12 of your 40 test categories worse. Which ships first, the client or the migration, and who decides?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Every number above is the Claude or OpenAI documentation as read on 28 October 2026. Tiers, model names, SDK defaults and the continuation rule for interrupted streams change; the streaming page already documents two continuation rules, one for Claude 4.5 and earlier and one for 4.6 and later. Other providers count limits differently: the rate-limits page notes that many use one combined tokens-per-minute limit, and even on Claude, Haiku 3.5 counts cache reads toward ITPM; the classifier and the token budget have to be rewritten per provider, which is an argument for keeping them behind one interface.
+
+The cells are single-threaded with injected clocks because the browser cannot block. A production client is asynchronous, and the hard parts move: cancellation that releases its semaphore slot and its token reservation, a breaker whose state is shared by every worker, and a micro-batcher whose flush races with its own timer.
+
+Not every model-API round is about the client. Rounds that hand over an agent loop or a retrieval pipeline test other things, and the patterns here are the floor of those rounds rather than their subject. And where an SDK already implements a pattern correctly, the better production choice is often to configure it rather than rewrite it, which a round that asks you to write it from scratch will not show.
+
+<SelfRate id="lesson:rounds/llm-app-coding/model-client-patterns" />

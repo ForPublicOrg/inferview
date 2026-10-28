@@ -1,0 +1,117 @@
+---
+title: Expert parallelism and all-to-all
+track: training
+module: moe
+order: 2
+kind: lesson
+level: staff
+minutes: 14
+summary: Expert parallelism places experts on different GPUs and moves tokens to them and back with two all-to-all exchanges per MoE layer, and this lesson computes when that traffic costs as much as the expert compute it enables and how DeepSeek-V3 and Kimi K2 placed experts to bound it.
+prerequisites: [training/moe/routing-balance]
+updated: 2026-10-28
+sources:
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: 61 layers, hidden 7168, first 3 layers dense, 1 shared and 256 routed experts with intermediate dimension 2048, 8 routed active; at most 4 nodes per token; 2048 H800 GPUs, 8 per node on NVLink, nodes on InfiniBand; PP16, EP64 over 8 nodes, ZeRO-1 DP, no TP; NVLink 160 GB/s, about 3.2 times IB at 50 GB/s; 3.2 experts per node on average, up to 13 experts at the same communication cost; IB to the same in-node index then NVLink forward; 20 of 132 SMs for communication; computation-to-communication ratio of about 1:1 for cross-node EP; DualPipe overlap; FP8 dispatch, BF16 combine; prefill unit 4 nodes / 32 GPUs with EP32, 32 redundant experts, re-chosen every 10 minutes, 8 original plus 1 redundant per GPU; decode unit 40 nodes / 320 GPUs with EP320, one expert per GPU, 64 GPUs for redundant and shared experts; asks hardware vendors to offload communication from SMs. Checked 2026-10-28.
+  - title: Moonshot AI, Kimi K2 technical report (arXiv 2507.20534)
+    url: https://arxiv.org/html/2507.20534
+    note: PP16 with virtual stages, EP16 chosen as the smallest feasible, ZeRO-1 DP; about 30 GB per GPU for all states; parameters and gradient buffers about 6 TB across a 256-GPU model-parallel group; EP all-to-all overlapped with computation under interleaved 1F1B with more warm-up micro-batches; DualPipe not used because of its memory cost. Checked 2026-10-28.
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: EP is combined with DP because EP only affects MoE layers and does not shard input tokens, so EP alone would repeat the non-MoE computation; all-to-all routes tokens to experts and gathers the results back; DeepSeek-V3 node limit of 4. Checked 2026-10-28.
+  - title: Austin et al., How to Scale Your Model, Part 4 Transformers (JAX scaling book)
+    url: https://jax-ml.github.io/scaling-book/transformers/
+    note: an MoE adds primarily two AllToAlls, one before and one after the MoE block; only when tokens are sharded along the same axis as the experts. Checked 2026-10-28.
+  - title: Austin et al., How to Scale Your Model, GPUs chapter (JAX scaling book)
+    url: https://jax-ml.github.io/scaling-book/gpus/
+    note: H100 9.9e14 bf16 FLOP/s dense, about 3.35 TB/s HBM; one 400 Gbps NIC per GPU, 50 GB/s; cross-node all-to-all effectively has 50 GB/s per GPU rather than 400 GB/s per node; H800 NVLink 300 GB/s versus 450 GB/s on H100. Checked 2026-10-28.
+  - title: PracHub, Explain mixture of experts and expert parallelism (posted 2026-09-01)
+    url: https://prachub.com/interview-questions/explain-mixture-of-experts-and-expert-parallelism
+    note: candidate report naming Mistral AI, software engineer technical screen; asks to trace tokens through routing, expert compute and recombination and when communication cancels the compute saving. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The exchange
+
+Expert parallelism (EP) gives each GPU in a group a slice of the experts of every MoE layer. Tokens live on the GPU that ran their attention; the router picks experts that mostly live elsewhere. So each MoE layer does a shuffle: dispatch every token's hidden state to the GPUs that hold its chosen experts, run the experts on whatever arrived, and combine the outputs back on the token's home GPU, weighted by the gates. Both moves are all-to-all exchanges with ragged sizes, set by routing decisions made a few microseconds earlier. The JAX scaling book counts them as the two new collectives an MoE adds over a dense model, one before and one after the block; the backward pass of an all-to-all is another all-to-all, so a training step pays four per MoE layer.
+
+It is a distributed shuffle in the MapReduce sense, with one difference that drives every design choice below: it sits on the critical path of every layer, many times per step, instead of once per job. A shuffle you cannot hide is paid as step time.
+
+EP is not a replacement for data parallelism. The Ultra-Scale Playbook points out that EP shards experts but not tokens, so a pure-EP group would run the same attention and dense layers on every GPU. In practice EP groups sit inside a data-parallel layout: each GPU brings its own tokens, and the EP group shares the experts.
+
+## Where the bytes go: DeepSeek-V3
+
+DeepSeek-V3's MoE layers have hidden size 7168, 256 routed experts plus 1 shared, each with an intermediate size of 2048, and 8 routed experts active per token. It trained on 2048 H800 GPUs, 8 per node on NVLink and nodes connected by InfiniBand, with 16-way pipeline parallelism, 64-way expert parallelism spanning 8 nodes, and ZeRO-1 data parallelism, without tensor parallelism. The report gives NVLink at 160 GB/s, about 3.2 times InfiniBand at 50 GB/s per GPU.
+
+The design move is node-limited routing: each token may reach experts on at most 4 nodes. Dispatch crosses InfiniBand once per target node, to the GPU with the same in-node index, which forwards over NVLink to the GPUs that hold the experts. A token that picks two experts on the same remote node pays one InfiniBand copy. The report says a token selects 3.2 experts per node on average, so the same InfiniBand traffic could serve up to 13 experts. Dispatch is sent in FP8; the combine stays in BF16 to protect precision.
+
+<Predict id="trn-moe-ib-bytes" question="With at most 4 target nodes and FP8 dispatch of a 7168-wide hidden state (one byte per element, ignoring scale factors), what is the most InfiniBand traffic one token's dispatch sends for one MoE layer, in bytes?" answer={28672} tolerance={0} unit="bytes">
+<p>4 x 7,168 x 1 = <b>28,672 bytes</b>. Without the node limit, 8 experts on 8 different nodes would cost 57,344 bytes, so the limit halves the worst case. If the combine returns one BF16 copy per node, it adds 4 x 7,168 x 2 = 57,344 bytes, for 86,016 bytes per token per MoE layer in the forward pass.</p>
+</Predict>
+
+Now compare that with the work it buys. Assume each expert is a gated FFN with three 7168 x 2048 matrices; the report gives the dimensions, not the count of matrices. One expert is then 3 x 7,168 x 2,048 = 44,040,192 parameters. As a check, 256 of them in each of the 58 MoE layers is 653.9B parameters, inside the reported 671B total; with two matrices per expert the experts would come to 435.9B, leaving an implausible 235B for everything else. The 8 routed experts cost 2 x 8 x 44,040,192 = 704,643,072 FLOPs per token in the forward pass.
+
+<Predict id="trn-moe-flops-per-byte" question="Using 704,643,072 forward FLOPs per token for the routed experts and 86,016 InfiniBand bytes per token (dispatch plus combine), how many FLOPs does the layer do per byte it sends across nodes?" answer={8192} tolerance={50} unit="FLOPs per byte">
+<p>704,643,072 / 86,016 = <b>8,192</b>. The scaling book's H100 figures give a GPU that can do 9.9e14 bf16 FLOP/s against a 50 GB/s NIC, 19,800 FLOPs per byte; the H800 has the same NIC class, and we assume H100-class compute for it. At peak FLOP/s, the exchange would take about 19,800 / 8,192 = 2.4 times as long as the expert math. At the utilisation a real run achieves, and with tokens reaching fewer than 4 nodes on average, the two land in the same range, which matches the report's statement that cross-node EP gives a computation-to-communication ratio of about 1:1.</p>
+</Predict>
+
+That ratio is the whole lesson. Sparsity cuts FLOPs per token, but it does not cut bytes per token: each token still ships its full hidden state to every node it visits. Make experts smaller (finer-grained) or activate fewer, and FLOPs per byte fall further. That is when communication cancels the saving: when the all-to-all can no longer be overlapped with something else, the step waits on the network, and the MoE trains at the speed of its interconnect.
+
+## What DeepSeek-V3 spent to hide it
+
+DeepSeek-V3's answer was to stop treating communication as a separate phase. DualPipe schedules the forward chunk of one micro-batch against the backward chunk of another, so the all-to-all of one overlaps the computation of the other; the report says all-to-all and pipeline communication can be fully hidden. The custom kernels use 20 of the H800's 132 SMs for communication, about 15% of the streaming multiprocessors, and the report asks hardware vendors for a communication co-processor so that share can go back to compute. Those are three costs the paper accepts for a 1:1 ratio: a custom pipeline schedule, custom communication kernels, and permanently reserved compute.
+
+The parameter layout follows from EP64. Each GPU holds 256 / 64 = 4 routed experts per layer, 176M expert parameters per layer. With PP16 over 61 layers, a stage has about 4 layers. An in-node EP8 would put 32 experts and 1.41B expert parameters per layer on each GPU, eight times as much, which is why the largest models spread experts across nodes and then fight the InfiniBand bill.
+
+## The other choice: Kimi K2
+
+Kimi K2 has 384 experts per layer with the same 7168 and 2048 dimensions, and trained with PP16, EP16 and ZeRO-1 data parallelism. The report calls EP16 the smallest feasible EP size. A 16-way group spans 2 nodes, so far less of the exchange crosses InfiniBand than with EP64 over 8 nodes, and each GPU holds 384 / 16 = 24 experts per layer. Parameters and gradient buffers come to about 6 TB across the 256-GPU model-parallel group (16 pipeline stages x 16 expert ranks), which is 6 TB / 256 = 23.4 GB per GPU, and the report gives about 30 GB per GPU for all states. Instead of DualPipe, which it rejected for its memory cost, K2 overlaps the EP all-to-all with computation under the standard interleaved 1F1B schedule by adding warm-up micro-batches.
+
+The two reports are a matched pair on the placement decision. DeepSeek spread experts wide to keep per-GPU memory low and paid with node-limited routing, a custom schedule and reserved SMs. Moonshot kept EP as small as memory allowed and paid with more parameters per GPU, a recomputation plan, and storing some activations in FP8.
+
+## The same decision at serving time
+
+Serving changes the balance. DeepSeek-V3's prefill unit is 4 nodes with 32 GPUs, EP32: each GPU hosts its 8 original experts plus 1 redundant copy of a hot expert, 32 redundant experts in all, re-chosen from online load statistics every 10 minutes. The decode unit is 40 nodes with 320 GPUs, EP320: one expert per GPU, with 64 GPUs hosting redundant and shared experts. Decode moves few tokens per step, so it trades per-GPU compute for latency and puts each expert's weights on its own GPU. Training balance does not carry over to serving traffic, and the redundant copies are the controller for that.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"We are training a 128-expert, top-8 MoE on 32 nodes of 8 GPUs with one 50 GB/s NIC per GPU. EP8 inside a node fits only if we recompute most activations, which costs us about a fifth of throughput by our profile; EP32 across four nodes fits comfortably. The run must start in three weeks and the budget is fixed. Which do you pick, and what would make you change your mind after the first day?"**
+</Callout>
+
+<p class="tiny">The cluster, the model and the recomputation cost are a scenario.</p>
+
+<Depth>
+<Fragment slot="short">
+<p>Measure the exchange before choosing: compute FLOPs per cross-node byte for this expert size and top-k and compare it with the GPU's FLOPs per NIC byte. If the ratio says communication would exceed compute and there is no overlap schedule ready in three weeks, take EP8 and pay the recomputation. If an overlap schedule exists, take EP32 with a node limit on routing. Either way, log exposed all-to-all time per step on day one.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The conflict is memory against network, with a deadline that rules out building DualPipe-style scheduling from scratch. EP8 keeps the all-to-all on NVLink, where the only cost is the recomputation the profile measured. EP32 sends most of each token's dispatch over InfiniBand, so its cost depends on how much of that time can be overlapped, which the team may not know yet.</p>
+<p>Compute the ratio for this model, as for DeepSeek-V3: forward FLOPs per token for the routed experts divided by the cross-node bytes per token. If the result is well below the GPU's FLOPs per NIC byte, exposed communication will exceed the expert compute, and the recomputation tax is the cheaper of the two. If it is near or above, EP32 with interleaved 1F1B overlap, as Kimi K2 did, is the better bet.</p>
+<p>Add a routing node limit for EP32 regardless: it caps the worst-case cross-node copies per token without changing the expert count.</p>
+<p>What you give up: EP8 gives up a fifth of throughput for certainty. EP32 gives up predictability: imbalance makes the all-to-all ragged and the slowest rank sets the step, so a routing skew that EP8 would absorb on NVLink becomes a network stall.</p>
+<p>The written artefact is a one-page decision note with the computed ratio, the day-one metric (exposed all-to-all milliseconds per step and its share of step time) and the threshold at which you switch layouts at the first checkpoint.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Day one shows exposed all-to-all at 30% of step time on EP32, and a switch to EP8 costs a restart from the last checkpoint. What else could you change first, and in what order?</li>
+<li>The modelling lead wants top-8 of 256 smaller experts instead of top-8 of 128 at the same FLOPs. What happens to FLOPs per cross-node byte, and do you agree?</li>
+<li>What would you need to see in the first week to reverse the EP8 decision mid-run, given that a layout change means resharding optimizer state?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The per-token byte count assumes dense hidden states on the wire. Quantising dispatch (FP8, as DeepSeek-V3 does) or deduplicating per node changes the numerator by a constant factor, so recompute the ratio for your kernels rather than reusing 8,192.
+
+Average ratios hide the tail. An all-to-all finishes when the most loaded receiver finishes, so routing imbalance of 1.5 times the mean on one rank stretches the exchange by roughly that factor even when the average is fine. That ties expert placement back to load balancing: redundant copies and node limits are both answers to the tail, not the mean.
+
+The overlap argument assumes there is something to overlap with. With small micro-batches or short pipelines there is not enough independent work in flight, and the all-to-all is exposed no matter how good the schedule is.
+
+Finally, the H800 numbers are specific to a part with reduced NVLink bandwidth, 300 GB/s against 450 GB/s on the H100 per the scaling book. On systems with much larger scale-up domains, EP can stay inside the fast fabric at sizes that needed InfiniBand here, and the placement trade-off shifts toward wide EP.
+
+<SelfRate id="lesson:training/moe/expert-parallelism" />

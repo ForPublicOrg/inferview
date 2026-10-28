@@ -1,0 +1,170 @@
+---
+title: Mixed precision without folklore
+track: training
+module: numerics
+order: 1
+kind: lesson
+level: senior
+minutes: 13
+summary: Which tensors stay in FP32 when a model trains in BF16 or FP16, derived from the bit layouts rather than from habit, and where FSDP2 exposes each choice.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Micikevicius et al., Mixed Precision Training (ICLR 2018, arXiv 1710.03740)
+    url: https://arxiv.org/abs/1710.03740
+    note: "FP16 weights, activations and gradients with two safeguards named in the abstract: an FP32 master copy of the weights that accumulates the updates, and loss scaling; nearly 2x memory reduction; models above 100 million parameters. Checked 2026-10-28."
+  - title: Hugging Face, The Ultra-Scale Playbook, mixed precision training
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "Bit layouts (FP32 1/8/23, FP16 1/5/10, BF16 1/8/7, E4M3 1/4/3, E5M2 1/5/2); the three FP16 tricks (FP32 weight copy, loss scaling, FP32 accumulation of sums and averages); mixed-precision memory of 2 + 2 + 4 + 4 + 4 = 16 bytes per parameter with Adam, 20 with an FP32 gradient accumulation buffer; 7B at 112 GB and 140 GB; mixed precision does not by itself save memory; Nanotron keeps FP32 gradients because BF16 is lossy for smaller values. Checked 2026-10-28."
+  - title: PyTorch 2.14, torch.distributed.fsdp.fully_shard (MixedPrecisionPolicy)
+    url: https://docs.pytorch.org/docs/2.14/distributed.fsdp.fully_shard.html
+    note: "MixedPrecisionPolicy(param_dtype=None, reduce_dtype=None, output_dtype=None, cast_forward_inputs=True); param_dtype sets the unsharded parameter used for compute and all-gather while the optimizer step uses the sharded parameter in its original dtype; reduce_dtype None with param_dtype set means gradients are reduced in the compute dtype; reduce_dtype float32 runs the reduction in full precision; with gradient sync disabled, gradients accumulate in reduce_dtype. Checked 2026-10-28."
+  - title: PyTorch 2.14, Automatic Mixed Precision package (torch.amp)
+    url: https://docs.pytorch.org/docs/2.14/amp.html
+    note: "CUDA ops that autocast to float16 are matmul, linear, conv and RNN cells; ops that autocast to float32 include softmax, log_softmax, cross_entropy, nll_loss, layer_norm, group_norm, norm, sum, cumsum, prod, exp, log, pow and rsqrt; GradScaler defaults init_scale 65536, growth_factor 2, backoff_factor 0.5, growth_interval 2000; gradient scaling exists because small FP16 gradients underflow to zero; BF16-pretrained models may not fit FP16's range (max 65504) and their gradients may overflow. Checked 2026-10-28."
+  - title: PyTorch 2.14, AMP examples
+    url: https://docs.pytorch.org/docs/2.14/notes/amp_examples.html
+    note: "scaler.step unscales the gradients and skips optimizer.step if they contain infs or NaNs; with gradient accumulation the scale stays constant and the inf check happens per effective batch. Checked 2026-10-28."
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: "AdamW first and second moments tracked in BF16; master weights and gradients kept in FP32; FP8 framework validated on about 1 trillion tokens. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+A mixed-precision run makes one decision per tensor class: the weights used for compute, the weights the optimizer updates, gradients as they are reduced across ranks and accumulated across micro-batches, optimizer moments, activations, and the outputs of a handful of numerically sensitive ops. The common recipe keeps the optimizer's copy of the weights, the gradient reduction and the sensitive ops in FP32 and runs the matrix multiplies in BF16. Each of those choices follows from two numbers per format, the exponent width and the mantissa width, and each one costs bytes that someone will ask you to give back.
+
+## Two numbers per format
+
+The bit layouts, from the Ultra-Scale Playbook:
+
+| Format | Sign | Exponent | Mantissa |
+|---|---|---|---|
+| FP32 | 1 | 8 | 23 |
+| FP16 | 1 | 5 | 10 |
+| BF16 | 1 | 8 | 7 |
+
+The exponent sets the range. FP16 has a 5-bit exponent with bias 15, so its largest finite value is (2 − 2^−10) × 2^15 = 65,504, its smallest normal value is 2^−14 ≈ 6.1 × 10^−5, and its smallest subnormal is 2^−24 ≈ 6.0 × 10^−8. BF16 keeps FP32's 8-bit exponent, so its largest value is (2 − 2^−7) × 2^127 ≈ 3.4 × 10^38, the same order as FP32.
+
+The mantissa sets the spacing. Between 1 and 2, FP32 values are 2^−23 apart, FP16 values 2^−10 ≈ 0.001 apart and BF16 values 2^−7 ≈ 0.0078 apart. The relative spacing is the same at every magnitude, so BF16 carries between two and three significant decimal digits.
+
+The two 16-bit formats therefore fail in opposite directions. FP16 runs out of range and keeps precision; BF16 keeps range and runs out of precision. Almost every rule in a mixed-precision recipe routes around one of those two failures.
+
+## FP16 needed loss scaling
+
+Gradients of a deep network are small, and many sit below 6 × 10^−8 or in the subnormal band above 2^−24 where precision thins out. In FP16 the smallest flush to zero and the update for the corresponding parameters is lost; the PyTorch AMP documentation gives that as the reason gradient scaling exists. The 2017 mixed-precision paper's fix is to multiply the loss by a constant before the backward pass, which multiplies every gradient by the same constant, and to divide it out before the optimizer step.
+
+The constant has to be large enough to lift small gradients above the floor and small enough that the largest gradient stays under 65,504. A gradient of 10^−9 underflows in FP16; scaled by 65,536 it becomes 6.6 × 10^−5, a normal FP16 value. A gradient of 1.0 scaled by the same factor is 65,536, above 65,504, and overflows to inf. One scale has to serve both, so it moves.
+
+PyTorch's `GradScaler` starts at 65,536 (2^16, the default `init_scale`) with a `growth_factor` of 2, a `backoff_factor` of 0.5 and a `growth_interval` of 2,000 steps. When the unscaled gradients contain an inf or a NaN, `scaler.step` skips the optimizer step. The scale is a control loop, and a run that skips many steps has trained on fewer batches than its step counter says, which is the first thing to check when an FP16 run's loss curve lags a BF16 run's at equal step counts.
+
+## BF16 does not, and pays in precision instead
+
+BF16 underflows only where FP32 does, so any gradient FP32 represents, BF16 represents too, with fewer significant bits. The AMP documentation describes `GradScaler` for FP16, and BF16 runs drop it. The cost moves to precision, and it shows up in two places: weight updates and sums.
+
+<Predict id="trn-num-mp-ulp" question="A weight stored in BF16 has the value 1.0. What is the gap between 1.0 and the next larger BF16 number? Use the 7 mantissa bits from the table." answer={0.0078125} tolerance={0.0001} unit="">
+<p>With 7 stored mantissa bits, the values between 1 and 2 are 1 + k × 2^−7, so the gap is 2^−7 = <b>0.0078125</b>. Round to nearest means any update smaller than half the gap, about 0.0039, leaves the weight where it was. An optimizer step of 10^−4 is 1/39 of that half-gap: applied a thousand times directly to the BF16 weight, it never moves it. Just below 1.0 the gap halves to 2^−8, and the update is still too small by a factor of 19.</p>
+</Predict>
+
+## Master weights
+
+That is the case for the master copy. The optimizer holds the weights in FP32, applies each update there, where 10^−4 on 1.0 is far above FP32's 2^−23 spacing, and casts to BF16 for the next forward pass. A thousand updates of 10^−4 move the FP32 copy from 1.0 to 0.9, and its BF16 cast reads 0.8984, within one BF16 gap of the true value. The cast is lossy; the accumulation is not.
+
+The bytes, as the Ultra-Scale Playbook counts them for mixed precision with Adam: 2 for the BF16 parameters, 2 for BF16 gradients, 4 for the FP32 master copy, and 4 + 4 for Adam's two moments, 16 bytes per parameter. A 7B model holds 7 × 10^9 × 16 = 112 GB of weights, gradients and optimizer state before activations, and 140 GB if gradients are also accumulated in an FP32 buffer, the 20-byte variant. The playbook draws the consequence: plain FP32 training with Adam is 4 + 4 + 8 = 16 bytes too, so mixed precision does not save state memory. It saves activation memory and runs the matrix multiplies on faster units.
+
+DeepSeek-V3 shows how far the state can be cut by a team willing to validate the change: its report tracks Adam's first and second moments in BF16 and keeps master weights and gradients in FP32. The moments tolerate BF16 because they are running averages read through a square root and a division, where a relative error of 2^−8 perturbs the step size by about the same relative amount. The master weights do not, for the reason in the Predict above.
+
+## Sums
+
+The second precision failure is accumulation. A running sum in BF16 stops growing once the gap between representable values exceeds twice the term being added.
+
+<Predict id="trn-num-mp-sum" question="Add 1.0 to a BF16 accumulator a thousand times, rounding to nearest-even after every addition. What value does the accumulator end on?" answer={256} tolerance={0} unit="">
+<p>Between 256 and 512 the BF16 gap is 2^(8 − 7) = 2. At 256, adding 1 gives 257, exactly halfway between 256 and 258, and round-to-nearest-even returns 256, whose last mantissa bit is 0. The accumulator ends at <b>256</b>, 74% short of 1,000. In FP32 the same loop is exact.</p>
+</Predict>
+
+That arithmetic is why the third FP16-era rule, accumulate sums and averages in FP32 and cast the result, did not go away with BF16. A norm takes a mean of squares over the hidden dimension; softmax sums exponentials over a row; cross-entropy reduces over the vocabulary; data-parallel training sums gradients across ranks and micro-batches. PyTorch autocast encodes most of this as op lists: on CUDA, `linear`, `matmul` and the convolutions run in the low-precision dtype, while `softmax`, `log_softmax`, `cross_entropy`, `layer_norm`, `norm`, `sum`, `exp`, `log`, `pow` and `rsqrt` autocast to float32. Code that computes a norm or a loss from elementary tensor ops whose intermediates are stored in BF16 gets none of that protection: each intermediate is rounded to 8 significant bits before the next op reads it. The first debug problem in this module is built on that.
+
+## Where FSDP2 exposes the choices
+
+FSDP2's `fully_shard` takes a `MixedPrecisionPolicy` with four fields, and two of them are the decisions above.
+
+`param_dtype` is the dtype of the unsharded parameter, the one gathered across ranks and used in forward and backward. Set to `torch.bfloat16`, the all-gather moves half the bytes. The sharded parameter, the one the optimizer steps, stays in its original dtype, so a model built in FP32 keeps FP32 shards, and those shards are the master weights.
+
+`reduce_dtype` is the dtype of the gradient reduce-scatter or all-reduce, and its default is the trap. With `reduce_dtype=None` and `param_dtype` set, gradients are reduced in the compute dtype, BF16. Summing gradients across many ranks in BF16 is the accumulator above with ranks as the loop. Setting `reduce_dtype=torch.float32` doubles the reduce-scatter's bytes and removes that rounding; when gradient sync is disabled for accumulation, FSDP also accumulates in `reduce_dtype`.
+
+```python
+import torch
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+
+policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+for block in model.layers:
+    fully_shard(block, mp_policy=policy)
+fully_shard(model, mp_policy=policy)
+```
+
+The doubled reduce-scatter is a real cost on a bandwidth-bound step, and it is the cost to measure before accepting the BF16 default: if the step is compute-bound, FP32 reduction is close to free.
+
+## Seeing it without a GPU
+
+BF16 is the top 16 bits of an FP32 number, so its rounding can be simulated with the standard library. This is the function behind both Predict answers.
+
+```python
+import struct
+
+def bf16(x):
+    """Round a Python float to the nearest BF16 value, ties to even."""
+    bits = struct.unpack(">I", struct.pack(">f", x))[0]
+    bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
+    return struct.unpack(">f", struct.pack(">I", bits))[0]
+
+acc = 0.0
+for _ in range(1000):
+    acc = bf16(acc + 1.0)
+print(acc)            # 256.0
+
+w = 1.0
+for _ in range(1000):
+    w = bf16(w - 1e-4)
+print(w)              # 1.0, every update rounded away
+```
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"A 70B run starts on a fixed cluster in two weeks. The plan is 600 MB per GPU over the memory budget at the target micro-batch. Two proposals are on the table: store Adam's moments in BF16 as DeepSeek-V3 did, or reduce gradients in BF16 by leaving `reduce_dtype` unset. Which do you accept, and what do you need before launch?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>The moments, not the reduction. Moments are running averages read through a square root and a division, and DeepSeek-V3 ran BF16 moments at scale. A BF16 reduction is a sum across ranks, the case where BF16 loses most, and it frees communication buffers rather than resident state, so it may not close the gap at all. Before launch I compare the baseline and BF16 moments on a short proxy run against the noise between two seeds.</p>
+</Fragment>
+<Fragment slot="long">
+<p>First the bytes. The moments are 8 of the 16 bytes per parameter; BF16 moments save 4 bytes per parameter, divided by the sharding degree. For 70B sharded over 64 ranks that is 70 × 10^9 × 4 / 64 ≈ 4.4 GB per GPU, far more than the 600 MB needed. The BF16 reduction saves transient buffer space and halves reduce-scatter bytes; I would measure what it frees before arguing about its numerics.</p>
+<p>Then the risk. BF16 moments perturb each step size by a relative error near 2^−8. A BF16 reduce-scatter rounds at every partial sum, and the error grows with the number of ranks contributing to each shard, which changes whenever the cluster size changes.</p>
+<p>The alternatives with known costs: more activation recomputation (step time, which I measure per block), a smaller micro-batch with more accumulation (throughput), or a higher sharding degree (communication). I write down that BF16 moments were validated on DeepSeek-V3, not on this model, and set a rollback trigger: if the proxy run's loss leaves the seed-noise band, or the full run's gradient-norm spikes rise in the first few thousand steps, restart from the last checkpoint with FP32 moments and the recompute option.</p>
+<p>How this fails: a proxy run at 1% of the token budget can miss a slow divergence, and the parameters most affected, those with tiny second moments, are the ones a loss curve averages away.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The proxy run is 1% of the token budget, and DeepSeek-V3 validated its FP8 framework on about a trillion tokens. What would convince you, short of a full run?</li>
+<li>Finance offers a week's delay and a larger cluster instead of either change. What would make you take the delay?</li>
+<li>Two engineers disagree: one says the moments' rounding averages out, the other that it biases parameters with tiny gradients. Which measurement settles it without deciding by rank?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The recipe assumes values that fit FP32's exponent and need only BF16's significance for compute. Three cases break it.
+
+Models trained in BF16 and run in FP16. The PyTorch AMP documentation warns that most BF16-pretrained models may not fit FP16's range and that their gradients may overflow rather than underflow, so the loss scale can fall below 1. Fine-tuning such a model in FP16 is the FP16 problem again, from the other side.
+
+Updates that are small relative to the value they change. The master copy fixes this for the optimizer, but anything else that accumulates into a BF16 tensor across steps, such as an exponential moving average of the weights stored in BF16, has the same rounding problem and no master copy.
+
+Formats with fewer bits. FP8 has a 4-bit or 5-bit exponent and 2 or 3 mantissa bits, so both failure modes return at once, and per-block scale factors replace the single loss scale. The next lesson covers how DeepSeek-V3 handled that.
+
+<SelfRate id="lesson:training/numerics/mixed-precision" />

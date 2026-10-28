@@ -1,0 +1,192 @@
+---
+title: The five patterns as code, with their failure modes
+track: workflows
+module: patterns
+order: 2
+kind: lesson
+level: senior
+minutes: 15
+summary: Prompt chaining, routing, parallelisation, orchestrator-workers and evaluator-optimiser each fit in a few lines of code, and each has a failure mode and an end-to-end success, latency and cost you can compute before building it.
+prerequisites: [workflows/patterns/workflow-or-agent]
+updated: 2026-10-28
+sources:
+  - title: Anthropic, Building effective agents (19 December 2024)
+    url: https://www.anthropic.com/engineering/building-effective-agents
+    note: the five workflow patterns and their stated use conditions; programmatic gates in prompt chaining; sectioning and voting; orchestrator subtasks are not predefined; evaluator-optimiser fits when evaluation criteria are clear and refinement adds measurable value
+  - title: Anthropic, How we built our multi-agent research system (13 June 2025)
+    url: https://www.anthropic.com/engineering/multi-agent-research-system
+    note: Anthropic's own measurements; agents use about 4 times the tokens of chat and multi-agent systems about 15 times; Opus 4 lead with Sonnet 4 subagents beat single-agent Opus 4 by 90.2% on an internal research eval; token usage explained 80% of BrowseComp variance, three factors 95%; parallel tool calling cut research time by up to 90% for complex queries; early versions spawned 50 subagents for simple queries; effort-scaling rules; synchronous subagent batches; plan saved to memory because context is truncated beyond 200,000 tokens
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import WorkflowsPatternsSandbox from '../../../../components/widgets/WorkflowsPatternsSandbox.astro';
+
+## Five shapes of control flow
+
+Anthropic's December 2024 post names the workflow patterns most teams converge on: prompt chaining (each call reads the previous call's output), routing (a classifier picks a specialised path), parallelisation (independent sections at once, or the same task several times for a vote), orchestrator-workers (a model splits the task at run time and delegates the parts) and evaluator-optimiser (one call drafts, another critiques, in a loop). The first three have a control flow fixed in code. The last two hand part of it to the model: the orchestrator decides how many workers and what each does, and the evaluator decides when the loop ends.
+
+Each pattern changes three numbers you can compute before building it: the probability an item ends correct, its latency, and the model calls it takes. The post gives the fit conditions; this lesson adds the arithmetic and the first failure mode seen in production.
+
+## The patterns as code
+
+All five fit in a page against a deterministic mock; swap `model` for a real client and the control flow does not change. `NeedsHuman` is the terminal state every pattern needs and most first drafts leave out.
+
+```python
+import json
+from concurrent.futures import ThreadPoolExecutor
+
+class NeedsHuman(Exception):
+    pass
+
+def model(prompt: str) -> str:
+    # Deterministic stand-in for a model client, so each pattern can be tested.
+    if prompt.startswith("classify:"):
+        text = prompt.split(":", 1)[1]
+        return "refund" if "refund" in text else "billing" if "invoice" in text else "general"
+    if prompt.startswith("plan:"):
+        return json.dumps([{"task": f"check {s}"} for s in ("totals", "vendor", "tax", "totals")])
+    if prompt.startswith("critique:"):
+        return "PASS" if "v2" in prompt else "FAIL: tax line missing"
+    if prompt.startswith("draft"):
+        return "draft v2" if "FAIL" in prompt else "draft v1"
+    return f"[{prompt[:40]}]"
+
+def chain(doc, steps, gates, retries=1):
+    out = doc
+    for step, gate in zip(steps, gates):
+        for _ in range(retries + 1):
+            candidate = model(f"{step}: {out}")
+            if gate(candidate):
+                out = candidate
+                break
+        else:
+            raise NeedsHuman(step, candidate)
+    return out
+
+ROUTES = {"refund": "refund-policy", "billing": "billing", "general": "general"}
+
+def route(text):
+    label = model(f"classify:{text}")
+    if label not in ROUTES:  # the label is model output, so it is validated like input
+        raise NeedsHuman("route", label)
+    return model(f"{ROUTES[label]}: {text}")
+
+def vote(prompt, k=3):
+    with ThreadPoolExecutor(k) as pool:
+        answers = list(pool.map(model, [prompt] * k))
+    best = max(set(answers), key=answers.count)
+    if answers.count(best) <= k // 2:
+        raise NeedsHuman("vote", answers)
+    return best
+
+MAX_WORKERS = 8
+
+def orchestrate(job):
+    plan = json.loads(model(f"plan:{job}"))
+    if not isinstance(plan, list) or not 1 <= len(plan) <= MAX_WORKERS:
+        raise NeedsHuman("plan", plan)
+    tasks = list(dict.fromkeys(t["task"] for t in plan))  # the plan repeats work; drop duplicates
+    with ThreadPoolExecutor(len(tasks)) as pool:
+        results = list(pool.map(lambda t: model(f"{t} for {job}"), tasks))
+    return model("synthesise: " + " | ".join(results)), len(tasks)
+
+def evaluate_optimise(brief, max_rounds=3):
+    feedback = ""
+    for _ in range(max_rounds):
+        draft = model(f"draft {brief} {feedback}")
+        verdict = model(f"critique: {draft}")
+        if verdict == "PASS":
+            return draft
+        feedback = verdict
+    raise NeedsHuman("evaluator", draft)
+
+print(chain("invoice 1041", ["extract", "summarise"], [lambda s: s.startswith("["), lambda s: len(s) < 200]))
+print(route("please refund order 77"))
+print(orchestrate("invoice 1041"))  # 3 tasks run, not 4: the duplicate was dropped
+print(evaluate_optimise("credit note"))  # passes on round 2
+```
+
+The interesting lines are the ones that are not model calls: the gate in `chain`, the enum check in `route`, the majority threshold in `vote`, the size cap and deduplication in `orchestrate`, and the round cap in `evaluate_optimise`. Each pattern's failure mode lives in the line you would be tempted to leave out.
+
+## Prompt chaining: latency bought for a gate
+
+A chain of n calls with per-call success p ends correct with probability p to the power n, and its latency is the sum of the calls. Four steps at 0.95 give 0.95⁴ = 81.5%, which is worse than any single step. A chain is only better than one prompt when splitting buys something one prompt cannot have: a deterministic check between steps. Anthropic's description includes this ("programmatic checks", which it calls gates) and most chains in code review do not.
+
+With a gate that catches a bad step with probability g and one retry, a step ends correct with probability p + (1 − p)·g·p. At p = 0.95 and g = 0.9 that is 0.99275 per step, and four steps give 0.99275⁴ = 97.1%, at an expected 4.17 calls instead of 4. Without a gate, the split cost you latency and bought nothing measurable. With one, it bought most of the lost success for about 4% more calls.
+
+The failure mode in production is the gate that checks shape rather than content: a JSON schema check after an extraction step catches malformed output and passes a well-formed invoice total that is wrong. Gates worth their latency check something the model could get wrong in the domain: line items sum to the total, every cited page exists, the extracted vendor is in the vendor master.
+
+## Routing: the confusion matrix is the floor
+
+A router is a classifier in front of specialised prompts or models. The post's examples are sending general questions, refund requests and technical support to different processes, and sending easy questions to a small model and hard ones to a large one. The second is a cost decision with a quality risk: a hard question routed to the small model is a regression no prompt change on that branch can fix.
+
+End-to-end correctness is bounded by the router: an item routed to the wrong branch is wrong regardless of how good that branch is. With class shares and per-class routing accuracy, the system's ceiling is the weighted diagonal of the router's confusion matrix, and branch quality multiplies it.
+
+<Predict id="wfl-router-floor" question="Traffic is 60% billing, 30% refund and 10% technical. The router sends billing correctly 98% of the time, refunds 90% and technical 70%. Every branch answers 95% of correctly routed items correctly and every misrouted item wrongly. What share of all items ends correct, in percent?" answer={88.2} tolerance={0.2} unit="%">
+Correctly routed share: 0.6 × 0.98 + 0.3 × 0.90 + 0.1 × 0.70 = 0.588 + 0.270 + 0.070 = 0.928. Multiply by branch accuracy: 0.928 × 0.95 = 0.8816, so 88.2%. Raising every branch to 100% still caps the system at 92.8%. Of the 7.2 points lost to routing, refunds and technical lose 3 each, technical from a third as much traffic, so the cheapest gain is usually an "unsure" route to a general branch or a person for low-confidence technical items, not a better technical prompt.
+</Predict>
+
+The error that costs most is asymmetric. A refund request routed to general support delays a customer; a general question routed to the refund path can trigger a refund flow. Measure the confusion matrix per pair of classes, and put a gate on the branch that has effects.
+
+## Parallelisation: sectioning and voting
+
+Sectioning splits a task into independent parts that run at once: one call screens the input for policy violations while another answers it, or each eval criterion gets its own judge call. Latency becomes the maximum of the parts instead of their sum, which is the gain; the cost is the same number of calls plus an aggregation step. The failure mode is the tail: the slowest of k parallel calls sets the latency, so the p99 of a sectioned step is worse than the p99 of any one call, and it gets worse as k grows.
+
+Voting runs the same task k times and takes the majority. If errors were independent, three votes at p = 0.9 would end correct with probability 3·0.9²·0.1 + 0.9³ = 0.972, and five votes 0.991. Errors are not independent. Three samples from the same model with the same prompt tend to fail on the same hard inputs in the same way, so the measured gain is smaller than the binomial predicts, and on the inputs where the model is confidently wrong it is zero. The post's voting examples (several prompts reviewing code for vulnerabilities, vote thresholds trading false positives against false negatives) use different prompts, which is the cheap way to decorrelate. Measure agreement between voters on a labelled set before paying k times the calls.
+
+## Orchestrator-workers: the plan is untrusted output
+
+The orchestrator is a model call whose output is a plan: how many workers, and what each should do. The post's fit condition is tasks whose subtasks cannot be predicted, such as a code change touching an unknown number of files. The plan is model output that drives effects, so it needs the validation you give a tool call: a schema, a cap on worker count, deduplication, a token budget per worker and a budget for the run.
+
+Anthropic's June 2025 multi-agent research write-up is a detailed public account of this pattern, and its failures are the missing validations. Early versions spawned 50 subagents for simple queries; vague task descriptions made subagents duplicate each other's work (two researching the same 2025 supply-chain question while a third covered 2021). The fix was partly prompt-level effort-scaling rules: one agent with 3 to 10 tool calls for fact-finding, 2 to 4 subagents with 10 to 15 calls each for comparisons, more than 10 subagents only for complex research. A rule in a prompt is a request; the cap in code is the enforcement.
+
+The cost arithmetic is what makes this pattern rare in back-office workflows. In Anthropic's measurements, agents used about 4 times the tokens of a chat interaction and the multi-agent system about 15 times. The same write-up reports the multi-agent configuration beating single-agent Opus 4 by 90.2% on its internal research eval, and that token usage alone explained 80% of performance variance on BrowseComp. Read together, those say a large part of the gain is bought with tokens. The pattern earns its cost when the task is valuable enough that 15 chat answers' worth of tokens is cheap, and when the subtasks are truly independent; the write-up names synchronous execution (the lead waits for each batch, one slow subagent blocks the run) as its own bottleneck.
+
+## Evaluator-optimiser: a different critic and a cap
+
+One call drafts, a second critiques, and the draft is revised until the critic passes it. The post's condition is clear evaluation criteria and refinement that adds measurable value. Two properties decide whether the loop helps: whether the critic catches bad drafts (call that rate q), and whether the loop ends.
+
+With per-round draft success p, a critic that catches a bad draft with probability q and always accepts a good one, and at most r rounds, let x = (1 − p)·q be the chance a round produces a bad draft that is caught. The item ends correct with probability p·(1 + x + … + x^(r−1)), goes to a human with probability x^r, and ships wrong otherwise. At p = 0.8, q = 0.8, r = 3: 94.8% correct, 0.4% to a human, 4.7% wrong and shipped, at 4.74 expected calls.
+
+Now make the critic the generator grading its own output. Its blind spots are the generator's blind spots, so q drops; at q = 0.3 the same loop ends 85.1% correct and ships 14.9% wrong, while the dashboard shows the critic passing almost everything. A self-grading loop looks healthy exactly when it is failing. The critic should differ from the generator in something that matters: a deterministic check where one exists (tests, a schema, a citation lookup), otherwise a different prompt with the criteria written out, a different model, or both. The cap is not optional: without `max_rounds`, a critic that never passes turns one item into an unbounded bill.
+
+## Run the arithmetic
+
+The sandbox computes the closed forms above from one set of per-call inputs. Move the chain's gate from 0 to 0.9, then drop the evaluator's catch rate and watch the wrong-and-shipped share grow while calls fall.
+
+<WorkflowsPatternsSandbox />
+
+## In the room
+
+<Depth>
+  <Fragment slot="short">
+    <p>A deal team wants a due-diligence summary of each data room, cited to the page, within ten minutes, at a model budget the finance lead has capped per deal. The proposal is orchestrator-workers with up to 20 subagents. I would use sectioning with a code-owned plan (one worker per known section such as financials, contracts and litigation), a deterministic citation check as the evaluator, and orchestrator-workers only for the cross-section questions the fixed sections miss.</p>
+  </Fragment>
+  <Fragment slot="long">
+    <p>The constraints pull three ways: the latency budget favours parallel work, the per-deal budget penalises the token multiplier of a model-owned plan, and the citation requirement needs a check a model cannot talk its way past. The sections of a data room are mostly known in advance, so the plan does not need to be model output; making it code removes the plan-validation problem and the 50-subagent failure in one move.</p>
+    <p>Each section worker returns claims with page references. The evaluator is code: every cited page exists and contains the quoted span. A failed citation sends that claim back for one revision, then to a human. Latency is the slowest section plus one revision round; cost is one call per section plus revisions. What I give up is coverage of questions that span sections (a contract clause that changes a revenue figure), which a fixed plan never asks. I would log what reviewers add by hand and use that to decide whether a bounded orchestrator step for cross-section questions is worth its token cost.</p>
+  </Fragment>
+  <Fragment slot="followups">
+    <ul>
+      <li>The citation check passes 99% of claims, and reviewers still find wrong figures in one summary in ten. What is the check missing, and what do you add without breaking the ten-minute budget?</li>
+      <li>The deal team says the cross-section questions are the only part they value. What would you need to see in the reviewer log to reverse the decision and make the plan model-owned?</li>
+      <li>Finance halves the per-deal budget a week before launch. Which calls do you cut, and what risk do you write down?</li>
+    </ul>
+  </Fragment>
+</Depth>
+
+## When this is wrong
+
+Every formula above assumes independent calls with a fixed success rate. Real per-call success varies with input difficulty, and failures correlate: the invoice that confuses extraction is the same invoice that confuses classification. Correlation makes chains better than p to the power n on easy inputs and worse on hard ones, and makes voting and self-critique weaker than the binomial says. Measure on a labelled set, sliced by difficulty.
+
+The orchestrator formula treats every worker as necessary. Synthesis often tolerates a failed worker (a summary with one section missing is degraded, not wrong), so p to the power w + 2 is a floor. The opposite also happens: a worker that returns confident wrong content poisons the synthesis, and no formula here catches it.
+
+Latency is not one number per call. Patterns that fan out are governed by the tail of the slowest call, and patterns that loop are governed by the round count distribution; a mean per item hides both.
+
+The vendor figures are one team's measurements on its own system and evals, published by the vendor. The 15 times token multiplier is a property of that research system's prompts and tasks, not of the pattern; your measured multiplier is the number that belongs in the budget.
+
+Patterns compose. Most production systems are a router in front of chains, with an evaluator on one branch. The per-pattern arithmetic still applies to each node; the end-to-end number is the product along each path, weighted by the router's traffic split.
+
+<SelfRate id="lesson:workflows/patterns/five-patterns" />

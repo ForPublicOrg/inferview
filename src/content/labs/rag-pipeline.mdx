@@ -1,0 +1,797 @@
+---
+title: Build a RAG pipeline with failure-stage tests
+track: rag
+module: debugging-rag
+kind: lab
+minutes: 150
+summary: Grow one retrieval pipeline over seven steps, from a structure-aware chunker to BM25, a dense stub, rank fusion, a reranker with a shared window, a context budget and a citation check, then make a broken stage name itself.
+updated: 2026-10-28
+sources:
+  - title: Barnett, Kurniawan, Thudumu, Brannelly and Abdelrazek, Seven Failure Points When Engineering a Retrieval Augmented Generation System (arXiv 2401.05856, 2024-01-11)
+    url: https://arxiv.org/abs/2401.05856
+    note: "FP1 Missing Content to FP7 Incomplete, including FP2 Missed the Top Ranked Documents, FP3 Not in Context (retrieved but dropped during consolidation) and FP4 Not Extracted; the paper says validation of a RAG system is only feasible during operation. The stage names in step 7. Checked 2026-10-28."
+  - title: Cormack, Clarke and Buettcher, Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods (SIGIR 2009)
+    url: http://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf
+    note: "RRFscore(d) = sum over rankings of 1 / (k + r(d)), with k = 60 fixed during a pilot; the pilot found k = 60 near-optimal but the choice not critical. Step 4. Checked 2026-10-28."
+  - title: Apache Lucene 9.0 API, BM25Similarity
+    url: https://lucene.apache.org/core/9_0_0/core/org/apache/lucene/search/similarities/BM25Similarity.html
+    note: "defaults k1 = 1.2 and b = 0.75; IDF log(1 + (docCount - docFreq + 0.5) / (docFreq + 0.5)). Step 2. Checked 2026-10-28."
+  - title: Cohere documentation, Rerank best practices
+    url: https://docs.cohere.com/docs/reranking-best-practices
+    note: "the query and the document both count against the model's context length, and long documents are truncated to max_tokens_per_doc (default 4096); the reason ScriptedReranker reads query and passage through one window in step 5. Checked 2026-10-28."
+  - title: techinterview.org, What applied-AI engineer interviews test in 2026 (2026-07-23)
+    url: https://www.techinterview.org/post/3233476824/ai-engineer-interview-rag-agents-evals/
+    note: "reports a take-home of 50 markdown documents, a 20-question eval set, recall@5 and faithfulness; the pipeline here is original material sized for the browser. Checked 2026-10-28."
+steps:
+  - title: Chunk along the document's structure
+    brief: |
+      Write chunk_markdown. A chunk never crosses a heading, carries its heading path ("Expenses > Hotel limits > Receipts"), and never splits a table, because a row without its header is a number with no meaning, and the answer is lost before retrieval runs. Prose longer than max_words is split, and blocks under one heading are packed together up to max_words. The tests check structure, not one chunking: the hidden tests generate documents and check that no word is lost or reordered, that only tables exceed max_words, and that ids are unique. Whether a long paragraph is cut at a word count or at sentence ends is your choice.
+    starter: |
+      import re
+
+
+      def words(text):
+          return re.findall(r"[a-z0-9]+", text.lower())
+
+
+      def chunk_markdown(doc_id, text, max_words=40):
+          """Split one markdown document into chunks.
+
+          Return a list of {"id": f"{doc_id}#{n}" with n from 0, "doc": doc_id,
+          "heading": the heading path such as "Expenses > Approval", "text": the chunk's body text}.
+          """
+          raise NotImplementedError
+    tests: |
+      DOC = """# Expenses
+      Rules for claiming money back.
+
+      ## Approval
+      Expenses over 500 EUR need approval from a director before purchase.
+
+      ## Hotel limits
+      Limits are per night and include tax.
+
+      | City | Hotel per night |
+      | --- | --- |
+      | London | 220 EUR |
+      | Paris | 190 EUR |
+      | Berlin | 150 EUR |
+      | Madrid | 140 EUR |
+
+      ### Receipts
+      Submit receipts within 30 days through the finance portal.
+      """
+      chunks = chunk_markdown("exp", DOC, max_words=12)
+      assert [c["id"] for c in chunks] == [f"exp#{i}" for i in range(len(chunks))], "ids are <doc>#0, <doc>#1, ... in document order"
+      assert all(c["doc"] == "exp" for c in chunks)
+      approval = [c for c in chunks if "director" in c["text"]]
+      assert len(approval) == 1 and approval[0]["heading"] == "Expenses > Approval", "a chunk carries its heading path"
+      assert [c["heading"] for c in chunks if "finance portal" in c["text"]] == ["Expenses > Hotel limits > Receipts"], "a level-3 heading nests under the level-2 heading above it"
+      assert not any("director" in c["text"] and "tax" in c["text"] for c in chunks), "no chunk crosses a heading"
+      table = [c for c in chunks if "Paris" in c["text"]]
+      assert len(table) == 1 and "Hotel per night" in table[0]["text"] and "Madrid" in table[0]["text"], "a table stays whole, header with its rows, even past max_words"
+      assert not any(line.startswith("#") for c in chunks for line in c["text"].splitlines()), "heading lines are not chunk text"
+      long = chunk_markdown("long", "# Notes\n" + " ".join(f"w{i}" for i in range(30)), max_words=12)
+      assert len(long) == 3 and all(len(c["text"].split()) <= 12 for c in long), "prose longer than max_words is split"
+    hidden: |
+      import random as _r
+
+      _g = _r.Random(7)
+      _lines, _expected = [], []
+      for _s in range(12):
+          _lines.append("#" * _g.randint(1, 3) + f" Section {_s}")
+          for _p in range(_g.randint(0, 3)):
+              if _g.random() < 0.3:
+                  _rows = ["| key | value |", "| --- | --- |"] + [f"| k{_s}x{_p}x{_j} | v{_j} |" for _j in range(_g.randint(1, 9))]
+                  _lines += _rows + [""]
+                  _expected += [w for row in _rows for w in words(row)]
+              else:
+                  _para = [f"t{_s}x{_p}x{_j}" for _j in range(_g.randint(1, 40))]
+                  _lines += [" ".join(_para), ""]
+                  _expected += _para
+      _doc = "\n".join(_lines)
+      for _mw in (5, 17, 60):
+          _cs = chunk_markdown("r", _doc, max_words=_mw)
+          assert [w for c in _cs for w in words(c["text"])] == _expected
+          assert all(len(c["text"].split()) <= _mw or c["text"].lstrip().startswith("|") or "\n|" in c["text"] for c in _cs)
+          assert len({c["id"] for c in _cs}) == len(_cs)
+          assert all(c["text"].strip() for c in _cs)
+      assert chunk_markdown("e", "# Only a heading\n\n## And another\n") == []
+      assert chunk_markdown("p", "No heading at all.")[0]["heading"] == ""
+      _two = chunk_markdown("d", "# A\n## B\nunder b\n# C\nunder c")
+      assert [c["heading"] for c in _two] == ["A > B", "C"]
+      assert chunk_markdown("s", "# T\none two\n\nthree four", max_words=10)[0]["text"].split() == ["one", "two", "three", "four"]
+    solution: |
+      import re
+
+
+      def words(text):
+          return re.findall(r"[a-z0-9]+", text.lower())
+
+
+      def _blocks(lines):
+          # A block is a paragraph or a whole table; a table is never split.
+          blocks, cur, table = [], [], False
+          for line in lines + [""]:
+              is_t = line.lstrip().startswith("|")
+              if cur and (not line.strip() or is_t != table):
+                  blocks.append(("table" if table else "prose", "\n".join(cur)))
+                  cur = []
+              if line.strip():
+                  if not cur:
+                      table = is_t
+                  cur.append(line)
+          return blocks
+
+
+      def chunk_markdown(doc_id, text, max_words=40):
+          sections, path, body = [], [], []
+          for line in text.splitlines():
+              m = re.match(r"^(#{1,6})\s+(.*\S)\s*$", line)
+              if m:
+                  sections.append((" > ".join(h for _, h in path), body))
+                  level = len(m.group(1))
+                  path = [p for p in path if p[0] < level] + [(level, m.group(2))]
+                  body = []
+              else:
+                  body.append(line)
+          sections.append((" > ".join(h for _, h in path), body))
+          chunks = []
+          for heading, lines in sections:
+              pieces = []
+              for kind, block in _blocks(lines):
+                  toks = block.split()
+                  if kind == "prose" and len(toks) > max_words:
+                      pieces += [(len(toks[i:i + max_words]), " ".join(toks[i:i + max_words])) for i in range(0, len(toks), max_words)]
+                  else:
+                      pieces.append((len(toks), block))
+              cur, size = [], 0
+              for n, piece in pieces:
+                  if cur and size + n > max_words:
+                      chunks.append((heading, "\n\n".join(cur)))
+                      cur, size = [], 0
+                  cur.append(piece)
+                  size += n
+              if cur:
+                  chunks.append((heading, "\n\n".join(cur)))
+          return [{"id": f"{doc_id}#{i}", "doc": doc_id, "heading": h, "text": t} for i, (h, t) in enumerate(chunks)]
+  - title: BM25 over chunks
+    brief: |
+      Write a BM25 index over the chunks with Lucene's defaults (k1 = 1.2, b = 0.75) and its IDF, log(1 + (N - df + 0.5) / (df + 0.5)). Index the heading path together with the text, so a chunk that says only "Sixteen weeks at full pay" is still found by a question about parental leave. Build postings once in the constructor: the hidden tests index 30,000 chunks and time 300 queries against a budget of 1.5 seconds, which a loop over every chunk per query does not meet. Ties may go either way; chunks that score 0 are never returned.
+    starter: |
+      import math
+      from collections import Counter
+
+
+      class BM25:
+          """BM25 over chunks, indexing each chunk's heading path together with its text.
+
+          search(query, k) returns up to k chunk ids, best first, never a chunk that scores 0.
+          """
+
+          def __init__(self, chunks, k1=1.2, b=0.75):
+              raise NotImplementedError
+
+          def search(self, query, k):
+              raise NotImplementedError
+    tests: |
+      CHUNKS = [
+          {"id": "sec#0", "doc": "sec", "heading": "Security > VPN", "text": "Production access requires the VPN. Error E1234 means the VPN certificate has expired."},
+          {"id": "sec#1", "doc": "sec", "heading": "Security > Laptops", "text": "Laptops are refreshed every three years and wiped before reuse."},
+          {"id": "exp#0", "doc": "exp", "heading": "Expenses > Approval", "text": "Expenses over 500 EUR need approval from a director before purchase."},
+          {"id": "exp#1", "doc": "exp", "heading": "Expenses > Receipts", "text": "Submit receipts within 30 days through the finance portal."},
+          {"id": "lv#0", "doc": "lv", "heading": "Leave > Parental leave", "text": "Sixteen weeks at full pay for any parent with six months of service."},
+      ]
+      bm = BM25(CHUNKS)
+      assert bm.search("what does error E1234 mean", 3)[0] == "sec#0", "a rare identifier finds its chunk"
+      assert bm.search("parental leave", 2) == ["lv#0"], "the heading path is indexed with the text"
+      assert bm.search("refund policy on gifts", 5) == [], "chunks that share no term with the query are not returned"
+      assert len(bm.search("the", 2)) == 2, "k caps the result"
+      assert bm.search("RECEIPTS portal", 1) == ["exp#1"], "matching is case-insensitive"
+    hidden: |
+      import time as _t
+      import random as _r
+
+      _ch = lambda i, h, t: {"id": f"h#{i}", "doc": "h", "heading": h, "text": t}
+      _every = BM25([_ch(0, "", "the cat"), _ch(1, "", "the dog"), _ch(2, "", "the end")])
+      assert len(_every.search("the", 5)) == 3
+      _len = BM25([_ch(0, "", "timeout " + "filler " * 30), _ch(1, "", "timeout here"), _ch(2, "", "other words")])
+      assert _len.search("timeout", 2) == ["h#1", "h#0"]
+      _rare = BM25([_ch(0, "", "rare word"), _ch(1, "", "common word"), _ch(2, "", "common text"), _ch(3, "", "common line")])
+      assert _rare.search("rare common", 1) == ["h#0"]
+      assert BM25([]).search("x", 3) == []
+      assert BM25([_ch(0, "", "a b"), _ch(1, "", "a b")]).search("a", 1) in (["h#0"], ["h#1"])
+      _g = _r.Random(3)
+      _big = BM25([_ch(i, "", " ".join(_g.choice(["c%d" % j for j in range(30)]) for _ in range(8)) + " r%d r%d" % (_g.randrange(2000), _g.randrange(2000))) for i in range(30000)])
+      _s = _t.perf_counter()
+      _res = [_big.search("r%d r%d" % (_g.randrange(2000), _g.randrange(2000)), 10) for _ in range(300)]
+      assert _t.perf_counter() - _s < 1.5
+      assert all(len(x) == 10 for x in _res)
+    solution: |
+      import math
+      from collections import Counter
+
+
+      class BM25:
+          def __init__(self, chunks, k1=1.2, b=0.75):
+              self.ids = [c["id"] for c in chunks]
+              tfs = [Counter(words(c["heading"] + " " + c["text"])) for c in chunks]
+              lengths = [sum(t.values()) for t in tfs]
+              avg = sum(lengths) / len(lengths) if lengths else 0.0
+              norm = [k1 * (1 - b + b * n / avg) if avg else k1 for n in lengths]
+              self.postings = {}
+              for i, tf in enumerate(tfs):
+                  for term, c in tf.items():
+                      self.postings.setdefault(term, []).append((i, c * (k1 + 1) / (c + norm[i])))
+              n = len(chunks)
+              self.idf = {t: math.log(1 + (n - len(p) + 0.5) / (len(p) + 0.5)) for t, p in self.postings.items()}
+
+          def search(self, query, k):
+              acc = {}
+              for term in dict.fromkeys(words(query)):
+                  for i, part in self.postings.get(term, []):
+                      acc[i] = acc.get(i, 0.0) + self.idf[term] * part
+              best = sorted((i for i in acc if acc[i] > 0), key=lambda i: (-acc[i], i))[:k]
+              return [self.ids[i] for i in best]
+  - title: A dense retriever on fixed vectors
+    brief: |
+      There is no embedding model in the browser, so embed() in the starter is a fixed stand-in: one axis per concept, with synonyms on the same axis, so "vacation" lands on the axis of "leave". Write DenseRetriever, which embeds every chunk once at construction and ranks by cosine similarity. A query with no known concept returns nothing rather than the least-bad chunks, because a retriever that always returns k results hides a miss from the stage after it. The hidden tests count calls to embed() during a search: one, for the query.
+    starter: |
+      CONCEPTS = {
+          "leave": ["leave", "vacation", "holiday", "pto", "time"],
+          "family": ["parental", "parent", "maternity", "paternity", "baby"],
+          "money": ["expense", "expenses", "eur", "cost", "spend", "reimbursement", "refund"],
+          "hotel": ["hotel", "accommodation", "lodging", "night"],
+          "receipt": ["receipt", "receipts", "invoice", "proof"],
+          "access": ["vpn", "remote", "tunnel", "production", "access"],
+          "device": ["laptop", "laptops", "computer", "hardware"],
+      }
+      _AXIS = {w: i for i, ws in enumerate(CONCEPTS.values()) for w in ws}
+
+
+      def embed(text):
+          """A fixed stand-in for an embedding model: one axis per concept, unit length, [] when no concept word appears."""
+          v = [0.0] * len(CONCEPTS)
+          for w in words(text):
+              if w in _AXIS:
+                  v[_AXIS[w]] += 1.0
+          n = sum(x * x for x in v) ** 0.5
+          return [x / n for x in v] if n else []
+
+
+      class DenseRetriever:
+          """Embeds each chunk's heading path and text once with embed().
+
+          search(query, k) returns up to k chunk ids by cosine similarity, best first, never a chunk at similarity 0.
+          """
+
+          def __init__(self, chunks):
+              raise NotImplementedError
+
+          def search(self, query, k):
+              raise NotImplementedError
+    tests: |
+      CHUNKS = [
+          {"id": "lv#0", "doc": "lv", "heading": "Leave > Annual leave", "text": "Full-time staff get 25 days of annual leave per calendar year."},
+          {"id": "lv#1", "doc": "lv", "heading": "Leave > Parental leave", "text": "Sixteen weeks at full pay for any parent with six months of service."},
+          {"id": "exp#0", "doc": "exp", "heading": "Expenses > Hotel limits", "text": "| City | Hotel per night |\n| Paris | 190 EUR |"},
+          {"id": "sec#0", "doc": "sec", "heading": "Security > VPN", "text": "Production access requires the VPN."},
+      ]
+      dense = DenseRetriever(CHUNKS)
+      assert dense.search("how many vacation days do I get", 1) == ["lv#0"], "a synonym with no shared word still finds the chunk"
+      assert dense.search("lodging allowance abroad", 2)[0] == "exp#0"
+      assert dense.search("maternity", 4)[0] == "lv#1"
+      assert dense.search("what is the weather like", 3) == [], "a query with no known concept returns nothing rather than noise"
+      assert len(dense.search("leave", 1)) == 1, "k caps the result"
+    hidden: |
+      _d = DenseRetriever(CHUNKS)
+      _real = embed
+      _count = [0]
+      def embed(text):
+          _count[0] += 1
+          return _real(text)
+      _out = _d.search("parental leave and hotel cost", 4)
+      embed = _real
+      assert _count[0] == 1
+      _q = _real("parental leave and hotel cost")
+      _sims = {c["id"]: sum(a * b for a, b in zip(_q, _real(c["heading"] + " " + c["text"]))) for c in CHUNKS}
+      _want = [i for i in sorted(_sims, key=lambda i: -_sims[i]) if _sims[i] > 0]
+      assert [round(_sims[i], 9) for i in _out] == [round(_sims[i], 9) for i in _want]
+      assert set(_out) == set(_want)
+      assert DenseRetriever([]).search("leave", 3) == []
+      assert DenseRetriever([{"id": "x#0", "doc": "x", "heading": "", "text": "nothing known here"}]).search("leave", 3) == []
+    solution: |
+      CONCEPTS = {
+          "leave": ["leave", "vacation", "holiday", "pto", "time"],
+          "family": ["parental", "parent", "maternity", "paternity", "baby"],
+          "money": ["expense", "expenses", "eur", "cost", "spend", "reimbursement", "refund"],
+          "hotel": ["hotel", "accommodation", "lodging", "night"],
+          "receipt": ["receipt", "receipts", "invoice", "proof"],
+          "access": ["vpn", "remote", "tunnel", "production", "access"],
+          "device": ["laptop", "laptops", "computer", "hardware"],
+      }
+      _AXIS = {w: i for i, ws in enumerate(CONCEPTS.values()) for w in ws}
+
+
+      def embed(text):
+          """A fixed stand-in for an embedding model: one axis per concept, unit length, [] when no concept word appears."""
+          v = [0.0] * len(CONCEPTS)
+          for w in words(text):
+              if w in _AXIS:
+                  v[_AXIS[w]] += 1.0
+          n = sum(x * x for x in v) ** 0.5
+          return [x / n for x in v] if n else []
+
+
+      class DenseRetriever:
+          def __init__(self, chunks):
+              self.ids = [c["id"] for c in chunks]
+              self.vectors = [embed(c["heading"] + " " + c["text"]) for c in chunks]
+
+          def search(self, query, k):
+              q = embed(query)
+              if not q:
+                  return []
+              sims = [(sum(a * b for a, b in zip(q, v)) if v else 0.0, i) for i, v in enumerate(self.vectors)]
+              best = sorted(((s, i) for s, i in sims if s > 0), key=lambda p: (-p[0], p[1]))
+              return [self.ids[i] for _, i in best[:k]]
+  - title: Reciprocal rank fusion
+    brief: |
+      Write rrf. Each id scores the sum of 1 / (k + rank) over the rankings that contain it, with k = 60, the constant Cormack, Clarke and Buettcher fixed in a pilot and found near-optimal but not critical. Fusion uses ranks only, so BM25 scores and cosine similarities never have to share a scale. The order of the input rankings must not change the result, so the tie-break has to depend on the ids and their ranks, not on which list came first. What a list that repeats an id contributes is yours to decide; state it in a comment.
+    starter: |
+      def rrf(rankings, k=60, top_n=10):
+          """Reciprocal rank fusion: each id scores the sum of 1 / (k + rank) over the rankings it appears in, rank from 1.
+
+          rankings is a list of id lists, best first. Return up to top_n ids, best fused score first.
+          """
+          raise NotImplementedError
+    tests: |
+      bm25_ids = ["sec#0", "exp#1", "lv#0"]
+      dense_ids = ["lv#0", "lv#1", "sec#0"]
+      fused = rrf([bm25_ids, dense_ids])
+      assert fused[:2] == ["sec#0", "lv#0"] or fused[:2] == ["lv#0", "sec#0"], "ids found by both retrievers come first"
+      assert set(fused) == {"sec#0", "exp#1", "lv#0", "lv#1"}, "every id from either list is kept"
+      assert rrf([["a", "b"], ["b", "c"]], k=60)[0] == "b", "rank 2 in both lists (2/62) beats rank 1 in one list (1/61)"
+      assert rrf([["a", "b", "c", "d"]], top_n=2) == ["a", "b"], "top_n caps the result"
+      assert rrf([[], []]) == []
+    hidden: |
+      import random as _r
+
+      _g = _r.Random(11)
+      for _ in range(200):
+          _pool = [f"d{i}" for i in range(15)]
+          _ls = [_g.sample(_pool, _g.randint(0, 10)) for _ in range(_g.randint(1, 4))]
+          _k = _g.choice([1, 10, 60])
+          _out = rrf(_ls, k=_k, top_n=50)
+          _sc = {}
+          for _l in _ls:
+              for _rk, _c in enumerate(_l, start=1):
+                  _sc[_c] = _sc.get(_c, 0.0) + 1.0 / (_k + _rk)
+          assert set(_out) == set(_sc) and len(_out) == len(_sc)
+          assert all(_sc[_out[i]] >= _sc[_out[i + 1]] - 1e-12 for i in range(len(_out) - 1))
+          assert rrf(list(reversed(_ls)), k=_k, top_n=50) == _out
+      assert rrf([["a", "b", "a"], ["b"]])[0] == "b"
+      assert rrf([["x"], ["y"]], top_n=5) in (["x", "y"], ["y", "x"])
+      assert rrf([["a"]], top_n=0) == []
+    solution: |
+      def rrf(rankings, k=60, top_n=10):
+          score, best = {}, {}
+          for ranking in rankings:
+              seen = set()
+              for rank, cid in enumerate(ranking, start=1):
+                  if cid in seen:
+                      continue  # a list that repeats an id counts its first rank only
+                  seen.add(cid)
+                  score[cid] = score.get(cid, 0.0) + 1.0 / (k + rank)
+                  best[cid] = min(best.get(cid, rank), rank)
+          # Policy: ties go to the id with the better single rank, then to the id itself, so the order is stable.
+          return sorted(score, key=lambda c: (-score[c], best[c], c))[:top_n]
+  - title: Rerank, then cut to a budget
+    brief: |
+      ScriptedReranker stands in for a cross-encoder. Like a real one, it reads the query and the passage through one shared window, so a long passage is scored on its beginning. Write rerank, which scores each candidate once with the question as the query, sorts best first with stable ties, drops scores below min_score and cuts to top_n. Then write build_context, which picks the chunks for the prompt in reranked order within a word budget. Whether to stop at the first chunk that does not fit or to skip it and try the next is your policy; the tests accept both and check that the best chunk is never displaced and that the budget holds.
+    starter: |
+      class ScriptedReranker:
+          """A deterministic stand-in for a cross-encoder.
+
+          It reads the query and the passage through one shared window of `window` words, query first, so a passage longer
+          than the room left is scored on its beginning only. The score is the share of distinct query words found in the
+          visible part of the passage. Every call is logged in self.calls as (query, passage).
+          """
+
+          def __init__(self, window=64):
+              self.window = window
+              self.calls = []
+
+          def score(self, query, passage):
+              self.calls.append((query, passage))
+              q = words(query)
+              visible = words(passage)[: max(0, self.window - len(q))]
+              return len(set(q) & set(visible)) / len(set(q)) if q else 0.0
+
+
+      def passage(chunk):
+          return chunk["heading"] + "\n" + chunk["text"]
+
+
+      def rerank(query, ids, chunks_by_id, reranker, top_n=4, min_score=0.0):
+          """Score each candidate's passage(chunk) once. Return up to top_n (id, score) pairs, best first, dropping scores
+          below min_score; candidates with equal scores keep their incoming order."""
+          raise NotImplementedError
+
+
+      def build_context(reranked, chunks_by_id, budget_words):
+          """Choose the chunk ids that go into the prompt from the reranked pairs, best first, with the total word count
+          of their text at most budget_words."""
+          raise NotImplementedError
+    tests: |
+      CH = {
+          "a": {"id": "a", "doc": "x", "heading": "Security > Laptops", "text": "Laptops are refreshed every three years."},
+          "b": {"id": "b", "doc": "x", "heading": "Security > VPN", "text": "Error E1234 means the VPN certificate has expired."},
+          "c": {"id": "c", "doc": "x", "heading": "Security > VPN", "text": "Production access requires the VPN."},
+          "d": {"id": "d", "doc": "x", "heading": "Expenses", "text": "Expenses over 500 EUR need approval."},
+      }
+      rr = ScriptedReranker()
+      out = rerank("what does error E1234 mean for the VPN", ["a", "c", "b", "d"], CH, rr, top_n=3)
+      assert [cid for cid, _ in out] == ["b", "c", "a"], "best score first, cut to top_n"
+      assert all(out[i][1] >= out[i + 1][1] for i in range(len(out) - 1))
+      assert len(rr.calls) == 4 and all(q == "what does error E1234 mean for the VPN" for q, _ in rr.calls), "each candidate is scored once, with the question as the query"
+      assert "Security > VPN" in rr.calls[1][1], "the reranker sees the heading path with the text"
+      assert [cid for cid, _ in rerank("nothing matches", ["a", "b", "c"], CH, ScriptedReranker())] == ["a", "b", "c"], "equal scores keep their incoming order"
+      assert rerank("VPN", ["a", "b", "c"], CH, ScriptedReranker(), min_score=0.5) == [("b", 1.0), ("c", 1.0)], "scores below min_score are dropped"
+      ctx = build_context([("b", 1.0), ("d", 0.5), ("c", 0.4)], CH, budget_words=14)
+      assert ctx[0] == "b" and sum(len(CH[c]["text"].split()) for c in ctx) <= 14, "best chunk first, within the word budget"
+      assert build_context([("b", 1.0)], CH, budget_words=3) == [], "a chunk larger than the whole budget is left out"
+    hidden: |
+      import random as _r
+
+      class _Fixed:
+          def __init__(self, table):
+              self.table, self.calls = table, []
+          def score(self, query, text):
+              self.calls.append((query, text))
+              return self.table[text]
+
+      _g = _r.Random(5)
+      for _ in range(150):
+          _n = _g.randint(0, 12)
+          _ch = {f"c{i}": {"id": f"c{i}", "doc": "d", "heading": "H", "text": " ".join(["w"] * _g.randint(1, 30)) + f" c{i}"} for i in range(_n)}
+          _ids = list(_ch)
+          _g.shuffle(_ids)
+          _tab = {passage(_ch[c]): _g.choice([0.0, 0.25, 0.5, 0.75, 1.0]) for c in _ids}
+          _f = _Fixed(_tab)
+          _top, _ms = _g.randint(1, 8), _g.choice([0.0, 0.3, 0.6])
+          _out = rerank("q", _ids, _ch, _f, top_n=_top, min_score=_ms)
+          assert len(_f.calls) == len(_ids)
+          _want = sorted([(c, _tab[passage(_ch[c])]) for c in _ids if _tab[passage(_ch[c])] >= _ms], key=lambda p: -p[1])[:_top]
+          assert _out == _want
+          _b = _g.randint(0, 80)
+          _ctx = build_context(_out, _ch, _b)
+          _len = lambda c: len(_ch[c]["text"].split())
+          assert sum(_len(c) for c in _ctx) <= _b
+          _order = [c for c, _ in _out]
+          assert [c for c in _order if c in _ctx] == _ctx and len(set(_ctx)) == len(_ctx)
+          _pre, _used = [], 0
+          for _c in _order:
+              if _used + _len(_c) > _b:
+                  break
+              _pre.append(_c)
+              _used += _len(_c)
+          assert _ctx[: len(_pre)] == _pre
+      _long = {"z": {"id": "z", "doc": "d", "heading": "T", "text": "intro " * 70 + "E1234 expired"}}
+      assert ScriptedReranker(window=64).score("E1234 expired", passage(_long["z"])) == 0.0
+      assert rerank("E1234 expired", ["z"], _long, ScriptedReranker(window=200)) == [("z", 1.0)]
+    solution: |
+      class ScriptedReranker:
+          """A deterministic stand-in for a cross-encoder.
+
+          It reads the query and the passage through one shared window of `window` words, query first, so a passage longer
+          than the room left is scored on its beginning only. The score is the share of distinct query words found in the
+          visible part of the passage. Every call is logged in self.calls as (query, passage).
+          """
+
+          def __init__(self, window=64):
+              self.window = window
+              self.calls = []
+
+          def score(self, query, passage):
+              self.calls.append((query, passage))
+              q = words(query)
+              visible = words(passage)[: max(0, self.window - len(q))]
+              return len(set(q) & set(visible)) / len(set(q)) if q else 0.0
+
+
+      def passage(chunk):
+          return chunk["heading"] + "\n" + chunk["text"]
+
+
+      def rerank(query, ids, chunks_by_id, reranker, top_n=4, min_score=0.0):
+          scored = [(cid, reranker.score(query, passage(chunks_by_id[cid]))) for cid in ids]
+          kept = [p for p in scored if p[1] >= min_score]
+          kept.sort(key=lambda p: -p[1])  # sort is stable, so equal scores keep their incoming order
+          return kept[:top_n]
+
+
+      def build_context(reranked, chunks_by_id, budget_words):
+          # Policy: skip a chunk that does not fit and keep trying smaller ones further down.
+          chosen, used = [], 0
+          for cid, _ in reranked:
+              n = len(chunks_by_id[cid]["text"].split())
+              if used + n <= budget_words:
+                  chosen.append(cid)
+                  used += n
+          return chosen
+  - title: Check that every claim cites a chunk it was given
+    brief: |
+      ScriptedModel stands in for the generator. It answers with sentences from the chunks it was given, each followed by the chunk id in brackets, and refuses when nothing matches. In sloppy mode it leaves one sentence uncited and cites a chunk that was never in its context. Write check_citations, which splits the answer into sentences, reports every sentence without a citation and every cited id outside the context, and treats a refusal as making no claim. This is a citation check, not a correctness check: a sentence can cite the right chunk and still misstate it.
+    starter: |
+      STOP = {"a", "an", "and", "are", "do", "does", "for", "how", "i", "in", "is", "of", "the", "to", "what", "when", "which", "with"}
+
+
+      class ScriptedModel:
+          """A deterministic stand-in for the generator.
+
+          For each context chunk that shares at least two non-stop words with the question, in context order, it writes the
+          chunk's sentence that shares the most words with the question, with the chunk id in brackets before the full stop.
+          With nothing to use it refuses.
+          mode="sloppy" leaves the second sentence uncited and cites a chunk it was never given in the third.
+          """
+
+          REFUSAL = "I could not find this in the documents."
+
+          def __init__(self, mode="faithful"):
+              self.mode = mode
+              self.calls = []
+
+          def answer(self, question, context):
+              self.calls.append((question, [cid for cid, _ in context]))
+              q = set(words(question)) - STOP
+              out = []
+              for cid, text in context:
+                  if len(q & set(words(text))) >= 2:
+                      sentences = [s.rstrip(".;") for s in re.split(r"(?<=[.;])\s+|\n", text) if s.strip()]
+                      best = max(sentences, key=lambda s: len(q & set(words(s))))
+                      out.append(f"{best} [{cid}].")
+              if not out:
+                  return self.REFUSAL
+              if self.mode == "sloppy":
+                  if len(out) > 1:
+                      out[1] = out[1].split(" [")[0] + "."
+                  out.append("Contractors are covered by the same rule [hr#9].")
+              return " ".join(out)
+
+
+      def check_citations(answer, context_ids):
+          """Every sentence of the answer must cite at least one chunk, as [id], and every cited id must be in context_ids.
+
+          Return {"ok": bool, "cited": ids in order of first citation, "uncited": sentences with no citation,
+          "unknown": cited ids that were not in the context}. A refusal makes no claim.
+          """
+          raise NotImplementedError
+    tests: |
+      CONTEXT = [
+          ("lv#1", "Parental leave is 16 weeks at full pay. It needs six months of service."),
+          ("lv#0", "Annual leave is 25 days per calendar year."),
+          ("sec#0", "Production access requires the VPN."),
+      ]
+      QUESTION = "How long is parental leave and how much annual leave is there?"
+      good = ScriptedModel().answer(QUESTION, CONTEXT)
+      report = check_citations(good, ["lv#1", "lv#0", "sec#0"])
+      assert report["ok"] and report["cited"] == ["lv#1", "lv#0"], "a faithful answer cites only chunks it was given"
+      bad = ScriptedModel(mode="sloppy").answer(QUESTION, CONTEXT)
+      report = check_citations(bad, ["lv#1", "lv#0", "sec#0"])
+      assert not report["ok"]
+      assert report["unknown"] == ["hr#9"], "a citation to a chunk outside the context is caught"
+      assert len(report["uncited"]) == 1 and "Annual leave" in report["uncited"][0], "a sentence with no citation is caught"
+      assert check_citations(ScriptedModel.REFUSAL, []) == {"ok": True, "cited": [], "uncited": [], "unknown": []}, "a refusal makes no claim"
+      assert check_citations("Leave is 25 days [lv#0] [lv#1].", ["lv#0"])["unknown"] == ["lv#1"], "every citation in a sentence is checked"
+    hidden: |
+      _r1 = check_citations("Leave is 25 days [lv#0]. Parental leave is 16 weeks [lv#1]. Laptops last three years.", ["lv#0", "lv#1"])
+      assert _r1["ok"] is False and _r1["unknown"] == [] and len(_r1["uncited"]) == 1
+      assert _r1["cited"] == ["lv#0", "lv#1"]
+      _r2 = check_citations("A [x#1]. B [x#1]. C [y#2].", ["x#1"])
+      assert _r2["cited"] == ["x#1", "y#2"] and _r2["unknown"] == ["y#2"]
+      assert check_citations("A [x#1].", ["x#1", "x#2"])["ok"] is True
+      assert check_citations("Leave is 25 days.", ["lv#0"])["ok"] is False
+      _m = ScriptedModel()
+      _ans = _m.answer("parental leave weeks", [("lv#1", "Parental leave is 16 weeks at full pay.")])
+      assert check_citations(_ans, [])["unknown"] == ["lv#1"]
+      assert check_citations(_m.answer("unrelated question", [("lv#1", "Parental leave is 16 weeks.")]), [])["ok"] is True
+    solution: |
+      STOP = {"a", "an", "and", "are", "do", "does", "for", "how", "i", "in", "is", "of", "the", "to", "what", "when", "which", "with"}
+
+
+      class ScriptedModel:
+          """A deterministic stand-in for the generator.
+
+          For each context chunk that shares at least two non-stop words with the question, in context order, it writes the
+          chunk's sentence that shares the most words with the question, with the chunk id in brackets before the full stop.
+          With nothing to use it refuses.
+          mode="sloppy" leaves the second sentence uncited and cites a chunk it was never given in the third.
+          """
+
+          REFUSAL = "I could not find this in the documents."
+
+          def __init__(self, mode="faithful"):
+              self.mode = mode
+              self.calls = []
+
+          def answer(self, question, context):
+              self.calls.append((question, [cid for cid, _ in context]))
+              q = set(words(question)) - STOP
+              out = []
+              for cid, text in context:
+                  if len(q & set(words(text))) >= 2:
+                      sentences = [s.rstrip(".;") for s in re.split(r"(?<=[.;])\s+|\n", text) if s.strip()]
+                      best = max(sentences, key=lambda s: len(q & set(words(s))))
+                      out.append(f"{best} [{cid}].")
+              if not out:
+                  return self.REFUSAL
+              if self.mode == "sloppy":
+                  if len(out) > 1:
+                      out[1] = out[1].split(" [")[0] + "."
+                  out.append("Contractors are covered by the same rule [hr#9].")
+              return " ".join(out)
+
+
+      def check_citations(answer, context_ids):
+          allowed, cited, uncited, unknown = set(context_ids), [], [], []
+          if answer.strip() == ScriptedModel.REFUSAL:
+              return {"ok": True, "cited": [], "uncited": [], "unknown": []}
+          for sentence in re.split(r"(?<=[.!?])\s+", answer.strip()):
+              ids = [i.strip() for group in re.findall(r"\[([^\]]+)\]", sentence) for i in group.split(",")]
+              if not ids:
+                  uncited.append(sentence)
+              for cid in ids:
+                  if cid not in cited:
+                      cited.append(cid)
+                  if cid not in allowed and cid not in unknown:
+                      unknown.append(cid)
+          return {"ok": not uncited and not unknown, "cited": cited, "uncited": uncited, "unknown": unknown}
+  - title: Localise a failure to one stage
+    brief: |
+      Wire the stages into run_pipeline, which returns a trace of what each stage passed on, and write localise, which names the first stage that lost the gold evidence: chunking when no chunk holds every evidence phrase, then retrieval, rerank, context and generation. The tests break one stage at a time (a fixed-window chunker, dense retrieval alone, a narrow reranker window with a score cutoff, a small budget, a sloppy model) and expect localise to name that stage and no other. The narrow window fails only on the long VPN chunk, which is the symptom of a reranker swap that truncates long documents.
+    starter: |
+      DOCS = {
+          "leave": """# Leave
+      ## Annual leave
+      Full-time staff get 25 days of annual leave per calendar year. Up to five unused days carry over.
+
+      ## Parental leave
+      Parental leave is 16 weeks at full pay for any parent with six months of service.""",
+          "expenses": """# Expenses
+      ## Approval
+      Expenses over 500 EUR need approval from a director before purchase.
+
+      ## Hotel limits
+      Limits are per night and include tax.
+
+      | City | Hotel per night |
+      | --- | --- |
+      | London | 220 EUR |
+      | Paris | 190 EUR |
+      | Berlin | 150 EUR |
+
+      ## Receipts
+      Submit receipts within 30 days through the finance portal.""",
+          "security": """# Security
+      ## VPN
+      Production access requires the VPN. Install the client from the IT portal, sign in with your company account, pick the nearest region and keep the client updated, because old clients are refused at the gateway. Error E1234 means the VPN certificate has expired; renew it in the IT portal.
+
+      ## Laptops
+      Laptops are refreshed every three years and wiped before reuse.""",
+      }
+
+
+      def run_pipeline(question, docs, reranker=None, model=None, chunker=None, retrievers=("bm25", "dense"),
+                       k=8, top_n=4, min_score=0.0, budget_words=120, max_words=60):
+          """Run every stage and return a trace: {"chunks": [...], "fused": [ids], "reranked": [ids],
+          "context": [ids], "answer": str, "citations": check_citations(...)}. Defaults: chunk_markdown,
+          ScriptedReranker(), ScriptedModel()."""
+          raise NotImplementedError
+
+
+      def localise(trace, evidence):
+          """evidence: phrases that must all appear in one chunk's text for that chunk to count as gold.
+          Return the first stage that lost the gold chunks: "chunking", "retrieval", "rerank", "context",
+          "generation", or "ok"."""
+          raise NotImplementedError
+    tests: |
+      HOTEL = ("What is the hotel limit per night in Paris?", ["Hotel per night", "Paris | 190 EUR"])
+      VPN = ("What does error E1234 mean on the VPN?", ["E1234 means the VPN certificate has expired"])
+      LEAVE = ("How many weeks of parental leave do parents get?", ["16 weeks at full pay"])
+      assert [localise(run_pipeline(q, DOCS), ev) for q, ev in (HOTEL, VPN, LEAVE)] == ["ok", "ok", "ok"], "the default pipeline answers all three"
+      def fixed_window(doc_id, text, max_words):
+          toks = text.split()
+          return [{"id": f"{doc_id}#{n}", "doc": doc_id, "heading": "", "text": " ".join(toks[i:i + 8])} for n, i in enumerate(range(0, len(toks), 8))]
+      assert localise(run_pipeline(HOTEL[0], DOCS, chunker=fixed_window), HOTEL[1]) == "chunking", "an 8-word window splits the table header from the Paris row"
+      assert localise(run_pipeline("What does error E1234 mean?", DOCS, retrievers=("dense",)), VPN[1]) == "retrieval", "dense alone has no vector for an error code"
+      narrow = dict(reranker=ScriptedReranker(window=24), min_score=0.3)
+      assert localise(run_pipeline(VPN[0], DOCS, **narrow), VPN[1]) == "rerank", "a narrow reranker window scores the long VPN chunk on its first words"
+      assert localise(run_pipeline(LEAVE[0], DOCS, **narrow), LEAVE[1]) == "ok", "the same window is harmless for a short chunk"
+      assert localise(run_pipeline(VPN[0], DOCS, budget_words=40), VPN[1]) == "context", "the long chunk is reranked first and then does not fit the budget"
+      assert localise(run_pipeline(VPN[0], DOCS, model=ScriptedModel("sloppy")), VPN[1]) == "generation"
+    hidden: |
+      _rr, _md = ScriptedReranker(), ScriptedModel()
+      _t = run_pipeline(VPN[0], DOCS, reranker=_rr, model=_md)
+      assert len(_rr.calls) == len(_t["fused"]) and all(q == VPN[0] for q, _ in _rr.calls)
+      assert _md.calls == [(VPN[0], _t["context"])]
+      assert set(_t) >= {"chunks", "fused", "reranked", "context", "answer", "citations"}
+      assert _t["citations"] == check_citations(_t["answer"], _t["context"])
+      _ck = [{"id": "a#0", "doc": "a", "heading": "", "text": "Parental leave is 16 weeks at full pay."}, {"id": "b#0", "doc": "b", "heading": "", "text": "Other."}]
+      def _tr(fused, reranked, context, answer):
+          return {"chunks": _ck, "fused": fused, "reranked": reranked, "context": context, "answer": answer, "citations": check_citations(answer, context)}
+      assert localise(_tr(["b#0"], ["a#0"], ["a#0"], "x [a#0]."), "16 weeks") == "retrieval"
+      assert localise(_tr(["a#0"], ["b#0"], ["a#0"], "x [a#0]."), "16 weeks") == "rerank"
+      assert localise(_tr(["a#0"], ["a#0"], ["b#0"], "x [b#0]."), "16 weeks") == "context"
+      assert localise(_tr(["a#0"], ["a#0"], ["a#0"], ScriptedModel.REFUSAL), "16 weeks") == "generation"
+      assert localise(_tr(["a#0"], ["a#0"], ["a#0", "b#0"], "Leave is long [b#0]."), "16 weeks") == "generation"
+      assert localise(_tr(["a#0"], ["a#0"], ["a#0"], "Parental leave is 16 weeks [a#0]."), "16 WEEKS") == "ok"
+      assert localise(_tr(["a#0"], ["a#0"], ["a#0"], "x [a#0]."), ["16 weeks", "Paris"]) == "chunking"
+      assert localise(run_pipeline("How many days of annual leave?", DOCS), "25 days of annual leave") == "ok"
+    solution: |
+      DOCS = {
+          "leave": """# Leave
+      ## Annual leave
+      Full-time staff get 25 days of annual leave per calendar year. Up to five unused days carry over.
+
+      ## Parental leave
+      Parental leave is 16 weeks at full pay for any parent with six months of service.""",
+          "expenses": """# Expenses
+      ## Approval
+      Expenses over 500 EUR need approval from a director before purchase.
+
+      ## Hotel limits
+      Limits are per night and include tax.
+
+      | City | Hotel per night |
+      | --- | --- |
+      | London | 220 EUR |
+      | Paris | 190 EUR |
+      | Berlin | 150 EUR |
+
+      ## Receipts
+      Submit receipts within 30 days through the finance portal.""",
+          "security": """# Security
+      ## VPN
+      Production access requires the VPN. Install the client from the IT portal, sign in with your company account, pick the nearest region and keep the client updated, because old clients are refused at the gateway. Error E1234 means the VPN certificate has expired; renew it in the IT portal.
+
+      ## Laptops
+      Laptops are refreshed every three years and wiped before reuse.""",
+      }
+
+
+      def run_pipeline(question, docs, reranker=None, model=None, chunker=None, retrievers=("bm25", "dense"),
+                       k=8, top_n=4, min_score=0.0, budget_words=120, max_words=60):
+          reranker = reranker or ScriptedReranker()
+          model = model or ScriptedModel()
+          chunks = [c for doc_id, text in docs.items() for c in (chunker or chunk_markdown)(doc_id, text, max_words)]
+          by_id = {c["id"]: c for c in chunks}
+          make = {"bm25": BM25, "dense": DenseRetriever}
+          fused = rrf([make[name](chunks).search(question, k) for name in retrievers], top_n=k)
+          reranked = rerank(question, fused, by_id, reranker, top_n=top_n, min_score=min_score)
+          context = build_context(reranked, by_id, budget_words)
+          answer = model.answer(question, [(cid, by_id[cid]["text"]) for cid in context])
+          return {"chunks": chunks, "fused": fused, "reranked": [cid for cid, _ in reranked], "context": context,
+                  "answer": answer, "citations": check_citations(answer, context)}
+
+
+      def localise(trace, evidence):
+          phrases = [" ".join(words(p)) for p in ([evidence] if isinstance(evidence, str) else evidence)]
+          gold = {c["id"] for c in trace["chunks"] if all(p in " ".join(words(c["text"])) for p in phrases)}
+          if not gold:
+              return "chunking"
+          for stage in ("fused", "reranked", "context"):
+              if not gold & set(trace[stage]):
+                  return {"fused": "retrieval", "reranked": "rerank", "context": "context"}[stage]
+          if not trace["citations"]["ok"] or not gold & set(trace["citations"]["cited"]):
+              return "generation"
+          return "ok"
+---
+
+This lab builds the pipeline the module debugs, one stage per step, in one file. Each step adds functions and runs its tests against everything you have written so far, so step 7 calls the chunker you wrote in step 1. The steps' tests feed each stage fixed inputs where they can, so a failing test in step 5 points at your reranking code and not at your BM25.
+
+There is no model in the lab. Three stand-ins in the starters replace the parts that would need one: `embed()` maps words onto fixed concept vectors, `ScriptedReranker` scores the share of query words it can see through a window it shares with the query, and `ScriptedModel` answers with sentences from its context and cites them. All three are deterministic, and the tests assert behaviour (calls made, budgets respected, citations checked) rather than exact output where a policy is yours to choose.
+
+Steps 1 to 4 build retrieval: structure-aware chunks, BM25, the dense stand-in and reciprocal rank fusion. Steps 5 and 6 are the stages between retrieval and the answer, where recall@k cannot see: reranking, the context budget and the citation check. Step 7 runs everything and breaks one stage at a time; the test passes only when your trace names the stage that was broken.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

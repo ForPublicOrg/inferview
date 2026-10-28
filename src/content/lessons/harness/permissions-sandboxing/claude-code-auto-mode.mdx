@@ -1,0 +1,164 @@
+---
+title: Claude Code auto mode
+track: harness
+module: permissions-sandboxing
+order: 8
+kind: teardown
+level: staff
+minutes: 14
+summary: Auto mode is a pipeline, not a model; deterministic rules and hooks run first, two tiers skip review, a two-stage classifier reads user messages and tool calls but not tool results, a probe watches the input side, and breakers hand control back to a person, with published error rates and a documented weak point in reading consent.
+prerequisites: [harness/permissions-sandboxing/classifier-approvers]
+updated: 2026-10-28
+sources:
+  - title: Anthropic Engineering, How we built Claude Code auto mode (John Hughes, 2026-03-25)
+    url: https://www.anthropic.com/engineering/claude-code-auto-mode
+    note: Anthropic's own evaluation. 93% prompt acceptance; threat model; server-side prompt-injection probe on tool outputs; transcript classifier on Sonnet 4.6; stage 1 single-token filter tuned toward blocking, stage 2 chain of thought on flagged actions; user messages and tool calls in, assistant text and tool results out; three tiers; broad allow rules dropped; results on 10,000 real actions, 52 real overeager actions and 1,000 synthetic exfiltration attempts (stage 1 8.5% FPR, 6.6% and 1.8% FNR; full pipeline 0.4% FPR, 17% and 5.7% FNR); misses from misjudged consent; lost provenance; blocked examples including batch-deleting remote branches after a vague clean-up request; 3 consecutive or 20 total denials escalate, headless exits; environment, block rules and allow exceptions in a fixed template; claude auto-mode defaults
+  - title: Claude Code docs, Choose a permission mode
+    url: https://code.claude.com/docs/en/permission-modes
+    note: auto runs everything with background safety checks; classifier requests go to Claude Sonnet 5 by default; dropped allow rules (Bash(*), PowerShell(*), wildcarded interpreters, package-manager run commands, Agent and Monitor rules) restored on leaving auto mode; read-only actions and working-directory edits skip the classifier except protected-path writes, and the first read outside the working directories prompts the user; classifier calls count toward token usage on Enterprise and API-based accounts and add a round trip; with server-side review, read-only shell commands wait for it; protected-path writes routed to the classifier; explicit ask rules and critical-path rm removals in every mode; fallback thresholds not configurable, total persists for the session; auto in project settings does not take effect; disableAutoMode in managed settings; useAutoModeDuringPlan on by default. Checked 2026-10-28.
+  - title: Claude Code docs, Best practices
+    url: https://code.claude.com/docs/en/best-practices
+    note: interactive terminal and VS Code sessions start in auto mode; what the classifier concentrates on (curl piped to bash, production deploys and migrations, force pushes over others' work, sensitive data to external endpoints, actions driven by content Claude read); Recently denied in /permissions with manual retry; runs after deny and ask rules and PreToolUse hooks; boundaries stated in conversation are block signals that can be lost when the conversation compacts; autoMode.environment and autoMode.allow in plain English with $defaults; /auto-mode-setup drafts environment entries. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Diagram from '../../../../components/Diagram.astro';
+import Trace from '../../../../components/Trace.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What it is and who runs it
+
+Auto mode is Claude Code's classifier-based approver. Anthropic built it after measuring that users accepted 93% of manual permission prompts, and the best-practices page, checked 2026-10-28, says interactive terminal and VS Code sessions now start in it. In auto mode Claude works without stopping for routine approvals, and a separate model reviews the actions that could do damage before they run.
+
+The previous lesson in this module, a walkthrough of Anthropic's March 2026 engineering post, covers the evaluation and how auto mode compares with Cursor's and Codex's reviewers. This teardown covers the system: the order in which each control runs, what each component sees, what it costs, and where it fails. Sources are Anthropic's post and Claude Code's documentation; the post's numbers are Anthropic's own measurements.
+
+## The system
+
+<Diagram
+  title="Where an action goes in auto mode"
+  nodes={[
+    { id: 'agent', label: 'Agent loop', note: 'proposes a tool call' },
+    { id: 'rules', label: 'Deny and ask rules, PreToolUse hooks', note: 'first, in every mode' },
+    { id: 't1', label: 'Tier 1: allowlist', note: 'read-only tools, narrow allow rules' },
+    { id: 't2', label: 'Tier 2: in-project edits', note: 'protected paths excepted' },
+    { id: 'view', label: 'Transcript view', note: 'user messages and tool calls only' },
+    { id: 's1', label: 'Stage 1 filter', note: 'single token, tuned to block' },
+    { id: 's2', label: 'Stage 2 reasoning', note: 'chain of thought on flagged actions' },
+    { id: 'breaker', label: 'Breaker', note: '3 in a row or 20 total' },
+    { id: 'tools', label: 'Tool execution' },
+    { id: 'user', label: 'User prompt', note: 'auto mode paused' },
+    { id: 'probe', label: 'Input probe', note: 'server-side, on tool results' },
+  ]}
+  edges={[
+    { from: 'agent', to: 'rules', label: 'tool call' },
+    { from: 'rules', to: 't1', label: 'no deny or ask' },
+    { from: 't1', to: 't2', label: 'not allowlisted' },
+    { from: 't2', to: 'view', label: 'tier 3' },
+    { from: 'view', to: 's1' },
+    { from: 's1', to: 's2', label: 'flagged' },
+    { from: 's1', to: 'tools', label: 'pass' },
+    { from: 's2', to: 'tools', label: 'cleared' },
+    { from: 's2', to: 'breaker', label: 'blocked' },
+    { from: 'breaker', to: 'user', label: 'threshold hit' },
+    { from: 'tools', to: 'probe', label: 'results' },
+    { from: 'probe', to: 'agent', label: 'warning if hijack-like' },
+  ]}
+  rows={[['agent'], ['rules'], ['t1', 't2'], ['view'], ['s1'], ['s2', 'breaker'], ['tools', 'user'], ['probe']]}
+/>
+
+**Deny and ask rules, PreToolUse hooks.** These run before anything in auto mode. A deny rule blocks in auto mode exactly as elsewhere, an explicit ask rule still prompts a person, and a hook that exits 2 blocks before the classifier sees the call. Recognised `rm` and `rmdir` removals of critical paths are never approved by an allow rule in any mode.
+
+**Tier 1, the allowlist.** Read-only tools and the user's allow rules resolve without review. On entering auto mode, Claude Code sets aside allow rules that amount to arbitrary code execution: `Bash(*)`, `PowerShell(*)`, wildcarded interpreters such as `Bash(python*)`, package-manager run commands, and `Agent` and `Monitor` allow rules. Narrow rules such as `Bash(npm test)` stay, and the dropped ones come back on leaving auto mode. The first read outside the working directories is the exception: in an interactive session Claude Code asks the user once whether to allow such reads.
+
+**Tier 2, in-project edits.** File edits inside the working directory are approved without a classifier call. Writes to protected paths (`.git`, `.claude`, `.vscode`, `.husky`, shell startup files, `.mcp.json` and the rest of the list) are excepted and routed to the classifier.
+
+**Transcript view.** Everything else (shell commands, web fetches, external integrations, subagent spawns, filesystem operations outside the project) reaches the classifier, which reads a stripped transcript: the user's messages and the agent's tool calls. The agent's prose and every tool result are removed, so the agent cannot talk the reviewer into an approval, and injected text in a tool result never reaches the reviewer.
+
+**Stage 1 filter.** A single-token yes or no decision, tuned to err toward blocking.
+
+**Stage 2 reasoning.** Chain-of-thought review, run only on actions stage 1 flags. The post names Sonnet 4.6 as the classifier; the permission-modes page now says classifier requests go to Claude Sonnet 5 by default.
+
+**Breaker.** A blocked action goes back to the agent with a reason, and the agent usually tries something safer. Three consecutive blocks, or twenty in a session, pause auto mode and return to prompting; a `claude -p` run exits instead. The thresholds are not configurable and the total persists for the session.
+
+**Input probe.** A server-side probe scans tool results and, when content looks like a hijack attempt, adds a warning to the agent's context. It works on the agent's side of the loop, not the classifier's: it is the one component that does read tool results.
+
+## One action, start to finish
+
+<Trace
+  title="A vague clean-up request in auto mode"
+  note="an illustrative session; the blocked action is one of the post's published examples"
+  steps={[
+    { actor: 'user', text: 'Asks Claude to clean up the stale release branches.' },
+    { actor: 'assistant', text: 'Runs `git branch -r --list "origin/release-*"`.' },
+    { actor: 'system', text: 'No deny or ask rule matches. The command is a read-only form of git, which auto mode treats as tier 1, and it runs.', note: 'In a session with server-side classifier review, read-only and sandboxed shell commands also wait for that review.' },
+    { actor: 'tool', text: 'Returns twelve remote branch names. The input probe scans the output and adds no warning.' },
+    { actor: 'assistant', text: 'Proposes `git push origin --delete` with all twelve branches.' },
+    { actor: 'system', text: 'Not read-only and not an in-project edit, so it goes to the classifier, which sees the user\'s request and this tool call. It does not see the branch list or Claude\'s reasoning.', note: 'Without the tool result, the classifier cannot check where the branch names came from.' },
+    { actor: 'system', text: 'Stage 1 flags it. Stage 2 judges that "clean up" does not clearly authorise deleting shared remote branches, and blocks.' },
+    { actor: 'assistant', text: 'Receives the reason, and asks the user which remote branches may be deleted instead of retrying.' },
+    { actor: 'system', text: 'Had the agent tried two more blocked actions in a row, auto mode would have paused and prompted the user directly.' },
+  ]}
+/>
+
+## Context strategy
+
+The classifier's context is a deliberate subset of the agent's: user messages and tool calls, nothing else. Its policy comes from a fixed prompt template with three slots the user or organisation fills in plain English: the environment (trusted boundaries such as source-control organisations, buckets and internal domains; by default only the current repository is trusted), block rules (more than twenty by default, grouped as destroy or exfiltrate, degrade security posture, cross trust boundaries, and bypass review or affect others), and narrow allow exceptions. In settings these are `autoMode.environment` and `autoMode.allow`, with `$defaults` to keep the baseline; `claude auto-mode defaults` prints it, and `/auto-mode-setup` drafts environment entries from the project and recent sessions.
+
+Because user messages are the classifier's evidence of intent, things the user says in conversation count. The best-practices page notes that "don't push until I've reviewed" is treated as a block signal, then adds the limit: it is still a model reading the transcript, and the sentence can be lost when the conversation compacts. The same channel works the other way: text a user pastes into the conversation arrives as a user message, and the classifier has no way to tell a user's instruction from a pasted paragraph.
+
+## Tools and permission model
+
+The ordering is the design. Deterministic controls run first and cannot be overridden by the classifier, two tiers remove the cheap and reversible actions from its workload, and the classifier handles only what is left. The settings around it keep it from being widened from a repository: `defaultMode: "auto"` in project settings does not take effect, and `permissions.disableAutoMode` in managed settings removes the mode entirely.
+
+Auto mode also reaches into plan mode. With auto mode available and `useAutoModeDuringPlan` on, the default, the classifier reviews shell commands during planning other than critical-path removals, while edits stay blocked until the plan is approved. Blocked actions appear under "Recently denied" in `/permissions`, where a person can retry one with a manual approval.
+
+## Cost and latency
+
+The latency design is in the tiers and the stages. Read-only actions and in-project edits never call the classifier. Of the actions that do, stage 1 is a single token. In the post's real-traffic set, stage 1 flagged 8.5% of actions, so the slower chain-of-thought stage ran on about 850 of 10,000 actions, not all of them.
+
+The false-positive cost can be computed from the post's rate. At 0.4% of reviewed actions wrongly blocked, a session averages 4 false blocks per 1,000 reviewed actions, each costing about one retry, according to the post. The twenty-block session total would be reached by false positives alone only after about 20 / 0.004 = 5,000 reviewed actions. Three false blocks in a row, if independent, happen with probability 0.004³ = 6.4 × 10⁻⁸ per run of three. So the consecutive breaker almost never fires on independent mistakes; it fires on a real pattern of blocked behaviour, or on a correlated false positive, such as a routine command in your setup that the classifier keeps refusing. The docs' answer to the second is an `autoMode.allow` entry or an environment description, not repeated manual approval.
+
+On Enterprise plans and on accounts that use the Claude API or a cloud provider, the docs say classifier calls count toward token usage: each check sends part of the transcript plus the pending action and adds a round trip before execution, so the overhead comes mainly from shell commands and network operations. Neither the post nor the docs give a per-action token figure.
+
+## Failure modes
+
+**Consent misread.** The post's own analysis: most misses on real overeager actions were cases where the classifier saw the danger and judged, wrongly, that the user's earlier words or approvals covered the action's full blast radius. Prompt changes did not fix this without costing more than they gained. The 17% false-negative rate on 52 real overeager actions is about nine misses, too few to say much about which kinds.
+
+**Lost provenance.** With tool results stripped, the classifier cannot tell whether an identifier in a tool call came from a query or was invented by the agent. Deleting "the job named like the one you mentioned" looks the same either way.
+
+**Stated boundaries decay.** A boundary the user states in conversation is a block signal only while it is in the transcript. Compaction can drop it, and nothing warns the user when it does.
+
+**Session-scoped breakers.** The twenty-block total persists for the session and the thresholds cannot be changed. A long unattended session that hits it pauses for a person, or, in `claude -p`, exits, which turns a safety control into a job failure that pipelines need to expect.
+
+**Out of scope by design.** The post's threat model includes a misaligned model and says the authors do not currently see one in practice; the classifier judges actions against the user's intent, so it is not a control for a user who intends harm.
+
+## What is not public
+
+Anthropic has not published the classifier's prompts beyond the configurable baseline that `claude auto-mode defaults` prints, or its training data. Also not public: the probe's model and threshold, how the 52 overeager actions were selected, how the rates were aggregated (6.6% of 52 is not a whole number of actions, so they are not single-run counts), and error rates for the Sonnet 5 classifier the docs now name. The published rates are 0.4% false positives on 10,000 real actions and 17% false negatives on 52 real overeager actions, both for the March 2026 pipeline.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your platform team runs Claude Code headless in auto mode for nightly maintenance jobs across 80 repositories. Last week three jobs exited when the breaker tripped, and on-call wants auto mode replaced with `bypassPermissions` inside containers before the next release in two weeks. What do you decide, and what do you write down?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Keep auto mode and fix the cause of the trips. Three consecutive false blocks are vanishingly unlikely if independent, so the trips are either real blocked behaviour or one routine action the classifier keeps refusing. Read the denials, add narrow `autoMode.allow` or environment entries for what is routine, and add deny or ask rules for what was rightly blocked. Containers with `bypassPermissions` remove the reviewer entirely; that is defensible only if the container has no credentials or network that matter, which nightly maintenance jobs usually do.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Start with the evidence. Each tripped job left its blocked actions; group them. If they are the same routine command across jobs, it is a correlated false positive, and the documented fix is to describe it as allowed or trusted in the auto-mode configuration, reviewed like any policy change. If they are actions you would not want unattended, the breaker did its job and the job definition needs to change.</p>
+<p>Then the proposal. `bypassPermissions` still applies deny rules, ignores allow rules, and otherwise approves everything without a reviewer. In a container, the remaining control is what the container can reach. Maintenance jobs push branches, call package registries and sometimes touch infrastructure, so the container would need its own egress and credential scoping before bypass is comparable.</p>
+<p>A middle path within two weeks: auto mode stays, the job wrapper treats a breaker exit as a distinct status that pages nobody and files the denials for review, and the three most common routine denials get configuration entries.</p>
+<p>What you give up: some nightly jobs will still stop on a block, by design. Write down the expected rate after the fixes and the condition under which you would revisit bypass in containers.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The denials show the classifier blocking a deploy-to-staging step that the jobs need. Do you allow it in the auto-mode configuration or move it out of the agent's job, and who owns that decision?</li>
+<li>On-call argues the classifier adds a nondeterministic failure to deterministic jobs. Which parts of the nightly jobs should not be agent work at all?</li>
+<li>Anthropic publishes rates for the current classifier with a higher false-positive rate on your kind of traffic. What would make you reverse the decision to stay on auto mode?</li>
+</ul>
+</Fragment>
+</Depth>
+
+<SelfRate id="lesson:harness/permissions-sandboxing/claude-code-auto-mode" />

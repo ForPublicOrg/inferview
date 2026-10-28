@@ -1,0 +1,161 @@
+---
+title: Latency budgets across hops
+track: system-design
+module: capacity
+order: 2
+kind: lesson
+level: senior
+minutes: 13
+summary: A latency budget is split across hops, percentiles of the hops do not add up to the percentile of the request, so the budget is checked by simulation or by replaying traces.
+prerequisites: [system-design/capacity/cost-model]
+updated: 2026-10-28
+sources:
+  - title: NVIDIA NIM, LLM benchmarking metrics
+    url: https://docs.nvidia.com/nim/benchmarking/llm/latest/metrics.html
+    note: TTFT generally includes request queuing, prefill and network latency; end-to-end latency = TTFT + generation time; ITL = (e2e latency − TTFT) / (output tokens − 1); total TPS rises with concurrency until the GPUs saturate while TPS per user falls; checked 2026-10-28
+  - title: Voice AI and Voice Agents, an illustrated primer (Pipecat maintainers, June 2026 update)
+    url: https://www.voiceaiandvoiceagents.com
+    note: 1,500 ms voice-to-voice is the stated target; a typical stack's stage table sums to 1,293 ms with LLM time to first byte at 650 ms, transcription and endpointing at 300 ms and TTS time to first byte at 120 ms; 500 ms demonstrated with Pipecat agents; checked 2026-10-28
+  - title: ElevenLabs, voice agent latency optimization (updated 2026-10-09)
+    url: https://elevenlabs.io/blog/voice-agent-latency-optimization
+    note: vendor target of P50 time to first audio under 800 ms and P95 under 1.5 s; illustrative stage budget summing to about 680 ms at P50 and about 1,560 ms at P95; streaming does not make the model faster; a 700 ms silence wait adds 700 ms to every turn; checked 2026-10-28
+  - title: Anthropic, pricing
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: fast mode on Opus 5.5 at $8 input and $40 output against $4 and $20 standard; checked 2026-10-28
+  - title: OpenAI API pricing
+    url: https://developers.openai.com/api/docs/pricing
+    note: Fast tier 2x and Ultrafast 6x Standard for gpt-6.1-sol; checked 2026-10-28
+  - title: Anthropic docs, prompt caching
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: cached prefixes generally improve time to first token for long documents; no figure is published; checked 2026-10-28
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+A latency budget assigns each hop of a request a share of one end-to-end target: network, retrieval, rerank, the model's time to first token, generation, and whatever runs after generation. The hops are measured as distributions, and the percentile the product promises is a property of the sum. The 95th percentile of a sum is not the sum of the 95th percentiles, so a budget written as a column of per-hop P95s is checked by simulation or by replaying traces, never by adding the column.
+
+## Name what the budget measures
+
+Use NVIDIA's definitions, because every vendor dashboard uses some variant of them. Time to first token includes queueing, prefill and network. End-to-end latency is time to first token plus generation time. Inter-token latency is (end-to-end − TTFT) / (output tokens − 1), so it excludes the first token.
+
+<Predict id="sys-capacity-e2e" question="TTFT is 0.5 s and the measured inter-token latency is 40 ms. How long until the 300th output token arrives?" answer={12.46} tolerance={0.1} unit="s">
+<p><b>12.46 s</b>: 0.5 + 299 × 0.040. The ITL formula divides by output tokens minus one, so the 300th token is 299 gaps after the first. Generation is 96 percent of the time.</p>
+</Predict>
+
+Which of these the budget binds depends on what the caller does with the output. A chat surface that streams cares about TTFT and about ITL staying under reading speed. A caller that parses JSON, runs a classifier verdict or speaks the answer needs the whole output or a whole sentence, so its budget is end-to-end or time to the first complete unit. ElevenLabs states the point for voice: streaming does not make the model faster, it starts output while generation continues. Writing the budget against the wrong quantity is the most common reason a design that met its budget on paper misses it in production.
+
+## Why the column of P95s is wrong
+
+The scenario: a search assistant whose product promise is first visible answer text within 750 ms at P95. Five hops are on the critical path, each with a measured median and P95 (scenario numbers). The code draws each hop from a lognormal with that median and P95 and adds them per request.
+
+```python
+import math, random
+
+random.seed(7)
+N = 200_000
+
+def hop(p50, p95):
+    # Lognormal with the given median and 95th percentile (scenario numbers).
+    mu, sigma = math.log(p50), (math.log(p95) - math.log(p50)) / 1.6449
+    return [random.lognormvariate(mu, sigma) for _ in range(N)]
+
+def pct(xs, p):
+    return sorted(xs)[int(p * len(xs)) - 1]
+
+hops = {"network": hop(60, 140), "embed": hop(40, 90), "search": hop(50, 120),
+        "rerank": hop(250, 600), "ttft": hop(700, 1800)}
+total = [sum(h[i] for h in hops.values()) for i in range(N)]
+
+print("sum of hop p95s:", round(sum(pct(h, 0.95) for h in hops.values())), "ms")
+print("p95 of the total:", round(pct(total, 0.95)), "ms")
+print("share under 750 ms:", round(sum(t < 750 for t in total) / N, 3))
+
+# Same hops, but each request also gets a shared load factor (busy minutes
+# slow every hop at once), which correlates the hops.
+load = [random.lognormvariate(0, 0.3) for _ in range(N)]
+print("p95 with shared load:", round(pct([t * m for t, m in zip(total, load)], 0.95)), "ms")
+```
+
+```text
+sum of hop p95s: 2758 ms
+p95 of the total: 2310 ms
+share under 750 ms: 0.107
+p95 with shared load: 2713 ms
+```
+
+With independent hops the column overstates the P95 by about 450 ms, because the slow tail of one hop rarely coincides with the slow tail of another. With a shared load factor, which is what a busy minute does to every hop on the same cluster, the P95 climbs back to within 50 ms of the column. Neither number is the column's fault or virtue: the column is right only when the hops are perfectly correlated, and the real correlation is a measurement. Replaying recorded per-hop traces for the same requests keeps the correlation that a simulation has to guess.
+
+Fan-out works the other way. A request that waits for three parallel shard calls waits for the slowest one.
+
+<Predict id="sys-capacity-fanout" question="A query fans out to 3 independent shards and waits for all of them. Each shard's P95 is 80 ms. What percentage of requests see all three shards finish within 80 ms?" answer={85.7} tolerance={0.5} unit="%">
+<p><b>85.7 percent</b>: 0.95³ = 0.857. With ten shards it is 0.95¹⁰ = 59.9 percent, so a per-shard P95 target of 80 ms gives a request-level 80 ms at roughly the 60th percentile. Fan-out needs the per-shard target set at a higher percentile, hedged requests, or a deadline that answers from the shards that returned.</p>
+</Predict>
+
+## Cutting a design that is three times over
+
+The simulated P95 is 2,310 ms against a 750 ms budget. The order of operations: measure the end-to-end distribution directly, rank hops by what they contribute to the tail, change one thing, and re-run the simulation or the trace replay after each change. Subtracting a hop's P95 from the total overstates the gain for the same reason the column overstates the total.
+
+The cuts fall into five kinds, each with its own cost.
+
+1. **Shrink a hop.** Cache the static part of the prompt so prefill covers only the dynamic tail; send 30 rerank candidates instead of 100. The cache costs a write premium and a layout rule. Fewer candidates cost recall at the cutoff.
+2. **Remove a hop.** Drop the reranker and trust first-stage ranking. Costs precision at the top of the list, which shows up as worse answers rather than slower ones.
+3. **Buy speed.** A smaller model, or a priced speed tier: fast mode on Opus 5.5 lists at $8 in and $40 out against $4 and $20, and OpenAI's Fast tier is 2 times Standard. Costs quality or money, and neither vendor publishes a speedup figure, so it is measured.
+4. **Move work off the critical path.** Precompute when the input is known early, run independent hops in parallel, or start retrieval on a stable partial input. Costs work that is thrown away.
+5. **Change what the budget measures.** Show the ranked sources first and stream the answer after. This is a product decision, and it is the one that usually closes a 3x gap.
+
+Re-simulated with the same function, each row keeping the cuts above it (scenario hop numbers):
+
+| Change | P50 | P95 |
+|---|---|---|
+| As designed | 1,171 ms | 2,310 ms |
+| Cache the static prefix (TTFT 350 / 800 ms) | 811 ms | 1,369 ms |
+| Rerank 30 candidates (80 / 200 ms) | 619 ms | 1,086 ms |
+| Smaller model (TTFT 250 / 550 ms) | 518 ms | 845 ms |
+| Budget applies to ranked sources, answer streams after | 253 ms | 409 ms |
+
+The in-place cuts get from 3.1 times over to 1.1 times over, and the last 100 ms would cost the reranker or more model quality. Redefining the first visible content meets the budget with margin and leaves the model's TTFT as a second, separately stated target. The TTFT figures after caching are scenario inputs: Anthropic says cached prefixes generally improve time to first token for long documents and publishes no figure, so the row is confirmed by measurement before it goes in a plan.
+
+## Concurrency per hop
+
+Little's law turns the budget into capacity. Each hop holds requests for its own mean time, so at 34.7 requests a second a 250 ms reranker holds about 9 in flight and the model hop, at 12.5 s per streamed answer, holds about 434. The cut that shortens generation shrinks the model fleet; the rerank cut barely moves anything but the reranker's own pool. NVIDIA's metrics note the coupling the other way: as concurrency rises, total tokens per second rises until the GPUs saturate, while tokens per second per user falls. A hop's latency is a function of the load on it, so a budget measured at last month's traffic is a budget at last month's concurrency.
+
+## Voice: whose number is it
+
+Voice budgets show why every target needs an owner. The Pipecat maintainers' guide (June 2026 update) sets 1,500 ms voice-to-voice as the target and lists a typical stack stage by stage: transcription and endpointing 300 ms, LLM time to first byte 650 ms, TTS time to first byte 120 ms, and the rest in capture, codecs, network and jitter buffers, 1,293 ms in total. ElevenLabs' post states a vendor target of P50 time to first audio under 800 ms and P95 under 1.5 s, with an illustrative stage table whose P95 column adds to about 1,560 ms. That column is a sum of per-stage P95s, which the simulation above shows is not the P95 of the turn. Its most useful line is about turn detection: a 700 ms silence wait adds 700 ms to every turn, which is the largest single number a voice design controls without changing a model.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+"Our support copilot drafts a reply when an agent opens a ticket. P95 is 6.9 seconds; the support director wants 2 seconds by next quarter, trust and safety will not drop the policy check on the full draft, and the search team will not change retrieval this quarter. Where do you cut?"
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>The budget is end-to-end, because the policy check needs the whole draft, so generation length is the largest term. I would move the work off the critical path: generate the draft when the ticket arrives, not when it is opened, and keep a shortened pipeline for tickets opened before precompute finishes. That costs model spend on tickets nobody opens and on drafts made stale by customer replies, so it ships with an invalidation rule and a spend alert.</p>
+</Fragment>
+<Fragment slot="long">
+<p>I would ask for the per-hop distributions from traces of the same requests, then rank by tail contribution: generation of a long draft, the main model's time to first token on an uncached prompt, the policy check, the query rewrite call, rerank, retrieval last because it is fixed.</p>
+<p>In-place cuts: cap the draft length (agents edit drafts anyway, but acceptance rate is the quality signal), cache the static prompt, drop the rewrite call for tickets where raw-text retrieval scores are high, rerank fewer candidates. Each is re-simulated rather than subtracted. They probably reach 3 to 4 seconds, not 2.</p>
+<p>Precompute closes the gap because the clock starts when the agent opens the ticket. The cost is drafts for tickets that are closed without being opened, and staleness: a customer reply after precompute invalidates the draft, and the regenerated one is on the critical path again. The failure mode is a mass incident where thousands of tickets arrive at once: precompute spend spikes and the queue delays drafts for exactly the tickets agents open first, so precompute needs its own concurrency cap with priority by ticket age.</p>
+<p>What I give up: spend on unopened tickets, and full freshness. Written down: a rollout plan with precompute behind a flag on one queue, rollback triggers on draft acceptance rate and on precompute spend per ticket, and the staleness rule.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Precompute doubles the model bill because 40 percent of tickets are closed by automation before an agent opens them. Which tickets do you precompute, and what do you tell the director about the rest?</em></li>
+<li><em>What would you need to see after launch to drop precompute and go back to on-open generation?</em></li>
+<li><em>Trust and safety offers to check the draft in chunks as it streams. What does that cost them, and would you take it?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The lognormal model gives every hop a smooth tail. Real hops have modes: a cache hit and a cache miss, a warm and a cold connection, a retry after a timeout. A bimodal hop can put the P95 of the total almost exactly on one hop's slow mode, which neither the independent nor the correlated simulation shows, and only trace replay does.
+
+The budget treats the model as a fixed-latency hop. Model latency depends on concurrency, prompt length and output length, so every cut that changes load or prompt shape changes the model hop too; re-measure under the new load before trusting the table.
+
+A latency budget also assumes the arrival rate is below capacity. Above it, queueing time grows without bound and no per-hop cut recovers the P95; the fix is capacity or admission control, which the traffic-to-fleet lesson sizes.
+
+<SelfRate id="lesson:system-design/capacity/latency-budgets" />

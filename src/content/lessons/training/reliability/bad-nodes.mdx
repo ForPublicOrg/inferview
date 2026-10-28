@@ -1,0 +1,139 @@
+---
+title: Finding bad nodes
+track: training
+module: reliability
+order: 3
+kind: lesson
+level: senior
+minutes: 12
+summary: Bad nodes surface as watchdog timeouts, stragglers and silent corruption, and when traces do not name the node, finding it is group testing with disjoint rounds, where a known-good node turns a group test into a single-node test.
+prerequisites: [training/reliability/failures-at-scale]
+updated: 2026-10-28
+sources:
+  - title: The Llama 3 Herd of Models (Meta, arXiv 2407.21783), section 3.3.4
+    url: https://arxiv.org/html/2407.21783
+    note: "NCCL flight recorder ring buffer dumped on watchdog or heartbeat timeout; NVLink failures appear as stalled loads and stores in CUDA kernels without a clear error code; NCCLX snapshots finished and pending transfers of a failing collective; stragglers found by prioritizing suspicious communications from selected process groups and investigating a few top suspects; Table 5 lists 7 NCCL watchdog timeouts with unknown cause and 6 silent data corruptions among 419 unexpected interruptions. The paper reports. Checked 2026-10-28."
+  - title: PracHub, Find all faulty GPU nodes with parallel group tests that cannot share nodes
+    url: https://prachub.com/interview-questions/find-all-faulty-gpu-nodes-with-parallel-group-tests-that-cannot-share-nodes
+    note: "Candidate report of an xAI machine learning engineer onsite question, posted 2026-09-05 and updated 2026-09-24: identify bad nodes with a group test that fails if any node in the group is bad, in parallel rounds where groups are disjoint and each has at least two nodes; follow-ups on few bad nodes, flaky tests, group-size-dependent test time and a live cluster. Taught here with original material. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+In a synchronous training job a bad node rarely announces itself. A collective is a barrier across every rank in its group, so when one rank stops, all of them time out together, and the error lands everywhere at once. The job of finding the bad node splits into two stages: read the evidence the job left behind, and when the evidence does not name a node, test nodes until it does. The second stage is a group-testing problem, and it has a clean algorithmic answer with costs worth stating in rounds and in tests.
+
+## Four shapes of a bad node
+
+**Crash.** A GPU, its memory or the host fails hard and the process dies. The scheduler sees which host died; this is the easy case and most of the Llama 3 failure table.
+
+**Hang.** A collective never completes. The Llama 3 paper notes that NVLink failures often show up as CUDA kernels stalled on loads and stores with no error code, so the only signal is a timeout. Its failure table lists seven NCCL watchdog timeouts with cause unknown.
+
+**Slow.** A straggler still works but slowly, and because every step waits for the slowest rank, one straggler slows thousands of GPUs. The paper says it looks like slow communication, not an error, and nothing interrupts the job.
+
+**Wrong.** Silent data corruption returns incorrect values without failing. Six of the 419 Llama 3 interruptions were attributed to it. Of the four shapes it is the hardest to localize, because the wrong value is reduced into everyone's gradients before anything looks unusual.
+
+## Reading the evidence first
+
+For hangs, the evidence is the per-rank history of collectives. PyTorch's flight recorder keeps a ring buffer of collective operations (enqueue, start and end times, process group, ranks, sizes, stack traces) and the Llama 3 team dumped it automatically on watchdog or heartbeat timeout. The analysis is a join across ranks: the collective that all ranks enqueued but some never started, or that one rank never enqueued, points at the rank that diverged. A rank that never entered the collective usually means a software or scheduling bug on that rank; a rank that entered and never finished points at its GPU, NVLink or NIC.
+
+For stragglers, the paper describes tooling that ranks communications from selected process groups by how suspicious they look, after which investigating a few top suspects usually found the straggler. The same idea works with simpler data: per-rank step time and per-collective wait time, where the straggler is the rank everyone else waits on and that itself waits on nobody.
+
+When the dump is missing (the host died before writing it), or the symptom is intermittent, or the suspect list is a whole rack, the remaining tool is to run test jobs on chosen sets of nodes and see which fail.
+
+## Bad-node search as group testing
+
+A candidate report on PracHub, posted in September 2026, describes an xAI onsite question built on exactly this. Stated in our own terms: there are n nodes; a test runs a job on a set of nodes and fails if any node in the set is bad; tests run in parallel rounds; within a round no node may be in two tests; and every test needs at least two nodes, because a single node cannot run a multi-node collective. Find the exact set of bad nodes.
+
+Three observations carry the solution.
+
+**A pass clears every node in the group; a failure only says "at least one".** Passes are cheap information, failures are expensive.
+
+**A known-good node turns a group test into a single-node test.** Test a suspect together with a node already known to be good, and the result is the suspect's status. Until two good nodes are known, every failure is ambiguous.
+
+**Identifiability depends on there being at least two good nodes.** With zero or one good node, every group of two or more contains a bad node, every test fails, and no strategy can tell the configurations apart. The procedure should detect that and say so rather than return a guess.
+
+### Rounds against tests
+
+Take a scenario with 512 nodes (a 4,096-GPU job at eight GPUs per node) and two bad nodes.
+
+*Pairs, then pad.* Round 1 tests 256 disjoint pairs. 254 pass, so 508 nodes are known good. Each of the two failing pairs has at least one bad node; round 2 tests all four suspects, each paired with a different good node. Total: 2 rounds, 260 tests.
+
+*Blocks, then halve.* Round 1 tests 32 blocks of 16. 30 pass, so 480 nodes are known good. Each failing block is split in half and both halves are tested; a failing half is split again, and a half of one node is padded with a good node. Halving from 16 to 8, 4, 2 and 1 takes four more rounds at four tests each (two blocks, two halves). Total: 5 rounds, 48 tests.
+
+<Predict id="trn-rel-bound" question="Each test returns one bit. What is the fewest tests that can, in the worst case, distinguish every possible choice of 2 bad nodes out of 512?" answer={17} tolerance={0} unit="tests">
+There are C(512, 2) = 512 × 511 / 2 = 130,816 possible bad sets. Each test has two outcomes, so t tests distinguish at most 2^t sets, and 2^17 = 131,072 is the first power of two above 130,816. Blocks-then-halve at 48 tests is within a factor of three of the bound; pairs-then-pad at 260 is fifteen times it, and buys three fewer rounds.
+</Predict>
+
+Which is better depends on what a round and a test cost. If a test is a fixed-length burn-in on nodes that are idle anyway, rounds are the wall-clock and pairs-then-pad wins. If each test is a job launch with scheduler overhead, or tested nodes are pulled out of a running job, tests are the cost and halving wins. If test time grows with group size, which it does for collectives that cross more switches, the first round of large blocks is the slow one, and smaller first-round blocks trade tests for time. Stating which of these the interviewer's cluster has is half the answer.
+
+```python
+import math
+
+def pairs_then_pad(n, d):
+    # Worst case: the d bad nodes sit in d different pairs.
+    return {"rounds": 2, "tests": n // 2 + 2 * d}
+
+def blocks_then_halve(n, d, blocks):
+    size = n // blocks
+    depth = math.ceil(math.log2(size))
+    return {"rounds": 1 + depth, "tests": blocks + 2 * d * depth}
+
+print(pairs_then_pad(512, 2))           # {'rounds': 2, 'tests': 260}
+print(blocks_then_halve(512, 2, 32))    # {'rounds': 5, 'tests': 48}
+print(math.ceil(math.log2(math.comb(512, 2))))   # 17
+```
+
+When bad nodes are common the picture inverts. If most blocks fail, the first round yields no good nodes and every later failure is ambiguous. The fallback is to test pairs until one passes, which with very few good nodes can take many rounds; with exactly two good nodes among n, only the one pair of both can ever pass, and finding it may need every pair to be tested. Problem trn-027 asks for the full search, including that case.
+
+## Flaky tests
+
+Real burn-in jobs fail for reasons unrelated to the nodes: a transient network error, a scheduler hiccup. Suppose a group of good nodes fails with probability p, and a group with a bad node always fails. A pass is still conclusive; a failure is not.
+
+The adjustment is to require repeated evidence before quarantine. Declare a node bad only after it fails k times, each time paired with a different known-good node, so that one bad partner cannot frame it. A good node is then quarantined by mistake with probability p^k.
+
+<Predict id="trn-rel-flaky" question="512 nodes, a good group fails 5% of the time (scenario), and a node is quarantined after 3 failures with three different good partners. If every node went through that check, how many good nodes would you expect to quarantine by mistake?" answer={0.064} tolerance={0.005} unit="nodes">
+0.05³ = 1.25 × 10⁻⁴ per node, times 512 = 0.064. Each extra repetition divides the false quarantines by 20 and adds a round for every suspect.
+</Predict>
+
+The harder case is the other direction: a bad node that passes sometimes, because its HBM errors appear only under sustained load or high temperature. Then a pass no longer clears a node, and the test has to be made harsher (longer, hotter, closer to the training workload) before the search logic means anything.
+
+## On a live cluster
+
+In production the search runs continuously, not once. Nodes that fail a job go to a quarantine pool rather than straight back to the scheduler, since the Llama 3 failure table counts interruptions, and a host the scheduler keeps returning to the job turns one fault into many interruptions. Quarantined nodes are tested against known-good nodes from a spare pool, and only nodes that pass a burn-in close to the training workload return. The spare pool is what makes the known-good partner cheap: with spares, every suspect can be tested individually in one round, and the group-testing problem only matters when spares run out or the fault is spread across many nodes.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+"Since Tuesday a 512-node training job hangs with NCCL watchdog timeouts about every six hours. Flight recorder dumps exist for three of the last four hangs and name different ranks each time. You have eight spare nodes and the run is already two days behind. How do you find the bad node, and do you keep training while you look?"
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Keep training on checkpoints and search in parallel. Different ranks per dump suggests the named rank is a victim, so I look at what the three dumps share: the same switch, the same rack, or one node that appears as a peer in every stuck collective. That narrows the suspects to a set small enough to test against the eight spares in one or two rounds, and I pull those suspects only when a test fails, not before.</p>
+</Fragment>
+<Fragment slot="long">
+<p>A hang every six hours costs one restart plus lost work each time; stopping the run to search costs everything. So training continues, with the interval checked against the new failure rate.</p>
+<p>The dumps name the rank that timed out last, not necessarily the one that stopped. Join them: for each hang, list the ranks that entered the stuck collective and the peers they were waiting on. If one node appears in all three as an awaited peer, test it first. If the common element is a switch or rack, the suspect set is the nodes behind it, perhaps 16.</p>
+<p>The constraint conflict is spares against wall-clock. With eight known-good spares, sixteen suspects can be tested individually in two rounds of eight, padding each suspect with a spare. The alternative is to drain the suspects from the job and test them as halves among themselves, which needs no spares but shrinks the job and leaves the first failing half ambiguous. I would use the spares and accept a smaller cushion against a real failure while the search runs.</p>
+<p>Failure mode of this plan: if the fault only appears under the full job's traffic, a two-node test passes every suspect and the search clears the bad node. The fallback is to remove suspects from the job one rack at a time and watch whether the hang rate changes, which takes days at one hang per six hours, so I would write down in advance how many hang-free hours count as cleared (at a six-hour mean, 24 hang-free hours happen by chance about 2% of the time if hangs are independent, e⁻⁴).</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The infrastructure lead wants to pull all 64 nodes behind the suspect switch now and run at seven-eighths size. You think that costs more than it saves. How do you settle it without deciding by rank?</em></li>
+<li><em>Two of your eight spares fail their own burn-in. What changes in the search, and what do you tell the capacity planners?</em></li>
+<li><em>What would you need to see to stop searching and accept a node as good?</em> A burn-in that reproduces the training job's collective pattern passing repeatedly, plus a hang-free period long enough that the observed rate would make it unlikely by chance.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The group-test model assumes a test is deterministic, monotone (a group with a bad node always fails) and independent of which other nodes are in it. Network faults violate the last: a bad link fails only the tests whose traffic crosses it, so the failing unit is a pair of nodes or a path, not a node, and node-level group testing can blame both endpoints or neither.
+
+Rounds are not free just because tests run in parallel. A round includes scheduling, job startup and collective initialization, which on a large cluster can exceed the test itself, so a strategy with fewer, larger rounds can win even when it runs more tests.
+
+Silent data corruption is mostly outside this model. A test that checks only completion cannot see wrong arithmetic; it needs known answers, such as deterministic kernels compared across nodes or replicated computation with a checksum, and the cost of that check is what limits how often it runs.
+
+<SelfRate id="lesson:training/reliability/bad-nodes" />

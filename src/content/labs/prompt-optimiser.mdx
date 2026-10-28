@@ -1,0 +1,562 @@
+---
+title: Build a mini prompt optimiser
+track: llmops
+module: prompt-lifecycle
+kind: lab
+minutes: 120
+summary: Grow one program over five steps that scores replies with feedback, bootstraps demos from passing traces, searches instructions and demo sets on a dev set, rejects an overfitted winner on a held-out set, and registers the result as an immutable prompt version.
+updated: 2026-10-28
+sources:
+  - title: DSPy documentation, Optimizers (main branch, checked 2026-10-28)
+    url: https://raw.githubusercontent.com/stanfordnlp/dspy/main/docs/docs/learn/optimization/optimizers.md
+    note: "BootstrapFewShot uses a teacher module, which defaults to your program, to generate complete demonstrations for each stage; start with BootstrapFewShot at around 10 examples, BootstrapFewShotWithRandomSearch at 50 or more, and MIPROv2 with 200 or more to prevent overfitting. Steps 2 and 3."
+  - title: DSPy documentation, GEPA overview (main branch, checked 2026-10-28)
+    url: https://raw.githubusercontent.com/stanfordnlp/dspy/main/docs/docs/api/optimizers/GEPA/overview.md
+    note: "GEPA expects the metric to return a dspy.Prediction with score and feedback, and keeps a Pareto frontier of candidates that score highest on at least one instance. Step 1."
+  - title: Langfuse documentation, Prompt management data model (checked 2026-10-28)
+    url: https://langfuse.com/docs/prompt-management/data-model
+    note: "versions are an immutable history and each update creates a new version; labels are pointers to versions; production is the default label and latest always points to the newest version; rollback reassigns production. Step 5."
+steps:
+  - title: A metric that returns a score and feedback text
+    brief: |
+      Every optimiser in this lab climbs whatever metric you give it, so the metric comes first. MockModel stands in for the model: it reads rules from the instruction, copies labels from demos that share a word with the ticket, falls back to keywords, and answers with a bare label only when the instruction asks for one word. Write metric(example, output), which returns a score in [0, 1] and a feedback string. A reply that is exactly the gold label scores 1.0. A reply that contains the right label in the wrong format earns partial credit, and how much is your call; its feedback says format. A wrong label, no label, or more than one label scores 0.0, and the feedback names what was expected and what came back. The feedback text matters because step 3 proposes new instructions from it, the way GEPA's metric returns feedback for its reflection step.
+    starter: |
+      import re
+
+      LABELS = ("billing", "bug", "account")
+      KEYWORDS = {"refund": "billing", "invoice": "billing", "charged": "billing",
+                  "crash": "bug", "error": "bug", "password": "account", "login": "account"}
+      STOPWORDS = {"a", "an", "the", "my", "i", "is", "it", "to", "on", "of", "and", "after", "for", "me", "this", "was", "not", "in", "please"}
+
+
+
+      class MockModel:
+          """A deterministic stand-in for the model that labels support tickets. Every call is appended to calls.
+
+          complete(instruction, demos, ticket) reads, in this order:
+          1. Rules in the instruction of the form: tickets that mention 'word' are label. The first rule whose word is in
+             the ticket decides.
+          2. Demos, a list of (ticket, label) pairs: the first demo that shares a word with the ticket, other than a keyword
+             or a stopword, decides.
+          3. KEYWORDS: the first word of the ticket that is a keyword decides.
+          4. Otherwise "account".
+          It answers with the bare label only when the instruction contains "one word"; otherwise "Category: <label>"."""
+
+          RULE = re.compile(r"tickets that mention '(\w+)' are (\w+)", re.I)
+
+          def __init__(self):
+              self.calls = []
+
+          def complete(self, instruction, demos, ticket):
+              self.calls.append((instruction, tuple(demos), ticket))
+              words = ticket.lower().split()
+              label = None
+              for word, rule_label in self.RULE.findall(instruction):
+                  if word.lower() in words:
+                      label = rule_label.lower()
+                      break
+              if label is None:
+                  for demo_ticket, demo_label in demos:
+                      shared = set(demo_ticket.lower().split()) & set(words)
+                      if shared - STOPWORDS - set(KEYWORDS):
+                          label = demo_label
+                          break
+              if label is None:
+                  label = next((KEYWORDS[w] for w in words if w in KEYWORDS), "account")
+              return label if "one word" in instruction.lower() else "Category: " + label
+
+
+      def ex(ticket, label):
+          return {"ticket": ticket, "label": label}
+
+
+      # TRAIN feeds bootstrapping, DEV the search, and HELDOUT only the final check.
+      TRAIN = [ex("refund for my subscription", "billing"), ex("charged twice for vat", "billing"),
+               ex("invoice missing receipt", "billing"), ex("app crash on export", "bug"),
+               ex("error then screen freezes", "bug"), ex("crash with blank page", "bug"),
+               ex("login fails with 2fa code", "account"), ex("password reset for username", "account"),
+               ex("my plan was charged twice", "billing"), ex("cannot login account locked", "account")]
+      DEV = [ex("subscription renewed twice", "billing"), ex("need vat on receipt", "billing"),
+             ex("export freezes halfway", "bug"), ex("blank dashboard today", "bug"),
+             ex("2fa code never arrives", "account"), ex("username already taken", "account"),
+             ex("urgent page stuck", "bug"), ex("urgent nothing loads", "bug"), ex("urgent spinner forever", "bug"),
+             ex("refund still pending", "billing")]
+      HELDOUT = [ex("receipt shows wrong vat", "billing"), ex("subscription cancelled by itself", "billing"),
+                 ex("export times out with blank file", "bug"), ex("screen freezes on save", "bug"),
+                 ex("locked out after 2fa change", "account"), ex("change username please", "account"),
+                 ex("urgent refund needed today", "billing"), ex("urgent invoice is wrong", "billing"),
+                 ex("urgent password reset", "account"), ex("urgent subscription renewed twice", "billing"),
+                 ex("crash when opening invoice", "bug"), ex("login link expired", "account")]
+
+
+      def metric(example, output):
+          """example is {"ticket", "label"}; output is the model's raw reply.
+          Return {"score": float in [0, 1], "feedback": str}."""
+          raise NotImplementedError
+    tests: |
+      m = MockModel()
+      assert m.complete("Label the ticket.", [], "refund please") == "Category: billing"
+      assert m.complete("Label the ticket. Answer with one word.", [], "refund please") == "billing"
+      assert metric({"ticket": "refund please", "label": "billing"}, "billing")["score"] == 1.0
+      r = metric({"ticket": "refund please", "label": "billing"}, "Category: billing")
+      assert 0 < r["score"] < 1 and "format" in r["feedback"], "right label in the wrong format: partial credit, and feedback that says format"
+      r = metric({"ticket": "app crash", "label": "bug"}, "billing")
+      assert r["score"] == 0.0 and "bug" in r["feedback"] and "billing" in r["feedback"], "feedback names the expected and the returned label"
+    hidden: |
+      for _hx_out in ("billing or bug", "I am not sure", "", "Category: account, maybe billing"):
+          _hx_r = metric({"ticket": "t", "label": "billing"}, _hx_out)
+          assert _hx_r["score"] == 0.0 and isinstance(_hx_r["feedback"], str) and _hx_r["feedback"]
+      assert "format" in metric({"ticket": "t", "label": "bug"}, "I am not sure")["feedback"]
+      assert metric({"ticket": "t", "label": "bug"}, "Category: billing")["score"] == 0.0
+      _hx_m = MockModel()
+      for _hx_ins in ("Label it.", "Label it. Answer with one word.", "Answer with one word. Tickets that mention 'urgent' are bug."):
+          for _hx_e in TRAIN + DEV + HELDOUT:
+              _hx_r = metric(_hx_e, _hx_m.complete(_hx_ins, [], _hx_e["ticket"]))
+              assert 0.0 <= _hx_r["score"] <= 1.0 and isinstance(_hx_r["feedback"], str) and _hx_r["feedback"]
+              assert (_hx_r["score"] == 1.0) == (_hx_m.complete(_hx_ins, [], _hx_e["ticket"]) == _hx_e["label"])
+    solution: |
+      import re
+
+      LABELS = ("billing", "bug", "account")
+      KEYWORDS = {"refund": "billing", "invoice": "billing", "charged": "billing",
+                  "crash": "bug", "error": "bug", "password": "account", "login": "account"}
+      STOPWORDS = {"a", "an", "the", "my", "i", "is", "it", "to", "on", "of", "and", "after", "for", "me", "this", "was", "not", "in", "please"}
+
+
+
+      class MockModel:
+          """A deterministic stand-in for the model that labels support tickets. Every call is appended to calls.
+
+          complete(instruction, demos, ticket) reads, in this order:
+          1. Rules in the instruction of the form: tickets that mention 'word' are label. The first rule whose word is in
+             the ticket decides.
+          2. Demos, a list of (ticket, label) pairs: the first demo that shares a word with the ticket, other than a keyword
+             or a stopword, decides.
+          3. KEYWORDS: the first word of the ticket that is a keyword decides.
+          4. Otherwise "account".
+          It answers with the bare label only when the instruction contains "one word"; otherwise "Category: <label>"."""
+
+          RULE = re.compile(r"tickets that mention '(\w+)' are (\w+)", re.I)
+
+          def __init__(self):
+              self.calls = []
+
+          def complete(self, instruction, demos, ticket):
+              self.calls.append((instruction, tuple(demos), ticket))
+              words = ticket.lower().split()
+              label = None
+              for word, rule_label in self.RULE.findall(instruction):
+                  if word.lower() in words:
+                      label = rule_label.lower()
+                      break
+              if label is None:
+                  for demo_ticket, demo_label in demos:
+                      shared = set(demo_ticket.lower().split()) & set(words)
+                      if shared - STOPWORDS - set(KEYWORDS):
+                          label = demo_label
+                          break
+              if label is None:
+                  label = next((KEYWORDS[w] for w in words if w in KEYWORDS), "account")
+              return label if "one word" in instruction.lower() else "Category: " + label
+
+
+      def ex(ticket, label):
+          return {"ticket": ticket, "label": label}
+
+
+      # TRAIN feeds bootstrapping, DEV the search, and HELDOUT only the final check.
+      TRAIN = [ex("refund for my subscription", "billing"), ex("charged twice for vat", "billing"),
+               ex("invoice missing receipt", "billing"), ex("app crash on export", "bug"),
+               ex("error then screen freezes", "bug"), ex("crash with blank page", "bug"),
+               ex("login fails with 2fa code", "account"), ex("password reset for username", "account"),
+               ex("my plan was charged twice", "billing"), ex("cannot login account locked", "account")]
+      DEV = [ex("subscription renewed twice", "billing"), ex("need vat on receipt", "billing"),
+             ex("export freezes halfway", "bug"), ex("blank dashboard today", "bug"),
+             ex("2fa code never arrives", "account"), ex("username already taken", "account"),
+             ex("urgent page stuck", "bug"), ex("urgent nothing loads", "bug"), ex("urgent spinner forever", "bug"),
+             ex("refund still pending", "billing")]
+      HELDOUT = [ex("receipt shows wrong vat", "billing"), ex("subscription cancelled by itself", "billing"),
+                 ex("export times out with blank file", "bug"), ex("screen freezes on save", "bug"),
+                 ex("locked out after 2fa change", "account"), ex("change username please", "account"),
+                 ex("urgent refund needed today", "billing"), ex("urgent invoice is wrong", "billing"),
+                 ex("urgent password reset", "account"), ex("urgent subscription renewed twice", "billing"),
+                 ex("crash when opening invoice", "bug"), ex("login link expired", "account")]
+
+
+      def metric(example, output):
+          """example is {"ticket", "label"}; output is the model's raw reply.
+          Return {"score": float in [0, 1], "feedback": str}."""
+          gold = example["label"]
+          text = output.strip()
+          found = [l for l in LABELS if re.search(r"\b" + l + r"\b", text.lower())]
+          if text.lower() == gold:
+              return {"score": 1.0, "feedback": "correct"}
+          if len(found) == 1 and found[0] == gold:
+              return {"score": 0.5, "feedback": f"format: right label {gold}, but the reply was {text!r}, not the bare label"}
+          if not found:
+              return {"score": 0.0, "feedback": f"format: no label in the reply {text!r}; expected {gold}"}
+          if len(found) > 1:
+              return {"score": 0.0, "feedback": f"format: more than one label in {text!r}; expected {gold}"}
+          return {"score": 0.0, "feedback": f"wrong label: expected {gold}, got {found[0]}"}
+  - title: Bootstrap few-shot from passing traces
+    brief: |
+      Bootstrapping runs a teacher over the training set and keeps only the traces that pass the metric, so a demo is never a reply the metric rejected. Write bootstrap(model, instruction, trainset, metric, max_demos), which calls the teacher (the model with the instruction and no demos) in trainset order, keeps (ticket, label) for every reply that scores 1.0, never keeps the same ticket twice, and stops calling the model once max_demos are kept. In production the training set is large and every teacher call is billed, so the tests count calls on a 200,000-row training set.
+    starter: |
+      def bootstrap(model, instruction, trainset, metric, max_demos=4):
+          """Run the teacher (model.complete with instruction and no demos) over trainset in order. Keep a
+          (ticket, label) demo only when the reply scores 1.0 under metric. Never keep the same ticket twice
+          (compare case- and whitespace-insensitively), and stop calling the model once max_demos are kept."""
+          raise NotImplementedError
+    tests: |
+      ONE = "Label the support ticket as billing, bug or account. Answer with one word."
+      m = MockModel()
+      demos = bootstrap(m, ONE, TRAIN, metric, max_demos=4)
+      assert len(demos) == 4
+      assert all(m.complete(ONE, [], t) == label for t, label in demos), "every demo is a reply that passed the metric"
+      assert bootstrap(MockModel(), "Label the support ticket.", TRAIN, metric, max_demos=4) == [], "replies in the wrong format never pass, so nothing is kept"
+      m = MockModel()
+      bootstrap(m, ONE, TRAIN * 20000, metric, max_demos=4)
+      assert len(m.calls) <= 10, "stop calling the teacher once the demos are collected"
+    hidden: |
+      _hx_ONE = "Answer with one word."
+      _hx_tr = [{"ticket": "Refund  for VAT", "label": "billing"}, {"ticket": "refund for vat", "label": "billing"},
+                {"ticket": "crash on load", "label": "account"}, {"ticket": "login loop", "label": "account"},
+                {"ticket": "error on save", "label": "bug"}]
+      _hx_m = MockModel()
+      _hx_d = bootstrap(_hx_m, _hx_ONE, _hx_tr, metric, max_demos=10)
+      assert len({" ".join(t.lower().split()) for t, _ in _hx_d}) == len(_hx_d), "no ticket kept twice"
+      assert ("crash on load", "account") not in _hx_d and ("crash on load", "bug") not in _hx_d, "a failing trace is never a demo"
+      assert {l for _, l in _hx_d} == {"billing", "account", "bug"}
+      assert all(len(bootstrap(MockModel(), _hx_ONE, TRAIN, metric, max_demos=k)) == min(k, 10) for k in (0, 1, 3, 10, 50))
+      _hx_m = MockModel()
+      bootstrap(_hx_m, _hx_ONE, TRAIN * 50000, metric, max_demos=1)
+      assert len(_hx_m.calls) == 1
+      assert all(c[1] == () for c in _hx_m.calls), "the teacher runs without demos"
+    solution: |
+      def bootstrap(model, instruction, trainset, metric, max_demos=4):
+          """Run the teacher (model with instruction and no demos) over trainset in order and keep (ticket, label)
+          demos from replies that score 1.0. Stop calling the model once max_demos are kept. Skip a ticket already kept."""
+          demos, seen = [], set()
+          for example in trainset:
+              if len(demos) >= max_demos:
+                  break
+              key = " ".join(example["ticket"].lower().split())
+              if key in seen:
+                  continue
+              reply = model.complete(instruction, [], example["ticket"])
+              if metric(example, reply)["score"] >= 1.0:
+                  demos.append((example["ticket"], example["label"]))
+                  seen.add(key)
+          return demos
+  - title: Instruction proposals with random search on a dev set
+    brief: |
+      Write propose(base, failures, n, seed), which reads the feedback from a run of the base instruction on the dev set and returns up to n distinct candidates: the base plus "Answer with one word." when any feedback is about format, and at most one rule "Tickets that mention 'word' are label." mined from a ticket the base got wrong. Which words you mine and in what order is your choice; the tests check that every rule comes from a failing ticket and its gold label. Then write random_search(model, instructions, demo_sets, dev, metric, budget, seed), which scores (instruction, demo set) pairs on the whole dev set in a seeded random order, never scores a pair twice, stops before it would exceed budget model calls, and returns the best pair with its dev score and the number of pairs tried. Notice which candidate wins: the dev set has three urgent tickets that are all bugs.
+    starter: |
+      import random
+
+
+      def propose(base, failures, n, seed=0):
+          """failures is a list of (example, feedback) pairs from running base on the dev set.
+          Return at most n distinct instructions, each one base plus fixes read from the feedback:
+          "Answer with one word." when any feedback is about format, and at most one rule of the form
+          "Tickets that mention 'word' are label." mined from a ticket whose feedback says "wrong label"."""
+          raise NotImplementedError
+
+
+      def random_search(model, instructions, demo_sets, dev, metric, budget, seed=0):
+          """Sample (instruction, demo set) pairs with random.Random(seed), never the same pair twice, score each on all
+          of dev (the mean metric score), and return {"instruction", "demos", "dev_score", "tried"} for the best pair,
+          where tried is the number of pairs scored. Never spend more than budget model calls."""
+          raise NotImplementedError
+    tests: |
+      BASE = "Label the support ticket as billing, bug or account."
+      m = MockModel()
+      fails = [(e, metric(e, m.complete(BASE, [], e["ticket"]))["feedback"]) for e in DEV]
+      cands = propose(BASE, fails, 5, seed=1)
+      assert 1 <= len(cands) <= 5 and len(set(cands)) == len(cands)
+      assert all(c.startswith(BASE) and "one word" in c for c in cands), "format feedback in the failures: every candidate fixes it"
+      ONE = BASE + " Answer with one word."
+      demos = bootstrap(MockModel(), ONE, TRAIN, metric, max_demos=8)
+      m = MockModel()
+      best = random_search(m, cands, [[], demos], DEV, metric, budget=40, seed=0)
+      assert len(m.calls) <= 40 and best["tried"] == 4, "40 calls buy four pairs on a 10-ticket dev set"
+      assert abs(best["dev_score"] - sum(metric(e, MockModel().complete(best["instruction"], best["demos"], e["ticket"]))["score"] for e in DEV) / len(DEV)) < 1e-9
+    hidden: |
+      _hx_B = "Label it."
+      _hx_f = [({"ticket": "urgent page stuck", "label": "bug"}, "wrong label: expected bug, got account"),
+               ({"ticket": "need vat on receipt", "label": "billing"}, "wrong label: expected billing, got account"),
+               ({"ticket": "refund now", "label": "billing"}, "correct")]
+      for _hx_seed in range(5):
+          _hx_c = propose(_hx_B, _hx_f, 20, seed=_hx_seed)
+          assert len(_hx_c) == len(set(_hx_c)) and all(c.startswith(_hx_B) and "one word" not in c for c in _hx_c), "no format feedback, no format fix"
+          for _hx_x in _hx_c:
+              for _hx_w, _hx_l in MockModel.RULE.findall(_hx_x):
+                  assert any(_hx_w in e["ticket"].split() and e["label"] == _hx_l for e, f in _hx_f if f.startswith("wrong label")), "rules come from failing tickets with their gold label"
+                  assert _hx_w not in KEYWORDS and _hx_w not in STOPWORDS and _hx_w != "now"
+              assert len(MockModel.RULE.findall(_hx_x)) <= 1
+      assert len(propose(_hx_B, _hx_f, 2)) <= 2
+      _hx_ins = ["Answer with one word."] + ["Answer with one word. Tickets that mention '%s' are bug." % w for w in ("urgent", "stuck", "page", "spinner")]
+      _hx_sets = [[], bootstrap(MockModel(), "Answer with one word.", TRAIN, metric, max_demos=8)]
+      _hx_all = max(sum(metric(e, MockModel().complete(i, d, e["ticket"]))["score"] for e in DEV) / len(DEV) for i in _hx_ins for d in _hx_sets)
+      _hx_m = MockModel()
+      _hx_best = random_search(_hx_m, _hx_ins, _hx_sets, DEV, metric, budget=10 ** 6, seed=3)
+      assert _hx_best["tried"] == 10 and abs(_hx_best["dev_score"] - _hx_all) < 1e-9, "with budget for every pair, the best pair wins"
+      assert len({(c[0], tuple(map(tuple, c[1]))) for c in _hx_m.calls}) == 10 and len(_hx_m.calls) == 100, "no pair scored twice"
+      for _hx_budget in (10, 25, 39):
+          _hx_m = MockModel()
+          _hx_r = random_search(_hx_m, _hx_ins, _hx_sets, DEV, metric, budget=_hx_budget, seed=1)
+          assert len(_hx_m.calls) <= _hx_budget and _hx_r["tried"] == _hx_budget // 10
+    solution: |
+      import random
+
+
+      def propose(base, failures, n, seed=0):
+          """failures: (example, feedback) pairs from running base. Return up to n distinct instructions, each base plus
+          fixes read from the feedback: "Answer with one word." when any feedback is about format, and one rule
+          "Tickets that mention 'w' are label." mined from a failing ticket."""
+          rng = random.Random(seed)
+          fix = " Answer with one word." if any(f.startswith("format") for _, f in failures) else ""
+          words = sorted({(w, ex["label"]) for ex, f in failures if f.startswith("wrong label")
+                          for w in ex["ticket"].lower().split() if w not in STOPWORDS and w not in KEYWORDS})
+          out = [base + fix] if fix else []
+          rng.shuffle(words)
+          for w, label in words:
+              if len(out) >= n:
+                  break
+              cand = f"{base}{fix} Tickets that mention '{w}' are {label}."
+              if cand not in out:
+                  out.append(cand)
+          return out[:n]
+
+
+      def random_search(model, instructions, demo_sets, dev, metric, budget, seed=0):
+          """Sample (instruction, demo set) pairs without repeats, score each on all of dev (mean metric score), and return
+          {"instruction", "demos", "dev_score", "tried"} for the best. Never spend more than budget model calls."""
+          rng = random.Random(seed)
+          pairs = [(i, d) for i in range(len(instructions)) for d in range(len(demo_sets))]
+          rng.shuffle(pairs)
+          best, tried = None, 0
+          for i, d in pairs[: budget // max(1, len(dev))]:
+              scores = [metric(ex, model.complete(instructions[i], demo_sets[d], ex["ticket"]))["score"] for ex in dev]
+              score = sum(scores) / len(scores)
+              tried += 1
+              if best is None or score > best["dev_score"]:
+                  best = {"instruction": instructions[i], "demos": list(demo_sets[d]), "dev_score": score}
+          best["tried"] = tried
+          return best
+  - title: A held-out check that catches overfitting
+    brief: |
+      The search picked its winner on the dev set, so its dev score is biased upward by the selection itself. Write heldout_check(model, baseline, candidate, heldout, metric, z), which scores both prompts on every held-out example, takes the per-example differences, and accepts the candidate only when the lower end of the z interval on the mean difference is above zero. The held-out set has urgent tickets about refunds and passwords. The tests build the rule that won on the dev set and check that it is rejected, while the candidate with bootstrapped demos and no rule is accepted.
+    starter: |
+      import math
+
+
+      def heldout_check(model, baseline, candidate, heldout, metric, z=1.96):
+          """baseline and candidate are {"instruction", "demos"}. Score both on every held-out example and compare them
+          pair by pair. Accept the candidate only when the lower end of the z interval on the mean paired gain is above 0.
+          Return {"accept", "baseline", "candidate", "gain", "low", "high"} with the two mean scores and the interval.
+          Raise ValueError with fewer than two held-out examples."""
+          raise NotImplementedError
+    tests: |
+      ONE = "Label the support ticket as billing, bug or account. Answer with one word."
+      baseline = {"instruction": ONE, "demos": []}
+      overfit = {"instruction": ONE + " Tickets that mention 'urgent' are bug.", "demos": bootstrap(MockModel(), ONE, TRAIN, metric, max_demos=8)}
+      honest = {"instruction": ONE, "demos": bootstrap(MockModel(), ONE, TRAIN, metric, max_demos=8)}
+      dev = lambda c: sum(metric(e, MockModel().complete(c["instruction"], c["demos"], e["ticket"]))["score"] for e in DEV) / len(DEV)
+      assert dev(overfit) > dev(honest) > dev(baseline), "on the dev set the overfitted candidate looks best"
+      r = heldout_check(MockModel(), baseline, overfit, HELDOUT, metric)
+      assert r["accept"] is False and r["low"] <= 0 < r["high"], "the urgent rule does not survive the held-out set"
+      r = heldout_check(MockModel(), baseline, honest, HELDOUT, metric)
+      assert r["accept"] is True and r["low"] > 0 and r["candidate"] > r["baseline"]
+    hidden: |
+      _hx_ONE = "Answer with one word."
+      _hx_b = {"instruction": _hx_ONE, "demos": []}
+      _hx_r = heldout_check(MockModel(), _hx_b, _hx_b, HELDOUT, metric)
+      assert _hx_r["accept"] is False and _hx_r["gain"] == 0
+      _hx_m = MockModel()
+      _hx_c = {"instruction": _hx_ONE, "demos": bootstrap(MockModel(), _hx_ONE, TRAIN, metric, max_demos=8)}
+      _hx_r = heldout_check(_hx_m, _hx_b, _hx_c, HELDOUT, metric)
+      assert len(_hx_m.calls) == 2 * len(HELDOUT), "each held-out example is scored once per prompt"
+      assert abs(_hx_r["gain"] - (_hx_r["candidate"] - _hx_r["baseline"])) < 1e-9 and _hx_r["low"] <= _hx_r["gain"] <= _hx_r["high"]
+      _hx_w = heldout_check(MockModel(), _hx_b, _hx_c, HELDOUT, metric, z=3.5)
+      assert _hx_w["high"] - _hx_w["low"] > _hx_r["high"] - _hx_r["low"]
+      _hx_bad = {"instruction": "Label it.", "demos": []}
+      assert heldout_check(MockModel(), _hx_b, _hx_bad, HELDOUT, metric)["accept"] is False, "a worse candidate is never accepted"
+      try:
+          heldout_check(MockModel(), _hx_b, _hx_c, HELDOUT[:1], metric)
+          raise AssertionError("one example cannot carry an interval")
+      except ValueError:
+          pass
+    solution: |
+      import math
+
+
+      def heldout_check(model, baseline, candidate, heldout, metric, z=1.96):
+          """baseline and candidate are {"instruction", "demos"}. Score both on every held-out example (paired) and accept
+          the candidate only when the lower bound of the interval on the mean paired gain is above zero.
+          Return {"accept", "baseline", "candidate", "gain", "low", "high"}."""
+          diffs, b_total, c_total = [], 0.0, 0.0
+          for ex in heldout:
+              b = metric(ex, model.complete(baseline["instruction"], baseline["demos"], ex["ticket"]))["score"]
+              c = metric(ex, model.complete(candidate["instruction"], candidate["demos"], ex["ticket"]))["score"]
+              b_total += b
+              c_total += c
+              diffs.append(c - b)
+          n = len(diffs)
+          if n < 2:
+              raise ValueError("need at least two held-out examples")
+          mean = sum(diffs) / n
+          sd = math.sqrt(sum((d - mean) ** 2 for d in diffs) / (n - 1))
+          half = z * sd / math.sqrt(n)
+          return {"accept": mean - half > 0, "baseline": b_total / n, "candidate": c_total / n,
+                  "gain": mean, "low": mean - half, "high": mean + half}
+  - title: Register the winner as a new prompt version with its scores
+    brief: |
+      In Langfuse's model every edit is a new immutable version and labels are pointers, with production as the default label and latest always on the newest version. Write a PromptRegistry with create, get, move_label and labels on that model, returning copies so no caller can edit a stored version. Then write register_winner, which stores the winner as a new version with its demos, dev score, held-out result and a fingerprint of each data set in the config, points staging at it only when the held-out check accepted it, and never touches production. A rejected winner is still recorded, because the next person to run the optimiser should see what was tried and why it did not ship.
+    starter: |
+      import copy
+      import hashlib
+      import json
+
+
+      class PromptRegistry:
+          """Versions are immutable and numbered from 1 per prompt name. Labels are pointers to versions;
+          "latest" always points at the newest version and only the registry moves it."""
+
+          def create(self, name, prompt, config=None):
+              """Store a new version and return its number."""
+              raise NotImplementedError
+
+          def get(self, name, label="production", version=None):
+              """Return {"version", "prompt", "config"} for the version, or for the version the label points at.
+              Raise KeyError when there is none."""
+              raise NotImplementedError
+
+          def move_label(self, name, label, version):
+              """Point label at an existing version; raise KeyError for a version that does not exist."""
+              raise NotImplementedError
+
+          def labels(self, name):
+              """Return {label: version} for the prompt."""
+              raise NotImplementedError
+
+
+      def register_winner(registry, name, winner, check, dev, heldout):
+          """winner is random_search's result and check is heldout_check's. Store the winner's instruction as a new
+          version whose config is {"demos", "dev_score", "heldout": the check, "dev_set" and "heldout_set": a fingerprint
+          of each data set that ignores row order}, so the scores can be traced to the data they came from. Point "staging" at it only when the check accepted it. Never move
+          "production". Return the version number."""
+          raise NotImplementedError
+    tests: |
+      reg = PromptRegistry()
+      v1 = reg.create("triage", "Label the support ticket as billing, bug or account.")
+      reg.move_label("triage", "production", v1)
+      ONE = "Label the support ticket as billing, bug or account. Answer with one word."
+      honest = {"instruction": ONE, "demos": bootstrap(MockModel(), ONE, TRAIN, metric, max_demos=8)}
+      honest["dev_score"] = 0.8
+      check = heldout_check(MockModel(), {"instruction": ONE, "demos": []}, honest, HELDOUT, metric)
+      v2 = register_winner(reg, "triage", honest, check, DEV, HELDOUT)
+      assert v2 == 2 and reg.labels("triage")["production"] == 1 and reg.labels("triage")["staging"] == 2
+      assert reg.labels("triage")["latest"] == 2
+      cfg = reg.get("triage", label="staging")["config"]
+      assert reg.get("triage", label="staging")["prompt"] == ONE
+      assert cfg["dev_score"] == 0.8 and cfg["heldout"]["gain"] == check["gain"] and cfg["heldout"]["accept"] is True, "the scores travel with the version"
+      assert cfg["dev_set"] != cfg["heldout_set"]
+    hidden: |
+      _hx_reg = PromptRegistry()
+      _hx_reg.create("p", "v1 text")
+      _hx_reg.move_label("p", "production", 1)
+      _hx_got = _hx_reg.get("p")
+      _hx_got["prompt"] = "edited"
+      _hx_got["config"]["x"] = 1
+      assert _hx_reg.get("p")["prompt"] == "v1 text" and _hx_reg.get("p")["config"] == {}, "a version cannot be edited in place"
+      _hx_cfg = {"t": [1]}
+      _hx_reg.create("p", "v2 text", _hx_cfg)
+      _hx_cfg["t"].append(2)
+      assert _hx_reg.get("p", version=2)["config"] == {"t": [1]}
+      assert _hx_reg.create("q", "other") == 1, "numbering is per prompt"
+      for _hx_bad in (lambda: _hx_reg.move_label("p", "production", 9), lambda: _hx_reg.get("p", label="nope"), lambda: _hx_reg.get("zzz")):
+          try:
+              _hx_bad()
+              raise AssertionError("expected KeyError")
+          except KeyError:
+              pass
+      _hx_ONE = "Answer with one word."
+      _hx_over = {"instruction": _hx_ONE + " Tickets that mention 'urgent' are bug.", "demos": bootstrap(MockModel(), _hx_ONE, TRAIN, metric, max_demos=8), "dev_score": 1.0, "tried": 4}
+      _hx_chk = heldout_check(MockModel(), {"instruction": _hx_ONE, "demos": []}, _hx_over, HELDOUT, metric)
+      _hx_v = register_winner(_hx_reg, "p", _hx_over, _hx_chk, DEV, HELDOUT)
+      _hx_l = _hx_reg.labels("p")
+      assert _hx_v == 3 and _hx_l["production"] == 1 and "staging" not in _hx_l and _hx_l["latest"] == 3, "a rejected winner is recorded, not staged"
+      assert _hx_reg.get("p", version=3)["prompt"] == _hx_over["instruction"]
+      _hx_r2 = PromptRegistry()
+      _hx_r2.create("p", "x")
+      _hx_a = register_winner(_hx_r2, "p", _hx_over, _hx_chk, DEV, HELDOUT)
+      _hx_b = register_winner(_hx_r2, "p", _hx_over, _hx_chk, DEV, HELDOUT[:-1] + [{"ticket": "other", "label": "bug"}])
+      _hx_fa, _hx_fb = (_hx_r2.get("p", version=v)["config"]["heldout_set"] for v in (_hx_a, _hx_b))
+      assert _hx_fa != _hx_fb, "a different held-out set gives a different fingerprint"
+      _hx_c = register_winner(_hx_r2, "p", _hx_over, _hx_chk, DEV, list(reversed(HELDOUT)))
+      assert _hx_r2.get("p", version=_hx_c)["config"]["heldout_set"] == _hx_fa, "the fingerprint does not depend on row order"
+      assert _hx_r2.get("p", version=_hx_c)["config"]["demos"] and _hx_r2.get("p", version=_hx_c)["config"]["heldout"]["accept"] is False
+    solution: |
+      import copy
+      import hashlib
+      import json
+
+
+      class PromptRegistry:
+          """Versions are immutable and numbered from 1 per name; labels are pointers to versions."""
+
+          def __init__(self):
+              self._versions = {}
+              self._labels = {}
+
+          def create(self, name, prompt, config=None):
+              versions = self._versions.setdefault(name, [])
+              versions.append(copy.deepcopy({"version": len(versions) + 1, "prompt": prompt, "config": config or {}}))
+              self._labels.setdefault(name, {})["latest"] = len(versions)
+              return len(versions)
+
+          def get(self, name, label="production", version=None):
+              n = version if version is not None else self._labels.get(name, {}).get(label)
+              if n is None:
+                  raise KeyError(f"{name} has no version labelled {label}")
+              return copy.deepcopy(self._versions[name][n - 1])
+
+          def move_label(self, name, label, version):
+              if label == "latest":
+                  raise ValueError("latest is managed by the registry")
+              if not 1 <= version <= len(self._versions.get(name, [])):
+                  raise KeyError(f"{name} has no version {version}")
+              self._labels.setdefault(name, {})[label] = version
+
+          def labels(self, name):
+              return dict(self._labels.get(name, {}))
+
+
+      def fingerprint(examples):
+          rows = sorted(json.dumps(e, sort_keys=True) for e in examples)
+          return hashlib.sha256("\n".join(rows).encode()).hexdigest()[:12]
+
+
+      def register_winner(registry, name, winner, check, dev, heldout):
+          """New version with the scores and data fingerprints in its config; "staging" only when the check accepted it."""
+          config = {
+              "demos": [list(d) for d in winner["demos"]],
+              "dev_score": winner["dev_score"],
+              "heldout": {k: check[k] for k in ("accept", "baseline", "candidate", "gain", "low", "high")},
+              "dev_set": fingerprint(dev),
+              "heldout_set": fingerprint(heldout),
+          }
+          version = registry.create(name, winner["instruction"], config)
+          if check["accept"]:
+              registry.move_label(name, "staging", version)
+          return version
+---
+
+The lab builds the loop the optimisers in this module share, small enough to read in one sitting: a metric with feedback, demos bootstrapped from passing traces, a search over instructions and demo sets, a held-out check, and a registry that keeps the result. Each step adds functions to the same file and its tests run against everything written so far.
+
+There is no model. MockModel is deterministic and its rules are in its docstring: instruction rules first, then demos that share a word with the ticket, then keywords. The three data sets are in the step 1 code. The dev set has a quirk a search will find: every ticket that mentions urgent is a bug. The held-out set does not share it, and step 4 exists to notice.
+
+The tests check behaviour, never prose: which replies the metric passes, how many model calls each function spends, that every demo came from a passing trace, that the overfitted winner is rejected, and that the registry never moves production.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

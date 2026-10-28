@@ -1,0 +1,134 @@
+---
+id: rag-030
+title: Correctness fell after a reranker change and recall did not
+subtitle: rank four defects with a sliced eval and no access to the model
+track: rag
+module: debugging-rag
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: true
+tags: [rerank, cross-encoder, context-window, evaluation, data-residency, debugging]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Cohere documentation, Models (rerank section)
+    url: https://docs.cohere.com/docs/models
+    note: "context length 32k for rerank-v5.0 and rerank-v4.0 models, 4k for rerank-v3.5 and the v3.0 models; the query and the document count together against the limit for a single document. An example of a published reranker window, not the model in this scenario. Checked 2026-10-28."
+  - title: Cohere documentation, Rerank best practices
+    url: https://docs.cohere.com/docs/reranking-best-practices
+    note: "the model takes both the query and the document into account against the limit; long documents are truncated to max_tokens_per_doc, default 4096; v3.5 and v3.0 queries over 2,048 tokens are truncated; for more control, chunk documents yourself. Checked 2026-10-28."
+  - title: Cohere API reference, Rerank v2
+    url: https://docs.cohere.com/reference/rerank
+    note: "max_tokens_per_doc defaults to 4096 and long documents are truncated to it. Checked 2026-10-28."
+  - title: Barnett et al., Seven Failure Points When Engineering a Retrieval Augmented Generation System (arXiv 2401.05856, 2024-01-11)
+    url: https://arxiv.org/abs/2401.05856
+    note: "FP2 Missed the Top Ranked Documents: the answer is in a document that did not rank highly enough to be returned. Checked 2026-10-28."
+  - title: Anthropic, Introducing Contextual Retrieval (2024-09-19)
+    url: https://www.anthropic.com/news/contextual-retrieval
+    note: "prepends usually 50 to 100 tokens of document context to each chunk; Anthropic reports contextual embeddings reduced its top-20 retrieval failure rate from 5.7% to 3.7%, measured as 1 minus recall@20 on its own datasets. Checked 2026-10-28."
+choices:
+  - text: Long pages are scored on their opening tokens only, so a passage deep in a page cannot lift the page it is in
+    correct: true
+    why: Losses grow with how far into its page the gold passage sits, from 2 questions under 2,000 tokens to 16 at 4,000 or more, and first-turn questions with no history lose too.
+  - text: The 0.30 cutoff was set on the old model's scores, so the new model's lower scores drop good pages before the prompt
+    correct: false
+    why: A real defect, but refusals rose by 4 of 300, and a cutoff does not care where in a page the answer sits.
+  - text: recall@10 held at 0.88, so retrieval is sound, and the loss must come from a generation change in the same release
+    correct: false
+    why: The harness computes recall@10 on the hybrid list before the reranker, so it cannot see a reranking failure; the release did not touch generation.
+  - text: Two turns of history in the rerank query pull its scores toward the earlier topic and away from the current question
+    correct: false
+    why: History shrinks the room left for the page, but first-turn questions with no history lost 8 of 17 in the deepest slice.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"Answer correctness on our eval set fell eleven points after we changed the reranker. Recall@10 did not move. What happened, and what do we do?"
+</Callout>
+
+The system and its numbers are a scenario. An internal policy assistant retrieves whole wiki pages and reranks them. Release 5.2 changed two things. A security review required that page text stay inside the company's cloud account, so reranking moved from a hosted model to a different model deployed in-region. And the rerank query now carries the last two conversation turns, so follow-up questions such as "and for contractors?" resolve. The new reranker cut p95 rerank latency from 410 ms to 95 ms. Moving back to the hosted model needs an exception from the security team.
+
+```python
+RERANK_MODEL = "policy-rerank-inregion"
+MIN_SCORE = 0.30
+
+def retrieve(question, history):
+    standalone = rewrite(question, history)
+    pages = hybrid_search(standalone, top_k=50)
+    query = render_turns(history[-2:]) + "\n\nQuestion: " + question
+    scores = reranker.score(RERANK_MODEL, query, [p.text for p in pages])
+    ranked = sorted(zip(pages, scores), key=lambda ps: ps[1], reverse=True)
+    return [p for p, s in ranked if s >= MIN_SCORE][:8]
+```
+
+The eval harness, unchanged in the release:
+
+```python
+report["recall@10"] = mean(recall_at_k(q.gold_pages, hybrid_search(q.standalone, top_k=50), 10) for q in evalset)
+```
+
+The 300-question eval set, before and after:
+
+```text
+                              before 5.2    after 5.2
+recall@10                     0.88          0.88
+answers correct               246           212
+refusals                      9             13
+p95 rerank latency            410 ms        95 ms
+
+tokens before the gold passage in its page      n     correct before    correct after
+under 2,000                                    182    152               150
+2,000 to 3,999                                  71     57                41
+4,000 or more                                   47     37                21
+  of which first-turn questions (no history)    22     17                 9
+```
+
+Which defect explains the drop? Rank the others, say what you would collect first, and choose a fix you can ship without the security exception.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the new model's maximum input length, and whether the query counts against it.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask at which stage the harness computes recall@10.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the distribution of page lengths in tokens among the 50 candidates for a typical query, and the token length of the rerank query by slice.</p></details>
+
+## Answer
+
+The candidates are whole pages and the new model reads the query and the page through one window. Whatever does not fit is never scored. A page whose answer sits 5,000 tokens in is judged on its first few thousand tokens, which are about something else, and it drops below pages that mention the topic early. The scale of that window is a property of the model you have to ask for (Hint 1); published rerankers differ widely, with Cohere listing 4k-token windows for its v3.5 model and 32k for v4.0, with the query and the document counted together and long documents truncated.
+
+**The evidence.** 246 to 212 is 34 lost answers. By slice they are 2, 16 and 16: 2 of the 152 answers that were right where the gold passage sits near the top of its page, 16 of 57 in the middle slice, and 16 of 37 in the deepest. A weaker model would lose answers in every slice; this one lost 2 of 152 where the passage is visible, so its ranking is fine on what it sees. The first-turn row rules out history as the main cause: questions with no history lost 8 of 17 in the deepest slice. recall@10 did not move because the harness computes it on the hybrid list before the reranker (Hint 2), so it measures the stage that did not change. In Barnett et al.'s terms the answers are now Missed the Top Ranked Documents, caused by a stage the metric skips.
+
+**The other defects, ranked.**
+
+1. *History in the rerank query* (second). It is real and it compounds the first: every token of the two previous turns comes out of the room left for the page, which is why part of the 2,000 to 3,999 slice fails. Collect query token counts by slice (Hint 3). The retrieval step already has `standalone`, the rewritten question; using it as the rerank query costs nothing.
+2. *The 0.30 cutoff* (third). It was set on the old model's score distribution. Refusals rose from 9 to 13, so it explains at most 4 of the 34. Recalibrate it on the eval set: score the gold and non-gold pages with the new model and choose the cutoff from those two distributions.
+3. *recall@10 measured before reranking* (fourth). It caused no wrong answer, but it is why the release shipped green. Add recall@8 on the reranked list, by slice, beside it.
+
+**What to collect before changing anything.** The model's input limit and its truncation behaviour, from the model card or by test: move a gold passage to the top of its page and re-score it. Post-rerank recall@8 by slice, which should reproduce the correctness pattern. The page length distribution among candidates, which decides what the fix costs.
+
+**The fix: two defensible answers.**
+
+- *Rerank passages, keep the in-region model.* Split each candidate page into windows that fit with the query, score every window, and give the page its best window's score. Cost: more scoring calls. If the 50 candidates average 2.5 windows each (an assumption to replace with the Hint 3 measurement), that is 125 scoring units instead of 50, and if latency scales with units, about 95 x 2.5 = 240 ms, against 410 ms before the release and a rerank budget I would set at 300 ms. Reranking 30 candidates instead of 50 brings it to about 140 ms if recall@50 and recall@30 on the hybrid list are close; measure that first.
+- *Get the security exception and go back to the hosted model.* Cost: weeks of review, an exception that every future reviewer has to re-read, and 410 ms again. It restores the old correctness without new code.
+
+I would ship passage reranking with `standalone` as the query and a recalibrated cutoff, because it stays inside the residency requirement and its cost is latency that can be measured before launch. The constraint conflict is residency against correctness, with latency as the price of reconciling them. What I give up: most of the latency the swap saved.
+
+**The failure mode of that fix.** Taking the best window per page favours long pages: a page with eight windows has eight chances at a high score, so long pages that mention the topic in passing can outrank the short page that answers it. And a window cut from the middle of a page loses its title and headings, so "the limit is 30 days" no longer says which limit. Prefix each window with the page title and heading path, the same move contextual retrieval makes with 50 to 100 tokens of context per chunk, and check the slice table by page length after the change.
+
+## Follow-ups
+
+- *Passage reranking puts the whole request at 1.3 s p95 against a 1.2 s target. Which half do you cut, candidates or windows per page, and what risk do you accept in writing?*
+- *What would you need to see in production to go back to reranking whole pages?* A model whose window exceeds the p99 page length plus the query, measured on your candidates, and post-rerank recall by slice flat across offsets.
+- *A colleague says the right fix is to index passages instead of pages, so the reranker never sees a long document. Two senior engineers disagree; how do you decide without deciding by rank?* Run both on the 300 questions with the slice table and the latency budget, and decide on the deepest slice and p95 together.
+- *The security team asks whether truncation means page text beyond the window is never processed by the in-region model. What do you check before answering yes?*
+
+## Common mistakes
+
+- Reading an unchanged recall@k as proof that retrieval is fine, without asking where it is measured.
+- Blaming generation for a loss that tracks where the answer sits in its page.
+- Removing the history from the query and stopping there; first-turn questions lose too.
+- Moving the cutoff to recover refusals and calling the problem fixed.
+- Requesting the security exception as the first move when a fix inside the requirement exists.

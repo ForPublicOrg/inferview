@@ -1,0 +1,190 @@
+---
+title: Collectives from first principles
+track: training
+module: distributed
+order: 1
+kind: lesson
+level: senior
+minutes: 12
+summary: Every parallelism in large-model training reduces to five collectives, and ring all-reduce, a reduce-scatter followed by an all-gather, sends close to twice the buffer per GPU at any GPU count, so link bandwidth rather than rank count sets its cost.
+prerequisites: [training/compute-scaling/flops-mfu]
+updated: 2026-10-28
+sources:
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: an all-reduce can be broken down into an all-gather and a reduce-scatter; reduce-scatter is two times faster than all-reduce; ring all-reduce appendix, each GPU sends 2 x (N-1) x K/N values, about 2K for large N; TP+SP uses two all-gathers and two reduce-scatters per block, equivalent in cost to vanilla TP's two all-reduces. Checked 2026-10-28.
+  - title: Korthikanti et al., Reducing Activation Recomputation in Large Transformer Models (arXiv 2205.05198)
+    url: https://arxiv.org/html/2205.05198
+    note: tensor parallelism uses four all-reduces per forward and backward pass; with sequence parallelism, four all-gathers and four reduce-scatters, the same bandwidth because a ring all-reduce is a reduce-scatter followed by an all-gather. Checked 2026-10-28.
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: H800 nodes of 8 GPUs; NVLink about 160 GB/s against InfiniBand 50 GB/s per GPU; cross-node all-to-all goes over IB to the same in-node index, then NVLink. Checked 2026-10-28.
+  - title: Dubey et al., The Llama 3 Herd of Models (arXiv 2407.21783)
+    url: https://arxiv.org/html/2407.21783
+    note: gradients accumulated in FP32 across micro-batches and reduce-scattered in FP32 across data-parallel workers. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Five operations
+
+Every parallel layout in this module is a choice about which tensors live where, and each choice is paid for in a small set of collective operations. Name them by what they leave behind on each of N ranks, with K the size of the full tensor.
+
+**Broadcast.** One rank's K bytes end up on every rank. Used at start-up and when one rank loads a checkpoint.
+
+**Reduce-scatter.** Every rank starts with its own K-byte tensor; each rank ends with one K/N slice of the elementwise sum. ZeRO and FSDP use it for gradients, so each rank holds the summed gradient for only the parameters it owns.
+
+**All-gather.** Every rank starts with a K/N slice; every rank ends with all K. FSDP uses it to materialise a layer's parameters just before computing it; sequence parallelism uses it to rebuild a full activation before a tensor-parallel matmul.
+
+**All-reduce.** Every rank starts with K bytes and ends with the full K-byte sum. Plain data parallelism uses it for gradients, tensor parallelism for partial matmul outputs.
+
+**All-to-all.** Every rank holds N pieces, one addressed to each peer, and ends with the N pieces addressed to it. Expert parallelism uses it to send tokens to experts and back; it is the only one of the five whose message sizes can differ per pair and per step.
+
+Pipeline and context parallelism mostly use point-to-point send and receive, which is not a collective but has the same cost model.
+
+The Ultra-Scale Playbook makes the decomposition that ties these together explicit: an all-reduce can be broken into a reduce-scatter and an all-gather. That identity is why ZeRO-1 and ZeRO-2 cost the same bandwidth as plain data parallelism, and why sequence parallelism adds no traffic over tensor parallelism. Korthikanti et al. count four all-reduces per layer in a tensor-parallel forward and backward pass, and four all-gathers plus four reduce-scatters with sequence parallelism, at the same bandwidth.
+
+## The ring
+
+The ring algorithm is the one whose arithmetic every capacity estimate in this module leans on. Arrange the N ranks in a ring and cut each rank's K-byte buffer into N chunks.
+
+In the reduce-scatter phase, each rank sends one chunk to its right neighbour, receives one from its left, and adds the received chunk into its own copy. After N - 1 steps, each rank holds one chunk that has passed through every rank, which is that chunk's full sum. In the all-gather phase, the ranks circulate those finished chunks for another N - 1 steps, overwriting instead of adding.
+
+Each step moves K/N bytes per rank. Per rank, the total sent is
+
+```
+reduce-scatter:      (N - 1) * K / N
+all-gather:          (N - 1) * K / N
+all-reduce:      2 * (N - 1) * K / N
+```
+
+The factor (N - 1)/N approaches 1 fast: 7/8 at N = 8, 63/64 at N = 64. So a ring all-reduce sends just under 2K bytes per GPU whether the ring has 8 members or 1,000. The work spreads; it does not shrink. Doubling the GPU count leaves per-GPU bytes almost unchanged and doubles the number of steps.
+
+<Predict id="trn-dist-ring-bytes" question="A 1B-parameter model keeps BF16 gradients, so the buffer is 2 GB. With a ring all-reduce over 8 GPUs, how many GB does each GPU send?" answer={3.5} tolerance={0.05} unit=" GB">
+<p>2 x (8 - 1) / 8 x 2 GB = <b>3.5 GB</b>. On 1,024 GPUs it is 2 x 1,023 / 1,024 x 2 GB = 3.996 GB. Adding 128 times the GPUs raised per-GPU traffic by 14%. The reduce-scatter half alone is 1.75 GB, which is the Playbook's point that a reduce-scatter is two times faster than an all-reduce: ZeRO-2 and FSDP replace the gradient all-reduce with a reduce-scatter and move the all-gather half to the parameters.</p>
+</Predict>
+
+## What it costs in time
+
+A useful model has two terms. With per-step latency alpha and per-GPU link bandwidth B in bytes per second:
+
+```
+t_allreduce = 2 * (N - 1) * alpha  +  2 * (N - 1) / N * K / B
+```
+
+For large buffers the second term dominates and is nearly independent of N, so the slowest link in the ring sets the time. For small buffers the first term dominates and grows linearly with N. Both observations drive design.
+
+The bandwidth term explains why topology matters more than rank count. DeepSeek-V3's report gives about 160 GB/s per GPU over NVLink inside an H800 node and 50 GB/s per GPU over InfiniBand between nodes. A 2 GB all-reduce over 8 GPUs in one node sends 3.5 GB per GPU, so 3.5 / 160 = 21.9 ms of pure transfer. Stretch the same ring across nodes and some link in it runs at 50 GB/s: 3.5 / 50 = 70 ms. A ring is only as fast as its slowest hop.
+
+The latency term explains why gradients are bucketed. Frameworks fuse many small gradient tensors into a few large buffers before reducing them, because each separate collective pays the 2(N - 1) alpha term again.
+
+## Hierarchy instead of a flat ring
+
+A flat ring across M nodes of 8 GPUs puts InfiniBand hops in the ring and pays the latency term over 8M ranks. The common alternative follows the topology:
+
+1. Reduce-scatter inside each node over NVLink, leaving each GPU with a K/8 slice summed across its node.
+2. All-reduce that K/8 slice across the M nodes, among the GPUs with the same local index, over InfiniBand.
+3. All-gather inside each node over NVLink.
+
+Per GPU, the cross-node traffic is now 2 (M - 1)/M x K/8 instead of close to 2K, an eighth of the bytes on the slow fabric, because the 8 GPUs of a node each carry a different slice in parallel on their own NICs. The same move appears again in this module: HSDP shards inside a node and replicates across nodes, and DeepSeek-V3's all-to-all crosses InfiniBand once per target node, to the GPU with the same in-node index, and forwards over NVLink.
+
+## A byte-counting simulator
+
+The code below runs the ring on Python lists, checks the sum, and counts bytes sent per rank. Run it with different N and confirm that per-rank traffic converges to 2K.
+
+```python
+def ring_allreduce(bufs):
+    """bufs: N equal-length float lists, one per rank. Returns (results, bytes sent per rank)."""
+    n, k = len(bufs), len(bufs[0])
+    assert k % n == 0
+    c = k // n
+    data = [list(b) for b in bufs]
+    sent = [0] * n
+
+    def chunk(i):
+        return range((i % n) * c, (i % n) * c + c)
+
+    # reduce-scatter: at step s, rank r sends chunk (r - s) to rank r + 1, which adds it
+    for s in range(n - 1):
+        msgs = [(r, (r - s) % n, [data[r][j] for j in chunk(r - s)]) for r in range(n)]
+        for r, idx, payload in msgs:
+            dst = (r + 1) % n
+            for j, v in zip(chunk(idx), payload):
+                data[dst][j] += v
+            sent[r] += 4 * len(payload)                     # FP32 bytes
+    # all-gather: rank r now owns the full sum of chunk (r + 1); circulate it
+    for s in range(n - 1):
+        msgs = [(r, (r + 1 - s) % n, [data[r][j] for j in chunk(r + 1 - s)]) for r in range(n)]
+        for r, idx, payload in msgs:
+            dst = (r + 1) % n
+            for j, v in zip(chunk(idx), payload):
+                data[dst][j] = v
+            sent[r] += 4 * len(payload)
+    return data, sent
+
+
+n, k = 8, 64
+bufs = [[float(r + 1)] * k for r in range(n)]
+out, sent = ring_allreduce(bufs)
+assert all(v == sum(range(1, n + 1)) for row in out for v in row)
+print(sent[0], 2 * (n - 1) / n * 4 * k)                     # 448 448.0
+```
+
+Every rank sends the same amount, which is the property that makes the ring bandwidth-optimal: no rank is a hot spot, unlike a parameter server where one node receives N - 1 full buffers.
+
+The [ring all-reduce lab](/labs/ring-allreduce) grows this into a tested simulator over six steps.
+
+## Where each collective lands
+
+The table below is the map for the rest of the module; each later lesson is one row in detail.
+
+| Parallelism | Sharded | Collective | How often |
+|---|---|---|---|
+| Data parallel | batch | all-reduce of gradients | once per step, overlapped with backward |
+| ZeRO-1/2, FSDP | optimizer, gradients, parameters | reduce-scatter gradients, all-gather parameters | per layer for ZeRO-3 |
+| Tensor parallel | matmul dimensions | all-reduce, or all-gather plus reduce-scatter with SP | per layer, on the critical path |
+| Pipeline parallel | layers | send and receive of activations | per micro-batch per stage boundary |
+| Context parallel | sequence | K/V rotation or all-gather | per attention layer |
+| Expert parallel | experts | all-to-all, dispatch and combine | per MoE layer |
+
+The column that matters for placement is the last one. A collective that runs once per step and overlaps with backward tolerates a slow fabric. A collective that runs inside every layer and blocks the next matmul does not, which is why tensor parallelism stays inside a node.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"A 7B dense model trains with plain data parallelism on 32 nodes of 8 GPUs. Profiling shows the gradient all-reduce exposed for a quarter of the step after overlap. The run must start in two weeks and you cannot change the cluster. The modelling team refuses to grow the global batch. What do you change?"**
+</Callout>
+
+<p class="tiny">The model size, cluster and profile are a scenario.</p>
+
+<Depth>
+<Fragment slot="short">
+<p>First check the reduction is hierarchical: a flat ring across 256 GPUs puts InfiniBand hops on every step and pays 510 latency terms. Then move from all-reduce to reduce-scatter plus a sharded optimizer (ZeRO-1), which costs the same bytes but lets the parameter all-gather overlap with the next forward. Larger gradient buckets cut the latency term. With the batch fixed, more gradient accumulation is off the table.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Size the problem first. The gradient buffer is 7B x 2 bytes = 14 GB in BF16, so each GPU sends just under 28 GB per step on a ring. At 50 GB/s per GPU that is 0.56 s if it all crosses InfiniBand. A hierarchical reduce, reduce-scatter in the node, all-reduce across the 32 nodes on a 14/8 = 1.75 GB slice, all-gather in the node, puts 2 x 31/32 x 1.75 = 3.39 GB per GPU on InfiniBand, about 68 ms. If the 25% exposure came from a flat ring, that alone may solve it.</p>
+<p>Second, look at when buckets fire. Overlap works only if the reduction of early buckets starts while later layers are still computing backward; a single bucket at the end exposes all of it. Third, reduce precision on the wire only with care: Llama 3 reduce-scattered gradients in FP32 for numerical stability, so a BF16 reduction halves bytes at a risk the team accepts in writing. Last, ZeRO-1 does not reduce bytes but splits the all-reduce into a reduce-scatter before the optimizer and an all-gather after it, and the all-gather can overlap with the next step's forward.</p>
+<p>The failure mode of the recommendation: a hierarchical reduce assumes the 8 GPUs of each node have their own NICs. If they share fewer NICs, the cross-node slices contend and the 8x saving shrinks by that ratio.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>You switch to BF16 gradient reduction and the loss curve matches for 2,000 steps. What would you need to see later in the run to reverse it, and what does reversing cost?</li>
+<li>Two senior engineers disagree: one wants ZeRO-1, one wants FSDP with full sharding. Both fit in memory. What measurement decides it without deciding by rank?</li>
+<li>The cluster team offers nodes with half the NICs per GPU at twice the node count. Redo the cross-node bytes and say whether you accept.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The alpha-beta model assumes one collective has the links to itself. In a real step, the data-parallel reduce-scatter, a pipeline send and an expert all-to-all can share the same NIC, and their times add instead of overlapping.
+
+A collective finishes when its slowest rank finishes. One GPU that enters late, because of a slow data loader, a thermal throttle or uneven routing, delays every rank, and the profile shows the wait as communication time on the healthy ranks. Treat exposed communication as a symptom until a straggler is ruled out.
+
+The ring is bandwidth-optimal for large buffers, not the only algorithm. Communication libraries choose among ring, tree and other algorithms by message size and topology, and switches that reduce inside the network change the 2K figure entirely. Measure the collective on the actual fabric before trusting a formula.
+
+All-to-all does not fit the ring picture. Its cost depends on how many bytes cross the slowest pair, which depends on routing decisions made at run time. The expert-parallelism lesson in the mixture-of-experts module treats it separately.
+
+<SelfRate id="lesson:training/distributed/collectives" />

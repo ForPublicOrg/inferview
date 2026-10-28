@@ -1,4 +1,5 @@
 // Synthetic trace for problem agt-002 (Agent loops forever), ported from prototypes/problem.html. Token counts are approximate.
+// Fault notes state what each injected run does, never whether it matches the recorded trace: the reader compares.
 import type { TraceFault, TraceStep } from './types.ts';
 
 const S = (role: TraceStep['role'], body: string, tok: number, warn = false): TraceStep => ({ role, body, tok, warn });
@@ -46,7 +47,7 @@ export const faults: TraceFault[] = [
       S('assistant', 'Total 49.00 minus 36.50 already refunded leaves 12.50.\ncalls issue_refund(order_id="A-1042", amount=12.5)', 40),
       S('tool', '{"ok":true,"refund_id":"r_9921"}', 18),
       S('assistant', 'Done. I have refunded the remaining $12.50 for order A-1042.', 24),
-      S('note', 'Terminates in 6 model calls. Retrying a transient error was correct. Different errors, different outcome: not the recorded trace.', 0),
+      S('note', 'Ends in 6 model calls with a refund of $12.50.', 0),
     ],
   },
   {
@@ -59,7 +60,7 @@ export const faults: TraceFault[] = [
       S('assistant', 'I did not receive a result for the order search. Let me try again.\ncalls search_orders(customer_id="c_7781")', 36),
       S('user', '[{"order_id":"A-1042","total":49.00,"status":"delivered","refunded":36.50}]', 40, true),
       S('assistant', 'The tool returned nothing. Searching again.\ncalls search_orders(customer_id="c_7781")', 36),
-      S('note', 'Loops, but on search_orders, and the model says it received no result. The recorded trace loops on issue_refund with an error in hand. Not this.', 0, true),
+      S('note', 'Loops on search_orders; the model says it received no result.', 0, true),
     ],
   },
   {
@@ -71,7 +72,7 @@ export const faults: TraceFault[] = [
       ...RETRY('The order total is $49. Issuing a full refund.'),
       ...RETRY('The refund did not go through. Let me retry.'),
       ...RETRY('Retrying the refund request.'),
-      S('note', 'Same call, same arguments, same opaque error, every step. This reproduces the recorded trace.', 0, true),
+      S('note', 'Continues until the step limit.', 0, true),
     ],
   },
   {
@@ -86,7 +87,7 @@ export const faults: TraceFault[] = [
       S('assistant', 'Verifying.\ncalls get_order(order_id="A-1042")', 22),
       S('tool', '{"order_id":"A-1042","status":"delivered","refunded":49.00}', 36),
       S('assistant', 'Refund verified. The remaining $12.50 has been refunded.', 22),
-      S('note', 'Terminates in 5 model calls. One verify step is an extra call, not a cycle. Not the recorded trace.', 0),
+      S('note', 'Ends in 5 model calls after one verification read.', 0),
     ],
   },
 ];

@@ -1,0 +1,159 @@
+---
+title: "Designing tools for agents: narrow, idempotent, well-errored"
+track: agents
+module: tools-mcp-a2a
+order: 1
+kind: lesson
+level: senior
+minutes: 13
+summary: A tool set is a prompt the model reads on every call, so its boundaries, argument names, response size, error text and the number of definitions loaded at once each move the wrong-call rate, and a rewrite is judged by a paired comparison on labelled traces.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Anthropic, Writing effective tools for agents (2025-09-11)
+    url: https://www.anthropic.com/engineering/writing-tools-for-agents
+    note: "consolidate (schedule_event, search_logs, get_customer_context); namespacing by service and resource, prefix versus suffix effect varies by model; response_format example 206 tokens detailed, 72 concise; Claude Code caps tool responses at 25,000 tokens by default; actionable errors; resolve UUIDs to names; held-out test sets; checked 2026-10-28"
+  - title: Anthropic, Introducing advanced tool use (2025-11-24)
+    url: https://www.anthropic.com/engineering/advanced-tool-use
+    note: "58 tools across five servers about 55K tokens; tool search about 500 tokens up front plus about 3K for 3 to 5 discovered tools; 85% reduction; MCP evals Opus 4 49% to 74%, Opus 4.5 79.5% to 88.1%; tool use examples 72% to 90% on complex parameters; vendor's own internal measurements"
+  - title: Claude API docs, Tool search tool (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool
+    note: "selection degrades past 30 to 50 tools; keep 3 to 5 tools non-deferred; up to 10,000 deferred tools; 5 results by default; deferred tools excluded from the system-prompt prefix so caching is preserved; a deferred tool cannot carry cache_control"
+  - title: MCP specification 2026-07-28, Tools
+    url: https://modelcontextprotocol.io/specification/2026-07-28/server/tools
+    note: "tool names SHOULD be 1 to 128 characters of A-Z a-z 0-9 _ - .; clients aggregating servers SHOULD prefix to disambiguate; protocol errors versus tool execution errors (isError); input validation errors are tool execution errors; stateful tools via explicit handles; annotations untrusted unless from trusted servers"
+  - title: MCP specification 2025-11-25, changelog
+    url: https://modelcontextprotocol.io/specification/2025-11-25/changelog
+    note: "SEP-1303: input validation errors returned as tool execution errors to enable model self-correction"
+  - title: Anthropic, How we built our multi-agent research system (2025-06-13)
+    url: https://www.anthropic.com/engineering/multi-agent-research-system
+    note: "a tool-testing agent rewrote flawed tool descriptions; later agents finished tasks in 40% less time"
+  - title: OpenAI, A practical guide to building agents (PDF, checked 2026-10-28)
+    url: https://cdn.openai.com/business-guides-and-resources/a-practical-guide-to-building-agents.pdf
+    note: "the issue is similarity or overlap, not only count: some systems handle more than 15 distinct tools, others struggle with fewer than 10 overlapping ones"
+  - title: OpenAI Agents SDK, Human in the loop (checked 2026-10-28)
+    url: https://openai.github.io/openai-agents-python/human_in_the_loop/
+    note: "approval does not guarantee exactly-once execution; assign a stable idempotency key per logical action and reuse it across retries"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The interface is read on every call
+
+A tool definition is an API whose client re-reads the documentation before every call and decides at run time which endpoint to hit. Five surfaces of the definition change what that client does: where the tool's boundary sits, what its arguments are called, how much it returns, what its errors say, and how many sibling definitions are in context when the model chooses. Each surface can be changed without touching the model, and each change can be measured as a change in the wrong-call rate on labelled traces. This lesson covers the five surfaces in that order, then the measurement.
+
+The protocol layer (MCP, function calling) does not change any of this. MCP decides how definitions reach the host; the host still renders them into the model's context as function schemas. Authorisation for remote tool servers is implemented in [MCP security](/learn/security/mcp-security), and tool sets for coding agents are in [Tool sets for coding agents](/learn/harness/tools-aci).
+
+## Boundaries: one tool per task step, not per endpoint
+
+The default wrapper (one tool per REST endpoint) produces tools that are individually correct and collectively ambiguous. Anthropic's tool-writing guide replaces `list_users`, `list_events` and `create_event` with one `schedule_event` that finds availability and books; `read_logs` with `search_logs`, which returns matching lines with context; and `get_customer_by_id`, `list_transactions` and `list_notes` with `get_customer_context`. The rule underneath is that the tool boundary should match a step the model would take, so that a correct plan needs fewer calls and fewer intermediate results pass through context.
+
+Overlap matters more than count. OpenAI's agent-building guide states that some systems manage more than 15 well-defined, distinct tools while others struggle with fewer than 10 overlapping ones, and recommends splitting into multiple agents only after clearer names, parameters and descriptions fail to fix selection. Two tools whose descriptions both plausibly match a request are a coin flip the model takes on every call.
+
+Names are the first disambiguator. The MCP 2026-07-28 tools page says names SHOULD be 1 to 128 characters drawn from ASCII letters, digits, underscore, hyphen and dot, and that a client aggregating several servers SHOULD prefix tool names with a server identifier, because two servers can each expose `search` and the self-reported server name is not guaranteed unique. Anthropic recommends namespacing by service and then resource (`asana_projects_search`, `asana_users_search`) and reports that prefix versus suffix naming had a non-trivial effect on its evals that differed by model, so the choice is an eval result, not a style rule.
+
+## Arguments: names and examples carry the contract
+
+Argument names are read as instructions. `user_id` beats `user`; an enum beats a free string the server will reject; a strict schema beats prose saying what the field should contain. Where the schema cannot express a convention (date formats, which of two IDs a field expects, how nested filters compose), Anthropic's tool-use examples feature attaches one to five sample calls to the definition, and the company reports that on its internal tests accuracy on complex parameter handling went from 72% to 90%. That is the vendor's measurement on its own models; the examples also add to the definition's token count, so they belong on the tools where the schema leaves room for a wrong call.
+
+Stateful tools need explicit handles. The 2026-07-28 MCP revision removed protocol-level sessions, and its tools page recommends that a tool which creates state (a cart, a browser context, a transaction) return a handle that later calls take as an argument. It lists four design points for those handles: authorise the caller against the handle on every call, keep the handle opaque, state its lifetime in the creating tool's description so the model sees it before creating state, and return a tool execution error naming the expiry when a handle is stale, so the model can create a new one.
+
+## Responses: context is the budget
+
+Every byte a tool returns is read by the model on the next call and on every call after it until compaction. Anthropic's guide shows a `response_format` parameter on a Slack search tool where the detailed response was 206 tokens and the concise one 72, and notes that Claude Code caps tool responses at 25,000 tokens by default. The same guide recommends pagination, range selection, filtering and truncation with sensible defaults, and returning resolved names instead of opaque identifiers: it reports that resolving UUIDs to semantic names (or to a 0-indexed scheme) improved retrieval precision by reducing hallucinated identifiers.
+
+Over a task the response size compounds. A search tool called 40 times returns 40 x 206 = 8,240 tokens in detailed mode and 40 x 72 = 2,880 concise: 5,360 tokens of context per task that the model has to read past, before any caching discount. The concise mode has to keep the identifiers the next call needs, or the model calls again in detailed mode and the saving reverses.
+
+## Errors: the model's only feedback channel
+
+MCP separates two failure paths. Protocol errors (unknown tool, a request that fails the call schema, server faults) are JSON-RPC errors that a client MAY show the model. Tool execution errors (API failures, input validation, business-rule rejections) come back as a normal result with `isError: true`, and clients SHOULD pass them to the model so it can correct itself. The 2025-11-25 revision (SEP-1303) moved input validation failures into the second path for that reason, and the 2026-07-28 tools page keeps it.
+
+The content of the error is the part teams skip. Compare `422 Unprocessable Entity` with `refund rejected: amount 49.00 exceeds refundable balance 12.50 on order 8812; call get_refundable_balance or refund at most 12.50`. The first produces a retry with the same arguments or an apology to the user; the second produces a corrected call. Anthropic's guidance is the same: errors should name the specific fix, with an example of a correct input where the format is the problem.
+
+## Side effects: the model retries, so the tool must absorb it
+
+A model that hits a timeout calls again. A harness that crashes after the tool acted and before it saved state replays the step. A human approval does not change this: the OpenAI Agents SDK documentation says that approval permits a tool call to execute and does not guarantee exactly-once execution, and recommends a stable idempotency key per logical action reused across retries, with an outcome that stays unclear recorded as unknown rather than replayed.
+
+The design point specific to agents is where the key comes from. If the model supplies it, a model retry is a new generation and can produce a new key, which defeats it. The harness should derive the key from the run and the step (run id, step index, tool name, a digest of the arguments) and inject it outside the model-visible schema, or the tool should derive it from a natural key such as the order id and the requested state. MCP tool annotations such as `idempotentHint` and `destructiveHint` describe intent for the client's UI; the spec says clients MUST treat annotations as untrusted unless the server is trusted, so they cannot replace the check in the server.
+
+## How many definitions are in context
+
+Every loaded definition is read on every call. Anthropic's example of five common MCP servers (GitHub, Slack, Sentry, Grafana, Splunk) is 58 tools and about 55K tokens of definitions before the conversation starts. Its tool search tool marks definitions `defer_loading: true`, keeps about 500 tokens of search tool in context, and loads the 3 to 5 tools a request needs, about 3K tokens; the post reports an 85% cut in token use and, on its MCP evals, accuracy rising from 49% to 74% for Opus 4 and from 79.5% to 88.1% for Opus 4.5. The API docs add that selection accuracy degrades once more than 30 to 50 tools are available, recommend keeping the 3 to 5 most used tools non-deferred, and allow up to 10,000 deferred tools per request.
+
+For a task of 30 model calls, the all-loaded configuration puts 30 x 55,000 = 1,650,000 definition tokens through the model; the deferred one puts through about 30 x (500 + 3,000) = 105,000. Prompt caching makes the first number cheaper than it looks in money, and does nothing for selection: the model still chooses among 58 descriptions on every call. Deferral and caching compose, because the API excludes deferred tools from the system-prompt prefix and appends discovered ones inline, so the cached prefix is untouched; a deferred tool cannot carry its own `cache_control` breakpoint.
+
+<Predict id="agt-tools-compound" question="With a 2% chance of a wrong call on each of 25 calls, what share of tasks contain at least one wrong call?" answer={39.7} tolerance={3} unit="%">
+<p><b>About 39.7%.</b> The chance of a clean task is 0.98 to the power 25, which is 0.603, so 1 - 0.603 = 0.397 of tasks see at least one wrong call. Halving the per-call rate to 1% gives 1 - 0.99<sup>25</sup> = 22.2%. Per-call error rates look small in a dashboard; the task-level number is what users see, and it grows with every call the tool design adds to a plan. This treats calls as independent, which they are not: a wrong call often causes the next one, so the real task rate can be higher.</p>
+</Predict>
+
+## Measuring a rewrite
+
+Count wrong calls per task, on the same tasks, before and after. A wrong call is one whose tool is outside the set a reviewer accepts for that step, or whose arguments were rejected and never corrected. Labels come from reading traces or from a judge calibrated against reading them (the [evals track](/learn/evals) covers both). Run both tool sets on the same held-out tasks with the same model and sampling settings, and compare paired outcomes: only the tasks that flipped carry information.
+
+```python
+from math import comb
+
+
+def task_failed(calls):
+    """A task fails if any call used a tool outside the step's accepted set,
+    or was rejected by argument validation and never corrected."""
+    return any(c["tool"] not in c["accepted"] or c.get("rejected") for c in calls)
+
+
+def paired_rewrite_test(before, after):
+    """before/after: task_id -> list of labelled calls, same tasks, same model settings."""
+    tasks = sorted(before.keys() & after.keys())
+    fixed = sum(task_failed(before[t]) and not task_failed(after[t]) for t in tasks)
+    broke = sum(not task_failed(before[t]) and task_failed(after[t]) for t in tasks)
+    n, k = fixed + broke, min(fixed, broke)          # only discordant tasks count
+    p = min(1.0, 2 * sum(comb(n, i) for i in range(k + 1)) / 2 ** n) if n else 1.0
+    return {"tasks": len(tasks), "fixed": fixed, "broke": broke, "p_two_sided": float(f"{p:.2g}"),
+            "calls_per_task_before": sum(map(len, before.values())) / len(tasks),
+            "calls_per_task_after": sum(map(len, after.values())) / len(tasks)}
+
+
+ok = {"tool": "search_orders", "accepted": {"search_orders"}}
+bad = {"tool": "list_orders", "accepted": {"search_orders"}}
+before = {f"t{i}": [ok, bad] if i < 30 else [ok] for i in range(100)}
+after = {f"t{i}": [ok, bad] if 25 <= i < 33 else [ok] for i in range(100)}
+print(paired_rewrite_test(before, after))
+# {'tasks': 100, 'fixed': 25, 'broke': 3, 'p_two_sided': 2.7e-05, 'calls_per_task_before': 1.3, 'calls_per_task_after': 1.08}
+```
+
+Report calls per task and tokens per task next to the failure counts: a rewrite that fixes selection by making every tool return more context can win on correctness and lose the budget. Keep the held-out tasks out of the loop that edits descriptions, which Anthropic's guide also recommends, because descriptions tuned against the eval set overfit to it. For scale, the one published before-and-after on descriptions alone is Anthropic's research system, where a tool-testing agent rewrote flawed descriptions and later agents completed tasks in 40% less time; that is one system on its own models and is a reason to measure, not a prediction.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your support agent reaches 140 tools on nine MCP servers; three servers are third-party and you cannot edit them. On labelled traces, 6% of calls are wrong and tasks average 20 calls. Product wants the wrong-call rate halved in three weeks, finance wants input tokens down this quarter, and you have one engineer. What do you change, in what order, and how do you show it worked?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Deferred loading with tool search first, because it is configuration, touches all nine servers including the three I cannot edit, and attacks both goals: fewer definitions in context per call and fewer look-alike candidates. Then consolidate and rename the overlapping tools on our six servers, rewrite their errors, and add a concise response mode to the two largest responders. I show it with a paired run on a held-out task set: tasks fixed versus tasks broken, calls per task and tokens per task, before and after each change.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Size of the problem. At 6% per call over 20 calls, 1 - 0.94<sup>20</sup> = 71% of tasks contain a wrong call; at 3% it is 1 - 0.97<sup>20</sup> = 46%. The target is a per-call metric, so I report the task number next to it; halving the call rate still leaves nearly half of tasks touched.</p>
+<p>Order. Week one: defer every tool except the three to five most used, and namespace in the host by server so the three third-party servers' tools cannot collide with ours. That needs no change on their side. Week two: from the labelled traces, list the tool pairs that are confused with each other; merge or rename those on our servers, and turn validation failures into tool execution errors that name the fix. Week three: add a concise response mode where responses dominate token use, and run the final paired comparison.</p>
+<p>What I give up. Tool search adds a search step to calls that need an undiscovered tool, so some tasks get one more model call and a little more latency; and a merged tool is a breaking change for any other host using our servers, so it ships as a new tool with the old one deprecated. Written down: the held-out task set, the labelling rule, and the threshold for rolling back each change (any increase in tasks broken that the paired test does not attribute to noise).</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The paired run shows wrong calls down by a third and tokens per task up 10% because tool search adds turns. Finance objects. Which goal do you trade, and who signs it?</em></li>
+<li><em>Most remaining wrong calls are on the three third-party servers. What can the host do without their cooperation, and when do you remove a server instead?</em></li>
+<li><em>What result in production would make you reverse deferral and load all tools again?</em> For example a measured rise in tasks where the right tool was never discovered, visible as searches that return nothing followed by a wrong call.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Most numbers here are Anthropic's measurements on Anthropic models with Anthropic's tooling: the 72-to-90 examples result, the tool search accuracy gains, the 30 to 50 tool threshold and the 40% time reduction. Other models respond differently to naming schemes (Anthropic says so about prefixes versus suffixes), and a tool set tuned on one model can regress on the next release, which is why the paired run belongs in CI rather than in a one-off study.
+
+Consolidation has a ceiling. A tool that does five things through a mode argument is an overloaded endpoint with a worse error surface, and some domains really have hundreds of distinct operations; there, deferral, routing to a smaller agent, or letting the model write code against tool APIs does more than merging. Deferred loading also fails quietly: a tool whose description does not match how users phrase the task is never discovered, and the trace shows a plausible wrong call rather than an error.
+
+Finally, the wrong-call rate is a proxy. A call can use the accepted tool and still produce a wrong outcome, and an unexpected tool can reach the right answer. Check the task outcome metric moved too.
+
+<SelfRate id="lesson:agents/tools-mcp-a2a/tool-design" />

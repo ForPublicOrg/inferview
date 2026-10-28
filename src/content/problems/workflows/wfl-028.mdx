@@ -1,0 +1,117 @@
+---
+id: wfl-028
+title: Design the persistence layer for a stateful agent framework
+subtitle: checkpoints, interrupts and resume, in the style of LangGraph
+track: workflows
+module: approvals-handoffs
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 45
+tags: [langgraph, checkpointing, human-in-the-loop, persistence, durable-execution]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: techinterview.org, LangChain interview guide (published 2026-04-24, updated 2026-07-12)
+    url: https://www.techinterview.org/companies/langchain/
+    note: an editorial guide that lists this prompt as a sample system-design question; it is not a candidate report, so no company is tagged (checked 2026-10-28)
+  - title: LangGraph docs, checkpointers
+    url: https://docs.langchain.com/oss/python/langgraph/checkpointers
+    note: StateSnapshot fields; a checkpoint per super-step; pending writes; put, put_writes, get_tuple, list and delete_thread; JsonPlusSerializer with pickle_fallback; EncryptedSerializer reading LANGGRAPH_AES_KEY; durability modes exit, async and sync; ULID checkpoint IDs; DeltaChannel in beta from langgraph 1.2 (checked 2026-10-28)
+  - title: LangGraph docs, interrupts
+    url: https://docs.langchain.com/oss/python/langgraph/interrupts
+    note: resume restarts the node from the beginning; resume values match interrupt calls by index; the same thread ID must be used to resume; a durable checkpointer in production (checked 2026-10-28)
+  - title: LangGraph docs, persistence
+    url: https://docs.langchain.com/oss/python/langgraph/persistence
+    note: keep thread_id under 255 characters with PostgresSaver; checkpoints accumulate over long conversations, so prune or set a retention policy (checked 2026-10-28)
+  - title: Temporal docs, workflow message passing
+    url: https://docs.temporal.io/encyclopedia/workflow-message-passing
+    note: the event-history alternative, in which messages and their results are recorded as history events (checked 2026-10-28)
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The round">
+"Design the persistence layer for a graph-based agent framework. Agents run for minutes to days, pause for a human, and resume on another machine. Users self-host it, and Postgres is the one datastore most of them will give you."
+</Callout>
+
+Requirements and constraints:
+
+- A run is a graph of nodes over a shared state. Nodes call models and tools. Any node can pause for human input and resume later, possibly on a different process.
+- Users want to inspect any past state, edit it, and branch a run from it.
+- Parallel branches in one step: if one fails, the others' work should not be lost.
+- Most users self-host and run Postgres; a few have only SQLite in development.
+- A typical state in the scenario you are given is around 200 KB (a long message list), and a run takes around 50 steps.
+
+Design the storage model, the write path, the pause and resume semantics, and the retention policy. Write the decision memo for one choice you would defend to the framework's maintainers.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what the framework promises about code that ran before a pause when the run resumes.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask how big a state gets at the 99th percentile, and how many runs per user are kept.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask who can read the checkpoint table in a self-hosted install.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Snapshot the state at every step boundary, keyed by thread, namespace and a sortable checkpoint ID, with a parent pointer so history is a tree and branching is a new child. Store per-task pending writes so a failed parallel step keeps its finished tasks. A pause is a pending interrupt on a task; resume re-runs that node from its first line with the resume values matched by order, which makes pre-pause side effects the user's problem to make idempotent. Snapshots cost storage, so deltas for large channels, a retention policy and encryption at rest are part of the design, not extras.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The central choice is snapshots against an event log. A snapshot store (what LangGraph does) writes the whole state at each step. Resume reads one row; inspecting, editing and branching are reads and writes of rows; any node code can run, because nothing is replayed. An event log (what Temporal does) records inputs and results and rebuilds state by replaying deterministic code. It stores less per step and can resume mid-function, but every model call, clock read and random number must sit behind a recorded activity, which is a heavy rule for users writing agent code in plain Python.</p>
+<p>Snapshots cost storage. At 200 KB per state and 50 steps, one run writes 200 KB × 50 = 10 MB. Ten thousand kept runs is 100 GB of mostly repeated message lists in a user's Postgres. That is why a delta encoding for append-mostly channels belongs in the design (LangGraph ships one as DeltaChannel, in beta from version 1.2) and why retention is a setting with a default rather than a footnote.</p>
+<p>What I give up with snapshots plus node restart: resume cannot continue from the middle of a node. Code above a pause runs again on resume, so a node that writes to a database before pausing writes twice unless the user makes it idempotent. The framework can document it, warn on it and offer a way to put side effects in their own step; it cannot prevent it.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Your storage numbers mean a default install fills its disk in a month for a busy user. Do you ship deltas as the default while they are in beta, or a retention default that deletes history users expect to keep? Which risk goes in the release notes?</em></li>
+<li><em>What would you need to see from users' bug reports to reverse node restart and build mid-node resume?</em></li>
+<li><em>Two resume requests for the same thread arrive within a millisecond, from two reviewers. What does your write path do, and what does each reviewer see?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+### Storage model
+
+A checkpoint row holds the state's channel values, the nodes to run next, metadata (source, writes, step number), a creation time, the parent checkpoint's ID and the pending tasks. LangGraph's `StateSnapshot` has these fields. The key is thread ID, checkpoint namespace (one per subgraph, so a subgraph's checkpoints do not collide with its parent's) and checkpoint ID. LangGraph's docs say checkpoint IDs can be ULIDs, which sort by time, so "latest for this thread" is an index range scan rather than a sort over timestamps that can tie.
+
+A second table holds pending writes: for each task in a step, the channel writes it produced, saved as the task finishes. If one of three parallel tasks fails, the other two have their writes stored, and the retry runs only the failed one. The interface has five verbs: put a checkpoint, put writes, get one checkpoint, list checkpoints, delete a thread. A backend that implements those five works, which is how one design serves both Postgres and SQLite.
+
+### Write path and durability
+
+Three modes, because users disagree about the trade: write the checkpoint before the next step starts (safest, adds a database round trip to every step), write it while the next step runs (a crash can lose the latest checkpoint), or write only when the run exits (cheapest, nothing to resume after a crash). LangGraph exposes these as `sync`, `async` and `exit`. The default matters more than the options: a run that pauses for a human for two days should not be one crash away from losing the pause, so a graph containing an interrupt should default to the synchronous write or warn when it does not.
+
+### Pause and resume
+
+A pause is recorded as an interrupt on the task, with the value shown to the human. Resume supplies values on the same thread ID; the node runs again from its first line, and each interrupt call in it returns the next resume value in order. Ordering by position is simple and breaks if the user's code calls interrupts conditionally or in a different order on the second run, which is why LangGraph's docs call the matching strictly index-based and list not reordering interrupt calls as a rule. The alternative, IDs per interrupt, is more robust to reordering and costs an API that asks users to name every pause.
+
+### Serialisation and security
+
+The serialiser must round-trip framework objects and user types. A pickle fallback handles anything, and it also means that whoever can write to the checkpoint table can run code in the agent process when a checkpoint is loaded. In a self-hosted install, many people can write to that database. Default to a JSON-family encoding, make pickle an explicit opt-in with that consequence stated, and offer encryption of stored state (LangGraph's `EncryptedSerializer` reads its AES key from an environment variable). State holds conversation text and tool arguments, which is personal data in most deployments.
+
+### Retention
+
+Every step adds a row, and the docs say checkpoints accumulate over long conversations. Pick a default and defend it: keep the full history for a run while it is active and for a set period after it completes, then keep only the final checkpoint and any that a user pinned. A week of full history after completion is reasonable for debugging; keeping everything forever is unreasonable as a default, because the cost lands on users who never open the history.
+
+### The decision memo
+
+"Decision: checkpoints are full snapshots per step with delta encoding for message-list channels, not an event log. Reason: users write ordinary Python with model and tool calls inline; an event log would require them to wrap every non-deterministic call. Cost accepted: storage that grows with state size times steps, and node restart on resume, which makes side effects before a pause run twice unless idempotent. Mitigations: retention default, delta channels, a development-mode warning for I/O above an interrupt, synchronous checkpoint writes by default in graphs that pause. Revisit if a majority of resume bugs reported in a release cycle are double side effects."
+
+### Where this design fails
+
+The node-restart rule is invisible until it costs money. The failure is a user who inserts an audit row or sends an email above the interrupt, tests the happy path once, and ships duplicates. Documentation does not reach that user. A development-mode warning might: on resume, the framework knows which node is re-running, so it can log every database, HTTP or file call the node makes before reaching its first interrupt. That needs instrumented clients, and it fires on nodes whose I/O is already idempotent, so it ships as a warning, never an error.
+
+## Follow-ups
+
+- *A large user wants checkpoints in their existing DynamoDB instead of Postgres. What in your interface do they implement, and which guarantee is hardest for them to keep?*
+- *Edit-and-branch lets a user change a past state and resume. A tool already ran with the old state. What does the framework promise about that tool's side effects?*
+- *You have one quarter and two engineers. Encryption by default, delta channels out of beta, or the side-effect warning: which ships, and what do you write down about the other two?*
+
+## Common mistakes
+
+- Designing an event log and then allowing model calls in node code. Replay either calls the model again or needs every call recorded, which is the activity rule under another name.
+- Keeping one row per thread and overwriting it. Inspection, branching and recovery of parallel work all need history.
+- Making pickle the default serialiser because it handles every type.
+- Leaving retention to users. The default is what most installs run.

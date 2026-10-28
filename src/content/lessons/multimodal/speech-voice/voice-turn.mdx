@@ -1,0 +1,124 @@
+---
+title: A voice turn, millisecond by millisecond
+track: multimodal
+module: speech-voice
+order: 2
+kind: lesson
+level: staff
+minutes: 16
+summary: Where the time in a cascaded voice turn goes, which rows are physics and which are design, and why a P95 target is lost on the LLM tail and on tool calls rather than on the median.
+prerequisites: [multimodal/speech-voice/speech-models]
+updated: 2026-10-28
+sources:
+  - title: Voice AI and Voice Agents, an illustrated primer (Kwindla Hultman Kramer and Pipecat contributors; June 2026 update, checked 2026-10-28)
+    url: https://www.voiceaiandvoiceagents.com
+    note: "round-trip table: macOS mic input 40, opus encoding 21, network stacks and transit 10, packet handling 2, jitter buffer 40, opus decoding 1, transcription and endpointing 300, LLM TTFB 650, sentence aggregation 20, TTS TTFB 120, opus encoding 21, packet handling 2, network 10, jitter buffer 40, opus decoding 1, macOS speaker output 15, total 1,293 ms; 1,500 ms as the target; 'critical' not to have spikes or let latency creep above 1,500 ms as tool calling is added; P95 times matter; LLM TTFT median and P95 per model (GPT-4.1 536/1,771 ms, Nemotron 3 Ultra self-hosted 541/712 ms); TTS time to first audio (ElevenLabs Turbo v2.5 330/670 ms, Cartesia Sonic 3.5 195/240 ms); a message before the function call or a watchdog timer for slow tools; every part of the pipeline cancellable; assistant context assembled from word-level timestamps to match what the user heard"
+  - title: ElevenLabs, voice agent latency optimization (published 2026-06-23, updated 2026-10-09; vendor)
+    url: https://elevenlabs.io/blog/voice-agent-latency-optimization
+    note: "time to first audio measured from the user stopping speaking to the first sample of the reply; the vendor's target of P50 under 800 ms and P95 under 1.5 s; illustrative budget P50/P95: capture and endpointing 120/280, STT finalization 60/150, network 60/160, LLM TTFT 250/600, TTS time to first audio 110/220, player buffering 80/150, end to end about 680/1,560 ms; overlapping stages recovers most of the budget; start LLM work on stable STT partials to hide endpointing delay; stream LLM tokens into TTS at sentence or clause boundaries"
+  - title: "Moshi: a speech-text foundation model for real-time dialogue (Défossez et al., arXiv 2410.00037, v2 2024-10-02)"
+    url: https://arxiv.org/abs/2410.00037
+    note: "parallel user and system audio streams with no explicit turns; the paper reports 160 ms theoretical and 200 ms practical latency"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+A voice turn has a budget the way a request path has an SLO, with one difference that changes the engineering: the user hears the tail. A web page that takes three seconds once in twenty loads is a slow page; a voice agent that goes silent for three seconds once in twenty turns is a call where the user says "hello?" and the agent hears a new turn. This lesson takes the Pipecat maintainers' measured round trip apart, separates the rows you cannot change from the ones you design, and shows why the turns that miss the target are almost all LLM tails and tool calls.
+
+## The round trip, row by row
+
+The primer's table, from the user's microphone to the agent's speaker, for a typical cascaded stack:
+
+| Row | ms | Kind |
+|---|---|---|
+| Mic input, opus encoding, network, packet handling, jitter buffer, opus decoding (up) | 114 | transport |
+| Transcription and endpointing | 300 | design |
+| LLM time to first byte | 650 | selection and design |
+| Sentence aggregation | 20 | design |
+| TTS time to first byte | 120 | selection |
+| Opus encoding, packet handling, network, jitter buffer, opus decoding, speaker output (down) | 89 | transport |
+| Total | 1,293 | |
+
+The up and down rows are sums of the table's entries (40 + 21 + 10 + 2 + 40 + 1 and 21 + 2 + 10 + 40 + 1 + 15). Two jitter buffers at 40 ms each are the largest transport cost, and they are the price of smooth audio over a lossy network; shrinking them trades latency for glitches, which users notice more than 40 ms. Transport is close to physics for a given client and region. The 1,090 ms in the middle is design.
+
+The primer's June 2026 update sets 1,500 ms voice-to-voice as the target and says it is critical not to have latency spikes, or to let latency creep above 1,500 ms as tool calling is added. The median stack leaves 207 ms of headroom. A single tool call costs more than that, as the section on tools shows.
+
+<Callout kind="gotcha">Two targets circulate and they measure different intervals. ElevenLabs' post says a natural-feeling agent typically targets P50 time to first audio under 800 ms and P95 under 1.5 s, where time to first audio starts when the user stops speaking. The Pipecat number starts at the microphone. 800 ms is one vendor's target for one interval, not a standard; write down which target and which start point a requirement uses before comparing anything against it.</Callout>
+
+## Medians add; tails do not
+
+ElevenLabs publishes an illustrative budget with both columns. P50: capture and endpointing 120, STT finalization 60, network 60, LLM time to first token 250, TTS time to first audio 110, player buffering 80, about 680 ms. P95: 280, 150, 160, 600, 220, 150, about 1,560 ms.
+
+The P50 column adds up to a median only if the stages are perfectly correlated, and the same is true of the P95 column. Summing per-stage P95s gives the turn where every stage has its bad moment at once. If stage tails were independent, the end-to-end P95 would be well below 1,560 ms, because a slow LLM rarely coincides with a slow network. If they are correlated (a congested Wi-Fi link slows both network legs and the jitter buffer grows, or a provider under load is slow on both the LLM and the TTS), the sum is close. You cannot tell which from a table; you can tell from per-stage timestamps on real turns, joined by turn id, which is the instrumentation to build first.
+
+What the sum does tell you is which single stage can break the target alone. The LLM's 600 ms is the largest P95 entry in the vendor's illustrative table. The primer's measured hosted-model P95s are much larger.
+
+<Predict id="mml-voice-turn-p95-swap" question="Take ElevenLabs' P95 column, which sums to 1,560 ms with 600 ms for LLM time to first token. Replace that stage with GPT-4.1's P95 of 1,771 ms from the primer's measurements. What does the column sum to?" answer={2731} tolerance={5} unit="ms">
+<p><b>2,731 ms</b>: 1,560 − 600 + 1,771. The LLM's tail alone is above the 1,500 ms target. No amount of work on the endpointer or the TTS recovers a turn where the model takes 1.8 seconds to start, so model selection on P95 time to first token comes before any pipeline tuning.</p>
+</Predict>
+
+## Four ways to take time off the critical path
+
+Each technique below removes a stage from the critical path or hides it, and each has a cost that shows up somewhere other than latency.
+
+**Streaming TTS.** If the pipeline waits for the full LLM reply before starting synthesis, the reply's generation time sits on the critical path: 60 tokens at 10 ms each is 600 ms (scenario values). Streaming the tokens into TTS at clause boundaries replaces that with the wait for the first clause, which is the primer's 20 ms "sentence aggregation" row. The cost is prosody and correctness at the clause boundary: the synthesizer speaks a clause before it knows how the sentence ends, and anything you wanted to check about the whole reply (a policy filter, a redaction pass) now runs per clause or not at all.
+
+**Speculative LLM start.** ElevenLabs recommends starting LLM work on stable partial transcripts, which hides endpointing delay. The request starts before the endpointer has decided the user is done. When the final transcript matches the interim, the first token arrives earlier by the lead time; when it does not, the speculative request is wasted and a new one starts at the endpoint. The costs are tokens on every miss, a provider rate limit hit twice as often, and a correctness rule the implementation must keep: nothing is spoken before the endpoint confirms the turn, or the agent answers a sentence the user had not finished.
+
+**Filler for slow tools.** A tool call puts the tool's latency and a second LLM time to first token on the critical path. The primer offers two responses: speak a message before executing the function call, or start a watchdog timer and play something if the tool has not returned. Both improve time to first audio and neither improves time to answer. A filler that fires on a 200 ms lookup is noise; one that never fires leaves seconds of silence. The watchdog threshold is a policy you tune on the distribution of your tool latencies.
+
+**Barge-in.** When the user talks over the agent, the primer requires every part of the pipeline to be cancellable, and the assistant message in the context to be rebuilt from word-level timestamps so that it matches what the user heard. Skip the second part and the next turn answers as though the user heard a sentence they interrupted. This does not change the latency of a turn; it changes whether the next one makes sense.
+
+## What the overlaps buy, on a simulated distribution
+
+The [voice turn lab](/labs/voice-turn) builds a seeded simulator of this pipeline. Its scenario uses the primer's table medians, scenario tails, a 25 percent chance of a tool call per turn with tool latencies around 800 ms median and 3,000 ms P95, a 70 percent interim-transcript match rate, and GPT-4.1 and ElevenLabs Turbo v2.5 at the latencies the primer measured. Run over 2,000 turns with seed 0, the simulator gives:
+
+| Configuration | First audio P50 | First audio P95 | LLM calls per turn |
+|---|---|---|---|
+| Serial | 2,261 | 4,816 | 1.24 |
+| Streaming TTS | 1,686 | 4,263 | 1.24 |
+| plus speculative start | 1,579 | 4,153 | 1.54 |
+| plus watchdog filler at 250 ms | 1,368 | 2,730 | 1.54 |
+| plus Nemotron 3 Ultra and Cartesia Sonic 3.5 | 1,222 | 1,527 | 1.54 |
+
+Numbers in ms, from the lab's code; the inputs are partly scenario, so read the deltas, not the absolutes. Three things are worth taking from it. Streaming TTS buys the most at the median. The filler is the largest P95 improvement, because the P95 turn is a tool turn, and it improves first audio only: in the last row the P95 of the answer itself is 3,235 ms. And speculation buys about 100 ms at the median for a 24 percent increase in LLM calls, a trade you price per minute before you make it.
+
+## The order of work
+
+1. Instrument every stage with timestamps on the same clock and join them per turn. Report P50 and P95 for first audio and for answer audio separately, and split tool turns from the rest.
+2. Choose the LLM on P95 time to first token from your region, with your prompt and tool definitions attached. This is the only change that moves the P95 of non-tool turns by hundreds of milliseconds.
+3. Stream TTS from the first clause.
+4. Put a watchdog on every tool call and decide what the agent says while it waits. Move slow tools off the turn where you can: prefetch account data at call start rather than on the turn that needs it.
+5. Add speculative start last, after you have measured the interim match rate on your traffic, and only if the budget still needs the median improvement.
+6. Make cancellation and context truncation correct before any of the above ships to users, because a barge-in bug shows up as an agent that argues with the user.
+
+A speech-to-speech model removes most of this list. Moshi, which models user and agent audio as parallel streams, reports 160 ms theoretical and 200 ms practical latency in the paper. The playbook in this module covers what you give up for that.
+
+## In the room
+
+**"Our voice agent meets 1.5 seconds at P50 but P95 is 4 seconds. We launch to a second market in six weeks and the team has two engineers. The LLM provider is fixed by contract until next year. What do you do?"**
+
+<Depth>
+<Fragment slot="short">
+<p>Split the P95 turns by whether they made a tool call. If the tail is tool turns, add a watchdog filler and prefetch the slow lookups at call start; that moves first-audio P95 without touching the contracted model. If the tail is non-tool turns, the model's time-to-first-token tail is the cause, and within the contract the levers are a shorter prompt, a regional endpoint, and asking the provider for a latency tier. Report answer P95 next to first-audio P95 so nobody mistakes the filler for a fix.</p>
+</Fragment>
+<Fragment slot="long">
+<p>With two engineers and six weeks, the first week goes on per-stage timestamps joined by turn id, because without them any change is a guess. The decision tree then has two branches. If tool turns dominate the P95 (likely when a quarter of turns call a tool, as in the simulator), the watchdog filler is days of work and moves first-audio P95 by more than a second; prefetching the account record when the call connects removes the tool from the turn entirely for the most common intent. If non-tool turns dominate, the contracted model's tail is the floor. A shorter system prompt and fewer tool definitions shorten prefill, which is part of time to first token; a regional endpoint removes a network leg; speculative start helps the median more than the tail. The answer to write down: first-audio P95 target met by launch, answer P95 not met, and the contract renewal as the date to change models.</p>
+<p>The failure mode: the filler makes the dashboard green while callers still wait three seconds for the answer to their question. If the launch criterion is a first-audio number, the team has optimised the metric rather than the call, and the second market inherits the problem.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Product says the filler phrase sounds robotic and wants it gone before launch. You lose about a second of P95. Which number do you put in front of them, and who decides?</li>
+<li>Speculative start would cost 24 percent more LLM calls. At what per-minute price and call volume does that stop being worth 100 ms at the median?</li>
+<li>What would you need to see in production to reverse the choice of a cascaded pipeline and move this agent to a speech-to-speech model?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The primer's table is one stack and one client; a phone call over SIP has a different transport row, and a mobile network adds jitter that the 40 ms buffers may not absorb. The simulator treats stages as independent draws, which understates the P95 when stage tails are correlated, and its tails are scenario values. Measured provider tails move week to week, so a model chosen on last month's P95 needs the measurement repeated before every renewal. The whole analysis assumes the turn ends when the user stops talking; full-duplex systems that listen while speaking, like Moshi, do not have that boundary, and a latency budget per turn is the wrong frame for them. Finally, faster is not always better: an agent that answers before the caller has finished thinking cuts them off, and the cost of that shows up in call outcomes, not in a latency chart.
+
+<SelfRate id="lesson:multimodal/speech-voice/voice-turn" />

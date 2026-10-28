@@ -1,0 +1,200 @@
+---
+title: "Fusion: RRF, score normalisation and when hybrid wins"
+track: rag
+module: hybrid-search
+order: 1
+kind: lesson
+level: senior
+minutes: 13
+summary: Reciprocal rank fusion merges a lexical and a dense ranking without calibrating their scores, its constant decides whether agreement or a single first place wins, and both the constant and the weights are tuned per query segment on held-out queries.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: "Cormack, Clarke and Büttcher, Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods (SIGIR 2009, checked 2026-10-28)"
+    url: http://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf
+    note: "score = sum of 1 / (k + r(d)), ranks from 1; k = 60 fixed in a pilot and not altered; Table 1 (30 Wumpus configurations, TREC topics 351-400) MAP .2072 at k = 0, .2123 at 10, .2145 at 60, .2147 at 80, .2098 at 500; best individual .2016, Condorcet .2074, CombMNZ .2039; Table 3 LETOR 3: RRF 0.6051, CombMNZ 0.6107 (difference -0.0056, p = .2)"
+  - title: Elasticsearch reference, RRF retriever (checked 2026-10-28)
+    url: https://www.elastic.co/docs/reference/elasticsearch/rest-apis/retrievers/rrf-retriever
+    note: "rank_constant default 60, at least 1; rank_window_size default 10, at least size; per-retriever weight default 1.0, non-negative, generally available since 9.2; higher rank_constant gives lower-ranked documents more influence"
+  - title: Qdrant documentation, hybrid and multi-stage queries (checked 2026-10-28)
+    url: https://qdrant.tech/documentation/concepts/hybrid-queries/
+    note: "RRF k set to 2 by default with zero-based ranks (top result r = 0); k configurable from v1.16.0; weighted RRF from v1.17.0; DBSF from v1.11.0 normalises as (s - (mean - 3 sd)) / (6 sd), not clipped, 0.5 when scores are identical; tune weights on half the eval queries and measure on the other half"
+  - title: Weaviate documentation, hybrid search (checked 2026-10-28)
+    url: https://docs.weaviate.io/weaviate/search/hybrid
+    note: "alpha 1 is pure vector, 0 pure keyword, default depends on the client; Relative Score Fusion is the default fusion method from v1.24; Ranked Fusion uses positions; autocut requires Relative Score Fusion"
+  - title: "Weller, Boratko, Naim and Lee, On the Theoretical Limitations of Embedding-Based Retrieval (arXiv 2508.21038, v2 2026-03-12, ICLR 2026, checked 2026-10-28)"
+    url: https://arxiv.org/abs/2508.21038
+    note: "the number of top-k subsets a single-vector embedding can return is bounded by its dimension; LIMIT: 50k documents, 1,000 queries, 2 relevant each; Table 5 recall@100: BM25 93.6, Promptriever Llama3 8B (4096 dim) 18.9, Gemini Embed (3072 dim) 10.0, GTE-ModernColBERT 54.8"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import RagRrf from '../../../../components/widgets/RagRrf.astro';
+
+## Two rankings, two scales
+
+A hybrid retriever runs a lexical leg and a dense leg and has to merge two ranked lists whose scores mean different things. BM25 scores are unbounded and spread out; cosine similarities from a current embedding model sit in a narrow band. The decision is whether to merge on scores, which needs the two scales made comparable, or on ranks, which throws the scores away. Reciprocal rank fusion (RRF) is the default answer because it needs no calibration, and the default hides two parameters that change results: the rank constant and the per-leg weight.
+
+The reason to run both legs is that their failure sets barely overlap. Lexical retrieval matches strings, so it wins on error codes, SKUs, clause numbers and names, and loses on paraphrase. Dense retrieval wins on paraphrase and loses on rare exact strings. There is also a hard limit on the dense side. Weller and colleagues show that the number of distinct top-k sets a single-vector embedding can return is bounded by its dimension, and built a benchmark, LIMIT (50,000 documents, 1,000 queries, two relevant documents each), to hit that bound. On it BM25 reaches 93.6 recall@100, the best single-vector model in their table (Promptriever on Llama 3 8B, 4,096 dimensions) reaches 18.9, and a multi-vector model, GTE-ModernColBERT, reaches 54.8. LIMIT is adversarial by construction, so the number says the ceiling exists, not that your corpus is near it.
+
+## Score fusion and the normalisation trap
+
+Score fusion normalises each list to a common range and takes a weighted sum, as with Weaviate's `alpha` (1 is pure vector, 0 pure keyword). The common normalisation, min-max, stretches whatever range each list has to 0 to 1, so a 0.04 gap in cosine similarity becomes as large as a decisive BM25 win. Qdrant's distribution-based score fusion (DBSF) instead maps each score through the list's mean and three sample standard deviations, `(s - (mean - 3 sd)) / (6 sd)`, without clipping.
+
+```python
+def minmax(scores):
+    lo, hi = min(scores.values()), max(scores.values())
+    return {d: (s - lo) / (hi - lo) if hi > lo else 1.0 for d, s in scores.items()}
+
+def convex(lexical, dense, alpha):
+    """alpha = 1 is pure dense, 0 is pure lexical (Weaviate's convention)."""
+    lx, dn = minmax(lexical), minmax(dense)
+    return {d: round(alpha * dn.get(d, 0.0) + (1 - alpha) * lx.get(d, 0.0), 3) for d in sorted(set(lx) | set(dn))}
+
+def dbsf(scores):
+    """Qdrant's documented normalisation: (s - (mean - 3 sd)) / (6 sd), sample sd, not clipped."""
+    vals = list(scores.values())
+    if len(vals) < 2 or len(set(vals)) == 1:
+        return {d: 0.5 for d in scores}
+    mean = sum(vals) / len(vals)
+    sd = (sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)) ** 0.5
+    return {d: (s - (mean - 3 * sd)) / (6 * sd) for d, s in scores.items()}
+
+bm25 = {"runbook": 9.1, "timeouts": 2.2, "faq": 2.0}
+cosine = {"postmortem": 0.83, "timeouts": 0.82, "faq": 0.80, "runbook": 0.79}
+print(convex(bm25, cosine, 0.5))
+# {'faq': 0.125, 'postmortem': 0.5, 'runbook': 0.5, 'timeouts': 0.389}
+lx, dn = dbsf(bm25), dbsf(cosine)
+print({d: round(lx.get(d, 0) + dn.get(d, 0), 3) for d in sorted(set(lx) | set(dn))})
+# {'faq': 0.808, 'postmortem': 0.683, 'runbook': 1.01, 'timeouts': 0.999}
+```
+
+Under min-max the runbook, with four times the next BM25 score and only 0.04 below the top cosine, ties with a postmortem that BM25 never returned. DBSF ranks the runbook first, by 0.011, and that margin rests on a standard deviation estimated from three values. Both methods normalise per query over whatever window came back, so the same document gets a different normalised score when the window size changes or one leg returns fewer hits. That instability is the practical case against score fusion when nobody owns the score distributions. Weaviate has made Relative Score Fusion its default since v1.24, and its autocut feature requires it, so on that engine score fusion is what you get unless you choose Ranked Fusion.
+
+Score fusion is not always worse. In the 2009 RRF paper's LETOR 3 experiment, CombMNZ, a score-based method, edged RRF (0.6107 against 0.6051 MAP, p = .2). When the scores are informative and stable, keeping them can help.
+
+## Reciprocal rank fusion and its constant
+
+RRF scores each document as the sum, over the rankings it appears in, of `1 / (k + rank)`, ranks starting at 1. It is a merge that trusts positions only, so it can run one list at a time without global state. The paper fixed `k = 60` in a pilot and did not change it during validation. Its Table 1, fusing 30 configurations of one search engine on TREC topics 351 to 400, shows how flat the curve is in the middle: MAP is .2123 at k = 10, .2145 at 60, .2147 at 80 and .2098 at 500, against .2072 at k = 0. From k = 10 to 100 the spread is .0024 MAP, about 1.1% of the value at 60. The fused run beat the best single configuration (.2016) by .0129, a 6.4% relative gain.
+
+The constant matters more than that table suggests when you fuse two lists instead of thirty, because it sets the exchange rate between agreement and a single first place.
+
+<Predict id="rag-fusion-rrf-tie" question="At k = 60, what rank r in both lists ties with first place in only one list?" answer={62} tolerance={1} unit="rank">
+<Fragment slot="prompt">
+<p>A document ranked first by BM25 and absent from the dense list scores 1/61. Another document appears in both lists at the same rank r, with equal weights.</p>
+</Fragment>
+<p>Solve 2 / (60 + r) = 1 / 61, so 60 + r = 122 and <b>r = 62</b>. A document that is mediocre in both lists ties with the best document in one list. At k = 1 the same equation gives 2 / (1 + r) = 1/2, so r = 3. Large k rewards agreement between the legs; small k rewards being first anywhere.</p>
+</Predict>
+
+Engines do not agree on the constant. Elasticsearch defaults `rank_constant` to 60. Qdrant documents k as 2 by default, configurable from v1.16.0, and uses zero-based ranks, so its first place scores `1 / (2 + 0) = 1/2`. Rewriting with one-based ranks, `1 / (2 + r - 1) = 1 / (1 + r)`: Qdrant's default is k = 1 in the paper's notation, at the steep end of the curve where a single first place dominates. A config that says `k: 60` means 60 on Elasticsearch and 59 on Qdrant, which is harmless; a team that never set k at all is running very different fusions on the two engines.
+
+The widget fuses two rankings for the query "E1234 timeout at checkout". Move k and the dense weight.
+
+<RagRrf />
+
+At k = 60 with equal weights, "Payment timeouts" (second in both lists, 0.0323) edges out the "E1234 runbook" (first lexical, fifth dense, 0.0318) and the "Checkout FAQ" (third in both, 0.0317). The runbook is the document the on-call engineer needed. At k = 5 it is still second (0.2667 against 0.2857). At k = 1 it ties for first. Raising the dense weight to 2 at k = 60 drops it to third, because weight multiplies the dense leg's contribution and the runbook's dense rank is poor. On this identifier query the right setting is small k or a lexical weight above 1, and on a paraphrased query it is the opposite, which is why one global setting is a compromise.
+
+<Callout kind="gotcha" label="The window is a parameter too">
+Elasticsearch's `rank_window_size` defaults to 10 and must be at least `size`, so unless you set it, each leg contributes only its top 10 and a document at rank 11 in both legs never enters the fusion. Weighted RRF is generally available from Elasticsearch 9.2 (per-retriever `weight`, default 1.0) and Qdrant v1.17.0 (a weights array matched to prefetches by order). Write the engine and version next to every fusion setting in a design document.
+</Callout>
+
+## Tuning against an eval set
+
+The tuning loop is short: an eval set labelled by query segment, a grid over k and the dense weight, selection on one half of the queries and measurement on the other. Qdrant's documentation gives the same split rule, and the reason is the usual one: measuring on the queries you tuned on inflates the result. The code below generates synthetic rankings in which identifier queries have the relevant document near the top of the lexical list and natural-language queries near the top of the dense list; in the other list it sits low or is missing.
+
+```python
+import random
+from collections import defaultdict
+
+def rrf(rankings, k=60, weights=None):
+    """rankings: lists of doc ids, best first. Ranks start at 1, as in the 2009 paper."""
+    weights = weights or [1.0] * len(rankings)
+    score = defaultdict(float)
+    for ranking, w in zip(rankings, weights):
+        for r, doc in enumerate(ranking, start=1):
+            score[doc] += w / (k + r)
+    return sorted(score, key=lambda d: (-score[d], d))
+
+def recall_at(ranking, relevant, n):
+    return len(set(ranking[:n]) & relevant) / len(relevant)
+
+def synthetic_query(rng, segment):
+    """One query: the relevant doc sits high in the list that suits the segment, low or absent in the other."""
+    pool = [f"d{i}" for i in range(200)]
+    rel = rng.choice(pool)
+    def ranking(good):
+        others = rng.sample([d for d in pool if d != rel], 30)
+        pos = rng.randint(0, 2) if good else rng.choice([rng.randint(6, 29), None])
+        if pos is not None:
+            others.insert(pos, rel)
+        return others[:30]
+    good_lexical = segment == "identifier"
+    return segment, ranking(good_lexical), ranking(not good_lexical), {rel}
+
+rng = random.Random(7)
+queries = [synthetic_query(rng, s) for s in ["identifier"] * 60 + ["natural"] * 140]
+rng.shuffle(queries)
+tune, held_out = queries[:100], queries[100:]
+
+def mean_recall(qs, fuse, n=5):
+    by_seg = defaultdict(list)
+    for seg, lex, den, rel in qs:
+        by_seg[seg].append(recall_at(fuse(lex, den), rel, n))
+    return {seg: round(sum(v) / len(v), 2) for seg, v in sorted(by_seg.items())}
+
+grid = [(k, w) for k in (1, 10, 60) for w in (0.5, 1.0, 2.0)]
+def overall(qs, k, w):
+    return sum(recall_at(rrf([l, d], k, [1.0, w]), r, 5) for _, l, d, r in qs) / len(qs)
+k, w = max(grid, key=lambda kw: overall(tune, *kw))
+print("chosen on the tuning half: k =", k, "dense weight =", w)
+print("lexical only ", mean_recall(held_out, lambda l, d: l))
+print("dense only   ", mean_recall(held_out, lambda l, d: d))
+print("rrf k=60     ", mean_recall(held_out, lambda l, d: rrf([l, d])))
+print("rrf tuned    ", mean_recall(held_out, lambda l, d: rrf([l, d], k, [1.0, w])))
+# chosen on the tuning half: k = 1 dense weight = 1.0
+# lexical only  {'identifier': 1.0, 'natural': 0.0}
+# dense only    {'identifier': 0.0, 'natural': 1.0}
+# rrf k=60      {'identifier': 0.7, 'natural': 0.49}
+# rrf tuned     {'identifier': 0.89, 'natural': 0.9}
+```
+
+The tuned setting wins on held-out queries, and the reason is the mechanism from the prediction. Each synthetic list draws 30 documents from a pool of 200, so unrelated documents land in both lists by chance, and at k = 60 that accidental agreement outscores a lone first place. Change the pool to 5,000 documents, which makes chance overlap rare, and k = 60 recovers to 0.97 and 0.90 while the tuned setting gives 1.0 and 0.91. Real retrievers overlap partly because both found relevant documents and partly for reasons unrelated to relevance, and only your eval set says which dominates. That is the case for tuning k instead of inheriting 60, and for reporting per segment: a single averaged recall would hide that the default fusion lost 30 points on identifier queries in the first run.
+
+## When hybrid wins, and when a router beats it
+
+Hybrid wins when a meaningful share of traffic contains tokens the embedding model has no reason to keep distinct: error codes, part numbers, ticket ids, clause references, product names coined after the model's training data. It should, on a segmented eval, match the better single leg on each segment. If it does not, the usual causes are a window too small for the weaker leg's correct answers to enter, a k that rewards chance agreement, or one leg returning junk for a query class. RRF still gives a junk list's first result 1/(k+1), so a leg that is useless for a segment drags that segment down. Weights fix a consistent imbalance; a router fixes a class-dependent one, by sending queries that match an identifier pattern to lexical first or by skipping a leg entirely. Routing costs a classifier and a new failure mode (misrouted queries), so it earns its place only when per-segment results show fusion losing to a single leg.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your support assistant runs dense-only retrieval. On-call engineers report that queries with error codes miss the runbook. You have two weeks, the p95 budget leaves 40 ms for a second retrieval leg, and the eval set has 400 labelled queries, 70 of them identifier queries. Product wants one tuning knob. What do you ship, and what do you report?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Add a BM25 leg and fuse with RRF, with the fusion window set explicitly and k and the lexical weight chosen on half the labelled queries and measured on the other half. I report recall per segment, identifier and natural language, for dense alone, lexical alone and fused, and I ship only if fused matches the better leg on both segments. The single knob is the lexical weight.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The 40 ms decides the shape: a BM25 leg adds an index lookup and no second model call per query, so it is the leg to measure against the budget first. RRF over score fusion because nobody on the team owns the score distributions and min-max over a 10-document window is unstable. I set the window to cover the candidate count the generator or reranker will consume, not the engine default.</p>
+<p>Tuning: 400 queries split 200 and 200, stratified so both halves hold 35 identifier queries. Grid over k in 1, 10, 60 and lexical weight in 0.5, 1, 2. Thirty-five held-out identifier queries is small; one query moves recall by about 2.9 points, so I report counts as well as rates and treat differences of one or two queries as noise.</p>
+<p>What I give up: one global setting is a compromise between segments. If the held-out results show the best setting for identifiers costs natural-language queries more than a few queries, I write that down and propose a regex router for identifier patterns as the next step, not in this release.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The tuned weight gains 9 identifier queries and loses 3 natural-language queries. Product wants a single headline number. Which do you report, and who decides whether 3 losses are acceptable?</em></li>
+<li><em>Your engine is Qdrant and the config never set k. What has production been running, in the paper's notation, and does that change your baseline?</em> k = 1, because Qdrant's default of 2 is applied to zero-based ranks.</li>
+<li><em>What would you need to see in production to replace RRF with score fusion?</em> Stable score distributions per leg across windows and query classes, and a held-out win large enough to pay for owning those distributions when a model or analyser changes.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The 2009 evidence for k = 60 comes from fusing 30 runs, or many TREC submissions, where agreement among systems is strong signal. A hybrid retriever fuses two legs with very different biases, which is a different regime; treat 60 as a starting point, not a measured optimum for two lists.
+
+Rank fusion discards information that is sometimes worth keeping. When one leg's score has a meaningful absolute value (a calibrated reranker score, or a BM25 score that is zero because no query term matched), ranks hide it, and a filter or threshold on that score can beat any fusion constant.
+
+Fusion only reorders what the legs returned. If the relevant document is in neither window, no constant or weight recovers it; that is a query, chunking or index problem. And the whole discussion assumes the merged list is the final ranking or the input to a reranker that reads a fixed number of candidates. When a cross-encoder rescores the top 100 anyway, fusion's job is recall at 100, not order at 5, and k matters much less.
+
+<SelfRate id="lesson:rag/hybrid-search/fusion" />

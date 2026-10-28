@@ -1,0 +1,83 @@
+---
+id: trn-016
+title: Size the pipeline bubble, then interleave it
+subtitle: p = 16 and m = 32, then two stages per device, and what the second number costs
+track: training
+module: distributed
+type: estimate
+difficulty: medium
+seniority: [senior]
+minutes: 15
+core: false
+tags: [pipeline-parallelism, bubble, interleaving, estimation]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Hugging Face, The Ultra-Scale Playbook, pipeline parallelism
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "bubble time (p - 1)(t_f + t_b) and bubble ratio (p - 1)/m for all-forward-all-backward and 1F1B; interleaving with v stages per device gives (p - 1)/(v m) and multiplies communication by v. Checked 2026-10-28."
+  - title: Narayanan et al., Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM (arXiv 2104.04473)
+    url: https://arxiv.org/abs/2104.04473
+    note: "the interleaved schedule improves throughput by more than 10%, the paper reports. Checked 2026-10-28."
+  - title: Austin et al., How to Scale Your Model, GPUs chapter (JAX scaling book)
+    url: https://jax-ml.github.io/scaling-book/gpus/
+    note: "InfiniBand NDR at 50 GB/s per GPU across H100 nodes. Checked 2026-10-28."
+range: { low: 17, high: 25, unit: "% of step time" }
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Sixteen pipeline stages, one per node, 32 micro-batches per step with 1F1B. How much of the step is bubble? Now each device takes two interleaved stages instead of one. What is the bubble now, and what did we pay for it?"
+</Callout>
+
+Scenario inputs: forward plus backward for one micro-batch on one stage takes 24 ms without interleaving, operation times are uniform across stages, and the activation passed between stages is one micro-batch of 4,096 tokens at hidden size 8,192 in BF16. Consecutive stages sit on different nodes, linked at 50 GB/s per GPU (the scaling book's InfiniBand figure for H100 nodes).
+
+Give the bubble with interleaving as a percentage of step time, and say whether you counted the transfers.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask whether "bubble" in the team's dashboards is idle time over useful time or idle time over the whole step.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask whether point-to-point sends overlap with compute in this engine, and where they cannot.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Without interleaving, the bubble is (p - 1)/m = 15/32 of the useful time: 360 ms of idle against 768 ms of work, 31.9% of a 1,128 ms step. With v = 2 it halves to 15/64: 180 ms against 768 ms, 19.0% of the step. Each micro-batch now crosses 31 device boundaries each way instead of 15, and if the transfers during fill and drain are exposed they add about 43 ms, making it about 22.5%. The price is twice the point-to-point traffic and a layer count that must divide into 32 virtual stages.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>No interleaving.</b> Useful work per device is m x 24 ms = 768 ms. The fill and drain leave each device idle for (p - 1) x 24 ms = 360 ms. Ratio 360/768 = 46.9%; share of step 360/1,128 = 31.9%. The two definitions differ by a lot here, which is why the first thing to settle is which one the dashboard reports.</p>
+<p><b>v = 2.</b> Each device runs two stages of half the layers, so each stage costs 12 ms per micro-batch and the fill and drain cost (p - 1) x 12 = 180 ms. Ratio 180/768 = 23.4%; share 180/948 = 19.0%. The step drops from 1,128 ms to 948 ms, 16% faster, before communication.</p>
+<p><b>The transfers.</b> One activation is 4,096 x 8,192 x 2 bytes = 67 MB, 1.34 ms at 50 GB/s. Without interleaving a micro-batch crosses 15 boundaries forward and 15 backward; with v = 2 it crosses 31 each way. In steady state the sends overlap with other micro-batches' compute; in fill and drain the first and last micro-batches wait for them. Counting the 16 extra hops each way as exposed adds 2 x 16 x 1.34 = 43 ms: (180 + 43)/(768 + 223) = 22.5% of the step. The same reasoning charges the non-interleaved schedule 40 ms for its own 30 hops, so the honest comparison is about 34% against about 22.5%.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Why does doubling m to 64 halve the bubble, and what does it cost in global batch or micro-batch size?</li>
+<li>At what v does the exposed transfer time eat the bubble saving?</li>
+<li>What would the bubble be with 1F1B and v = 2 if the first and last stages carry the embedding and the loss and run 20% slower?</li>
+</ul>
+</Fragment>
+</Depth>
+
+**The dominant term** is the fill and drain, (p - 1) stage-times, against m stage-times of work. Interleaving shortens a stage-time by v; adding micro-batches lengthens the work. The transfers are second-order at these sizes: 1.34 ms per hop against a 12 ms stage.
+
+**Reasonable answers** land between about 17% and 25%: 19.0% as a share of the step with free transfers, 22.5% with fill-and-drain transfers exposed, and 23.4% if the reader reports idle over useful time. **Unreasonable answers:** dividing the bubble by v and also by v again for the shorter stages (11.7% ratio, about 10% share); applying v to the number of micro-batches as if interleaving added micro-batches, which gives the right ratio for the wrong reason and breaks when m changes; and quoting 46.9% as the share of the step.
+
+**What interleaving costs.** Twice the point-to-point traffic: 31 sends per micro-batch each way instead of 15, 2.1 GB instead of 1.0 GB per micro-batch in each direction. A model whose layer count is not a multiple of p x v = 32 gets uneven virtual stages, and the slowest one sets the pace. And a harder schedule, whose bookkeeping is where the bugs in pipeline engines tend to live.
+
+**The assumption that flips the conclusion** is whether sends overlap with compute. If the engine serialises them, each device pays for every send on its own timeline: with v = 2 it sends 2 x 32 activations each way per step instead of 32, 64 extra sends at 1.34 ms, 86 ms. Interleaving still wins, by 180 - 86 = 94 ms. The saving is gone when a hop costs more than 180 / 64 = 2.8 ms, about twice the figure here: a link at half the bandwidth, or activations twice as large for the same compute.
+
+## Follow-ups
+
+- *Your engine team says interleaving will take three weeks to stabilise. Raising m to 64 costs nothing in engineering but doubles the global batch. Which do you take, and what do you write down about the risk to convergence?*
+- *The model has 80 layers and the cluster forces p = 16. What do you do about v, and what does an uneven split cost?*
+- *What would you need to see in a profile to conclude the transfers, not the bubble, are now the larger loss?*
+
+## Common mistakes
+
+- Reporting (p - 1)/m as the share of step time; it is idle over useful time.
+- Assuming interleaving is free because the bytes per hop are small, without checking whether sends overlap.
+- Forgetting that interleaving needs the layer count to divide by p x v.

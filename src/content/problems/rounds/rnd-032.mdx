@@ -1,0 +1,594 @@
+---
+id: rnd-032
+title: Bug squash in a dependency scanner
+subtitle: three user reports, one package
+track: rounds
+module: codebase-rounds
+type: repo
+difficulty: hard
+seniority: [senior, staff]
+minutes: 60
+core: true
+tags: [bug-squash, repo, ast, imports, retries, streams, reproduction]
+companies:
+  - name: Stripe
+    url: https://prachub.com/interview-experiences/stripe-new-grad-software-engineer-interview-experience-rejected-after-ai-coding-and-integration-plus-bug-squash-onsite
+updated: 2026-10-28
+sources:
+  - title: PracHub, Stripe new grad software engineer interview experience (published 2026-10-17)
+    url: https://prachub.com/interview-experiences/stripe-new-grad-software-engineer-interview-experience-rejected-after-ai-coding-and-integration-plus-bug-squash-onsite
+    note: "candidate report: a Bug Squash round on open-source Python libraries (Mako, Requests, Colander); the Mako bugs listed include a missing visit_arg in the AST visitor and file opening that checked only that the path exists, not that it is a file; the Requests bug is a 307 redirect that resends a body stream already consumed. The package in this problem is original and follows those bug classes. Checked 2026-10-28."
+  - title: Hello Interview, Meta's AI-enabled coding interview
+    url: https://www.hellointerview.com/blog/meta-ai-enabled-coding
+    note: "candidate reports gathered by a former Meta staff engineer: phase 1 of the round is fixing a non-algorithmic bug in a multi-file project. Checked 2026-10-28."
+  - title: Python docs, ast.NodeVisitor
+    url: https://docs.python.org/3/library/ast.html
+    note: "visit() calls visit_classname, or generic_visit() if that method does not exist; generic_visit calls visit() on all children; ImportFrom has module (None for `from . import x`), names and level. Checked 2026-10-28."
+  - title: PEP 420, Implicit namespace packages
+    url: https://peps.python.org/pep-0420/
+    note: "per directory: foo/__init__.py makes a regular package; otherwise foo.py (or .pyc, .so, .pyd) is a module; otherwise a directory foo is recorded as a possible namespace portion. Checked 2026-10-28."
+  - title: Requests source, utils.rewind_body
+    url: https://github.com/psf/requests/blob/main/src/requests/utils.py
+    note: "moves the body back to its recorded starting position before a resend on redirect and raises UnrewindableBodyError when the body cannot seek. Checked 2026-10-28."
+  - title: Stripe API reference, idempotent requests
+    url: https://docs.stripe.com/api/idempotent_requests
+    note: "a client-generated key lets a request be repeated after a connection error without performing the operation twice. Checked 2026-10-28."
+code:
+  files:
+    depscan/__init__.py: |
+      """depscan: follow a project's local imports from an entry module and report calls that deserialise or evaluate untrusted input."""
+
+      __version__ = "0.4.1"
+    depscan/report.py: |
+      """Findings as newline-delimited JSON, the format the webhook expects."""
+      import io
+      import json
+
+      from depscan.rules import RISKY
+
+
+      def to_ndjson(findings):
+          lines = [
+              json.dumps({"path": path, "line": line, "call": call, "why": RISKY[call]}, sort_keys=True)
+              for path, line, call in findings
+          ]
+          return ("\n".join(lines) + "\n" if lines else "").encode("utf-8")
+
+
+      def as_stream(findings):
+          """A seekable binary stream of the report, for upload."""
+          return io.BytesIO(to_ndjson(findings))
+    depscan/rules.py: |
+      """The calls depscan reports, keyed by the fully qualified name the scanner resolves a call to."""
+
+      RISKY = {
+          "pickle.load": "unpickling runs code chosen by whoever wrote the bytes",
+          "pickle.loads": "unpickling runs code chosen by whoever wrote the bytes",
+          "marshal.loads": "marshal data is not validated and can crash the interpreter",
+          "builtins.eval": "evaluates a string as Python",
+          "builtins.exec": "executes a string as Python",
+      }
+
+
+      def qualified(module, name):
+          """The rule key for name imported from module: qualified("pickle", "loads") is "pickle.loads"."""
+          return f"{module}.{name}" if module else name
+    depscan/scan.py: |
+      """Scan a project from an entry module: follow local imports, report risky calls, upload the report."""
+      import ast
+      import os
+      from collections import deque
+
+      from depscan.rules import RISKY, qualified
+      from depscan.transport import Request, TransientError
+
+
+      class CallFinder(ast.NodeVisitor):
+          """Collects risky calls and the modules a file imports. `module` is the file's dotted name."""
+
+          def __init__(self, module, is_package):
+              self.module = module
+              self.package = module if is_package else module.rpartition(".")[0]
+              self.names = {}        # local name: the qualified name it refers to
+              self.imports = set()   # dotted modules this file imports
+              self.calls = []        # (line, qualified name)
+
+          def visit_Import(self, node):
+              for alias in node.names:
+                  self.imports.add(alias.name)
+                  if alias.asname:
+                      self.names[alias.asname] = alias.name
+                  else:
+                      head = alias.name.split(".")[0]
+                      self.names[head] = head
+
+          def visit_Call(self, node):
+              name = self._resolve(node.func)
+              if name in RISKY:
+                  self.calls.append((node.lineno, name))
+              self.generic_visit(node)
+
+          def _resolve(self, func):
+              parts = []
+              while isinstance(func, ast.Attribute):
+                  parts.append(func.attr)
+                  func = func.value
+              if not isinstance(func, ast.Name):
+                  return None
+              parts.reverse()
+              if func.id in self.names:
+                  return qualified(self.names[func.id], ".".join(parts)) if parts else self.names[func.id]
+              return None if parts else qualified("builtins", func.id)
+
+
+      def resolve_module(root, dotted):
+          """The file that `import dotted` loads from root, or None when there is no source file to scan."""
+          base = os.path.join(root, *dotted.split("."))
+          if os.path.exists(base):
+              return os.path.join(base, "__init__.py")
+          if os.path.exists(base + ".py"):
+              return base + ".py"
+          return None
+
+
+      def scan_project(root, entry):
+          """Sorted list of (path relative to root with forward slashes, line, call) for every risky call reachable from
+          the entry module through imports that resolve to files under root."""
+          found, seen, queue = set(), set(), deque([entry])
+          while queue:
+              module = queue.popleft()
+              if module in seen:
+                  continue
+              seen.add(module)
+              path = resolve_module(root, module)
+              if path is None:
+                  continue
+              with open(path, encoding="utf-8") as f:
+                  tree = ast.parse(f.read(), filename=path)
+              finder = CallFinder(module, os.path.basename(path) == "__init__.py")
+              finder.visit(tree)
+              rel = os.path.relpath(path, root).replace(os.sep, "/")
+              found.update((rel, line, call) for line, call in finder.calls)
+              for name in finder.imports:
+                  parts = name.split(".")
+                  queue.extend(".".join(parts[:i]) for i in range(1, len(parts) + 1))
+          return sorted(found)
+
+
+      def upload(transport, url, body, retries=3):
+          """POST the report stream to the webhook, resending up to `retries` times on TransientError."""
+          request = Request("POST", url, body, {"Content-Type": "application/x-ndjson"})
+          for attempt in range(retries + 1):
+              try:
+                  return transport.send(request)
+              except TransientError:
+                  if attempt == retries:
+                      raise
+    depscan/testing.py: |
+      """Test helpers that ship with depscan: a project builder, a fake webhook and a stream that refuses whole reads."""
+      import hashlib
+      import io
+      import os
+      import tempfile
+
+      from depscan.transport import CHUNK, TransientError, read_chunks
+
+
+      def make_project(files):
+          """Write {relative path: text} under a new directory in the working directory and return its path."""
+          root = tempfile.mkdtemp(prefix="project-", dir=os.getcwd())
+          for rel, text in files.items():
+              full = os.path.join(root, *rel.split("/"))
+              os.makedirs(os.path.dirname(full), exist_ok=True)
+              with open(full, "w", encoding="utf-8") as f:
+                  f.write(text)
+          return root
+
+
+      def digest(data):
+          """(length, sha256 hex) of bytes: what FakeServer records for a delivered body."""
+          return len(data), hashlib.sha256(data).hexdigest()
+
+
+      class FakeServer:
+          """A webhook that accepts whatever body arrives. The first fail_first sends read the whole body, then fail
+          with TransientError, the way a connection reset after the upload looks to the client."""
+
+          def __init__(self, fail_first=0):
+              self.fail_first = fail_first
+              self.attempts = 0
+              self.delivered = []
+
+          def send(self, request):
+              self.attempts += 1
+              h, n = hashlib.sha256(), 0
+              for chunk in read_chunks(request.body):
+                  h.update(chunk)
+                  n += len(chunk)
+              if self.attempts <= self.fail_first:
+                  raise TransientError("connection reset by peer")
+              self.delivered.append((n, h.hexdigest()))
+              return {"status": 200, "bytes": n}
+
+
+      READ_LIMIT = 1024 * 1024
+
+
+      class StrictStream(io.RawIOBase):
+          """A binary stream of `size` generated bytes that raises MemoryError on a read of more than READ_LIMIT bytes.
+          With seekable=False it behaves like a pipe or a socket: seek and tell raise io.UnsupportedOperation."""
+
+          _BLOCK = bytes(range(251)) * (2 * READ_LIMIT // 251 + 2)
+
+          def __init__(self, size, seekable=True):
+              self.size = size
+              self.pos = 0
+              self._seekable = seekable
+
+          def readable(self):
+              return True
+
+          def seekable(self):
+              return self._seekable
+
+          def read(self, n=-1):
+              if n is None or n < 0 or n > READ_LIMIT:
+                  raise MemoryError(f"read({n}) on a {self.size}-byte stream: read in chunks of at most {READ_LIMIT} bytes")
+              n = min(n, self.size - self.pos)
+              start = self.pos % 251
+              out = self._BLOCK[start:start + n]
+              self.pos += n
+              return out
+
+          def readall(self):
+              raise MemoryError("readall() on a stream that does not fit in memory")
+
+          def readinto(self, b):
+              data = self.read(min(len(b), READ_LIMIT))
+              b[:len(data)] = data
+              return len(data)
+
+          def tell(self):
+              if not self._seekable:
+                  raise io.UnsupportedOperation("tell")
+              return self.pos
+
+          def seek(self, pos, whence=0):
+              if not self._seekable:
+                  raise io.UnsupportedOperation("seek")
+              base = {0: 0, 1: self.pos, 2: self.size}[whence]
+              self.pos = max(0, base + pos)
+              return self.pos
+
+          def expected(self, start=0):
+              """digest() of the bytes from start to the end, computed in chunks."""
+              h, n, pos = hashlib.sha256(), 0, start
+              while pos < self.size:
+                  k = min(CHUNK, self.size - pos)
+                  s = pos % 251
+                  h.update(self._BLOCK[s:s + k])
+                  n += k
+                  pos += k
+              return n, h.hexdigest()
+    depscan/transport.py: |
+      """The transport contract. Production wraps an HTTP client; tests use depscan.testing.FakeServer.
+
+      A transport's send(request) streams request.body from its current position to EOF in chunks of CHUNK bytes and
+      returns a response dict. It raises TransientError when the request may be retried: a reset connection, a 502, 503
+      or 504. Bodies are binary file-like objects and can be larger than memory, so nothing in depscan reads one whole.
+      """
+
+      CHUNK = 64 * 1024
+
+
+      class TransientError(Exception):
+          """The send failed in a way a retry can fix. The server may already have read part or all of the body."""
+
+
+      class Request:
+          def __init__(self, method, url, body, headers=None):
+              self.method = method
+              self.url = url
+              self.body = body
+              self.headers = dict(headers or {})
+
+
+      def read_chunks(body, size=CHUNK):
+          """Yield body from its current position to EOF in chunks of at most size bytes."""
+          while True:
+              chunk = body.read(size)
+              if not chunk:
+                  return
+              yield chunk
+  target: depscan/scan.py
+  tests: |
+    import io
+    from depscan.scan import scan_project, upload
+    from depscan.testing import FakeServer, make_project, digest
+
+    app = make_project({
+        "app/__init__.py": "",
+        "app/main.py": "import pickle\nfrom app import jobs\n\n\ndef handle(raw):\n    return pickle.loads(raw)\n",
+        "app/jobs.py": "from pickle import loads\n\n\ndef run(raw):\n    return loads(raw)\n",
+    })
+    found = scan_project(app, "app.main")
+    assert ("app/main.py", 6, "pickle.loads") in found
+    assert ("app/jobs.py", 5, "pickle.loads") in found, found
+
+    svc = make_project({
+        "svc/__init__.py": "",
+        "svc/api.py": "import svc.util\n",
+        "svc/util.py": "def load(text):\n    return eval(text)\n",
+        "svc/util/__pycache__/__init__.cpython-312.pyc": "",
+    })
+    assert scan_project(svc, "svc.api") == [("svc/util.py", 2, "builtins.eval")]
+
+    report = b'{"call": "pickle.loads", "line": 6, "path": "app/main.py"}\n' * 2000
+    server = FakeServer(fail_first=1)
+    upload(server, "https://hooks.example.test/depscan", io.BytesIO(report))
+    assert server.attempts == 2
+    assert server.delivered == [digest(report)], server.delivered
+  hidden: |
+    from depscan.testing import StrictStream
+    from depscan.transport import TransientError
+
+    _p = make_project({
+        "pkg/__init__.py": "from . import helpers\n",
+        "pkg/helpers.py": "from .codec import decode as d\n\n\ndef go(b):\n    return d(b)\n",
+        "pkg/codec.py": "from pickle import loads as decode\nimport marshal as m\n\n\ndef raw(b):\n    return m.loads(b)\n",
+        "pkg/sub/__init__.py": "",
+        "pkg/sub/deep.py": "from ..codec import raw\nfrom .. import helpers\n\n\ndef x(s):\n    return exec(s)\n",
+    })
+    _f = scan_project(_p, "pkg.sub.deep")
+    assert ("pkg/codec.py", 6, "marshal.loads") in _f
+    assert ("pkg/sub/deep.py", 6, "builtins.exec") in _f
+    assert _f == sorted(set(_f))
+    assert scan_project(_p, "pkg") == [("pkg/codec.py", 6, "marshal.loads")]
+
+    _q = make_project({
+        "lib/__init__.py": "",
+        "lib/main.py": "from lib import both, space\nimport lib.gone\n",
+        "lib/both.py": "def a(s):\n    return eval(s)\n",
+        "lib/both/__init__.py": "def b(s):\n    return exec(s)\n",
+        "lib/space/data.txt": "not python\n",
+        "lib/gone/__pycache__/x.pyc": "",
+    })
+    assert scan_project(_q, "lib.main") == [("lib/both/__init__.py", 2, "builtins.exec")]
+
+    _body = StrictStream(300_000)
+    _body.seek(1234)
+    _s = FakeServer(fail_first=3)
+    upload(_s, "https://hooks.example.test/depscan", _body, retries=3)
+    assert _s.attempts == 4 and _s.delivered == [_body.expected(1234)]
+
+    _s = FakeServer(fail_first=5)
+    try:
+        upload(_s, "https://hooks.example.test/depscan", StrictStream(10_000), retries=2)
+        _raised = False
+    except TransientError:
+        _raised = True
+    assert _raised and _s.attempts == 3 and _s.delivered == []
+
+    _pipe = StrictStream(200_000, seekable=False)
+    _s = FakeServer(fail_first=1)
+    try:
+        upload(_s, "https://hooks.example.test/depscan", _pipe)
+    except Exception:
+        pass
+    assert _s.delivered in ([], [StrictStream(200_000).expected()])
+
+    _s = FakeServer(fail_first=0)
+    upload(_s, "https://hooks.example.test/depscan", StrictStream(50_000, seekable=False))
+    assert _s.attempts == 1 and _s.delivered == [StrictStream(50_000).expected()]
+
+    try:
+        import tracemalloc
+    except ImportError:
+        tracemalloc = None
+    _big = StrictStream(8 * 1024 * 1024)
+    _s = FakeServer(fail_first=2)
+    if tracemalloc:
+        tracemalloc.start()
+    upload(_s, "https://hooks.example.test/depscan", _big)
+    _peak = tracemalloc.get_traced_memory()[1] if tracemalloc else 0
+    if tracemalloc:
+        tracemalloc.stop()
+    assert _s.delivered == [_big.expected()] and _peak < 2 * 1024 * 1024
+  solution: |
+    """Scan a project from an entry module: follow local imports, report risky calls, upload the report."""
+    import ast
+    import os
+    from collections import deque
+
+    from depscan.rules import RISKY, qualified
+    from depscan.transport import Request, TransientError
+
+
+    class UnrewindableBody(Exception):
+        """A send failed after reading from a body that cannot seek, so a resend would carry the wrong bytes."""
+
+
+    class CallFinder(ast.NodeVisitor):
+        """Collects risky calls and the modules a file imports. `module` is the file's dotted name."""
+
+        def __init__(self, module, is_package):
+            self.module = module
+            self.package = module if is_package else module.rpartition(".")[0]
+            self.names = {}        # local name: the qualified name it refers to
+            self.imports = set()   # dotted modules this file imports
+            self.calls = []        # (line, qualified name)
+
+        def visit_Import(self, node):
+            for alias in node.names:
+                self.imports.add(alias.name)
+                if alias.asname:
+                    self.names[alias.asname] = alias.name
+                else:
+                    head = alias.name.split(".")[0]
+                    self.names[head] = head
+
+        def visit_ImportFrom(self, node):
+            if node.level:
+                parts = self.package.split(".") if self.package else []
+                if node.level > 1:
+                    parts = parts[: len(parts) - (node.level - 1)]
+                base = ".".join(parts + ([node.module] if node.module else []))
+            else:
+                base = node.module or ""
+            if not base:
+                return
+            self.imports.add(base)
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                target = qualified(base, alias.name)
+                self.imports.add(target)  # "from pkg import mod" loads a submodule when one exists
+                self.names[alias.asname or alias.name] = target
+
+        def visit_Call(self, node):
+            name = self._resolve(node.func)
+            if name in RISKY:
+                self.calls.append((node.lineno, name))
+            self.generic_visit(node)
+
+        def _resolve(self, func):
+            parts = []
+            while isinstance(func, ast.Attribute):
+                parts.append(func.attr)
+                func = func.value
+            if not isinstance(func, ast.Name):
+                return None
+            parts.reverse()
+            if func.id in self.names:
+                return qualified(self.names[func.id], ".".join(parts)) if parts else self.names[func.id]
+            return None if parts else qualified("builtins", func.id)
+
+
+    def resolve_module(root, dotted):
+        """The file that `import dotted` loads from root, or None when there is no source file to scan.
+        The import system's order: a regular package, then a module; a bare directory is a namespace package."""
+        base = os.path.join(root, *dotted.split("."))
+        init = os.path.join(base, "__init__.py")
+        if os.path.isfile(init):
+            return init
+        if os.path.isfile(base + ".py"):
+            return base + ".py"
+        return None
+
+
+    def scan_project(root, entry):
+        """Sorted list of (path relative to root with forward slashes, line, call) for every risky call reachable from
+        the entry module through imports that resolve to files under root."""
+        found, seen, queue = set(), set(), deque([entry])
+        while queue:
+            module = queue.popleft()
+            if module in seen:
+                continue
+            seen.add(module)
+            path = resolve_module(root, module)
+            if path is None:
+                continue
+            with open(path, encoding="utf-8") as f:
+                tree = ast.parse(f.read(), filename=path)
+            finder = CallFinder(module, os.path.basename(path) == "__init__.py")
+            finder.visit(tree)
+            rel = os.path.relpath(path, root).replace(os.sep, "/")
+            found.update((rel, line, call) for line, call in finder.calls)
+            for name in finder.imports:
+                parts = name.split(".")
+                queue.extend(".".join(parts[:i]) for i in range(1, len(parts) + 1))
+        return sorted(found)
+
+
+    def _start_of(body):
+        """The position to rewind to before a resend, or None when the stream cannot seek."""
+        try:
+            return body.tell() if body.seekable() else None
+        except (AttributeError, OSError):
+            return None
+
+
+    def upload(transport, url, body, retries=3):
+        """POST the report stream to the webhook, resending up to `retries` times on TransientError.
+        Every attempt sends the bytes from the body's position at the call. A stream that cannot seek is sent once;
+        after a failure UnrewindableBody is raised instead of resending what is left of it."""
+        start = _start_of(body)
+        request = Request("POST", url, body, {"Content-Type": "application/x-ndjson"})
+        for attempt in range(retries + 1):
+            if attempt:
+                if start is None:
+                    raise UnrewindableBody("the report stream cannot seek; build it again and upload again")
+                body.seek(start)
+            try:
+                return transport.send(request)
+            except TransientError:
+                if attempt == retries:
+                    raise
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The round, as a candidate report describes it">
+You get a real-looking Python library, a list of behaviours that are wrong, and an hour. Reproduce each one, fix it with the smallest change that is correct, and keep the existing behaviour intact. One candidate report places this round at Stripe on open-source libraries; the package below is original.
+</Callout>
+
+`depscan` follows a project's local imports from an entry module, reports calls that deserialise or evaluate input (`pickle.loads`, `marshal.loads`, `eval`, `exec`), and uploads the report to a webhook with retries. Every file is in the panel; you edit `depscan/scan.py`. `rules.py` holds the call table, `transport.py` the transport contract, and `testing.py` the fakes the tests use, including a stream that refuses to be read whole. The issue tracker has three open reports:
+
+1. "depscan flags `pickle.loads` in `app/main.py` but says nothing about `app/jobs.py`, which calls it too."
+2. "We turned the `svc/util/` package into `svc/util.py`. Since then depscan crashes with `FileNotFoundError` on my laptop. CI is fine."
+3. "Some nights the webhook stores an empty report. The gateway resets connections while it deploys."
+
+Fix all three. Two decisions are yours, and the hidden tests accept more than one answer to each: what `upload` does with a body that cannot seek (a pipe, a socket), and how many resends it makes. Reports from a large monorepo can be bigger than the runner's memory, so the fix cannot hold a whole report in memory. Say which order you take the three in and why, given the hour.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which import statements appear in the files depscan misses and which appear in the files it finds.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for a listing of `svc/` on the laptop and in a fresh CI checkout, including untracked and ignored entries.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask for the byte count of each empty delivery and the number of sends the client logged for the same report.</p></details>
+
+## Answer
+
+Take the bugs in the order they are cheap to reproduce. Reports 1 and 2 are pure functions of a directory tree, so a three-file project from `make_project` reproduces each in a minute. Report 3 needs the fake server, so it goes last, and it is the one with decisions in it.
+
+**Report 1: a missing visitor method.** `CallFinder` defines `visit_Import` and no `visit_ImportFrom`. `ast.NodeVisitor.visit` dispatches on the class name and falls back to `generic_visit`, which walks the children and records nothing, so nothing fails loudly. Two symptoms come from that one gap. `from pickle import loads` never enters `self.names`, so `loads(raw)` resolves to `builtins.loads`, which is not in the table. And `from app import jobs` is never added to `self.imports`, so `jobs.py` is never scanned at all, which is why the report says "nothing" rather than "the wrong line". The fix resolves relative imports before recording names: `level` 1 is the current package, each further level drops one trailing component, and `from . import helpers` has `module` set to `None`. Every `from base import name` records both `base` and `base.name` as imports, because `name` may be a submodule; the scanner already ignores imports that resolve to no file.
+
+**Report 2: an existence check that should be a file check.** `resolve_module` asks `os.path.exists(base)` and, when a directory is there, returns `base/__init__.py` without checking it exists. Converting a package to a module removes the tracked files, but `svc/util/__pycache__/` is ignored by git and stays on the laptop, so the directory survives and `open` fails on an `__init__.py` that is gone. A fresh CI checkout has no such directory, which is why CI passes. The fix follows the import system's order from PEP 420: `base/__init__.py` if it is a file, else `base.py` if it is a file, else `None`, because a bare directory is a namespace package with no source of its own. The same order decides the case where `lib/both/__init__.py` and `lib/both.py` both exist: the package wins.
+
+**Report 3: a resend of a consumed stream.** The first `send` reads the body to EOF, the gateway resets the connection, and the retry hands the transport the same object. `read_chunks` yields nothing, the lenient webhook stores zero bytes, and `upload` returns success. The Stripe candidate report describes the same class of bug in Requests on a 307 redirect, where the header still announces the original length and the server waits for bytes that never come. Requests handles it in `rewind_body`, which seeks the body back to the starting position it recorded before resending on a redirect and raises `UnrewindableBodyError` when the body cannot seek. The fix here does the same: `start = body.tell()` once, before the first send, and `body.seek(start)` before each resend. The start position matters, not 0: a caller that wrote a preamble and positioned the stream must get the same bytes on every attempt, and a hidden test checks it.
+
+### The two decisions
+
+A body that cannot seek has two defensible answers.
+
+- **Send it once and refuse to resend.** After a transient failure, raise `UnrewindableBody`. Cost: the report is lost on any reset, and the caller has to rebuild it and call again. Nothing extra is held in memory or written to disk.
+- **Spool it.** Copy the stream into `tempfile.SpooledTemporaryFile(max_size=N)` on the first pass and resend from the spool. Cost: you choose N, which is memory held per upload before the spool goes to disk, and the report (file paths and the lines with dangerous calls) is written to the runner's temporary directory, which on shared CI runners is a place other jobs can read.
+
+Reading the whole stream into `bytes` so that it can be resent is not defensible here: the contract in `transport.py` says bodies can exceed memory, and the hidden tests measure peak allocation on an 8 MiB body.
+
+The reference solution refuses. `report.as_stream` already returns a seekable `BytesIO`, so the common path rewinds for nothing, and only a caller who hands in a pipe meets the refusal. That caller knows whether the report can be regenerated, which the library does not.
+
+For the number of resends, the code has no backoff, so every resend lands within milliseconds of the reset, probably on the same draining instance. Any count from two to five is reasonable once the resends are spaced with backoff and jitter and the total wait fits inside the CI job's timeout; the hidden tests check only that `retries` resends happen and no more. An unbounded count, or a larger count with no spacing, is not reasonable: it adds load during the deploy that caused the resets.
+
+### What the fix gets wrong
+
+The resend fixes empty deliveries and creates duplicate ones. "Connection reset after the upload" means the server may already have stored the report, so the resend can store it twice. Before the fix the webhook saw an empty body; after it, the same report can arrive two or three times. The cure is on the protocol, not in `upload`: send a key derived from the report's digest in a header and have the webhook keep the first delivery per key, the pattern Stripe documents for idempotent requests. Rewinding also assumes the bytes behind the stream did not change between attempts; a file another process is appending to breaks that assumption silently.
+
+### The reference solution, in short
+
+`visit_ImportFrom` resolves the base module, records the base and each `base.name` as imports and binds each local name; `resolve_module` checks `__init__.py` and then `base.py` with `os.path.isfile`; `upload` records `tell()` before the first send, seeks back before every resend, and raises `UnrewindableBody` instead of resending a stream that cannot seek. The full file is under the runner.
+
+## Follow-ups
+
+- *Your fix turns empty deliveries into duplicate deliveries, and the webhook team cannot add deduplication this quarter. Do you ship it, and what do you put in the release note?* An empty report silently hides findings; a duplicate is noisy but complete. Ship, state the duplicate risk in the note, and add the digest header now so the webhook can use it later.
+- *What would you need to see before switching from refusing non-seekable bodies to spooling them?* The share of uploads that arrive as pipes and fail on a reset, from the client's logs, and a temporary directory on the runners that is private to the job.
+- *Two reviewers disagree: one wants `from x import *` followed, the other says it floods the scan with unrelated modules. How do you settle it without deciding by rank?* Run both on the three largest repositories that use depscan and compare findings gained against files scanned and time taken.
+- *What changes when the transport is a real HTTP client?* urllib3 and Requests already rewind on some retries and redirects, so check which layer owns the rewind before adding a second one; a chunked upload with no Content-Length makes a truncated resend look complete to the server, which is the failure this problem reproduces.
+
+## Common mistakes
+
+- Seeking to 0 instead of the position the stream had when `upload` was called.
+- Making the stream rewindable by reading it all into memory.
+- Adding a special case for `from pickle import loads` instead of handling `ImportFrom`, which leaves relative imports and `from app import jobs` unfollowed.
+- Replacing `exists` with `isdir` for the package check, which still accepts the stale directory.
+- Catching `FileNotFoundError` in `scan_project` and moving on, which hides `svc/util.py` instead of scanning it.

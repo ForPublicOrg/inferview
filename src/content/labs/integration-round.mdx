@@ -1,0 +1,859 @@
+---
+title: "Integration round against a mock service"
+track: rounds
+module: llm-app-coding
+kind: lab
+minutes: 120
+summary: "Five parts against a deterministic payments API in the browser: cursor pagination, tokens collected from response headers, idempotent reconciliation, retries in one layer with partial failure, and a report a person can act on."
+updated: 2026-10-28
+sources:
+  - title: "PracHub, Stripe new grad software engineer interview experience"
+    url: https://prachub.com/interview-experiences/stripe-new-grad-software-engineer-interview-experience-rejected-after-ai-coding-and-integration-plus-bug-squash-onsite
+    note: "candidate report (rejected), posted 2026-10-17: the integration exercises have several parts, one with five parts where completing three is \"generally enough\" and one with four; checked 2026-10-28"
+  - title: "Aced, Ramp AI Engineer interview experience"
+    url: https://www.aced.io/experiences/ramp-ai-engineer-interview-13abb1
+    note: "candidate report (rejected), interview about three months before the report; lists \"Implement an in-memory database in CodeSignal, with each round adding more functionality\" and \"Escape the Maze\", an HTTP crawl to an exit URL with robust error handling whose second level needs auth headers collected while crawling; no stage details. The specifications here are original; checked 2026-10-28"
+  - title: "Stripe API reference, pagination"
+    url: https://docs.stripe.com/api/pagination
+    note: "cursor-based lists with limit (1 to 100, default 10), starting_after and ending_before; has_more marks the last page; the model for the mock's lists"
+  - title: "Stripe API reference, idempotent requests"
+    url: https://docs.stripe.com/api/idempotent_requests
+    note: "v1 saves the status and body of the first request with a key and returns them on retries; the same key with different parameters errors; keys may be pruned after 24 hours; avoid sensitive data in keys; the model for the mock's POST"
+steps:
+  - title: "Paginate a list endpoint"
+    brief: "PaymentsAPI stands in for the network, and every request goes through send. Write list_all(api, path, headers, limit, on_page): follow starting_after cursors until has_more is false, call on_page with each page's response, and raise APIError on any non-200 page rather than return a partial list. The tests add objects while you page; a cursor stays put under inserts where an offset does not."
+    starter: |
+      import json
+
+
+      class Response:
+          def __init__(self, status, body=None, headers=None):
+              self.status = status
+              self.body = body if body is not None else {}
+              self.headers = headers or {}
+
+
+      class APIError(Exception):
+          def __init__(self, status, body=None):
+              super().__init__(f"HTTP {status}: {body}")
+              self.status, self.body = status, body
+
+
+      class PaymentsAPI:
+          """A deterministic stand-in for a payments provider's HTTP API. Do not edit it; the tests drive it.
+
+          GET  /v1/accounts                    cursor-paginated accounts; the header x-account-tokens carries
+                                               "acct=token" pairs for the accounts on that page
+          GET  /v1/accounts/<id>/charges       cursor-paginated charges, newest first; needs x-account-token
+          POST /v1/accounts/<id>/charges       body {amount, currency, order_id}; needs x-account-token and
+                                               idempotency-key. A repeated key with the same body returns the
+                                               saved response; with a different body it is a 400.
+          Lists take limit (1 to 100, default 10) and starting_after (an object id) and return {data, has_more}.
+          """
+
+          def __init__(self, accounts, faults=None, lost_responses=()):
+              self.charges = {a: [dict(c) for c in cs] for a, cs in accounts.items()}   # oldest first
+              # (method, path) -> faults served in order before the real answer: "503", "timeout", "429:2" (retry-after 2);
+              # a value ending in * ("500*") is served on every request from then on
+              self.faults = {k: list(v) for k, v in (faults or {}).items()}
+              self.lost = set(lost_responses)   # order ids whose first successful POST times out after the charge is made
+              self.generation = 0
+              self.saved = {}                   # idempotency key -> (body, response)
+              self.log = []                     # (method, path, params, headers, body) for every request
+              self.slept = []                   # seconds passed to sleep()
+              self.hooks = {}                   # request number -> function(api), run as that request arrives
+              self.made = 0
+
+          def sleep(self, seconds):
+              self.slept.append(seconds)
+
+          def token(self, account):
+              return f"tok_{account}_{self.generation}"
+
+          def rotate_tokens(self):
+              self.generation += 1
+
+          def add_account(self, account):
+              self.charges.setdefault(account, [])
+
+          def add_charge(self, account, amount, currency, order_id):
+              self.made += 1
+              charge = {"id": f"ch_{self.made:05d}", "amount": amount, "currency": currency, "order_id": order_id}
+              self.charges[account].append(charge)
+              return dict(charge)
+
+          def _page(self, objects, params):
+              try:
+                  limit = int(params.get("limit", 10))
+              except ValueError:
+                  return Response(400, {"error": "bad_limit"})
+              if not 1 <= limit <= 100:
+                  return Response(400, {"error": "bad_limit"})
+              start = 0
+              after = params.get("starting_after")
+              if after is not None:
+                  ids = [o["id"] for o in objects]
+                  if after not in ids:
+                      return Response(400, {"error": "unknown_cursor"})
+                  start = ids.index(after) + 1
+              page = objects[start:start + limit]
+              return Response(200, {"data": [dict(o) for o in page], "has_more": start + limit < len(objects)})
+
+          def request(self, method, path, params=None, headers=None, body=None):
+              params = dict(params or {})
+              headers = {k.lower(): v for k, v in (headers or {}).items()}
+              body = json.loads(json.dumps(body)) if body is not None else None
+              self.log.append((method, path, params, headers, body))
+              hook = self.hooks.pop(len(self.log), None)
+              if hook:
+                  hook(self)
+              pending = self.faults.get((method, path))
+              if pending:
+                  kind = pending[0] if pending[0].endswith("*") else pending.pop(0)
+                  kind = kind.rstrip("*")
+                  if kind == "timeout":
+                      raise TimeoutError(path)
+                  if kind.startswith("429"):
+                      return Response(429, {"error": "rate_limited"}, {"retry-after": kind.split(":")[1]})
+                  return Response(int(kind), {"error": "server_error"})
+              parts = path.strip("/").split("/")
+              if method == "GET" and parts == ["v1", "accounts"]:
+                  accounts = [{"id": a} for a in sorted(self.charges)]
+                  resp = self._page(accounts, params)
+                  if resp.status == 200:
+                      pairs = [f"{a['id']}={self.token(a['id'])}" for a in resp.body["data"]]
+                      resp.headers["x-account-tokens"] = ",".join(pairs)
+                  return resp
+              if len(parts) == 4 and parts[:2] == ["v1", "accounts"] and parts[3] == "charges":
+                  account = parts[2]
+                  if account not in self.charges:
+                      return Response(404, {"error": "no_such_account"})
+                  if headers.get("x-account-token") != self.token(account):
+                      return Response(401, {"error": "invalid_token"})
+                  if method == "GET":
+                      return self._page(list(reversed(self.charges[account])), params)
+                  if method == "POST":
+                      return self._create(account, headers, body)
+              return Response(404, {"error": "not_found"})
+
+          def _create(self, account, headers, body):
+              key = headers.get("idempotency-key")
+              if not key:
+                  return Response(400, {"error": "idempotency_key_required"})
+              if key in self.saved:
+                  saved_body, saved = self.saved[key]
+                  if saved_body != body:
+                      return Response(400, {"error": "idempotency_key_reused"})
+                  return Response(saved.status, dict(saved.body))
+              ok = (isinstance(body, dict) and type(body.get("amount")) is int and body["amount"] > 0
+                    and isinstance(body.get("currency"), str) and isinstance(body.get("order_id"), str))
+              if not ok:
+                  return Response(400, {"error": "invalid_charge"})
+              charge = self.add_charge(account, body["amount"], body["currency"], body["order_id"])
+              resp = Response(200, charge)
+              self.saved[key] = (body, resp)
+              if body["order_id"] in self.lost:
+                  self.lost.discard(body["order_id"])
+                  raise TimeoutError("the charge was made; the response was lost")
+              return resp
+
+
+      def send(api, method, path, params=None, headers=None, body=None):
+          """Every request in this lab goes through send. Step 4 replaces it with a version that retries."""
+          return api.request(method, path, params=params, headers=headers, body=body)
+
+
+      def list_all(api, path, headers=None, limit=100, on_page=None):
+          """Every object of a cursor-paginated list, in the order the API returns them.
+          on_page(response) is called with each page's response. A non-200 page raises APIError."""
+          raise NotImplementedError
+    tests: |
+      def fixture(n_accounts=250, per_account=0):
+          accounts = {f"acct_{i:04d}": [] for i in range(n_accounts)}
+          api = PaymentsAPI(accounts)
+          for i in range(n_accounts):
+              for j in range(per_account):
+                  api.add_charge(f"acct_{i:04d}", 100 * (j + 1), "usd", f"ord_{i}_{j}")
+          return api
+
+      api = fixture(250)
+      got = list_all(api, "/v1/accounts")
+      assert [a["id"] for a in got] == sorted(api.charges), "every account, in API order"
+      assert len(api.log) == 3, "250 objects at limit 100 is three requests"
+      assert all(p.get("limit") == 100 for _, _, p, _, _ in api.log)
+
+      api = fixture(250)
+      api.hooks[2] = lambda a: [a.add_account(f"acct_000{c}") for c in "ab"]
+      got = [a["id"] for a in list_all(api, "/v1/accounts")]
+      assert len(got) == len(set(got)), "no duplicates when objects are added mid-listing"
+      assert {f"acct_{i:04d}" for i in range(250)} <= set(got), "nothing that existed at the start is missed"
+
+      pages = []
+      list_all(fixture(30), "/v1/accounts", limit=10, on_page=pages.append)
+      assert len(pages) == 3 and all(p.status == 200 for p in pages), "on_page sees each page's response"
+      try:
+          list_all(fixture(5), "/v1/accounts", limit=500)
+          refused = False
+      except APIError as e:
+          refused = e.status == 400
+      assert refused, "a non-200 page raises APIError instead of returning a partial list"
+    hidden: |
+      for _n, _lim in [(0, 100), (1, 1), (100, 100), (101, 100), (37, 7)]:
+          _api = fixture(_n)
+          _got = list_all(_api, "/v1/accounts", limit=_lim)
+          assert [a["id"] for a in _got] == sorted(_api.charges)
+          assert len(_api.log) == max(1, -(-_n // _lim))
+      _api = fixture(3, per_account=25)
+      _api.rotate_tokens()
+      _ch = list_all(_api, "/v1/accounts/acct_0001/charges", headers={"x-account-token": _api.token("acct_0001")}, limit=10)
+      assert [c["order_id"] for c in _ch] == [f"ord_1_{j}" for j in reversed(range(25))]
+      _api.hooks[len(_api.log) + 2] = lambda a: a.add_charge("acct_0002", 5, "usd", "late")
+      _ch2 = list_all(_api, "/v1/accounts/acct_0002/charges", headers={"x-account-token": _api.token("acct_0002")}, limit=10)
+      assert len({c["id"] for c in _ch2}) == len(_ch2) and {f"ord_2_{j}" for j in range(25)} <= {c["order_id"] for c in _ch2}
+    solution: |
+      import json
+
+
+      class Response:
+          def __init__(self, status, body=None, headers=None):
+              self.status = status
+              self.body = body if body is not None else {}
+              self.headers = headers or {}
+
+
+      class APIError(Exception):
+          def __init__(self, status, body=None):
+              super().__init__(f"HTTP {status}: {body}")
+              self.status, self.body = status, body
+
+
+      class PaymentsAPI:
+          """A deterministic stand-in for a payments provider's HTTP API. Do not edit it; the tests drive it.
+
+          GET  /v1/accounts                    cursor-paginated accounts; the header x-account-tokens carries
+                                               "acct=token" pairs for the accounts on that page
+          GET  /v1/accounts/<id>/charges       cursor-paginated charges, newest first; needs x-account-token
+          POST /v1/accounts/<id>/charges       body {amount, currency, order_id}; needs x-account-token and
+                                               idempotency-key. A repeated key with the same body returns the
+                                               saved response; with a different body it is a 400.
+          Lists take limit (1 to 100, default 10) and starting_after (an object id) and return {data, has_more}.
+          """
+
+          def __init__(self, accounts, faults=None, lost_responses=()):
+              self.charges = {a: [dict(c) for c in cs] for a, cs in accounts.items()}   # oldest first
+              # (method, path) -> faults served in order before the real answer: "503", "timeout", "429:2" (retry-after 2);
+              # a value ending in * ("500*") is served on every request from then on
+              self.faults = {k: list(v) for k, v in (faults or {}).items()}
+              self.lost = set(lost_responses)   # order ids whose first successful POST times out after the charge is made
+              self.generation = 0
+              self.saved = {}                   # idempotency key -> (body, response)
+              self.log = []                     # (method, path, params, headers, body) for every request
+              self.slept = []                   # seconds passed to sleep()
+              self.hooks = {}                   # request number -> function(api), run as that request arrives
+              self.made = 0
+
+          def sleep(self, seconds):
+              self.slept.append(seconds)
+
+          def token(self, account):
+              return f"tok_{account}_{self.generation}"
+
+          def rotate_tokens(self):
+              self.generation += 1
+
+          def add_account(self, account):
+              self.charges.setdefault(account, [])
+
+          def add_charge(self, account, amount, currency, order_id):
+              self.made += 1
+              charge = {"id": f"ch_{self.made:05d}", "amount": amount, "currency": currency, "order_id": order_id}
+              self.charges[account].append(charge)
+              return dict(charge)
+
+          def _page(self, objects, params):
+              try:
+                  limit = int(params.get("limit", 10))
+              except ValueError:
+                  return Response(400, {"error": "bad_limit"})
+              if not 1 <= limit <= 100:
+                  return Response(400, {"error": "bad_limit"})
+              start = 0
+              after = params.get("starting_after")
+              if after is not None:
+                  ids = [o["id"] for o in objects]
+                  if after not in ids:
+                      return Response(400, {"error": "unknown_cursor"})
+                  start = ids.index(after) + 1
+              page = objects[start:start + limit]
+              return Response(200, {"data": [dict(o) for o in page], "has_more": start + limit < len(objects)})
+
+          def request(self, method, path, params=None, headers=None, body=None):
+              params = dict(params or {})
+              headers = {k.lower(): v for k, v in (headers or {}).items()}
+              body = json.loads(json.dumps(body)) if body is not None else None
+              self.log.append((method, path, params, headers, body))
+              hook = self.hooks.pop(len(self.log), None)
+              if hook:
+                  hook(self)
+              pending = self.faults.get((method, path))
+              if pending:
+                  kind = pending[0] if pending[0].endswith("*") else pending.pop(0)
+                  kind = kind.rstrip("*")
+                  if kind == "timeout":
+                      raise TimeoutError(path)
+                  if kind.startswith("429"):
+                      return Response(429, {"error": "rate_limited"}, {"retry-after": kind.split(":")[1]})
+                  return Response(int(kind), {"error": "server_error"})
+              parts = path.strip("/").split("/")
+              if method == "GET" and parts == ["v1", "accounts"]:
+                  accounts = [{"id": a} for a in sorted(self.charges)]
+                  resp = self._page(accounts, params)
+                  if resp.status == 200:
+                      pairs = [f"{a['id']}={self.token(a['id'])}" for a in resp.body["data"]]
+                      resp.headers["x-account-tokens"] = ",".join(pairs)
+                  return resp
+              if len(parts) == 4 and parts[:2] == ["v1", "accounts"] and parts[3] == "charges":
+                  account = parts[2]
+                  if account not in self.charges:
+                      return Response(404, {"error": "no_such_account"})
+                  if headers.get("x-account-token") != self.token(account):
+                      return Response(401, {"error": "invalid_token"})
+                  if method == "GET":
+                      return self._page(list(reversed(self.charges[account])), params)
+                  if method == "POST":
+                      return self._create(account, headers, body)
+              return Response(404, {"error": "not_found"})
+
+          def _create(self, account, headers, body):
+              key = headers.get("idempotency-key")
+              if not key:
+                  return Response(400, {"error": "idempotency_key_required"})
+              if key in self.saved:
+                  saved_body, saved = self.saved[key]
+                  if saved_body != body:
+                      return Response(400, {"error": "idempotency_key_reused"})
+                  return Response(saved.status, dict(saved.body))
+              ok = (isinstance(body, dict) and type(body.get("amount")) is int and body["amount"] > 0
+                    and isinstance(body.get("currency"), str) and isinstance(body.get("order_id"), str))
+              if not ok:
+                  return Response(400, {"error": "invalid_charge"})
+              charge = self.add_charge(account, body["amount"], body["currency"], body["order_id"])
+              resp = Response(200, charge)
+              self.saved[key] = (body, resp)
+              if body["order_id"] in self.lost:
+                  self.lost.discard(body["order_id"])
+                  raise TimeoutError("the charge was made; the response was lost")
+              return resp
+
+
+      def send(api, method, path, params=None, headers=None, body=None):
+          """Every request in this lab goes through send. Step 4 replaces it with a version that retries."""
+          return api.request(method, path, params=params, headers=headers, body=body)
+
+
+      def list_all(api, path, headers=None, limit=100, on_page=None):
+          """Every object of a cursor-paginated list, in the order the API returns them."""
+          out, params = [], {"limit": limit}
+          while True:
+              resp = send(api, "GET", path, params=dict(params), headers=headers)
+              if resp.status != 200:
+                  raise APIError(resp.status, resp.body)
+              if on_page is not None:
+                  on_page(resp)
+              data = resp.body["data"]
+              out.extend(data)
+              if not resp.body.get("has_more") or not data:
+                  return out
+              params["starting_after"] = data[-1]["id"]     # a cursor, not an offset: inserts at the head cannot shift it
+  - title: "Collect auth headers while crawling"
+    brief: "The charges endpoints need x-account-token, and tokens appear only in the x-account-tokens header of each page of /v1/accounts. account_tokens collects them, fetch_charges lists one account's charges with its token, and charges_by_account does it for every account. Tokens rotate without warning: on a 401, refresh every token once by listing the accounts again, then list that account from its first page; a second 401 raises. One rotation costs one refresh, not one per account."
+    starter: |
+      def account_tokens(api):
+          """{account_id: token}, collected from the x-account-tokens header of every accounts page."""
+          raise NotImplementedError
+
+
+      def fetch_charges(api, account, tokens):
+          """One account's charges, newest first. tokens is the dict from account_tokens; keep it current."""
+          raise NotImplementedError
+
+
+      def charges_by_account(api, accounts=None):
+          """{account_id: charges} for the given accounts, or every account."""
+          raise NotImplementedError
+    tests: |
+      def fixture(n_accounts=250, per_account=0):
+          accounts = {f"acct_{i:04d}": [] for i in range(n_accounts)}
+          api = PaymentsAPI(accounts)
+          for i in range(n_accounts):
+              for j in range(per_account):
+                  api.add_charge(f"acct_{i:04d}", 100 * (j + 1), "usd", f"ord_{i}_{j}")
+          return api
+
+      def account_list_requests(api):
+          return sum(1 for m, p, _, _, _ in api.log if p == "/v1/accounts")
+
+      api = fixture(150)
+      tokens = account_tokens(api)
+      assert len(tokens) == 150 and tokens["acct_0149"] == api.token("acct_0149"), "tokens from the headers of both pages"
+
+      api = fixture(12, per_account=30)
+      result = charges_by_account(api)
+      assert sorted(result) == sorted(api.charges)
+      assert [c["order_id"] for c in result["acct_0003"]] == [f"ord_3_{j}" for j in reversed(range(30))], "newest first, every page"
+      sent = [h.get("x-account-token") for m, p, _, h, _ in api.log if p.endswith("/charges")]
+      assert all(t and t.startswith("tok_") for t in sent), "every charges request carries its account's token"
+
+      api = fixture(12, per_account=30)
+      api.hooks[6] = lambda a: a.rotate_tokens()
+      result = charges_by_account(api)
+      assert all(len(result[a]) == 30 for a in result), "a rotation mid-run is survived with no duplicates"
+      assert account_list_requests(api) == 2, "one refresh of the account list after a rotation, not one per account"
+
+      subset = charges_by_account(fixture(5, per_account=2), accounts=["acct_0001"])
+      assert list(subset) == ["acct_0001"]
+    hidden: |
+      _api2 = fixture(4, per_account=5)
+      _tok2 = account_tokens(_api2)
+      _api2.rotate_tokens()
+      assert len(fetch_charges(_api2, "acct_0002", _tok2)) == 5 and _tok2["acct_0002"] == _api2.token("acct_0002")
+      _api4 = fixture(3, per_account=2)
+      try:
+          fetch_charges(_api4, "acct_9999", account_tokens(_api4))
+          _status = None
+      except APIError as _e:
+          _status = _e.status
+      assert _status == 404
+      _api5 = fixture(3, per_account=150)
+      _api5.hooks[3] = lambda a: a.rotate_tokens()
+      _r5 = charges_by_account(_api5)
+      assert all(len(v) == 150 and len({c["id"] for c in v}) == 150 for v in _r5.values()), "a 401 on page two restarts that list, it does not append to it"
+    solution: |
+      def _parse_tokens(header):
+          tokens = {}
+          for pair in header.split(","):
+              account, sep, token = pair.strip().partition("=")
+              if sep:
+                  tokens[account] = token
+          return tokens
+
+
+      def account_tokens(api):
+          """{account_id: token}, collected from the x-account-tokens header of every accounts page."""
+          tokens = {}
+          list_all(api, "/v1/accounts", on_page=lambda resp: tokens.update(_parse_tokens(resp.headers.get("x-account-tokens", ""))))
+          return tokens
+
+
+      def fetch_charges(api, account, tokens):
+          """One account's charges. On a 401, refresh every token once (tokens is updated in place) and list again
+          from the first page; a second 401 raises."""
+          path = f"/v1/accounts/{account}/charges"
+          try:
+              return list_all(api, path, headers={"x-account-token": tokens.get(account, "")})
+          except APIError as e:
+              if e.status != 401:
+                  raise
+          tokens.clear()
+          tokens.update(account_tokens(api))
+          return list_all(api, path, headers={"x-account-token": tokens.get(account, "")})
+
+
+      def charges_by_account(api, accounts=None):
+          """{account_id: charges, newest first} for the given accounts, or every account."""
+          tokens = account_tokens(api)
+          wanted = sorted(tokens) if accounts is None else list(accounts)
+          return {account: fetch_charges(api, account, tokens) for account in wanted}
+  - title: "Reconcile payments idempotently"
+    brief: "reconcile(api, ledger) compares each ledger entry (order_id, account, amount, currency) with the account's charges: matched when a charge for the order has the same amount and currency, mismatch when it differs (never charge again to fix it), created when there is none and you make one. Each POST carries an idempotency key that is the same for the same order on every run. The mock sometimes makes the charge and then times out; your retry must get that charge back, not make a second one, and a second reconcile run sends no POSTs."
+    starter: |
+      def idempotency_key(order_id):
+          raise NotImplementedError
+
+
+      def create_charge(api, entry, tokens):
+          """POST one charge for a ledger entry and return the charge."""
+          raise NotImplementedError
+
+
+      def reconcile(api, ledger):
+          """{order_id: "matched" | "mismatch" | "created"} for each ledger entry."""
+          raise NotImplementedError
+    tests: |
+      def scenario(lost=()):
+          api = PaymentsAPI({"acct_a": [], "acct_b": []}, lost_responses=lost)
+          api.add_charge("acct_a", 1200, "usd", "ord_1")
+          api.add_charge("acct_a", 500, "usd", "ord_2")
+          api.add_charge("acct_b", 900, "eur", "ord_3")
+          ledger = [
+              {"order_id": "ord_1", "account": "acct_a", "amount": 1200, "currency": "usd"},
+              {"order_id": "ord_2", "account": "acct_a", "amount": 550, "currency": "usd"},
+              {"order_id": "ord_3", "account": "acct_b", "amount": 900, "currency": "eur"},
+              {"order_id": "ord_4", "account": "acct_b", "amount": 300, "currency": "eur"},
+              {"order_id": "ord_5", "account": "acct_a", "amount": 75, "currency": "usd"},
+          ]
+          return api, ledger
+
+      def charges_for(api, order_id):
+          return [c for cs in api.charges.values() for c in cs if c["order_id"] == order_id]
+
+      def posts(api):
+          return [(h.get("idempotency-key"), b["order_id"]) for m, _, _, h, b in api.log if m == "POST"]
+
+      api, ledger = scenario()
+      status = reconcile(api, ledger)
+      assert status == {"ord_1": "matched", "ord_2": "mismatch", "ord_3": "matched", "ord_4": "created", "ord_5": "created"}
+      assert len(charges_for(api, "ord_2")) == 1, "a wrong amount is reported, never charged again"
+      assert [o for _, o in posts(api)] == ["ord_4", "ord_5"]
+
+      api, ledger = scenario(lost={"ord_4"})
+      status = reconcile(api, ledger)
+      assert status["ord_4"] == "created" and len(charges_for(api, "ord_4")) == 1, "a lost response is retried without a second charge"
+      keys = [k for k, o in posts(api) if o == "ord_4"]
+      assert len(keys) == 2 and keys[0] == keys[1], "the retry reuses the key"
+
+      again = reconcile(api, ledger)
+      assert again["ord_4"] == "matched" and again["ord_5"] == "matched", "a second run finds what the first one made"
+      assert len(posts(api)) == 3, "and sends nothing"
+      assert all(len(charges_for(api, o)) == 1 for o in ["ord_1", "ord_2", "ord_3", "ord_4", "ord_5"])
+    hidden: |
+      import random as _r
+
+      def _recon_check(seed):
+          rng = _r.Random(seed)
+          accounts = {f"acct_{i}": [] for i in range(4)}
+          api = PaymentsAPI(accounts)
+          ledger = []
+          for n in range(60):
+              acct, amount = f"acct_{rng.randrange(4)}", rng.choice([100, 250, 999])
+              ledger.append({"order_id": f"o{n}", "account": acct, "amount": amount, "currency": "usd"})
+              roll = rng.random()
+              if roll < 0.4:
+                  api.add_charge(acct, amount, "usd", f"o{n}")
+              elif roll < 0.5:
+                  api.add_charge(acct, amount + 1, "usd", f"o{n}")
+          api.lost = {e["order_id"] for e in ledger if rng.random() < 0.2}
+          if rng.random() < 0.5:
+              api.hooks[rng.randrange(2, 8)] = lambda a: a.rotate_tokens()
+          first = reconcile(api, ledger)
+          second = reconcile(api, ledger)
+          if any(len(charges_for(api, e["order_id"])) != 1 for e in ledger):
+              return False
+          if any(second[o] not in ("matched", "mismatch") for o in second):
+              return False
+          return all((first[o] == "mismatch") == (second[o] == "mismatch") for o in first)
+
+      assert all(_recon_check(s) for s in range(8))
+      _api = PaymentsAPI({"acct_a": []})
+      _api.saved[idempotency_key("ord_x")] = ({"amount": 1, "currency": "usd", "order_id": "other"}, Response(200, {}))
+      try:
+          reconcile(_api, [{"order_id": "ord_x", "account": "acct_a", "amount": 5, "currency": "usd"}])
+          _raised = False
+      except APIError as _e:
+          _raised = _e.status == 400
+      assert _raised, "a reused key with a different body is an error to surface, not to retry"
+      assert idempotency_key("ord_9") == idempotency_key("ord_9") != idempotency_key("ord_10")
+    solution: |
+      def idempotency_key(order_id):
+          # Derived from the order, never random: a rerun after a crash sends the same key for the same order.
+          return f"reconcile:{order_id}"
+
+
+      def create_charge(api, entry, tokens):
+          """POST one charge for a ledger entry. A timeout may hide a charge that was made, so the retry
+          sends the same key and the provider answers with the saved charge."""
+          account = entry["account"]
+          body = {"amount": entry["amount"], "currency": entry["currency"], "order_id": entry["order_id"]}
+          refreshed = False
+          for _ in range(3):
+              headers = {"x-account-token": tokens.get(account, ""), "idempotency-key": idempotency_key(entry["order_id"])}
+              try:
+                  resp = send(api, "POST", f"/v1/accounts/{account}/charges", headers=headers, body=body)
+              except TimeoutError:
+                  continue
+              if resp.status == 401 and not refreshed:
+                  tokens.clear()
+                  tokens.update(account_tokens(api))
+                  refreshed = True
+                  continue
+              if resp.status != 200:
+                  raise APIError(resp.status, resp.body)
+              return resp.body
+          raise TimeoutError(f"no answer for {entry['order_id']}")
+
+
+      def reconcile(api, ledger):
+          """{order_id: "matched" | "mismatch" | "created"} for each ledger entry."""
+          tokens = account_tokens(api)
+          found = {}
+          for account in sorted({e["account"] for e in ledger}):
+              for charge in fetch_charges(api, account, tokens):
+                  found.setdefault((account, charge["order_id"]), charge)
+          status = {}
+          for entry in ledger:
+              key = (entry["account"], entry["order_id"])
+              charge = found.get(key)
+              if charge is None:
+                  found[key] = create_charge(api, entry, tokens)
+                  status[entry["order_id"]] = "created"
+              elif (charge["amount"], charge["currency"]) == (entry["amount"], entry["currency"]):
+                  status[entry["order_id"]] = "matched"
+              else:
+                  status[entry["order_id"]] = "mismatch"      # never charge again to fix an amount: a person decides
+          return status
+  - title: "Retries and partial failure"
+    brief: "Replace send with the only layer that retries: up to MAX_ATTEMPTS requests on a status in RETRY_STATUS or a TimeoutError, waiting retry-after when given and a capped delay otherwise (through api.sleep), never sleeping after the last attempt, and never retrying a POST without an idempotency key. Take any retry loop out of create_charge, because retries in two layers multiply. Orders on an account whose charges cannot be listed get status unknown and no POSTs; a create with no answer is unknown, and one the provider refuses with a 4xx is error. The other accounts finish."
+    starter: |
+      RETRY_STATUS = {429, 500, 502, 503, 504}
+      MAX_ATTEMPTS = 4
+
+
+      def send(api, method, path, params=None, headers=None, body=None):
+          """Replace the step 1 send: the one place that retries. Sleep with api.sleep(seconds)."""
+          raise NotImplementedError
+
+      # create_charge and reconcile change too: see the brief.
+    tests: |
+      def ledger_for(spec):
+          return [{"order_id": o, "account": a, "amount": amt, "currency": "usd"} for o, a, amt in spec]
+
+      def requests_to(api, method, path):
+          return sum(1 for m, p, _, _, _ in api.log if m == method and p == path)
+
+      api = PaymentsAPI({"acct_a": [], "acct_b": []}, faults={("GET", "/v1/accounts"): ["503", "429:2", "timeout"]})
+      status = reconcile(api, ledger_for([("o1", "acct_a", 100), ("o2", "acct_b", 200)]))
+      assert status == {"o1": "created", "o2": "created"}, "three transient failures on the first page are survived"
+      assert 2.0 in api.slept and len(api.slept) == 3, "retry-after is obeyed; one sleep per retry"
+      assert all(s <= 4.0 for s in api.slept if s != 2.0), "computed delays are capped"
+
+      api = PaymentsAPI({"acct_a": [], "acct_b": []}, faults={("GET", "/v1/accounts/acct_b/charges"): ["500*"]})
+      status = reconcile(api, ledger_for([("o1", "acct_a", 100), ("o2", "acct_b", 200), ("o3", "acct_b", 300)]))
+      assert status == {"o1": "created", "o2": "unknown", "o3": "unknown"}, "one broken account does not stop the others"
+      assert requests_to(api, "POST", "/v1/accounts/acct_b/charges") == 0, "nothing is created where the list could not be read"
+      assert requests_to(api, "GET", "/v1/accounts/acct_b/charges") == 4, "four attempts, then give up on that account"
+
+      api = PaymentsAPI({"acct_a": []}, faults={("POST", "/v1/accounts/acct_a/charges"): ["timeout*"]})
+      status = reconcile(api, ledger_for([("o1", "acct_a", 100)]))
+      assert status == {"o1": "unknown"}, "no answer means the charge may exist"
+      assert requests_to(api, "POST", "/v1/accounts/acct_a/charges") == 4, "retries happen in one layer: 4 attempts, not 3 x 4"
+
+      api = PaymentsAPI({"acct_a": []}, faults={("POST", "/v1/accounts/acct_a/charges"): ["503"]})
+      resp = send(api, "POST", "/v1/accounts/acct_a/charges", headers={"x-account-token": api.token("acct_a")}, body={"amount": 1, "currency": "usd", "order_id": "z"})
+      assert resp.status == 503 and requests_to(api, "POST", "/v1/accounts/acct_a/charges") == 1, "a POST without a key is never retried"
+
+      api = PaymentsAPI({"acct_a": []})
+      status = reconcile(api, ledger_for([("o1", "acct_missing", 100), ("o2", "acct_a", 0)]))
+      assert status == {"o1": "unknown", "o2": "error"}, "a 404 account is unknown; a refused charge is an error"
+      assert requests_to(api, "GET", "/v1/accounts/acct_missing/charges") == 1, "a 404 is not retried"
+    hidden: |
+      import random as _r
+
+      def _chaos(seed):
+          rng = _r.Random(seed)
+          accts = [f"acct_{i}" for i in range(5)]
+          faults = {}
+          for a in accts:
+              if rng.random() < 0.5:
+                  faults[("GET", f"/v1/accounts/{a}/charges")] = [rng.choice(["500", "503", "timeout", "429:1"]) for _ in range(rng.randrange(1, 4))]
+              if rng.random() < 0.15:
+                  faults[("GET", f"/v1/accounts/{a}/charges")] = ["502*"]
+              if rng.random() < 0.5:
+                  faults[("POST", f"/v1/accounts/{a}/charges")] = [rng.choice(["500", "timeout", "429:0.5"]) for _ in range(rng.randrange(1, 5))]
+          api = PaymentsAPI({a: [] for a in accts}, faults=faults)
+          led = []
+          for n in range(40):
+              a = rng.choice(accts)
+              led.append({"order_id": f"o{n}", "account": a, "amount": rng.choice([10, 20]), "currency": "usd"})
+              if rng.random() < 0.3:
+                  api.add_charge(a, led[-1]["amount"], "usd", f"o{n}")
+          api.lost = {e["order_id"] for e in led if rng.random() < 0.15}
+          st = reconcile(api, led)
+          if set(st) != {e["order_id"] for e in led}:
+              return False
+          for e in led:
+              made = [c for c in api.charges[e["account"]] if c["order_id"] == e["order_id"]]
+              if len(made) > 1:
+                  return False
+              if st[e["order_id"]] in ("created", "matched") and len(made) != 1:
+                  return False
+          keyed = {}
+          for m, p, _, h, b in api.log:
+              if m == "POST":
+                  keyed[h.get("idempotency-key")] = keyed.get(h.get("idempotency-key"), 0) + 1
+          if any(n > 2 * MAX_ATTEMPTS for n in keyed.values()):
+              return False
+          return all(s <= 4.0 or s in (1.0,) for s in api.slept)
+
+      assert all(_chaos(s) for s in range(10))
+    solution: |
+      RETRY_STATUS = {429, 500, 502, 503, 504}
+      MAX_ATTEMPTS = 4
+
+
+      def send(api, method, path, params=None, headers=None, body=None):
+          """The only place that retries. A POST without an idempotency key is sent once."""
+          keyed = method != "POST" or bool((headers or {}).get("idempotency-key"))
+          attempts = MAX_ATTEMPTS if keyed else 1
+          for attempt in range(attempts):
+              last = attempt == attempts - 1
+              delay = min(4.0, 0.25 * 2 ** attempt)
+              try:
+                  resp = api.request(method, path, params=params, headers=headers, body=body)
+              except TimeoutError:
+                  if last:
+                      raise
+                  api.sleep(delay)
+                  continue
+              if resp.status not in RETRY_STATUS or last:
+                  return resp
+              if resp.status == 429:
+                  try:
+                      delay = float(resp.headers["retry-after"])
+                  except (KeyError, ValueError):
+                      pass
+              api.sleep(delay)
+
+
+      def create_charge(api, entry, tokens):
+          """One POST through send, which owns the retries; a 401 refreshes the tokens once."""
+          account = entry["account"]
+          body = {"amount": entry["amount"], "currency": entry["currency"], "order_id": entry["order_id"]}
+          for refreshed in (False, True):
+              headers = {"x-account-token": tokens.get(account, ""), "idempotency-key": idempotency_key(entry["order_id"])}
+              resp = send(api, "POST", f"/v1/accounts/{account}/charges", headers=headers, body=body)
+              if resp.status == 401 and not refreshed:
+                  tokens.clear()
+                  tokens.update(account_tokens(api))
+                  continue
+              if resp.status != 200:
+                  raise APIError(resp.status, resp.body)
+              return resp.body
+
+
+      def reconcile(api, ledger):
+          """{order_id: status}. matched, mismatch and created as before; unknown when the account could not be
+          listed or a create got no answer (the charge may exist); error when the provider refused the create."""
+          tokens = account_tokens(api)
+          found, unlisted = {}, set()
+          for account in sorted({e["account"] for e in ledger}):
+              try:
+                  charges = fetch_charges(api, account, tokens)
+              except (APIError, TimeoutError):
+                  unlisted.add(account)           # without the list we cannot know what exists: create nothing here
+                  continue
+              for charge in charges:
+                  found.setdefault((account, charge["order_id"]), charge)
+          status = {}
+          for entry in ledger:
+              order, key = entry["order_id"], (entry["account"], entry["order_id"])
+              if entry["account"] in unlisted:
+                  status[order] = "unknown"
+                  continue
+              charge = found.get(key)
+              if charge is not None:
+                  same = (charge["amount"], charge["currency"]) == (entry["amount"], entry["currency"])
+                  status[order] = "matched" if same else "mismatch"
+                  continue
+              try:
+                  found[key] = create_charge(api, entry, tokens)
+                  status[order] = "created"
+              except TimeoutError:
+                  status[order] = "unknown"
+              except APIError as e:
+                  status[order] = "unknown" if e.status in RETRY_STATUS else "error"
+          return status
+  - title: "A final report"
+    brief: "report(ledger, status) returns plain JSON data: the order count, counts by status, integer cents by status and currency, the sorted order ids that need a person (mismatch, unknown, error, or no status at all), the sorted accounts with unknown orders, and complete, true only when nothing needs review. The same inputs in any order give byte-identical JSON, so two runs can be diffed."
+    starter: |
+      def report(ledger, status):
+          """A JSON-ready summary of a reconcile run."""
+          raise NotImplementedError
+    tests: |
+      import json
+
+      ledger = [
+          {"order_id": "o1", "account": "acct_a", "amount": 1200, "currency": "usd"},
+          {"order_id": "o2", "account": "acct_a", "amount": 550, "currency": "usd"},
+          {"order_id": "o3", "account": "acct_b", "amount": 900, "currency": "eur"},
+          {"order_id": "o4", "account": "acct_b", "amount": 300, "currency": "eur"},
+          {"order_id": "o5", "account": "acct_c", "amount": 75, "currency": "usd"},
+      ]
+      api = PaymentsAPI({"acct_a": [], "acct_b": [], "acct_c": []}, faults={("GET", "/v1/accounts/acct_c/charges"): ["503*"]})
+      api.add_charge("acct_a", 1200, "usd", "o1")
+      api.add_charge("acct_a", 500, "usd", "o2")
+      status = reconcile(api, ledger)
+      r = report(ledger, status)
+      assert json.loads(json.dumps(r)) == r, "plain JSON: no sets, tuples or objects"
+      assert r["orders"] == 5 and sum(r["by_status"].values()) == 5
+      assert r["by_status"] == {"created": 2, "matched": 1, "mismatch": 1, "unknown": 1}
+      assert r["needs_review"] == ["o2", "o5"] and r["unknown_accounts"] == ["acct_c"] and r["complete"] is False
+      totals = {}
+      for per in r["cents"].values():
+          for currency, amount in per.items():
+              totals[currency] = totals.get(currency, 0) + amount
+      assert totals == {"usd": 1825, "eur": 1200}, "every cent of the ledger is in exactly one status"
+      assert all(type(v) is int for per in r["cents"].values() for v in per.values()), "integer cents, never floats"
+      assert report(list(reversed(ledger)), status) == r, "the order of the ledger does not change the report"
+    hidden: |
+      import random as _r
+
+      for _seed in range(6):
+          _rng = _r.Random(_seed)
+          _led = [{"order_id": f"o{i}", "account": f"a{_rng.randrange(3)}", "amount": _rng.randrange(1, 10**6), "currency": _rng.choice(["usd", "eur", "jpy"])} for i in range(80)]
+          _st = {e["order_id"]: _rng.choice(["matched", "created", "mismatch", "unknown", "error"]) for e in _led}
+          _rep = report(_led, _st)
+          assert json.loads(json.dumps(_rep)) == _rep
+          assert sum(_rep["by_status"].values()) == 80
+          _shuf = list(_led)
+          _rng.shuffle(_shuf)
+          assert json.dumps(report(_shuf, _st)) == json.dumps(_rep)
+          _tot = {}
+          for _e in _led:
+              _tot[_e["currency"]] = _tot.get(_e["currency"], 0) + _e["amount"]
+          _seen = {}
+          for _per in _rep["cents"].values():
+              for _c, _a in _per.items():
+                  _seen[_c] = _seen.get(_c, 0) + _a
+          assert _seen == _tot
+          assert _rep["complete"] == all(_st[e["order_id"]] in ("matched", "created") for e in _led)
+          assert _rep["needs_review"] == sorted(o for o, s in _st.items() if s in ("mismatch", "unknown", "error"))
+      _clean = report(ledger[:1], {"o1": "matched"})
+      assert _clean["complete"] is True and _clean["needs_review"] == [] and _clean["unknown_accounts"] == []
+      _gap = report(ledger[:2], {"o1": "matched"})
+      assert _gap["complete"] is False and "o2" in _gap["needs_review"], "an order with no status is not complete"
+    solution: |
+      REVIEW = ("mismatch", "unknown", "error")
+
+
+      def report(ledger, status):
+          """A JSON-ready summary of a reconcile run. Integer cents only; the same inputs in any order give the same report."""
+          by_status, cents = {}, {}
+          for entry in ledger:
+              s = status.get(entry["order_id"], "missing")
+              by_status[s] = by_status.get(s, 0) + 1
+              per = cents.setdefault(s, {})
+              per[entry["currency"]] = per.get(entry["currency"], 0) + entry["amount"]
+          flagged = [e for e in ledger if status.get(e["order_id"], "missing") in REVIEW + ("missing",)]
+          return {
+              "orders": len(ledger),
+              "by_status": dict(sorted(by_status.items())),
+              "cents": {s: dict(sorted(per.items())) for s, per in sorted(cents.items())},
+              "needs_review": sorted(e["order_id"] for e in flagged),
+              "unknown_accounts": sorted({e["account"] for e in ledger if status.get(e["order_id"]) == "unknown"}),
+              "complete": not flagged,
+          }
+---
+An integration round hands you an unfamiliar API and a sequence of parts that unlock in order. A candidate report from a Stripe onsite describes one such exercise with five parts, where completing three is "generally enough". This lab has five parts against `PaymentsAPI`, a deterministic payments service that runs in your browser. Read its docstring first, the way you would read the reference of an API you have never used.
+
+The service behaves like the real thing in the ways that cost integrations money:
+
+- **Cursor pagination.** Lists page by cursor and change while you page.
+- **Rotating tokens.** Account tokens arrive only in response headers and rotate without warning.
+- **Lost responses.** A charge can be made and its response lost.
+- **Failures.** Failures arrive as 429s with `retry-after`, as 5xx responses, and as timeouts.
+
+The idempotency rules follow Stripe's published behaviour: a repeated key with the same body returns the saved response, and the same key with a different body is an error.
+
+Every request goes through `send`. In step 4 you replace `send` with a version that retries, and everything written in steps 1 to 3 picks it up without changes. The tests assert behaviour: the requests made, the keys sent, the charges that exist afterwards and the time spent sleeping. They never check prose.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser, with the standard library only.

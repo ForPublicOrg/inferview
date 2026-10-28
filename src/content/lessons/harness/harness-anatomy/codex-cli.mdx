@@ -1,0 +1,190 @@
+---
+title: OpenAI Codex CLI
+track: harness
+module: harness-anatomy
+order: 7
+kind: teardown
+level: staff
+minutes: 15
+summary: A teardown of the Codex CLI from OpenAI's repository, engineering posts and docs, covering stateless Responses API requests, the AGENTS.md chain, sandbox modes, approval policies, Starlark rules, the auto-review agent and server-side compaction.
+prerequisites: [harness/harness-anatomy/request-lifecycle, harness/harness-anatomy/deterministic-controls]
+updated: 2026-10-28
+sources:
+  - title: openai/codex on GitHub
+    url: https://github.com/openai/codex
+    note: Apache-2.0; install via npm, Homebrew or standalone installers; 97.3% of the repository's code bytes are Rust according to the GitHub languages API on 2026-10-28 (computed from 79,927,754 of 82,179,531 bytes)
+  - title: OpenAI, Unrolling the Codex agent loop (Michael Bolin, 2026-01-23)
+    url: https://openai.com/index/unrolling-the-codex-agent-loop/
+    note: Responses API endpoints; instructions, tools, input; the four inserted input items; MCP tools not sandboxed by Codex; no previous_response_id; cache-miss causes and the MCP tool-order bug; config changes appended; /responses/compact and auto_compact_limit
+  - title: OpenAI Codex docs, Agent approvals and security
+    url: https://learn.chatgpt.com/docs/agent-approvals-security
+    note: network off by default; untrusted approval policy retired; protected paths .git, .agents, .codex, .aws read-only inside writable roots; network_proxy and domain rules; destructive MCP tool annotations require approval; Auto and dangerous full-access presets; trust_level untrusted disables project-local configuration. Checked 2026-10-28.
+  - title: OpenAI Codex docs, Sandbox
+    url: https://learn.chatgpt.com/docs/sandboxing
+    note: read-only, workspace-write, danger-full-access; on-request and never; approvals_reviewer user or auto_review; Seatbelt on macOS, bubblewrap on Linux and WSL2, native Windows sandbox. Checked 2026-10-28.
+  - title: OpenAI Codex docs, Rules
+    url: https://learn.chatgpt.com/docs/agent-configuration/rules
+    note: Starlark prefix_rule; allow, prompt, forbidden with most restrictive winning; match and not_match validated at load; tree-sitter splitting of plain-word chains only. Checked 2026-10-28.
+  - title: OpenAI Codex docs, Auto-review
+    url: https://learn.chatgpt.com/docs/sandboxing/auto-review
+    note: reviewer agent at the sandbox boundary; sees a compact transcript, not hidden reasoning; circuit breaker after 3 consecutive denials or 10 in the last 50 reviews; /approve for one retry; not a deterministic security guarantee. Checked 2026-10-28.
+  - title: OpenAI Codex docs, Custom instructions with AGENTS.md
+    url: https://learn.chatgpt.com/docs/agent-configuration/agents-md
+    note: discovery order, one file per directory, project_doc_max_bytes 32 KiB by default, chain rebuilt on every run. Checked 2026-10-28.
+  - title: OpenAI, Harness engineering, leveraging Codex in an agent-first world (Ryan Lopopolo, 2026-02-11)
+    url: https://openai.com/index/harness-engineering/
+    note: OpenAI's own account; a short AGENTS.md of roughly 100 lines as a map into docs/; a single large AGENTS.md failed
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import Diagram from '../../../../components/Diagram.astro';
+import Trace from '../../../../components/Trace.astro';
+
+## What it is and who runs it
+
+The Codex CLI is OpenAI's local coding agent, published under Apache-2.0 at `github.com/openai/codex` and written mostly in Rust (97.3% of the repository's code bytes on 2026-10-28, by GitHub's language count). OpenAI uses "Codex" for a family of products; its January 2026 engineering post names the shared core the Codex harness, the agent loop and execution logic under the CLI, the cloud product and the IDE extension. The CLI talks to the Responses API: `chatgpt.com/backend-api/codex/responses` with a ChatGPT login, `api.openai.com/v1/responses` with an API key, or a local endpoint with `--oss`.
+
+This teardown uses three kinds of source: the repository, OpenAI's two 2026 engineering posts about the loop and about harness engineering, and the current Codex documentation, checked on 2026-10-28. Several docs pages describe behaviour shared with ChatGPT's desktop app and Work products; only the CLI and IDE behaviour is described here. OpenAI notes that many design decisions are recorded in GitHub issues and pull requests; this teardown does not rely on them.
+
+## The system
+
+<Diagram
+  title="Codex CLI: the harness around one thread"
+  nodes={[
+    { id: "user", label: "User", note: "CLI, IDE extension" },
+    { id: "agents", label: "AGENTS.md chain", note: "home, then root to cwd" },
+    { id: "config", label: "config.toml", note: "instructions, MCP, policy" },
+    { id: "env", label: "environment_context", note: "cwd and shell" },
+    { id: "compact", label: "Compaction endpoint", note: "encrypted item" },
+    { id: "loop", label: "Codex harness loop", note: "stateless requests" },
+    { id: "api", label: "Responses API", note: "full input every call" },
+    { id: "mcp", label: "MCP tools", note: "not sandboxed by Codex" },
+    { id: "rules", label: "Execution rules", note: "Starlark prefix rules" },
+    { id: "approval", label: "Approval policy", note: "on-request or never" },
+    { id: "reviewer", label: "Auto-review agent", note: "replaces the prompt" },
+    { id: "sandbox", label: "Sandbox", note: "read-only, workspace-write, full access" },
+    { id: "proxy", label: "Network proxy", note: "domain rules" }
+  ]}
+  edges={[
+    { from: "user", to: "loop" },
+    { from: "agents", to: "loop", label: "per run" },
+    { from: "config", to: "loop" },
+    { from: "env", to: "loop" },
+    { from: "loop", to: "compact", label: "past limit" },
+    { from: "loop", to: "api", label: "input list" },
+    { from: "loop", to: "mcp" },
+    { from: "loop", to: "rules" },
+    { from: "rules", to: "approval", label: "escalation" },
+    { from: "approval", to: "reviewer", label: "auto_review" },
+    { from: "rules", to: "sandbox" },
+    { from: "sandbox", to: "proxy", label: "network" }
+  ]}
+  rows={[["user"], ["agents", "config", "env", "compact"], ["loop"], ["api", "mcp"], ["rules"], ["approval", "reviewer"], ["sandbox"], ["proxy"]]}
+/>
+
+Codex harness loop. The loop sends a request, consumes the server-sent event stream, runs any tool calls, appends the call and its output to the input, and repeats until the model returns a message with no tool call, which ends the turn. A conversation is called a thread.
+
+Responses API. Each request carries `instructions` (from `model_instructions_file` or the base instructions bundled for the model), `tools` and the full `input` list. Codex does not send `previous_response_id`, so the server holds no conversation state; reasoning from earlier turns returns as `encrypted_content` the server can decrypt.
+
+AGENTS.md chain. At startup Codex reads AGENTS.override.md or AGENTS.md from its home directory, then at most one file per directory from the project root down to the working directory, and concatenates them root first so nearer files win. It stops adding files at `project_doc_max_bytes`, 32 KiB by default, and rebuilds the chain on every run.
+
+config.toml. The user's `~/.codex/config.toml` sets the instructions file, `developer_instructions`, MCP servers, sandbox mode, approval policy, reviewer and network settings. Codex may start in read-only until the working directory is trusted, and marking a project untrusted in the user config also disables its project-local configuration.
+
+environment_context. A user-role message with the working directory and shell. When the directory changes mid-thread, Codex appends a new one instead of editing the first.
+
+Compaction endpoint. Past `auto_compact_limit`, Codex calls `/responses/compact`, which returns a shorter item list including a `compaction` item whose `encrypted_content` stands in for the earlier conversation.
+
+MCP tools. Tools from configured MCP servers appear alongside Codex's own. The sandbox description Codex sends applies only to its shell tool; MCP servers enforce their own guardrails. Tools that advertise a destructive annotation always require approval.
+
+Execution rules. `.rules` files in Starlark define `prefix_rule` entries with a pattern, a decision (`allow`, `prompt` or `forbidden`), a justification shown in prompts or rejections, and `match` and `not_match` examples that Codex validates when the file loads. When several rules match, the most restrictive wins.
+
+Approval policy. `on-request` works inside the sandbox and asks before crossing it; `never` does not stop for approval. The older `untrusted` policy is retired.
+
+Auto-review agent. With `approvals_reviewer = "auto_review"`, approval requests at the sandbox boundary go to a separate Codex agent instead of the user. It does not widen the sandbox; it only changes who answers.
+
+Sandbox. `read-only`, `workspace-write` (the default for local work) or `danger-full-access`, enforced by Seatbelt on macOS, bubblewrap on Linux and WSL2 and a native sandbox on Windows. It applies to spawned commands and their children. Inside writable roots, `.git`, `.agents`, `.codex` and `.aws` stay read-only.
+
+Network proxy. Network access is off by default in `workspace-write`. When it is turned on, the `network_proxy` feature constrains traffic to configured domain rules; enabling domain rules without the feature does not restrict anything.
+
+## One turn, start to finish
+
+<Trace
+  title="One Codex turn: run the tests and fix the failure"
+  note="assembled from the January 2026 post and the current docs"
+  steps={[
+    { actor: "user", text: "Types: run the tests and fix the failure." },
+    { actor: "harness", text: "Builds instructions and the tool list in a stable order: shell, update_plan, web search, MCP tools." },
+    { actor: "harness", text: "Builds input: a developer message describing workspace-write and on-request, any developer_instructions, the AGENTS.md chain and skills metadata, environment_context, then the user message." },
+    { actor: "harness", text: "POSTs the whole payload without previous_response_id.", note: "Stateless by design; compatible with zero data retention." },
+    { actor: "assistant", text: "Streams a reasoning item and a function_call: shell with command pytest -q." },
+    { actor: "harness", text: "Checks the argument list against the rules; nothing matches, and the command fits workspace-write, so it runs inside the sandbox without a prompt." },
+    { actor: "tool", text: "Appends the reasoning item, the call and its output to input; the previous request is now an exact prefix of the next." },
+    { actor: "assistant", text: "Requests a command that downloads a fixture from an external host." },
+    { actor: "harness", text: "Network is off in workspace-write, so this is an escalation. The approval policy is on-request with auto_review, so a reviewer agent sees a compact transcript and the exact request and returns a decision with a rationale.", note: "A denial tells the agent not to work around it; three in a row end the turn." },
+    { actor: "user", text: "Switches the permissions profile with /permissions mid-thread." },
+    { actor: "harness", text: "Appends a new developer message in the same format as the original permissions item instead of editing it." },
+    { actor: "assistant", text: "Edits the failing module, re-runs the tests, and returns a message with no tool call. The turn ends." },
+    { actor: "system", text: "Later, past auto_compact_limit: /responses/compact returns a shorter input with an encrypted compaction item." }
+  ]}
+/>
+
+## Context strategy
+
+Codex re-sends the whole thread on every request and relies on exact-prefix caching to keep sampling cost linear. OpenAI's post says outright that the JSON sent over a thread grows quadratically and that it accepts this for statelessness and zero data retention. Everything else in the context strategy protects the prefix: tools in a fixed order, permission and directory changes appended as new messages, and project instructions read once per run.
+
+Project instructions follow OpenAI's own advice from its harness-engineering post. A single large AGENTS.md failed for that team because it crowded out the task, made every rule look equally important, rotted quickly and could not be checked mechanically; they replaced it with roughly 100 lines that point into a structured `docs/` directory. The 32 KiB default cap enforces a version of the same discipline, with the risk that a long root file pushes the most specific file past the cap. Skills appear only as metadata until used.
+
+Compaction moved from a client-side summary request to a server endpoint that returns an opaque item. That trades inspectability for whatever the server can preserve that a text summary cannot: a client can no longer read what was kept.
+
+## Tools and permission model
+
+Codex separates two questions that Claude Code answers in one engine. The sandbox mode decides what a command can technically do. The approval policy decides when Codex must stop and ask before going beyond that. The docs' Auto preset, and the default, is `workspace-write` with `on-request`; the dangerous full-access preset (`--dangerously-bypass-approvals-and-sandbox`, alias `--yolo`) removes both the boundary and the approvals.
+
+Rules handle exceptions without widening the sandbox. A rule's `allow` lets a matching command run outside the sandbox without a prompt, `prompt` asks every time and `forbidden` refuses. For `bash -lc` scripts, Codex parses with tree-sitter and splits plain-word chains joined by `&&`, `||`, `;` or `|` into separate commands, each checked, so `git add . && rm -rf /` cannot ride on a `git add` allow rule. Scripts with redirection, substitution, environment assignments, globs or control flow are not split and are matched as one invocation. `codex execpolicy check` shows which rules match a command and the strictest decision.
+
+Auto-review is the probabilistic layer. It triggers on shell calls requesting escalated permissions, network requests blocked by policy, edits outside writable roots and MCP or app tools that require approval. Its policy targets exfiltration of secrets, credential probing, broad security weakening and destructive actions, and the policy text lives in the open-source repository. The reviewer sees user messages, surfaced assistant updates, relevant tool calls and outputs, and the proposed action, but not hidden reasoning. A denial returns the rationale with an instruction not to pursue the same outcome by a workaround. A per-turn circuit breaker interrupts after three consecutive denials or ten within the last fifty reviews, and `/approve` lets the user approve one recent denied action for a single retry, which still goes through review.
+
+## Cost and latency
+
+OpenAI lists the cache-miss causes: changing tools mid-thread, changing the model, and changing the sandbox configuration, approval mode or working directory. It also records two MCP-specific traps. Early MCP support enumerated tools in an inconsistent order, which caused misses until fixed, and an MCP server can change its tool list mid-session with `notifications/tools/list_changed`, which forces a choice between honouring it and keeping the cache. The post's view is that sampling cost dominates network cost, so the quadratic payload is acceptable as long as the cache hits.
+
+Auto-review adds a model call only at the sandbox boundary; routine commands inside the sandbox run without it. The docs' guidance for high review volume is to fix the boundary first, with narrow writable roots and precise prefix rules, instead of teaching the reviewer to approve noise.
+
+## Failure modes
+
+The documented ones are specific. MCP tools run outside Codex's sandbox. Full access with `never` produces no approval requests, so auto-review never runs. A domain on the network allowlist does not trigger review by itself, so sensitive actions inside the boundary need explicit `prompt` rules or tool approval settings to reach the reviewer. The rules engine treats any non-trivial shell script as one opaque command. Auto-review "can still make mistakes, especially in adversarial or unusual contexts", in the docs' words, and a timeout is reported to the agent as not proof the action is unsafe. AGENTS.md content past 32 KiB is dropped from the chain, so the nearest, most specific file is the one at risk.
+
+The design also has a structural property worth naming in a review: every safety-relevant change mid-thread is delivered to the model as an appended message while the old text stays in context. Enforcement changes immediately in the sandbox; only the model's description of it is appended.
+
+## What is not public
+
+The contents of the encrypted `compaction` item and of encrypted reasoning items are not readable by clients, and OpenAI has not published what they contain. The system message the Responses server prepends is controlled by the server, as is the order of the first three prompt items. The docs point to an OpenAI research post for auto-review's evaluation results, which this teardown did not draw on; how the reviewer model was trained is not described in the sources used here. Codex states that MCP tools are not sandboxed by Codex; what a given MCP server enforces is up to that server.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your security team will only approve Codex for a regulated codebase if no command can reach the network without review and the vendor keeps no conversation data. Developers want long autonomous runs overnight. Configure it, and say what you give up."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>workspace-write with network off, on-request approvals routed to auto_review, narrow prefix rules for the test and build commands, forbidden rules for pushes and deploys, and MCP servers limited to read-only tools or tools marked as requiring approval. Codex's stateless requests fit zero data retention. What you give up is any overnight step that needs the network without a reviewed escalation, and the reviewer's judgment is a probabilistic control on top of a deterministic boundary.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The boundary does the guaranteeing. workspace-write keeps writes in the project with .git and credential directories read-only, and network off means any network need becomes an escalation. Pin that in managed requirements so a local config cannot switch to full access.</p>
+<p>Auto-review replaces the human at that boundary for overnight runs. It sees the request and a compact transcript, denies with a rationale, and the circuit breaker stops a run that keeps pushing. Because it is not deterministic, keep forbidden rules for actions that must never happen, such as pushing to protected branches, so they never depend on the reviewer.</p>
+<p>MCP is the gap: Codex does not sandbox MCP servers. Allow only servers whose tools are read-only or carry approval annotations, and treat a remote server as able to change after approval.</p>
+<p>Zero data retention is already the reason Codex avoids previous_response_id; reasoning travels as encrypted items. Confirm the account is on ZDR, since the client behaviour alone does not make it so.</p>
+<p>What you give up: tasks that need package downloads overnight must pre-build their environment, and some runs will stop on the circuit breaker and wait for morning.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Overnight runs stop on the circuit breaker most nights because the reviewer denies a dependency download. Do you widen the network rules or pre-build images, and what does each cost?</li>
+<li>Security asks what the reviewer saw when it approved a command that later caused an incident. What can you reconstruct from the session logs, and what can you not?</li>
+<li>A team wants a broad rule allowing their Python interpreter outside the sandbox. What does that rule really grant, and what would you approve instead?</li>
+</ul>
+</Fragment>
+</Depth>
+
+<SelfRate id="lesson:harness/harness-anatomy/codex-cli" />

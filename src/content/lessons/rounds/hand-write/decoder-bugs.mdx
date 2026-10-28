@@ -1,0 +1,183 @@
+---
+title: A small decoder with bugs, then a KV cache
+track: rounds
+module: hand-write
+order: 3
+kind: lesson
+level: senior
+minutes: 18
+summary: The silent defects in a small decoder and its training step are found faster by tests that treat the model as a black box than by reading it, and a KV cache is correct only when a test proves its logits equal the full pass and its size follows from the config.
+prerequisites: [rounds/hand-write/invariants]
+updated: 2026-10-28
+sources:
+  - title: "PracHub, Debug a small PyTorch transformer with four bugs, then add a KV cache (OpenAI, Machine Learning Engineer, onsite; candidate report)"
+    url: https://prachub.com/interview-questions/debug-a-small-pytorch-transformer-with-four-bugs-then-add-a-kv-cache
+    note: posted 2026-09-20, updated 2026-09-24; original code not reported, page supplies a stand-in; four bugs, the page hinting that one stops the code and the others run but produce a wrong model; per bug the candidate gives the symptom (crash, silent accuracy problem or no learning), a quick test and the fix; per-layer KV cache, prompt then one token per step computing only the new token's projections, logits equal to the full-sequence pass; follow-ups on KV size for 32 layers, hidden size 4096, 16-bit cache and 8,000 tokens, batched prompts of different lengths, MQA or GQA, and rotary embeddings. Checked 2026-10-28.
+  - title: Attention Is All You Need (Vaswani et al., arXiv 1706.03762, 2017)
+    url: https://arxiv.org/abs/1706.03762
+    note: section 3.1, decoder masking plus outputs offset by one position so prediction i depends only on positions before i; 3.2.3, masked inputs set to minus infinity. Checked 2026-10-28.
+  - title: "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints (Ainslie et al., EMNLP 2023, arXiv 2305.13245)"
+    url: https://arxiv.org/abs/2305.13245
+    note: GQA-G shares one K and V head per group of query heads, GQA-1 is MQA and GQA-H is MHA; uptraining with 5% of pre-training compute (about 600 TPUv3 chip-days); table 1, T5-XXL time per sample per TPUv4 chip and average score, MHA 1.51 s and 47.2, MQA 0.24 s and 46.6, GQA-8 0.28 s and 47.1. Checked 2026-10-28.
+  - title: Meta-Llama-3.1-70B-Instruct config.json (unsloth mirror on Hugging Face)
+    url: https://huggingface.co/unsloth/Meta-Llama-3.1-70B-Instruct/blob/main/config.json
+    note: hidden_size 8192, num_attention_heads 64, num_key_value_heads 8, num_hidden_layers 80, max_position_embeddings 131072, torch_dtype bfloat16. Checked 2026-10-28.
+  - title: Google Cloud TPU documentation, The bfloat16 numerical format
+    url: https://docs.cloud.google.com/tpu/docs/bfloat16
+    note: same dynamic range as float32 at half the memory; converting to float32 pads 16 zero bits into the mantissa. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import CodeRunner from '../../../../components/CodeRunner.astro';
+
+export const decCode = String.raw`import math, random
+
+rng = random.Random(0)
+VOCAB, D, MAXLEN, PAD = 11, 4, 16, 0
+def mat(r, c): return [[rng.gauss(0, 0.5) for _ in range(c)] for _ in range(r)]
+EMB, POS = mat(VOCAB, D), mat(MAXLEN, D)
+WQ, WK, WV, WO = mat(D, D), mat(D, D), mat(D, D), mat(D, VOCAB)
+
+def vecmat(x, W): return [sum(x[i] * W[i][j] for i in range(len(x))) for j in range(len(W[0]))]
+
+def embed(tok, pos): return [e + p for e, p in zip(EMB[tok], POS[pos])]
+
+def attend(q, Ks, Vs):
+    s = [sum(a * b for a, b in zip(q, k)) / math.sqrt(D) for k in Ks]
+    m = max(s)
+    w = [math.exp(x - m) for x in s]
+    z = sum(w)
+    return [sum(w[j] * Vs[j][c] for j in range(len(Vs))) / z for c in range(D)]
+
+def forward(tokens):
+    # full pass: logits for every position, causal by slicing keys to 0..i
+    xs = [embed(t, i) for i, t in enumerate(tokens)]
+    Ks, Vs = [vecmat(x, WK) for x in xs], [vecmat(x, WV) for x in xs]
+    return [vecmat(attend(vecmat(xs[i], WQ), Ks[: i + 1], Vs[: i + 1]), WO) for i in range(len(tokens))]
+
+class Cache:
+    def __init__(self): self.K, self.V = [], []
+
+def step(cache, token):
+    # one new token: its position is the number of tokens already cached
+    x = embed(token, len(cache.K))
+    cache.K.append(vecmat(x, WK))
+    cache.V.append(vecmat(x, WV))
+    return vecmat(attend(vecmat(x, WQ), cache.K, cache.V), WO)
+
+def loss(tokens):
+    # next-token cross-entropy, averaged over non-pad targets only
+    logits = forward(tokens[:-1])
+    total, n = 0.0, 0
+    for row, target in zip(logits, tokens[1:]):
+        if target == PAD:
+            continue
+        m = max(row)
+        total += m + math.log(sum(math.exp(v - m) for v in row)) - row[target]
+        n += 1
+    return total / n
+`;
+
+export const decTests = String.raw`def close(a, b, tol=1e-9): return all(abs(x - y) <= tol for x, y in zip(a, b))
+seq = [3, 7, 1, 9, 4, 2, 8]
+full = forward(seq)
+other = seq[:4] + [5] + seq[5:]
+assert all(close(a, b) for a, b in zip(full[:4], forward(other)[:4])), "changing token 4 leaves logits 0..3 alone"
+cache = Cache()
+for i, t in enumerate(seq):
+    assert close(step(cache, t), full[i]), f"cached step {i} differs from the full pass"
+padded = [3, 7, 1, 9, PAD, PAD]
+assert abs(loss(padded) - loss([3, 7, 1, 9])) < 1e-12, "pad targets add nothing to the loss"
+`;
+
+## The reported exercise
+
+A candidate report on PracHub (posted 2026-09-20) describes an OpenAI Machine Learning Engineer onsite in two parts. First, a small decoder-only transformer language model and its training step contain four bugs. The page hints that one stops the code from running and the others run but produce a wrong model; for each, the candidate states the symptom (a crash, a silent accuracy problem or no learning), a quick test that detects it and the fix. Second, the candidate adds a per-layer KV cache: process the prompt, then generate one token per step computing projections only for the new token, with logits equal to a full-sequence forward pass. The page says the original code was not reported and supplies a stand-in, so this lesson uses its own toy model and its own defect list.
+
+Crashing bugs announce themselves; the round is decided by the silent ones. A model with a silent defect trains, its loss falls, and nothing in a forty-line training loop looks wrong on a first read. Reading for defects scales with the length of the code. Tests that treat the model as a black box run in seconds and do not care how the code is written, so the efficient order is: fix whatever crashes, then run the tests below, then read only the code a failing test points at.
+
+## Six tests that find defects without reading the code
+
+| Defect class | Black-box test | What the failure looks like |
+|---|---|---|
+| Mask direction or mask fill | change the token at position t; logits at every position before t must not change | earlier logits move; with a reversed mask, training loss falls much faster than it should |
+| Target shift | on a fixture, assert `targets[t] == inputs[t + 1]` | a model trained with `targets == inputs` learns to copy and its loss collapses |
+| Logit scale or init | loss at initialisation is close to `ln(vocab)` | far above `ln(vocab)`: logits too large at init |
+| Training-step order | overfit one tiny batch; every parameter that should train changes after one step | loss stays flat (step before backward, gradients never zeroed, a detached tensor) |
+| Padding in the loss | loss is unchanged by appending pad tokens or changing what the pad positions contain | loss moves with pad content or with the amount of padding |
+| Silent broadcasting | run every test with distinct sizes for batch, length, heads and width, and assert shapes at each boundary | a shape that only works when two sizes are equal |
+
+The first row covers the most defects per test. Vaswani et al. state the contract: masking in the decoder, together with targets offset by one position, makes the prediction at position i depend only on earlier positions. The perturbation test checks that contract end to end, through every layer, so it catches a mask built with the wrong triangle, a mask filled with 0 instead of minus infinity, a mask applied after the softmax and any other path by which a later token reaches an earlier logit. It cannot see leaks between sequences in a batch; a test that perturbs one sequence and checks the others covers that.
+
+<Predict id="rnd-hw-init-loss" question="A freshly initialised model with a 1,000-token vocabulary has logits near zero. What cross-entropy should the first batch report?" answer={6.91} tolerance={0.05} unit="nats">
+<p>Near-zero logits give a near-uniform softmax, so every target has probability about 1/1000 and the loss is ln(1000) = 6.91 nats. A first loss several times ln(1000) says the logits start large, usually an output projection without a scaled initialisation, and early training is spent shrinking them. A loss that stays at 6.91 for many steps says nothing is learning, which points at the training step rather than the model.</p>
+</Predict>
+
+The broadcasting row needs an example, because the defect is invisible in the usual toy test. Suppose per-token losses come out as `(B, T, 1)` and the padding mask is `(B, T)`. Broadcasting aligns shapes from the right: the last axes are 1 and T, which broadcast to T; the middle axes are T and B, which are compatible only if they are equal. With B = 2 and T = 3 the multiplication raises an error. With a test batch of B = 4 and T = 4, it silently returns a `(4, 4, 4)` tensor in which every sequence's loss is multiplied by every other sequence's mask, and the mean of that is a plausible number. Using distinct sizes in every test, for example batch 2, length 3, heads 4, width 5, turns this class of defect into a crash.
+
+The training-step tests catch a different class. Calling the optimizer step before the backward pass, or never zeroing gradients between steps, leaves a model that runs and changes. The overfit test is the cheapest detector: a correct model and training step drive the loss on one tiny batch close to zero, and a broken step does not. It is a weak test in the other direction, because a model that sees its targets through a leaky mask overfits faster, which is why it runs after the causality test, not instead of it.
+
+## The KV cache and the equivalence test
+
+The cache holds, per layer, the keys and values of every token processed so far, shaped `(batch, kv_heads, length, head_dim)` and appended to on each step. The prompt step runs the full causal forward pass over the prompt and fills the cache. Each generation step projects only the new token, appends its K and V, and attends its single query over the whole cache. That query needs no causal mask, since every cached key is in its past, but the prompt step still needs one, and a common defect reuses the wrong mask between the two paths.
+
+The defect specific to caching is the position offset. The new token's position is the number of tokens already cached, an absolute index. Code that computes positions from the length of the current input passes position 0 for every generated token. With absolute position embeddings, sinusoidal or learned, the prompt's logits still match and the first generated token's do not; with rotary embeddings the same mistake rotates the new query and key by the wrong angle, and since cached keys are stored already rotated, the error compounds across steps.
+
+The equivalence test is the contract from the report: for every step, the cached logits equal the full forward pass's logits at that position. Run it with a one-token prompt, a prompt that reaches the maximum length, and a batch of prompts with different lengths, where per-row positions and padding masks expose most of the remaining bugs. "Equal" needs a definition. In float64 pure Python the two paths agree to the last bits on a toy model; in float32 or bf16 they reduce in different orders and differ by rounding. Two measurements separate rounding from a defect: the size of the difference at the first cached step relative to the dtype, and whether it grows with the step index. A position bug appears at the first cached step and stays large; rounding stays at the dtype's scale.
+
+The cell is a one-layer, attention-only toy with learned absolute positions and a padding-aware loss, in pure Python. The tests are three rows from the tables above: causality by perturbation, cached against full logits at every step, and loss invariance to padding.
+
+<CodeRunner id="lesson-rounds-hw-decoder" title="A toy decoder, its cache and three black-box tests" starter={decCode} tests={decTests} gradable={false} />
+
+Change `embed(token, len(cache.K))` to `embed(token, 0)` in `step` and the equivalence test fails at step 1, not step 0. Change the slices `Ks[: i + 1], Vs[: i + 1]` in `forward` to the full lists and the causality test fails. Delete the `if target == PAD` check and the padding test fails.
+
+## Sizing the cache
+
+The size follows from the config: two tensors (K and V) per layer, each holding `kv_heads × head_dim` values per token, times tokens, times batch, times bytes per value. The report's follow-up asks for one case of it.
+
+<Predict id="rnd-hw-kv-size" question="Full multi-head attention, 32 layers, hidden size 4096, a 16-bit cache, one sequence of 8,000 tokens. How large is the KV cache, in GB (1e9 bytes)?" answer={4.19} tolerance={0.05} unit="GB">
+<p>With full multi-head attention the K and V widths per layer equal the hidden size. 2 × 32 × 4096 × 8,000 × 2 bytes = 4,194,304,000 bytes, 4.19 GB or 3.91 GiB, for one sequence. A batch of 16 such sequences needs 67 GB of cache before any weights are loaded. Mixing GB and GiB moves the answer by about 7 percent, which is enough to change whether a batch fits on one device.</p>
+</Predict>
+
+Grouped-query attention changes the `kv_heads` term. Ainslie et al. define GQA-G as query heads split into G groups, each sharing one key head and one value head, so GQA-1 is multi-query attention and GQA-H, with one group per head, is multi-head attention. Their T5-XXL results, uptrained from multi-head checkpoints with 5% of the original pre-training compute, put GQA-8 at 0.28 seconds per sample against 1.51 for multi-head and 0.24 for multi-query, with an average score of 47.1 against 47.2 and 46.6.
+
+Llama 3.1 70B's published config uses that design: 80 layers, 64 query heads, 8 key-value heads and hidden size 8192, so the head dimension is 8192 / 64 = 128 and the K and V width per layer is 8 × 128 = 1,024. Per token, 2 × 80 × 1,024 × 2 bytes = 327,680 bytes, 320 KiB. At the config's maximum of 131,072 positions, one sequence needs 40 GiB of cache; with all 64 heads it would need eight times that, 320 GiB. [rnd-004](/problems/rnd-004) asks how many long requests fit on one GPU with this arithmetic, and [rnd-018](/problems/rnd-018) asks for the grouped-query decode step whose output must equal the full recompute.
+
+In a hand-written cache, the GQA saving survives only if the cache stores the 8 KV heads and each query head indexes its group's KV head at attention time. Repeating KV heads to match the 64 query heads before writing them to the cache gives correct logits and undoes the saving. The paper's definitions supply two property tests: with G equal to the number of query heads, the GQA path must equal the multi-head path, and with G = 1 it must equal multi-query.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+"A teammate's KV-cache PR passes the equivalence test in float32. In bf16 on the serving path, cached logits differ from the full pass by more than the test's tolerance, and greedy outputs diverge on a few prompts after many tokens. The release is Friday. Block it, merge it, or merge it with a change?"
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Find out whether the difference is rounding or a defect before deciding. Compare both bf16 paths with a float32 reference and plot the difference against step index. If the cached path's error is the same size as the full path's and does not grow with position, it is reduction order: merge with a bf16 tolerance derived from the dtype and a top-1 agreement metric, and keep the strict float32 test in CI. If the error jumps at the first cached step or grows with position, block.</p>
+</Fragment>
+<Fragment slot="long">
+<p>bf16 keeps float32's range at half the memory; converting to float32 pads 16 zero bits into the mantissa, so bf16 carries far fewer significant bits, and two paths that sum in different orders disagree in the low bits. The full pass computes attention for all positions in one matmul; the cached path reduces one query against a growing cache. Disagreement at bf16 rounding scale is expected, and greedy decoding turns a tiny difference into a different token wherever the top two logits nearly tie, after which the sequences diverge for good. That explains the symptom without any defect.</p>
+<p>Three measurements decide it. Both bf16 paths against a float32 reference: if they are equally far from it, neither is wrong. Error against step index: flat means rounding, a step change at the prompt boundary means a position or mask defect. Divergent prompts: check whether the first differing token had a near-tie in the reference logits.</p>
+<p>The failure mode of merging on that evidence is a real defect small enough to hide under a bf16 tolerance, for example a position off by one under a smooth position encoding, where neighbouring positions produce similar vectors. That is why the float32 equivalence test stays strict and blocking, and the bf16 gate is a separate, looser test with its tolerance written down next to the reason.</p>
+<p>What I give up: Friday holds only if the measurements are clean; if the error grows with position, the release ships with recompute for long prompts or slips.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Running the float32 reference on every serving PR doubles that suite's runtime. Which configurations do you cut, and what risk do you accept in writing?</li>
+<li>What would you need to see in production traffic to roll the cache back to recompute for prompts above some length?</li>
+<li>Product wants prompts of different lengths batched into the same cache before Friday. What test do you add, and what do you refuse to ship without it?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Production engines do not keep one contiguous cache per sequence. Paged caches split it into fixed blocks, prefix sharing lets sequences point at the same blocks, sliding-window attention evicts old entries, and quantised caches store K and V in fewer bits than the model computes in. Equivalence then means equality with a reference that applies the same window or quantisation, and a quantised cache cannot match an unquantised full pass at any tight tolerance.
+
+The six tests find defects that change behaviour on small inputs. A defect that appears only at long context, such as an overflow in position handling past some length or a rotary frequency computed in low precision, passes every toy test, so the equivalence test also runs at the model's maximum length at least once.
+
+The initial-loss check assumes logits start near zero. Tied input and output embeddings, a final normalisation with a large learned gain or a checkpoint loaded instead of a fresh initialisation all break the assumption without any defect. And the six-row table is one ordering of likely defects in a small decoder; the four bugs in a given round are whatever its author planted, which is why the tests come before the reading.
+
+<SelfRate id="lesson:rounds/hand-write/decoder-bugs" />

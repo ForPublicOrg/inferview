@@ -1,37 +1,40 @@
 ---
 id: rag-007
 title: The bot cites a deleted policy
-subtitle: find and fix
+subtitle: rank the defects in a sync job
 track: rag
 module: ingestion
 type: debug
 difficulty: medium
-seniority: [mid, senior]
+seniority: [senior]
 minutes: 20
-core: true
-tags: [ingestion, freshness, deletes, indexing]
+core: false
+tags: [ingestion, freshness, deletes, indexing, pgvector, change-feed]
 companies: []
 updated: 2026-10-28
 sources:
   - title: techinterview.org, RAG system design interview (updated 2026-07-02)
     url: https://www.techinterview.org/post/3233476088/rag-system-design-interview/
-    note: "The model just cited a policy we deleted last week. Why did that happen, and how do you stop it?"
-  - title: pgvector README
+    note: "candidate report: \"The model just cited a policy we deleted last week. Why did that happen, and how do you stop it?\" Checked 2026-10-28."
+  - title: pgvector README (v0.8.7 in the install instructions)
     url: https://github.com/pgvector/pgvector
-    note: vectors are rows in a Postgres table; a deleted row is not returned by queries
+    note: "vectors are rows in a Postgres table; filtering happens after the approximate index scan; dead tuples can reduce the number of results an HNSW query returns, and vacuuming HNSW indexes can take a while. Checked 2026-10-28."
 choices:
-  - text: The sync job only processes created or modified documents, so a deleted document's chunks are never removed
+  - text: Positional chunk ids leave an edited document's tail chunks behind when the new version is shorter
+    correct: false
+    why: A real defect in this job, but the cited row is chunk 0 of a document that was deleted, not the tail of one that was edited.
+  - text: The cursor is saved at job end, so a deletion that lands while the job runs is never picked up
+    correct: false
+    why: A real race, but the deletion at 14:05 on 20 October falls inside the next run's window, and that run logged a delete.
+  - text: A semantic cache answered from an entry written before the deletion reached the vector index
+    correct: false
+    why: The request trace shows a cache miss and a fresh retrieval that returned the deleted policy's chunk at rank 1.
+  - text: The delete call passes the document id, but chunk rows are keyed by document id and position
     correct: true
-    why: The trace shows the chunk still in the index with the old document id, and `list_changed` never reports deletions, so nothing ever removes it.
-  - text: The model remembers the old policy from its training data and ignores the retrieved context
+    why: "`DELETE ... WHERE id = ANY(['hr-remote-2024'])` matches no row named `hr-remote-2024:0`, deletes nothing, raises nothing, and the job still counts `deleted=1`."
+  - text: The HNSW graph keeps entries for deleted rows and returns them until the index is rebuilt
     correct: false
-    why: The answer cites chunk `hr-remote-2024:0` from your own index, and the retrieval log shows that chunk returned at rank 1 on this request.
-  - text: A semantic cache in front of the pipeline served an answer cached before the deletion
-    correct: false
-    why: A cache hit would skip retrieval, but the log shows a fresh retrieval at request time that returned the deleted policy's chunk.
-  - text: The HNSW graph still contains nodes for deleted rows, and the index returns them until it is rebuilt
-    correct: false
-    why: Engines that delete lazily still filter deleted entries out of results; here the chunk row itself still exists, because nothing ever deleted it.
+    why: "In pgvector a deleted row's dead tuples can cost results until vacuum, but are not returned; here the row itself still exists."
 ---
 import Callout from '../../../components/Callout.astro';
 
@@ -41,62 +44,96 @@ import Callout from '../../../components/Callout.astro';
 "The model just cited a policy we deleted last week. Why did that happen, and how do you stop it?"
 </Callout>
 
-The HR team deleted the 2024 remote-work policy on 20 October and published a new one. On 27 October an employee asks how many remote days are allowed and gets the old answer, with a citation. You have the ingestion job and the request trace.
+HR deleted the 2024 remote-work policy at 14:05 UTC on 20 October and published a new one. On 27 October an employee asks how many remote days are allowed and gets the old answer, with a citation. The index is a pgvector table. You have the sync job, the store, two nights of job logs and one request trace.
 
 ```python
-# runs nightly
-def sync(since):
-    for doc in source.list_changed(since):        # documents created or modified since the last run
-        chunks = chunk(doc.text)
-        for i, text in enumerate(chunks):
-            index.upsert(
+def sync(state):
+    since = state.last_run
+    for change in source.changes(since=since):
+        if change.kind == "deleted":
+            store.delete([change.doc_id])
+            stats["deleted"] += 1
+            continue
+        doc = source.get(change.doc_id)
+        for i, text in enumerate(chunk(doc.text)):
+            store.upsert(
                 id=f"{doc.id}:{i}",
                 vector=embed(text),
                 text=text,
-                meta={"doc": doc.id, "updated": doc.updated},
+                meta={"doc": doc.id, "version": doc.version},
+            )
+        stats["upserted"] += 1
+    state.last_run = datetime.now(timezone.utc)
+    log.info("sync since=%s %s ok", since, stats)
+
+
+class ChunkStore:
+    def delete(self, ids):
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM chunks WHERE id = ANY(%s)", (ids,))
+
+    def upsert(self, id, vector, text, meta):
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO chunks (id, embedding, text, meta) VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding, "
+                "text = EXCLUDED.text, meta = EXCLUDED.meta",
+                (id, vector, text, Json(meta)),
             )
 ```
 
 ```text
+2026-10-20T02:11:37Z sync since=2026-10-19T02:09:52Z {'upserted': 22, 'deleted': 0} ok
+2026-10-21T02:12:05Z sync since=2026-10-20T02:11:37Z {'upserted': 13, 'deleted': 1} ok
+
 request 7f3a  2026-10-27T09:14:03Z  q="how many remote days per week?"
   cache: miss
   retrieve: k=5
-    1  hr-remote-2024:0     score=0.81  updated=2024-03-02
-    2  hr-remote-2026:0     score=0.79  updated=2026-10-20
-    3  hr-remote-2026:1     score=0.74  updated=2026-10-20
-    4  hr-travel-2025:3     score=0.52  updated=2025-06-11
-    5  hr-leave-2026:7      score=0.49  updated=2026-01-15
+    1  hr-remote-2024:0     score=0.81
+    2  hr-remote-2026:0     score=0.79
+    3  hr-remote-2026:1     score=0.74
+    4  hr-travel-2025:3     score=0.52
+    5  hr-leave-2026:7      score=0.49
   answer cites: hr-remote-2024:0
 source.get("hr-remote-2024") -> 404 Not Found
 ```
 
+Which defect explains the citation? Then rank the others and say what you would collect before changing anything.
+
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>What does `list_changed` return for a document that no longer exists?</p></details>
-<details class="hint"><summary>Hint 2</summary><p>The source returns 404 for the cited document, but the index still has its chunk. Which code path could have removed it?</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask what the <code>deleted</code> counter in the log counts.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the change feed entries between the two runs, with their document ids.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request a query of the chunks table for every row whose <code>meta</code> names a document the source no longer has.</p></details>
 
 ## Answer
 
-The sync is upsert-only. `list_changed(since)` reports documents that were created or modified; a deleted document is neither, so it never appears, and no code path ever removes its chunks. The index therefore holds both the 2024 and the 2026 policy, they are about the same topic, and the old one happened to score slightly higher. The model did exactly what it was asked: it answered from the top retrieved chunk and cited it.
+The delete path exists and runs, and deletes nothing. Chunk rows are written as `hr-remote-2024:0`, `hr-remote-2024:1` and so on; the delete is issued with the bare document id, `WHERE id = ANY(['hr-remote-2024'])` matches zero rows, Postgres does not treat that as an error, and the job increments `deleted` for the call, not for rows. The log for the 21 October run says `deleted: 1 ok`, which is what makes this survive review: every signal anyone looks at says deletes work. The old and new policies are about the same topic, the old one scores slightly higher on this question, and the model does what it was told with the top chunk.
 
-The fix has layers:
+**What the evidence does not show, and what to collect.** The log does not say which document the one delete was for. Before fixing, pull the change feed between 02:11:37 on 20 October and 02:12:05 on 21 October and confirm it holds `hr-remote-2024` as `deleted`; if it does not, the source never reported the deletion and the defect is upstream. Then count the orphans: rows whose `meta->>'doc'` is not among the source's current ids. If you cannot get the feed (retention ran out), the fix below is safe either way, because it deletes by document and adds a reconciliation that does not depend on the feed.
 
-1. **Process deletes.** Consume tombstones from the source (a change feed or webhook that includes deletions), and delete every chunk whose `meta.doc` matches.
-2. **Reconcile.** A periodic job lists all source ids and all indexed document ids and deletes the difference, because event streams drop messages.
-3. **Version chunk ids.** `id=f"{doc.id}:{i}"` also leaves orphans on edits: if a document shrinks from 12 chunks to 9, chunks 10 to 12 keep the old text. Write chunks under a version (`doc.id@version:i`), switch readers to the new version, then delete the old one.
-4. **Guard at query time.** Drop retrieved chunks whose document is marked deleted or superseded, and prefer the newest version when two versions of the same document match.
-5. **Test it.** Add eval questions about recently deleted and edited documents and assert the old answers do not come back.
+**The fix.**
 
-Why the wrong picks are tempting. "The model remembers its training data" is a real failure mode for public facts, but this is an internal policy and the citation points at your own chunk. Stale semantic caches are a real cause of exactly this symptom, which is why the trace shows `cache: miss`. Lazy graph deletion exists in several engines, but they filter tombstoned entries from results; the row here was never deleted at all.
+1. Delete by document: `DELETE FROM chunks WHERE meta->>'doc' = %s`, with an index on that expression, and log the rows deleted, not the calls. A delete that removes zero rows for a document the index has seen is a warning.
+2. Make an edit replace the document's chunks in one transaction: delete every row for the document, insert the new chunks, commit. That also fixes the second defect below. pgvector lives in Postgres, so this is one transaction; with a vector store that has none, write the new version under versioned ids and delete the old version after.
+3. Reconcile nightly: list source ids, list `meta->>'doc'` values, delete the difference. Change feeds lose events, and this would have caught the bug on its first night.
+4. Add eval questions about recently deleted and edited documents, and assert the old answers do not come back.
+
+**The other defects, ranked.**
+
+- *Positional ids on edits* (second). When a document shrinks from 12 chunks to 9, rows `:9` to `:11` keep the old text forever. Same symptom class, different document: any edited document can be cited from its old tail. It will happen to the next policy that is shortened.
+- *Cursor saved at job end* (third). `state.last_run` is taken after the loop, so a change that lands between the feed read and the end of the run is never seen. The 20 October run ended at 02:11:37 and the deletion was at 14:05, so not this time. Fix by saving the feed's own position, or the time the read started minus a margin, and relying on idempotent upserts for the overlap.
+- *Semantic cache and HNSW* are not defects here. The trace shows `cache: miss`. In pgvector a deleted row leaves dead tuples that can reduce the number of results until vacuum, but they are not returned; the problem here is that the row was never deleted.
 
 ## Follow-ups
 
-- *How quickly must a delete propagate?* Agree a freshness target with the document owners (HR may need same-day removal for legal reasons) and alert on the lag.
-- *What about permission changes?* Same pipeline: an ACL change is a change, and stale ACL labels leak documents to people who lost access.
-- *How would you clean up the index you have now?* Run the reconciliation once with a dry run, review the list of orphaned document ids, then delete.
+- *Legal says a deleted policy must be unsearchable within 24 hours. Which of your fixes meets that on its own, and what do you alert on?*
+- *The reconciliation would delete 30 percent of the index tonight because the source listing API timed out halfway. What stops it?*
+- *The same store holds access-control labels in `meta`. What does this bug do to a document whose permissions were revoked rather than deleted?*
 
 ## Common mistakes
 
-- Adding "prefer the newest document" to the prompt, which treats the symptom and leaves the deleted text searchable.
-- Full nightly re-indexes as the fix: correct, but they hide the missing delete path and get expensive as the corpus grows.
-- Forgetting the edit case, where positional chunk ids leave stale tails.
+- Concluding deletes work because the job logs a delete count; it counts calls.
+- Adding "prefer the newest document" to the prompt, which leaves the deleted text retrievable.
+- Fixing the delete id and leaving the positional tails of edited documents.
+- Treating a nightly full re-index as the fix; it hides the broken delete path and grows with the corpus.

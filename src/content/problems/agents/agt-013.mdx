@@ -1,95 +1,148 @@
 ---
 id: agt-013
 title: The agent that forgot what it finished
-subtitle: drift after half an hour
+subtitle: the progress notes and the checkpoint disagree
 track: agents
 module: memory-state
 type: debug
 difficulty: hard
 seniority: [senior, staff]
-minutes: 20
+minutes: 30
 core: false
-tags: [context-engineering, compaction, long-running, memory]
+tags: [long-running, checkpointing, progress-files, harness, verification]
 companies: []
 updated: 2026-10-28
 sources:
-  - title: ombharatiya, AI system design guide, question bank (Q112)
-    url: https://github.com/ombharatiya/ai-system-design-guide/blob/main/00-interview-prep/01-question-bank.md
-    note: "your agent does well on short tasks but degrades past 30 minutes of autonomous work; diagnose and fix it with context engineering"
-  - title: amitshekhariitbhu, AI engineering interview questions
-    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
-    note: "your long-running agent drifts after hours and confidently works on the wrong thing"
-  - title: Anthropic, Effective context engineering for AI agents (2025-09-29)
-    url: https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents
-    note: compaction, structured note-taking, context rot
-  - title: Anthropic, Effective harnesses for long-running agents (2025-11-26)
+  - title: Anthropic Engineering, Effective harnesses for long-running agents (Justin Young, 2025-11-26)
     url: https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents
-    note: feature list and progress file outside the context; failure modes of declaring victory early and redoing work
+    note: "an initializer session writes a JSON feature list with every feature marked failing, claude-progress.txt and an initial commit; each later session reads the git log and progress file, picks the highest-priority unfinished feature, and runs a basic end-to-end test before new work; observed failures include declaring the project done early and marking features complete without end-to-end testing; the article says compaction alone isn't sufficient"
+  - title: Claude docs, memory tool, multisession software development pattern (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool
+    note: "mark a feature complete only after end-to-end verification confirms it works, not when the code is written; each session updates the progress log before it ends"
+  - title: LangGraph docs, checkpointers, durability modes (checked 2026-10-28)
+    url: https://docs.langchain.com/oss/python/langgraph/checkpointers
+    note: "\"exit\" persists only when execution ends, so intermediate state is lost on a crash; \"sync\" persists before the next step begins"
 choices:
-  - text: The compaction prompt keeps only a short prose summary, which drops the task list and the record of finished work, and nothing outside the context holds them
+  - text: A context reset returns before the checkpoint save, so the features that session finished never reach the list the next prompt trusts
     correct: true
-    why: The trace shows the drift starting right after the first compaction, and the summary mentions neither which tasks are done nor the agreed order. A progress file and task list on disk would survive compaction.
-  - text: The context window overflowed and the provider silently dropped the system prompt
+    why: The loaded state still says session 2 after three sessions, and session 3 ended through the reset branch, which returns before store.save; session 4 was then told F1 to F4 is the authoritative list.
+  - text: mark_done appends to progress.md without running the feature test, so the notes claim features that the test suite does not support
     correct: false
-    why: The excerpt shows the system prompt intact after compaction, and the harness compacts well below the window. An overflow would produce an error, not quiet drift.
-  - text: Sampling temperature is too high, so the model wanders over long runs
+    why: A real defect, and it explains F7 being listed as done with a failing test, but it does not make a session rebuild F5 and F6, which pass their tests at HEAD.
+  - text: The token budget leaves too little headroom below the window, so the feature list was lost when the context overflowed in the middle of a session
     correct: false
-    why: Temperature affects every turn equally. It would not explain behaviour that is fine for 30 minutes and changes exactly at the compaction.
-  - text: The prompt cache is returning stale responses from earlier in the run
+    why: The harness reset at 151,220 tokens against a 150,000 budget and session 4 started cleanly at 18,900 tokens; nothing overflowed, and session 4 had a list, just a stale one.
+  - text: The fresh session started before the old one exited, so two sessions shared the branch and each rebuilt what the other committed
     correct: false
-    why: Prompt caching reuses the computation for an identical prefix; it never returns an earlier answer. And compaction changes the prefix, so the cache misses anyway.
+    why: Session 3's loop does nothing after the reset branch, whether start_fresh runs the next session inline or spawns it, and the harness log shows one session at a time; the rewrite commit is session 4's.
 ---
 import Callout from '../../../components/Callout.astro';
 
 ## Question
 
-<Callout kind="interview" label="Interview question">
-"Your agent does well on short tasks but degrades past about 30 minutes of autonomous work. Diagnose it."
+<Callout kind="interview" label="Debug, 30 minutes">
+"A long-running coding agent rebuilt two features it had already finished, after a context reset. The progress file and the run checkpoint disagree about what is done. Which defect explains the rebuild, what else is wrong, and what would you change?"
 </Callout>
 
-A coding agent works through a list of eight tasks in a repository. Runs under half an hour go well. In longer runs, it starts re-implementing tasks it already finished, and once it reported "all tasks complete" with three still failing tests. Here is the harness config and an excerpt from a long run (synthetic, written for this problem).
+The harness follows the shape of Anthropic's long-running harness: a feature list, a progress file the agent appends to, a commit per feature, and a fresh session when the context gets too long. The team added a run checkpoint so the orchestrator can resume a run after a crash. The code and the evidence below are constructed for this problem.
+
+```python
+START_PROMPT = """Features already completed (authoritative): {done}
+Do not rework completed features. progress.md has notes from earlier sessions.
+Implement the lowest-numbered feature that is not completed, commit it, then call mark_done."""
+
+def run_session(run_id, budget_tokens=150_000):   # 200k window; leave room for the reply
+    state = store.load(run_id)                     # {"done": [...], "session": n}
+    prompt = START_PROMPT.format(done=", ".join(state["done"]) or "none")
+    convo = Conversation(system=SYSTEM, first=prompt)
+    finished = []
+    while True:
+        reply = model.step(convo)
+        for call in reply.tool_calls:
+            result = tools.run(call)               # bash, edit, git, run_tests, mark_done
+            convo.add_result(call, result)
+            if call.name == "mark_done":
+                finished.append(call.args["feature"])
+                progress.append(f"{call.args['feature']}: done")
+        if convo.input_tokens > budget_tokens:
+            return start_fresh(run_id)
+        if reply.stop_reason == "end_turn":
+            break
+    state["done"] += finished
+    state["session"] += 1
+    store.save(run_id, state)
+    return state
+```
 
 ```text
-harness config
-  compaction       when input tokens exceed 120,000
-  compaction step  "Summarize the conversation so far in about 300 words."
-  after compaction context = system prompt + summary + last 2 turns
-  task list        given once, in the first user message
-  progress notes   none
+store, run r-311, as loaded by session 4
+  {"done": ["F1", "F2", "F3", "F4"], "session": 2}
 
-minute 34, first compaction, summary as stored
-  "The agent has been improving the payments module. It refactored the
-   currency helpers, fixed several failing tests, and discussed the
-   approach for retries with the user. Work is progressing well."
+progress.md, last lines
+  F4: done
+  F5: done
+  F6: done
+  F7: done
 
-minute 35
-  assistant  I'll continue with the payments work. Let me look at the
-             currency helpers to see what could be improved.
-             calls read_file("src/payments/currency.py")
+git log --oneline, newest first
+  b7a91f0  F5: CSV export endpoint (rewrite)
+  9c1e0a2  F6: retry policy for the export job
+  41b7d3e  F5: CSV export endpoint
+  e02f9c1  F4: pagination on /orders
+
+harness log
+  10:02  session 3 started, 18,400 input tokens
+  10:41  session 3 reset, 151,220 input tokens > 150,000
+  10:41  session 4 started, 18,900 input tokens
+  11:05  session 4 commit b7a91f0
+
+CI at HEAD, 11:30
+  F1-F6 tests pass; F7 test fails
 ```
+
+Session 4 rewrote F5, which was committed and passing, and is now working on F6. Nobody has looked at F7.
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>When exactly does the behaviour change, and what happens to the context at that moment?</p></details>
-<details class="hint"><summary>Hint 2</summary><p>After compaction, where in the context is the list of eight tasks?</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask what the session counter in the loaded state should read if every session so far had saved.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the store's write log for run r-311, with the session that made each write.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask which record session 4's prompt told it to believe, and which records it was never shown.</p></details>
 
 ## Answer
 
-Compaction is erasing the agent's plan. The task list existed only in the first user message, and the compaction prompt asked for a 300-word prose summary, which kept the mood ("work is progressing well") and lost the facts: which of the eight tasks are done, which tests still fail, what was agreed about retries. After minute 34 the agent's context holds the system prompt, a vague summary and two recent turns, so it does the natural thing with a vague summary: it picks something plausible and starts again.
+The reset branch returns before the save. `run_session` collects finished features in a local list and writes them to the store only after the loop breaks on `end_turn`. When the context passes the budget, `return start_fresh(run_id)` leaves the function from inside the loop, so everything session 3 finished is lost from the checkpoint. The counter confirms it: three sessions have run and the loaded state says `"session": 2`. Session 4 then got a prompt that called the stale list authoritative and told it not to rework what was on it, so it did what it was told and started at F5. This is LangGraph's `"exit"` durability mode rebuilt by hand: state persisted only when the run ends cleanly, lost on any other exit, and a context reset is just another exit.
 
-The fix is to put state that must survive outside the context and make compaction preserve facts. Anthropic's long-running harness keeps a feature list where each item starts as failing and flips only after an end-to-end test, plus a progress file the agent updates as it works, and each fresh context starts by reading them. The compaction prompt should demand specific content (open tasks, finished tasks with evidence, decisions, files touched, failing tests) rather than a word count. And "all tasks complete" should be checked by the harness against the task list and the test run, not taken from the model.
+The evidence is incomplete, and two things are worth collecting before changing anything. The store's write log would show whether session 3 ever wrote, which separates "the save never ran" from "the save ran and was overwritten". The transcript tail of session 3 would show whether F7's `mark_done` came before or after a failing test run. Without either, the fix does not depend on them: at session start, derive what is done from evidence instead of trusting any one record.
 
-Why the wrong picks are tempting. Silent truncation does happen in some homemade harnesses, but here the system prompt is visibly intact and compaction runs well below the limit. Temperature is the reflex answer to "the model wanders", but it cannot explain a change at a specific minute. The prompt cache cannot return stale answers; it only skips recomputing an identical prefix.
+The secondary defects, ranked:
+
+1. **`mark_done` is unverified.** It writes `F7: done` to `progress.md` on the model's word, and CI says F7 fails. This is the failure Anthropic's harness article names, marking features complete without end-to-end testing, and it will cause the opposite symptom later: a session that skips F7 because the notes say it is done. Make `mark_done` run the feature's test, commit, and only then record the feature, in that order.
+2. **Three records, no reconciliation.** The checkpoint, `progress.md` and git each say something different, and the prompt picks the one the harness writes least reliably. Git commits are evidence that code exists, not that it works; the feature tests are the only record that says "done" in the sense that matters.
+3. **The prompt asserts authority it cannot check.** "Authoritative" plus "do not rework" turns a stale list into an instruction. A session should start, as Anthropic's does, by reading the git log and the notes and running a basic end-to-end test before new work.
+
+Why the wrong picks are tempting. Overflow is the reflex answer to "the agent forgot", but the harness reset with headroom and the new session started small. Concurrent sessions do produce exactly this kind of duplicate work in harnesses that spawn without waiting; here session 3 does nothing after the reset branch and the log shows one session at a time.
+
+### The decision: what is the source of truth for "done"
+
+Two answers are defensible.
+
+- **Derive "done" from the tests at every session start.** The checkpoint becomes a cache. Cost: test time on every session. As a scenario, if the end-to-end suite takes 6 minutes and sessions run about 39 minutes between resets, as session 3 did from 10:02 to 10:41, re-verification adds 6 / 45, about 13 percent, to wall-clock time.
+- **Keep the checkpoint authoritative and make its writes correct.** Save on every exit path (in a `finally`, or better, at each verified `mark_done`, with `sync`-style durability), so the checkpoint is at most one feature behind. Cost: it is still a record the harness can get wrong in a new way, and a crash between the commit and the save means one feature is redone.
+
+I would write the checkpoint at each verified `mark_done` and add a narrow reconciliation at session start: compare the feature commits in git since the last checkpointed feature with the checkpoint, and run only those features' tests. That bounds re-verification to the features in dispute, usually zero or one, instead of the whole suite. The quantity I chose is that scope; running the full suite every session is reasonable when it takes a minute, and unreasonable at 6 minutes with sessions resetting every 40.
+
+The failure mode of this fix is the tests themselves. A flaky end-to-end test flips a finished feature to "not done" and the next session rebuilds it, which is the original symptom with a new cause. And the agent can edit a failing test until it passes; Anthropic's harness tells the agent that removing or editing tests is unacceptable, which is an instruction, not a control. Make the feature tests read-only to the agent's sandbox, and quarantine a test that has flipped twice in a run instead of letting it drive rework.
 
 ## Follow-ups
 
-- *How would you detect this in production?* Log every compaction with before and after token counts, and alert when a run's tool calls after a compaction repeat files or tasks from before it.
-- *What should never be compacted?* The goal, the acceptance criteria and the list of open items. Keep them in a pinned block or a file, not in the conversation.
-- *Compaction versus tool-result clearing?* Clearing old tool outputs is lighter and keeps the conversation; it is often enough to delay compaction a long way.
+- *Re-verifying disputed features adds a sandbox start and a test run to some sessions, and the team pays for sandbox hours. Which features do you stop re-checking, and what risk do you write down?*
+- *What would you need to see in run logs to drop the checkpoint entirely and derive "done" from git and the tests alone?*
+- *Two senior engineers disagree: one wants `progress.md` to be the only record because the model reads it anyway, the other wants a database row the harness owns. How do you decide without deciding by rank?*
+- *How would you detect this class of bug in production before a person notices duplicate commits?* Alert when a session's commits touch the files of a feature whose test already passes at the session's starting commit, and when the session counter skips.
 
 ## Common mistakes
 
-- Blaming the model's long-context ability without looking at what the harness put in the context.
-- Writing compaction prompts with a length target and no required content.
-- Letting the model declare completion with no check against the task list and tests.
-- Keeping the plan only in the first message of the conversation.
+- Blaming the model's memory when the harness handed it a stale list and told it to trust it.
+- Fixing the save path and leaving `mark_done` unverified, which trades rebuilt features for skipped ones.
+- Treating a commit message that names a feature as proof the feature works.
+- Running the whole end-to-end suite at every session start without computing what it costs per session.

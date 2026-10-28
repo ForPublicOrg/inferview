@@ -1,0 +1,131 @@
+---
+id: api-022
+title: Long answers got twice as slow after an SDK upgrade
+subtitle: first token unchanged, last token late
+track: apis
+module: api-anatomy
+type: debug
+difficulty: hard
+seniority: [staff]
+minutes: 30
+core: false
+tags: [streaming, latency, sdk-upgrade, api-versioning, observability]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Claude docs, streaming messages (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/build-with-claude/streaming
+    note: event order and delta types; SDK helpers accumulate the message; thinking deltas arrive in thinking blocks before the text they precede
+  - title: Claude docs, migrating to API version 2026-10-21 (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/migration-2026-10-21
+    note: temperature, top_p and top_k return 400 even at default values; requests then sample at temperature 1.0; new SDK major versions send the key as Authorization Bearer instead of X-Api-Key
+  - title: Claude docs, API errors (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/errors
+    note: omitting thinking runs adaptive thinking on current models; request-id on every response
+choices:
+  - text: Dropping temperature=0.2 restored sampling at 1.0, so long answers became longer and now take proportionally longer to stream
+    correct: false
+    why: A real behaviour change from the upgrade, but output tokens per long answer rose by about 8 percent, which cannot double the time to stream them.
+  - text: Adaptive thinking now runs by default, so the model spends more time reasoning before and between the blocks of a long answer
+    correct: false
+    why: Thinking before the answer would move time to first token, which did not change, and `usage.output_tokens`, which includes thinking, rose only about 8 percent.
+  - text: The new event loop re-renders the whole accumulated answer on every delta, so client work grows with the square of its length
+    correct: true
+    why: Work per delta grows with the answer so far, total work with its square, which leaves the first token untouched, spares short answers and doubles long ones.
+  - text: "The SDK now sends the key as Authorization: Bearer, and the gateway's slower auth path adds latency to every streamed chunk"
+    correct: false
+    why: The header changed, but authentication happens once per request, before the first byte; a slower auth path would move time to first token.
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Debug, 30 minutes">
+Pick the hypothesis that explains the symptom, rank the others with the measurement that would confirm or kill each, and say what you ship this week.
+</Callout>
+
+Scenario: a chat service streams Claude answers to the browser over a WebSocket. Last Tuesday it upgraded the Anthropic Python SDK to the major version that sends API version 2026-10-21, and in the same pull request the frontend team switched the socket protocol to rendered HTML snapshots. Since then:
+
+- Time to first token, p50 and p99: unchanged.
+- Total time for answers under about 500 output tokens: unchanged.
+- p99 total time for answers over 1,500 output tokens: roughly doubled.
+- Output tokens per answer over 1,500 tokens, from `usage`: up about 8 percent.
+- Error rate and 429 rate: unchanged. The service has no CPU dashboard per stream.
+
+The diff, trimmed:
+
+```python
+# before
+with client.messages.stream(model=MODEL, max_tokens=4096, temperature=0.2,
+                            system=SYSTEM, messages=history) as stream:
+    for text in stream.text_stream:
+        ws.send_json({"delta": text})
+    ws.send_json({"done": True})
+```
+
+```python
+# after
+with client.messages.stream(model=MODEL, max_tokens=4096,
+                            system=SYSTEM, messages=history) as stream:
+    answer = ""
+    for event in stream:
+        if event.type == "content_block_delta" and event.delta.type == "text_delta":
+            answer += event.delta.text
+            ws.send_json({"html": render_markdown(answer), "done": False})
+        elif event.type == "message_stop":
+            ws.send_json({"html": render_markdown(answer), "done": True})
+```
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Request two timestamps per delta: when the event arrived from the provider and when the socket send finished.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the provider-side generation rate was, output tokens divided by total time minus time to first token, before and after.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask whether you can replay one recorded long stream through the old and new handlers offline.</p></details>
+
+## Answer
+
+The new loop calls `render_markdown(answer)` on the whole accumulated answer for every text delta, and sends the whole rendered HTML each time. Work per delta grows with the answer so far, so total work grows with the square of its length. The first delta is cheap, so time to first token does not move; short answers stay under the point where the handler falls behind; long answers spend more time in rendering and in serialising ever-larger snapshots than the model spends generating. While the handler is busy, events queue behind it and the last one reaches the browser late.
+
+That explanation fits every row of the evidence, but the evidence is incomplete: there is no CPU or per-event timing. Before changing code, collect the two timestamps per delta from hint 1. If the gap between arrival and send grows through the answer, the handler is the bottleneck. Replaying a recorded long stream through both handlers offline confirms it without production traffic. Without those measurements, ship the fix behind a flag and compare p99 for long answers between flagged and unflagged traffic.
+
+Ranking the others, each with its measurement:
+
+1. **Temperature back to 1.0** is real. Under 2026-10-21 the parameter returns a 400 even at its default, the upgrade removed it, and the migration guide says no other setting replaces the effect. Measured output length rose about 8 percent, which explains about 8 percent of streaming time, not 100. It still needs its own follow-up: answer quality and length on the route's evals at the default temperature, or keep the route on `2023-06-01` until they pass.
+2. **Socket payload growth** is part of the same defect, not a separate one: each snapshot carries the whole answer, so bytes sent grow with the square of the length too. Measure bytes per stream before and after.
+3. **Adaptive thinking.** Measure time to first token and compare `usage.output_tokens` before and after. Both say no.
+4. **The Authorization header.** Measure gateway time per request; it is paid once, before the first byte.
+
+The decision is how to fix rendering, and two answers are defensible. **Render on the server, throttled and incremental**: render at most every few tens of milliseconds, or only the trailing unfinished block, and send diffs. The frontend's HTML protocol stays; the cost is server CPU and code that must handle markdown constructs spanning deltas, such as an open code fence. **Send text deltas and render in the browser**: the old protocol's cost profile returns and the server does constant work per delta; the cost is reverting the frontend team's protocol change and moving markdown sanitisation to the client, which security will want to review. The constraint conflict is the frontend team's protocol against a latency regression users already feel; I would ship the throttle this week because it keeps both teams' changes, and plan the protocol decision with the frontend owner.
+
+Failure mode of the throttle: a time-based throttle delays the final snapshot by up to one interval if the last delta lands just after a render, and a block-based renderer mis-renders when a delta closes a construct opened many deltas earlier. Always render on `message_stop` regardless of the throttle, and test with answers that open a code fence early and close it late.
+
+<Depth>
+<Fragment slot="short">
+<p>The new handler re-renders and re-sends the whole answer on every delta, so client work is quadratic in answer length: first token unchanged, long answers late. Confirm with per-delta arrival and send timestamps; fix by throttled or incremental rendering, or by sending deltas and rendering in the browser. Separately, evaluate the route at the default temperature, because the upgrade removed <code>temperature=0.2</code>.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Two changes shipped in one pull request: an API version that forced a sampling change, and a protocol that made the handler quadratic. The latency symptom points at the second, because it touches neither time to first token nor short answers. The sampling change is a quality and length change that latency dashboards will not show.</p>
+<p>Process fix: version upgrades that change request semantics ship separately from protocol changes, and the stream handler gets a benchmark that replays a long recorded stream and fails if time grows faster than linearly with length.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The frontend lead says server-side rendering is non-negotiable for XSS reasons. Which fix do you ship, and what latency do you accept for the longest answers?</li>
+<li>What would you need to see after the throttle ships to also revert the socket protocol?</li>
+<li>Product wants <code>temperature=0.2</code> back. Do you pin the route to <code>2023-06-01</code>, and what retires that pin?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Pushback:* the replay benchmark adds minutes to every CI run. Which half of the coverage do you cut, and what regression do you accept missing?
+- *Reversal:* what would per-delta timestamps have to show for you to drop the rendering hypothesis and reopen the provider side?
+- *Operating:* the model behind this route retires in sixty days and the replacement only accepts default sampling. Twelve of forty eval prompts regress on length. Which ship, and who signs?
+
+## Common mistakes
+
+- Attributing the slowdown to the provider because the upgrade touched the API version.
+- Reading "time to first token unchanged" as "streaming is fine".
+- Fixing the latency and forgetting the sampling change that shipped with it.
+- Throttling renders without a final render on `message_stop`.

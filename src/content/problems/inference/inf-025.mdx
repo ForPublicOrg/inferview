@@ -1,0 +1,126 @@
+---
+id: inf-025
+title: What a shared system prompt saves in the prefix cache
+subtitle: hit rate and prefill compute at forty requests a second, then with a salt per tenant
+track: inference
+module: faster-cheaper
+type: estimate
+difficulty: medium
+seniority: [senior, staff]
+minutes: 25
+core: false
+tags: [prefix-caching, prefill, flops, kv-cache, multi-tenant, routing]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: vLLM documentation, automatic prefix caching design
+    url: https://docs.vllm.ai/en/latest/design/prefix_caching.html
+    note: "Each full block is hashed from its parent block's hash, its tokens and extra keys (LoRA ids, multimodal hashes, cache salt); only full blocks are cached; free blocks are evicted least recently used first; a cache_salt is injected into the first block's hash so only requests with the same salt share blocks. Checked 2026-10-28."
+  - title: GitHub advisory GHSA-935w-9g4m-p28p (CVE-2026-105752), vLLM Harmony tool continuations drop cache_salt
+    url: https://github.com/advisories/GHSA-935w-9g4m-p28p
+    note: "Published 2026-09-28, low severity, fixed in vLLM 0.30.0: tool-continuation prompts on one endpoint were cached without the caller's salt, so another tenant could read cached-token counts and learn whether a prefix had been cached. Checked 2026-10-28."
+  - title: Qwen2.5-7B-Instruct model card and config
+    url: https://huggingface.co/Qwen/Qwen2.5-7B-Instruct
+    note: "7.61B parameters, 6.53B non-embedding; 28 layers; 28 query heads and 4 KV heads; hidden size 3,584; untied embeddings; BF16. Checked 2026-10-28."
+  - title: NVIDIA H100 product page
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: "H100 SXM: 80 GB, 3.35 TB/s, 1,979 TFLOPS BF16 Tensor Core with sparsity (dense is half). Checked 2026-10-28."
+range: { low: 1.3, high: 2.0, unit: PFLOP/s of prefill saved across the fleet }
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+Estimate the prefix-cache hit rate and the prefill compute it saves for a shared system prompt, at a stated request rate and replica count. Then say what changes when security asks for a cache salt per tenant.
+</Callout>
+
+Scenario inputs, not a real deployment:
+
+- Qwen2.5-7B-Instruct in BF16, 8 replicas, one H100 SXM each, behind a round-robin load balancer.
+- 40 requests per second at peak.
+- Every request opens with the same 3,000-token system prompt (tool catalogue and policies), followed by a mean of 600 tokens of tenant and user content. Mean output is 300 tokens.
+- vLLM with prefix caching on and a block size of 16 tokens.
+
+Estimate:
+
+1. the share of prompt tokens served from the cache at peak;
+2. the prefill compute saved per second across the fleet, in PFLOP/s;
+3. what happens to both when the security review requires a `cache_salt` per tenant across 150 tenants.
+
+State the assumptions you choose.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how the cache decides that two prompts share a block, and what happens to a block that is only partly shared.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask which of the model's parameters a prompt token actually passes through during prefill.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>For part 3, ask for the request rate of the smallest tenants and how much KV memory each replica has left for blocks nobody is using.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>About 83% of prompt tokens hit: 187 full blocks, 2,992 tokens of the 3,600. That saves about 4.1 × 10^13 FLOPs per request and about 1.6 PFLOP/s across the fleet, roughly a fifth of each replica's dense BF16 peak. The dominant term is 2 FLOPs per non-embedding parameter per cached token; attention over the prefix adds under 5%. A salt per tenant does not change the arithmetic while every tenant's prefix stays resident on every replica, and it breaks when the small tenants' requests arrive further apart than the cache's eviction horizon. Routing by tenant is the fix for that, and it brings its own hot-spot problem.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>Hit rate.</b> vLLM caches full blocks only, and each block's hash includes its parent's, so a block is shared only if every token before it matches. 3,000 / 16 = 187.5. That gives 187 full blocks, 2,992 tokens; the 188th block mixes 8 system-prompt tokens with user content and differs per request. Each replica receives a request every 8 / 40 = 0.2 s, and every request touches the prefix, so least-recently-used eviction never reaches it. Cold misses happen once per replica after a restart or a scale-out. The hit rate is 2,992 / 3,600 = 83%.</p>
+<p><b>FLOPs per cached token, the choice to defend.</b> A prompt token passes through every projection and MLP matrix once, 2 FLOPs per parameter. The embedding is a lookup, and an engine that samples only after the last prompt position runs the output head once per request, not once per token, so the right count is the 6.53B non-embedding parameters: 2 × 6.53 × 10^9 = 1.31 × 10^10 FLOPs per token. Using the 7.61B total is the common choice and overstates the cost by about 17%.</p>
+<p><b>Attention over the prefix.</b> Causal attention over n tokens costs about n² × d for the scores and n² × d for the weighted values, with d = 28 heads × 128 = 3,584. For n = 2,992 that is 2 × 2,992² × 3,584 = 6.4 × 10^10 FLOPs per layer, 1.8 × 10^12 over 28 layers.</p>
+<p><b>Per request.</b> 2,992 × 1.31 × 10^10 = 3.91 × 10^13 FLOPs, plus 0.18 × 10^13 for attention, 4.09 × 10^13 in total.</p>
+<p><b>Fleet.</b> 40 × 4.09 × 10^13 = 1.64 × 10^15 FLOP/s, about 1.6 PFLOP/s. With total parameters it is 1.9. The band, 1.3 to 2.0, admits either parameter count, with or without attention, and with or without the block rounding.</p>
+<p><b>What that is in GPUs.</b> Per replica, 1.64 × 10^15 / 8 = 2.0 × 10^14 FLOP/s. NVIDIA lists 1,979 TFLOPS BF16 with sparsity, so about 990 dense. The cache saves about 21% of each replica's dense peak. At an assumed 50% of peak during prefill, the prefix would take 4.09 × 10^13 / (0.5 × 9.9 × 10^14) = 83 ms of GPU time per request, which is time-to-first-token the cache removes.</p>
+<p><b>Part 3: a salt per tenant.</b> The salt goes into the first block's hash, so 150 tenants make 150 copies of the same prefix. Their size:</p>
+<ul>
+<li>KV per token is 2 × 28 layers × 4 KV heads × 128 × 2 bytes = 57,344 bytes.</li>
+<li>One copy is 2,992 × 57,344 = 172 MB.</li>
+<li>Round-robin sends every tenant to every replica, so each replica holds up to 150 × 172 MB = 25.7 GB of prefixes.</li>
+</ul>
+<p>The memory budget, a reader-chosen assumption:</p>
+<ul>
+<li>80 GB, less 15.2 GB of weights (7.61B × 2 bytes) and a few GB of workspace, leaves about 50 GB of KV.</li>
+<li>Active sequences hold their own tails. Per replica that is 5 requests per second × about 6 s in the system × 900 unshared tokens × 57 KB ≈ 1.5 GB.</li>
+</ul>
+<p>So the copies fit, and while every tenant's prefix stays resident the hit rate and the 1.6 PFLOP/s do not change.</p>
+<p><b>The assumption that flips it.</b> Finished requests leave their unshared blocks in the cache. At 5 requests per second × 900 tokens × 57 KB, that is about 0.26 GB per second of churn. With about 48 GB free and 25.7 GB of it holding prefixes, a block survives roughly (48 - 25.7) / 0.26 ≈ 86 s without being touched. Suppose (scenario) the 20 largest tenants carry 80% of traffic and the other 130 share 8 requests per second.</p>
+<ul>
+<li>Each small tenant sends 0.06 requests per second, which round-robin spreads to 0.0075 per second per replica.</li>
+<li>The chance its next request lands within 86 s is 1 - e^(-0.0075 × 86) ≈ 48%.</li>
+<li>Small tenants are 20% of requests. About half of those now miss, so the fleet hit share drops by about a tenth and the saving falls toward 1.5 PFLOP/s.</li>
+</ul>
+<p>The result is sensitive to these inputs. With a 12,000-token prompt the 150 copies need 103 GB, more than the replica has, and the small tenants miss almost every time.</p>
+<p><b>The decision: round-robin with salts, or routing by tenant.</b></p>
+<ul>
+<li><i>Keep round-robin.</i> Cost: the small tenants' hit rate falls, by an amount that grows with prompt length and tenant count.</li>
+<li><i>Route each tenant to a home replica</i> by consistent hashing with a load bound. Each replica then holds about 19 prefixes, and each small tenant reaches its replica 8 times as often, so its prefix effectively never leaves. Cost: a tenant whose traffic exceeds one replica's share has to spill to a second replica, which then misses. A replica failure moves its tenants and their cold prefixes at once. And the router needs the tenant id, which it may not see today.</li>
+</ul>
+<p>The constraint conflict is isolation against compute. The salt exists because a shared cache is a membership oracle: GHSA-935w-9g4m-p28p, fixed in vLLM 0.30.0, is a case where one endpoint dropped the salt, and another tenant could read cached-token counts to learn whether a prefix had been cached. For a system prompt that is identical for every tenant and secret from none, the salt protects nothing. A narrower design salts only the blocks after the shared prompt. That needs the engine to support a salt that starts at a chosen block rather than the first, and vLLM's documented salt goes into the first block.</p>
+<p><b>How the estimate fails.</b> It assumes the cached prefix is byte-identical. A timestamp, a tenant name or a reordered tool list in the first 3,000 tokens changes every block hash after it, and the hit rate falls to the blocks before the first difference.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Security will accept an unsalted shared prompt only if you can show the prompt contains nothing tenant-specific. How do you prove that on every deploy?</em></li>
+<li><em>What would make you move from round-robin to tenant routing?</em> A measured hit rate for the small tenants below the share the arithmetic predicts, at a prompt length or tenant count you expect within the quarter.</li>
+<li><em>The tool catalogue in the prompt changes weekly. What does a change cost on the first request after the deploy, and does it matter?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+The worked figure for the band is 1.64 PFLOP/s: 40 requests per second × (2,992 cached tokens × 2 × 6.53 × 10^9 + 1.8 × 10^12 of prefix attention). Unreasonable choices land outside the band:
+
+- 6 FLOPs per parameter. That is the training figure: forward and backward.
+- Counting the 600 user tokens as cached. They differ per request and start inside a block that already differs.
+- Answering per replica, 0.2 PFLOP/s, when the question asks for the fleet.
+- Expecting round-robin to lower the hit rate for one shared prompt. With a request every 0.2 s on every replica, it stays resident everywhere.
+
+## Follow-ups
+
+- *Prefill is 40% of each replica's GPU time at peak. Does the cache let you drop a replica?* Only if the replicas are prefill-limited at peak and decode keeps its latency target with the batch that results; measure step time with the extra load before cutting.
+- *How would you measure the hit rate in production rather than estimate it?* Cached prompt tokens over total prompt tokens per replica and per tenant, from the engine's usage counters, alongside TTFT split by hit and miss.
+
+## Common mistakes
+
+- Counting the partly shared block, or assuming the cache matches at token granularity.
+- Using 6N, or total parameters with the output head applied to every prompt token.
+- Treating a per-tenant salt as free because the prompt text is the same.
+- Forgetting that finished requests' blocks stay in the cache and set how long an idle tenant's prefix survives.

@@ -1,0 +1,118 @@
+---
+title: Fusion, torch.compile, Triton and CUDA graphs
+track: training
+module: gpu-kernels
+order: 3
+kind: lesson
+level: senior
+minutes: 13
+summary: What fusion saves in HBM traffic, what each torch.compile mode trades, why CUDA graphs need static shapes and no CPU synchronisation, and when a hand-written Triton or CUDA kernel is worth its upkeep.
+prerequisites: [training/gpu-kernels/roofline-training]
+updated: 2026-10-28
+sources:
+  - title: PyTorch 2.14 documentation, torch.compile
+    url: https://docs.pytorch.org/docs/2.14/generated/torch.compile.html
+    note: "modes default, reduce-overhead (CUDA graphs, 'useful for small batches'), max-autotune (Triton or template matmuls, CUDA graphs on by default on GPU) and max-autotune-no-cudagraphs; reduced overhead 'can come at the cost of more memory usage'; CUDA graphs only for CUDA-only graphs that do not mutate inputs; dynamic None, True and False; fullgraph; inductor as the default backend; recompile_limit default 8, then fall back to eager, or FailOnRecompileLimitHit with fullgraph=True; caches are per code object. Checked 2026-10-28."
+  - title: PyTorch 2.14 documentation, CUDA semantics
+    url: https://docs.pytorch.org/docs/2.14/notes/cuda.html
+    note: "CUDA graph capture constraints: non-default stream, CPU-GPU synchronising ops such as .item() prohibited, dynamic control flow prohibited unless via torch.cond, dynamic shapes prohibited, CPU work elided on replay, same memory addresses on every replay, private memory pools; whole-network and partial capture with make_graphed_callables; caching allocator, empty_cache, PYTORCH_ALLOC_CONF expandable_segments (experimental, default False) and max_split_size_mb as a last resort; timing with synchronize or events; CUDA_LAUNCH_BLOCKING=1. Checked 2026-10-28."
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "the ladder PyTorch, torch.compile, Triton, CUDA ranked by ease, speed and flexibility; a standalone Triton kernel beat torch.compile at small sizes, which the authors attribute to compilation time; a tiled CUDA matmul reached about 6.6 TFLOPS. Checked 2026-10-28."
+  - title: Horace He, Making Deep Learning Go Brrrr From First Principles
+    url: https://horace.io/brrr_intro.html
+    note: "fusing x.cos().cos() cuts 4 global reads and writes to 2, a 2x speedup; about 280 thousand PyTorch operations per second on tiny tensors in the post's measurement. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The ladder, and where to stop on it
+
+The Ultra-Scale Playbook ranks the ways to get a kernel: plain PyTorch (easy, slow), torch.compile (easy, fast, not flexible), Triton (harder, faster, more flexible) and CUDA (hardest, fastest and most flexible if done right). Each rung costs more to write and much more to keep: a hand-written kernel needs its own backward, its own numerical tests and a re-check on every framework and driver upgrade. The decision is how far up to climb for a given op, and the previous lesson already gives the bound on what any rung can win: the bytes a bandwidth-bound op stops moving, or the launches an overhead-bound step stops paying for.
+
+## What fusion saves
+
+An unfused chain of k pointwise ops on a tensor reads and writes the tensor k times. Fused into one kernel, it reads once and writes once. Horace He's example is `x.cos().cos()`: four global reads and writes unfused, two fused, a 2x speedup for an op that is entirely bandwidth-bound. Fusion does nothing for FLOPs; the arithmetic is the same.
+
+<Predict id="trn-fuse-chain" question="Scenario: after the MLP up projection, a 268 MB BF16 activation goes through a bias add, a GELU and a dropout as three separate kernels. Ignoring dropout's mask, how many milliseconds does fusing the three into one kernel save at 3.35 TB/s?" answer={0.32} tolerance={0.03} unit="ms">
+<p>Unfused: three kernels, each reading and writing 268 MB, 6 × 268 = 1,610 MB, 0.48 ms. Fused: one read and one write, 537 MB, 0.16 ms. The saving is <b>about 0.32 ms</b> per layer per micro-batch in the forward pass. Fold the chain into the matmul's epilogue as well and the read disappears too.</p>
+</Predict>
+
+The same arithmetic tells you where fusion is not worth the effort. Fusing a residual add with the LayerNorm after it saves one write and one read of a 4,096 × 8,192 BF16 activation, 67 MB, about 0.02 ms. Against the roughly 6.7 ms of forward matmul compute in a layer of the previous lesson's scenario block (2.22 ms for the QKV and output projections together, 4.44 ms for the two MLP matmuls), that is 0.3%. A custom kernel for it is rarely worth writing by hand; a compiler that fuses it for free is.
+
+## torch.compile: modes and their costs
+
+`torch.compile` traces Python into graphs and hands them to a backend, Inductor by default, which fuses pointwise and reduction ops into generated kernels. The PyTorch 2.14 documentation lists four modes:
+
+| Mode | What it adds | Cost |
+|---|---|---|
+| `default` | fusion and code generation | compile time on first call and on each recompilation |
+| `reduce-overhead` | CUDA graphs, described as useful for small batches | more memory, because workspace memory is cached; only applies to CUDA-only graphs that do not mutate inputs |
+| `max-autotune` | Triton or template matmuls chosen by benchmarking, with CUDA graphs on by default on GPU | longest compile time, plus the CUDA-graph constraints |
+| `max-autotune-no-cudagraphs` | autotuning without CUDA graphs | compile time |
+
+Two parameters decide how often you pay compile time again. A compiled frame is guarded on the properties it was traced with, including input shapes. With `dynamic=False` every new shape is a new specialisation. With the default `dynamic=None` PyTorch detects that a dimension changed and compiles a more dynamic kernel on the recompile. With `dynamic=True` it tries to generate the most dynamic kernel up front. A frame keeps at most `recompile_limit` compiled results, 8 by default, and then falls back to eager; with `fullgraph=True`, hitting the limit raises `FailOnRecompileLimitHit` instead. The caches are per code object, so a function compiled once and called from many places shares one set of results.
+
+`fullgraph=False`, the default, lets the tracer split the function at anything it cannot capture, a graph break, and run that piece in Python. Each break ends a fused region and adds a return to the interpreter, so a model with a print, a data-dependent Python branch or a `.item()` in the middle compiles into several smaller graphs with less fusion between them. `fullgraph=True` turns every break into an error, which is the way to find them.
+
+## CUDA graphs: what capture freezes
+
+A CUDA graph records a sequence of kernel launches once and replays it with one launch from the CPU. It attacks the overhead regime: in Horace He's measurement PyTorch issued about 280 thousand operations per second on tiny tensors, about 3.6 µs each. A scenario step of 2,000 small kernels would spend 2,000 × 3.6 µs = 7.2 ms issuing them; if the GPU work takes 5 ms, the CPU is the bottleneck and a graph replay removes most of that 7.2 ms.
+
+Replay works because nothing about the recorded launches changes, and the CUDA semantics notes list what that forbids. During capture, ops that synchronise the CPU with the GPU, such as `.item()`, are prohibited, as is control flow that depends on CPU or GPU data unless expressed with `torch.cond`. Dynamic shapes are prohibited. CPU work is not captured and is skipped on replay. Every replay reads and writes the same memory addresses, which is why graph inputs must be copied into static buffers and why graphs own a private memory pool that lives until the graph and every tensor it created are gone.
+
+The consequence for training is that a CUDA graph is a specialisation on shape. Feed a `reduce-overhead` model a new sequence length and it needs a new graph, with its own memory, on top of a recompile. Bucketing sequence lengths to a small fixed set of shapes is what makes CUDA graphs usable with variable-length data. Where a whole step cannot be captured, `torch.cuda.make_graphed_callables()` graphs the safe parts and leaves the rest eager.
+
+## The caching allocator, and timing honestly
+
+PyTorch does not return freed GPU memory to the driver; its caching allocator keeps freed blocks for reuse. `torch.cuda.empty_cache()` releases unused cached blocks, but the documentation is explicit that it does not increase the memory available to PyTorch, because tensors in use are not freed. Calling it every step only forces the allocator to request memory from the driver again. Fragmentation from varying allocation sizes, for example varying batch shapes, is what `PYTORCH_ALLOC_CONF=expandable_segments:True` addresses (experimental, off by default in 2.14); `max_split_size_mb` is documented as a last resort for out-of-memory failures.
+
+Kernel launches are asynchronous, so a Python timer around a GPU op measures the launch, not the work. Time with `torch.cuda.synchronize()` before reading the clock or with CUDA events. `CUDA_LAUNCH_BLOCKING=1` makes every launch synchronous; it is for locating the op that raised an error, and timings taken under it measure a different program.
+
+## When a hand-written kernel is worth it
+
+The procedure, applied per op:
+
+1. Compute the ceiling: bytes removed times occurrences per step divided by 3.35 TB/s, or launches removed times launch cost. If the ceiling is under a few percent of step time, stop.
+2. Try `torch.compile` with `fullgraph=True` on the region, fix the graph breaks it reports, and measure. Automatic fusion of pointwise and norm chains usually reaches most of the ceiling.
+3. Write Triton when the compiler cannot express the fusion: an op that needs a custom tiling, an online reduction across a dimension (the pattern behind FlashAttention), or an epilogue the compiler does not fuse. Triton keeps the kernel in Python and portable across NVIDIA generations.
+4. Write CUDA when the kernel needs hardware features the higher rungs do not expose well, such as explicit TMA pipelines or cluster shared memory, and when a team will own it through upgrades.
+
+The Playbook's own numbers show why step 4 is rare: a correct, tiled CUDA matmul reached about 6.6 TFLOPS, 0.67% of the H100's dense BF16 peak. The rung is the fastest only for engineers who already know how to reach the hardware's limits.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"A research team wants a hand-written CUDA kernel for a new normalisation that the compiler handles with three graph breaks. The platform team of three must support it through quarterly PyTorch upgrades, and the run starts in six weeks. What do you build?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>First remove the graph breaks; they are usually Python-side causes (a scalar pulled to the CPU, a data-dependent branch) and fixing them may give most of the fusion for free. If the compiled result is still far from the bandwidth floor, write the kernel in Triton, not CUDA, with a backward and a numerical test against the eager reference. CUDA is justified only if Triton cannot reach the floor and someone owns the kernel through upgrades. The cost of Triton is a few percent of possible speed; the cost of CUDA is a maintenance line item every quarter.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Size the prize before choosing the rung. A normalisation is bandwidth-bound; its floor is its tensor bytes over 3.35 TB/s, and the gap between its measured time and that floor, times its occurrences per step, is the most any kernel can win. If that is 1% of step time, no rung is worth six weeks.</p>
+<p>Fix graph breaks with <code>fullgraph=True</code> as the detector. Each break ends a fused region, so three breaks can mean four separate kernels where one would do. If the breaks come from a value pulled to the CPU, express the computation on the GPU; if from a branch on data, see whether it can be <code>torch.cond</code> or hoisted.</p>
+<p>If compiled performance is still short, the two defensible choices are Triton, which the team can read and which ports across GPU generations, at the cost of some peak performance; and CUDA, which can reach the floor and use TMA or clusters, at the cost of an owner for every upgrade and a slower path to fix numerical bugs. With a three-person platform team, choose Triton unless the measured gap justifies a named owner.</p>
+<p>Either kernel needs a gate before the run: forward and backward compared with the eager op across the real shapes and dtypes, with tolerances set from the eager op's own run-to-run variation, and a short training run comparing loss curves. The failure mode is a kernel that matches on test shapes and diverges on a shape the test did not cover, such as a hidden size that is not a multiple of the tile.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The Triton kernel is 15% slower than the research team's CUDA prototype. They want the prototype shipped. Who decides, and on what numbers?</li>
+<li>After a PyTorch upgrade, the compiled model recompiles at the first step of every epoch. What do you check first?</li>
+<li>What would you need to see to delete the custom kernel and go back to the compiler's output?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Compile time is real time. For a short fine-tuning job or an evaluation loop that changes shapes, compilation and autotuning can cost more than they save, and `max-autotune` has the longest compile of the modes. Measure end to end, including the first steps.
+
+Fusion changes the order of floating-point operations, so a fused kernel does not match the eager result bit for bit. Test against tolerances derived from the reference's own variation, not against equality, and expect loss curves to differ in the low digits.
+
+The mode descriptions here are from the PyTorch 2.14 documentation. Defaults such as the recompile limit and which modes enable CUDA graphs are version-specific; check the documentation for the version you run.
+
+<SelfRate id="lesson:training/gpu-kernels/fusion-compile" />

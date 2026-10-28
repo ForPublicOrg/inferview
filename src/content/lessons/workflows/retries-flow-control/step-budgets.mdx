@@ -1,0 +1,155 @@
+---
+title: "Playbook: cost and latency budgets per step"
+track: workflows
+module: retries-flow-control
+order: 3
+kind: playbook
+level: senior
+minutes: 13
+summary: Give every step its own token budget, timeout, retry budget and model tier, and set each one from what the step's failure costs downstream, which in an extraction pipeline with a review queue is usually the reviewer, not the model.
+prerequisites: [workflows/retries-flow-control/retries-model-steps]
+updated: 2026-10-28
+sources:
+  - title: Timeouts, retries and backoff with jitter (Marc Brooker, Amazon Builders' Library, 2019-12-05)
+    url: https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter
+    note: choose an acceptable false-timeout rate (0.1 percent in the example) and read the matching latency percentile (p99.9); pad when p99.9 sits close to p50
+  - title: Scaling catalog attribute extraction with multi-modal LLMs (Instacart, 2025-08-01)
+    url: https://company.instacart.com/tech-innovation/scaling-catalog-attribute-extraction-with-multi-modal-llms
+    note: PARSE; a cheaper model matched quality on simpler attributes at 70 percent lower cost and lost 60 percent accuracy on difficult ones; confidence from a yes or no self-verification prompt; low-confidence values go to human auditors; models and datasets not named
+  - title: Accelerating large-scale test migration with LLMs (Airbnb Engineering, Charles Covey-Brandt; no date on the page)
+    url: https://airbnb.tech/?p=366
+    note: per-step loop runner with a configurable attempt count; retry prompts carried validation errors and the latest file; prompts of 40,000 to 100,000 tokens; most files done by 10 attempts, long-tail files retried 50 to 100 times; 75 percent in four hours, 97 percent after four days of tuning
+  - title: Claude docs, batch processing
+    url: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+    note: batch prices at 50 percent of standard; Claude Sonnet 5.5 at $1 input and $5 output per million tokens; Claude Haiku 5.5 at $0.05 and $0.25 for prompts up to 100,000 tokens; most batches within 1 hour, 24-hour expiry unbilled
+  - title: Claude docs, rate limits
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: OTPM counts generated tokens and ignores max_tokens; workspace spend limits
+  - title: OpenAI API docs, rate limits
+    url: https://developers.openai.com/api/docs/guides/rate-limits
+    note: the rate limit is calculated as the maximum of max_tokens and the estimated tokens
+---
+
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+A per-run cap, such as a maximum spend or a maximum number of turns, stops a runaway workflow after the damage. It does not say which step spent the money or the time, and it lets one slow or expensive step consume the allowance of the steps after it. The decision this playbook covers is the budget each step gets, as four numbers written next to the step definition:
+
+**A token budget**: the input the step may send and its `max_tokens`.
+
+**A timeout**: per attempt, read from the step's latency distribution.
+
+**A retry budget**: how many attempts, and for repair loops, how much the prompt may grow.
+
+**A model tier**: which model runs the step, and whether a cheaper model runs first.
+
+The run's budget is then the sum of the steps' budgets, and an overrun is attributed to a step before anyone opens a trace.
+
+## Inputs that change it
+
+**The cost of the step's failure downstream.** If a failed extraction goes to a human reviewer, the reviewer's cost per item sets how much model spend a retry is worth. If it goes to a nightly re-run, failure is cheap and the retry budget can be small.
+
+**The latency distribution per step and model.** Model latency grows with output length, so a classification step and an extraction step on the same model have different percentiles. Brooker's procedure picks the timeout by choosing an acceptable false-timeout rate, 0.1 percent in his example, and reading the matching percentile, p99.9.
+
+**How the provider counts `max_tokens`.** Claude's OTPM counts tokens as they are generated and ignores `max_tokens`. OpenAI calculates the rate limit as the larger of `max_tokens` and the estimate, so a generous `max_tokens` on a high-volume step spends rate-limit headroom it never uses. On OpenAI, the output budget is also a capacity decision.
+
+**Prompt growth in repair loops.** Airbnb's test-migration pipeline retried each step up to a configurable number of attempts, and each retry prompt carried the validation errors and the latest version of the file. Its prompts ran from 40,000 to 100,000 tokens; most files finished within 10 attempts, and long-tail files were retried 50 to 100 times. A repair attempt costs more than the first attempt and the cost rises with each one.
+
+**Whether a cheaper model is good enough for this step's inputs.** Instacart's PARSE platform found a cheaper model matched quality on simpler attributes at a 70 percent cost reduction, and lost 60 percent accuracy on difficult ones. The post does not name the models or the evaluation set, so treat the numbers as the shape of the trade-off, not as transferable values.
+
+## The options
+
+**Per-run cap only.** Wins when the workflow is short, the steps cost about the same, and an overrun is rare enough that a person investigates each one. Loses as soon as one step dominates cost or latency, because the cap cannot say which.
+
+**Fixed per-step budgets.** Wins for pipelines with stable inputs: extraction, classification, summarisation over a known corpus. Each step's token, timeout and retry numbers come from its measured distribution, and the review queue catches what exhausts its budget.
+
+**A cascade inside a step.** A cheaper model runs first; a confidence signal decides whether the expensive model runs. Instacart's confidence signal was a second yes or no prompt asking whether the extracted value is entailed, with the token probability of "yes" as the score, and values below the threshold went to human auditors. Wins when the input mix is mostly easy and the confidence signal separates easy from hard. Loses on inputs where the cheap model is confidently wrong, because those never escalate.
+
+**A batch lane for the step.** Wins when nobody waits for the step's result. Claude's batch prices are 50 percent of standard, most batches finish within an hour, and unprocessed requests expire after 24 hours without charge, which replaces the per-attempt timeout with a deadline on submission time.
+
+## Worked decision: a three-step extraction
+
+The case is a scenario with every assumption labelled. A pipeline reads business documents of about 6,000 tokens each (scenario) and runs three steps:
+
+1. **Classify** the document type on Claude Haiku 5.5, 50 output tokens (scenario).
+2. **Extract** the fields as JSON on Claude Sonnet 5.5, 800 output tokens (scenario).
+3. **Validate**, and on failure **repair** on Sonnet 5.5: each repair attempt resends the document plus the previous output and the validation errors, adding 1,000 tokens per attempt (scenario), so attempt k sends 6,000 + 1,000k input tokens.
+
+Documents that exhaust the repair budget go to a review queue. Scenario rates: 15 percent of documents fail validation after step 2; half of those are fixed by the first repair, half of the rest by the second. A reviewer costs $3.00 per document (scenario: 3 minutes at a loaded $60 per hour). Prices are the batch prices from Claude's batch-processing page, because nobody waits for this pipeline: Haiku 5.5 at $0.05 input and $0.25 output per million tokens, Sonnet 5.5 at $1 and $5.
+
+| Step | Calculation | Cost per call |
+|---|---|---|
+| Classify (Haiku 5.5) | 6,000 × $0.05/M + 50 × $0.25/M | $0.0003125 |
+| Extract (Sonnet 5.5) | 6,000 × $1/M + 800 × $5/M | $0.0100 |
+| Repair attempt 1 | 7,000 × $1/M + 800 × $5/M | $0.0110 |
+| Repair attempt 2 | 8,000 × $1/M + 800 × $5/M | $0.0120 |
+| Repair attempt 3 | 9,000 × $1/M + 800 × $5/M | $0.0130 |
+
+With a repair budget of two attempts, a failing document costs $0.011 + 0.5 × $0.012 = $0.017 in repairs, or 0.15 × $0.017 = $0.00255 per document overall. Model cost per document: $0.0003125 + $0.0100 + $0.00255 = $0.0129. The share that reaches review is 0.15 × 0.25 = 3.75 percent, at $3.00 each: $0.1125 per document. Review is 90 percent of the pipeline's cost per document ($0.1125 of $0.1254). At standard prices the model cost doubles to $0.0257 and review is still 81 percent.
+
+So the dominant term is the review queue, and the retry budget should be set against it.
+
+<Predict id="wfl-rfc-third-repair" question="A third repair attempt costs $0.013 and, if it succeeds, saves one $3.00 review. Below what success probability (in percent) does the third attempt cost more than it saves?" answer={0.43} tolerance={0.05} unit="%">
+<p><b>About 0.43 percent.</b> Break-even is $0.013 / $3.00 = 0.0043. If more than about 1 in 230 documents that reach attempt 3 are fixed by it, the attempt pays. Even ten attempts with the prompt growing each time cost $0.155 in total, a twentieth of one review. In this pipeline the repair budget is bounded by time, rate-limit headroom and the risk of a wrong value that passes validation, not by token cost. Airbnb's 50 to 100 retries on long-tail files follow the same logic, against a manual estimate of 1.5 years of engineering time.</p>
+</Predict>
+
+The cascade question for step 2 has the same structure. Running extraction on Haiku 5.5 first costs 6,000 × $0.05/M + 800 × $0.25/M = $0.0005, plus a self-verification prompt of about 6,800 input tokens at $0.00034: $0.00084 per document. Escalating a fraction e to Sonnet adds e × $0.010. The cascade is cheaper than Sonnet alone whenever $0.00084 + $0.010e is below $0.010, that is, for any escalation rate below 92 percent. Cost never decides it; accuracy does. A wrong value that passes validation and skips review is the expensive outcome, and Instacart's 60 percent accuracy drop on difficult attributes is the warning. The decision: route attributes known to be difficult straight to Sonnet, cascade only the simple ones, and measure the error rate among values the cheap model was confident about.
+
+The token budget per step follows from the output distribution. On a Claude batch, a `max_tokens` of twice the step's p99.9 output length costs nothing in rate limit and guards against a runaway generation. On OpenAI the same headroom is counted against TPM on every request, so the budget sits closer to the measured tail.
+
+The timeout per step comes from its own percentiles. Scenario latencies for the online version of this pipeline: classify p99.9 of 6 seconds, extract and repair p99.9 of 60 seconds. At a 0.1 percent false-timeout rate, step timeouts are 6 and 60 seconds; the run's worst case with one retry per call and two repairs is 2 × 6 + 2 × 60 + 2 × (2 × 60) = 372 seconds plus backoff. That figure is the run budget, derived rather than chosen. On the batch lane, per-call timeouts give way to one deadline: submit early enough that the 24-hour expiry falls after the result is needed.
+
+<Callout kind="gotcha">
+If p99.9 sits close to p50, Brooker notes the timeout needs padding, because a small shift in latency then times out a large share of calls. Model steps with short, fixed outputs, such as classification, often have that shape.
+</Callout>
+
+## What to measure after deciding
+
+**Cost per document per step**, from the provider's usage fields, so a regression is attributed to a step on the day it ships.
+
+**Repair success by attempt number.** The break-even above holds only while the marginal success rate of the last allowed attempt stays above it; if attempt 2 fixes almost nothing, cut it.
+
+**Review rate and review age.** Review is the dominant cost; a model or prompt change that moves it by a point moves the pipeline's cost more than any token optimisation.
+
+**Escalation rate and confident-error rate in the cascade.** Sample values the cheap model was confident about and check them by hand; this is the number that says whether the cascade is safe.
+
+**False-timeout rate per step**, against the 0.1 percent chosen, and the p99.9 it was set from, recomputed when the model or the output length changes.
+
+## In the room
+
+The three-step pipeline goes online for a customer-facing intake form. The product owner wants a 30-second p95 for the whole run, finance wants model cost per document held at today's batch level, and the review team is already at capacity. Set the per-step budgets and say what gives.
+
+<Depth>
+<Fragment slot="short">
+<p>The three constraints cannot all hold: online prices are double batch, and the repair loop alone can exceed 30 seconds at the tail. I keep the latency target for the first pass and give up the cost target, then shrink review load. Classify and extract run online with timeouts from their p99.9; repairs move off the request path to an asynchronous lane at batch prices, with the user shown the extracted fields as pending. The repair budget stays at two attempts or more, because one avoided review pays for hundreds of repair calls.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Cost first. Online, model cost per document is about $0.0257 against $0.0129 on batch. Finance's target can be met only by cutting model calls: a cascade on simple attributes cuts the extraction step's cost for any escalation rate below 92 percent, so the trade is accuracy on confidently wrong values, which I measure by sampling before turning it on for difficult attributes.</p>
+<p>Latency. A 30-second p95 leaves room for classify and extract at their medians, not for repairs, so repair cannot sit on the request path. The run budget splits into a synchronous part (classify plus extract, with timeouts at 6 and 60 seconds and no retry on the request path beyond one) and an asynchronous part (repairs, then review). The user sees a pending state for the 15 percent that fail validation.</p>
+<p>Review capacity. At 3.75 percent of documents reaching review, the team's capacity sets a ceiling on daily volume. More repair attempts reduce that share at trivial model cost; I raise the budget and watch the marginal success rate per attempt. What I give up, in writing: the cost target is missed by up to twice the batch figure for documents that need the large model, and 15 percent of users see a pending state. Failure mode: a repair that passes validation with a wrong value now reaches the customer's record without review, so the validation rules carry more weight than before and need their own tests.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Finance rejects the doubled cost. Which step moves to the cheaper model, and what confident-error rate would you accept in writing?</li>
+<li>The provider's p99.9 for the extraction step rises from 60 to 110 seconds after a model update. Which budgets change automatically and which need a decision?</li>
+<li>The review team says repaired documents are more often wrong than first-pass ones. What would you need to see to cut the repair budget to zero?</li>
+<li>Two senior engineers disagree on per-step budgets versus one run budget with a dashboard. What evidence settles it without deciding by rank?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The worked case assumes failures are visible. Validation catches a malformed JSON object or a missing field; it does not catch a well-formed wrong value. When most errors are silent, the review queue is not the dominant cost, the downstream consequence of an unreviewed error is, and the budgets should be set against a sampled error rate rather than the review price.
+
+Per-step budgets assume steps are independent. In an agent loop, where the next step depends on the last step's output, a tight budget on one step moves cost to the next, and a run-level budget with per-step attribution is the better control.
+
+The arithmetic is linear in the scenario rates. If repair success falls sharply after the first attempt, or reviewers cost more for documents that failed repair, the break-even moves; the procedure holds, the numbers do not.
+
+Prices were read from Claude's batch-processing page on 28 October 2026. Instacart's and Airbnb's figures are each company's own measurements under conditions their posts only partly describe.
+
+<SelfRate id="lesson:workflows/retries-flow-control/step-budgets" />

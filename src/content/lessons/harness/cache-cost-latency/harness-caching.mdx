@@ -1,0 +1,174 @@
+---
+title: Prompt caching inside a harness
+track: harness
+module: cache-cost-latency
+order: 1
+kind: lesson
+level: staff
+minutes: 14
+summary: A harness re-sends the whole conversation on every turn and the provider caches it by exact prefix, so any change near the front of the request is a full-price re-read; Claude Code and Codex publish which session events do that, and a session's hit rate and bill can be computed from its event list.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Claude Code docs, How Claude Code uses prompt caching (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/prompt-caching
+    note: "layer table (system prompt and tools, project context, conversation); the list of actions that invalidate the cache and the list that keep it; CLAUDE.md read once at session start, mid-session edits neither invalidate nor apply until /clear, /compact or restart; effort keeps the cache on Opus 5.5, Sonnet 5.5, Haiku 5.5 and Fable 5.1 with an API key or subscription; TTL buckets (one hour for the main conversation on a subscription within plan usage, five minutes otherwise); gateways that strip cache_control bill the whole history uncached; Prompt cache (main) line in /usage from v2.1.251"
+  - title: OpenAI, Unrolling the Codex agent loop (Michael Bolin, 2026-01-23)
+    url: https://openai.com/index/unrolling-the-codex-agent-loop/
+    note: "cache misses from changing tools, the model, sandbox configuration, approval mode or working directory; initial MCP support enumerated tools in an inconsistent order; honouring an MCP server's tool-list change mid-conversation can cause an expensive miss; agent loop quadratic in JSON sent, caching makes sampling linear; sandbox, approval and cwd changes handled by appending a new message; no previous_response_id, to keep requests stateless and support Zero Data Retention"
+  - title: Model Context Protocol specification 2025-11-25, Tools
+    url: https://modelcontextprotocol.io/specification/2025-11-25/server/tools
+    note: "the listChanged capability and the notifications/tools/list_changed notification a server sends when its tool list changes"
+  - title: Claude API docs, Prompt caching (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: "prefix order tools, system, messages; 5-minute write 1.25x and 1-hour write 2x base input; reads 0.1x, 0.05x on Opus 5.5 and Sonnet 5.5; the lifetime runs from the start of the request that writes or reads the entry; total input = cache reads + cache writes + input_tokens"
+  - title: Claude API docs, Pricing (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: "Opus 5.5 $4 input, $5 5-minute write, $0.20 cache hit, $20 output per million tokens; fast mode on Opus 5.5 $8 input and $40 output, with caching multipliers applied on top; Haiku 5.5 $0.10 input and $0.125 5-minute write up to 100K-token prompts, $0.50 and $0.625 above; Haiku 4.5 $1 input and $1.25 write; Opus 4.6 $5 input, $6.25 write, $0.50 read, $25 output; the 5-minute write pays off after one read and the 1-hour write after two"
+  - title: Thariq Shihipar, Lessons from building Claude Code, prompt caching is everything (2026-04-30)
+    url: https://claude.com/blog/lessons-from-building-claude-code-prompt-caching-is-everything
+    note: "the team alerts on cache hit rate and declares a SEV when it drops; past breaks from a timestamp in the system prompt, non-deterministic tool order and changed Agent tool parameters; plan mode as tools; deferred tool stubs with defer_loading; compaction run with the parent's prefix; switching from Opus to Haiku 100k tokens in can cost more than letting Opus answer"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The mechanism
+
+Every turn, a coding agent's harness re-sends the system prompt, tool definitions, project context, every earlier message and tool result, and the new input. Codex makes the trade-off explicit: it skips the Responses API's `previous_response_id` so each request stays stateless and Zero Data Retention works. The JSON sent over a conversation therefore grows quadratically, and the Codex post says that cache hits are what make sampling linear instead.
+
+The provider's prompt cache is keyed on an exact prefix. Claude Code's documentation states the consequence plainly: a change anywhere in the prefix recomputes everything after it, and there is no per-file or per-segment caching. On the Claude API the prefix order is tools, then system, then messages, and a change at one level invalidates that level and every later one. Two dimensions sit outside the content and partition the cache entirely: the model (each model has its own cache) and, in Claude Code, the speed setting (fast mode and standard speed keep separate caches). On most models, effort is a third.
+
+The harness designer is deciding which session events may touch the front of the request. Claude Code orders each request so the layers that change least come first:
+
+| Layer | Content | Changes when |
+|---|---|---|
+| System prompt | Core instructions, tool definitions | The set of loaded tool definitions changes |
+| Project context | CLAUDE.md, auto memory, unscoped rules | Session start, `/clear`, `/compact` |
+| Conversation | Messages, responses, tool results | Every turn |
+
+## What breaks the cache in Claude Code
+
+Claude Code's prompt-caching page (checked 2026-10-28) lists the actions that cost a full or partial re-read, each a one-time slower and more expensive turn.
+
+**Switching models.** The next request reads the whole history with no cache hits. Several switches are easy to miss: the `opusplan` setting runs Opus in plan mode and Sonnet otherwise, so every plan-mode toggle is a switch; automatic model fallback after a safety classifier flag is a switch; and a skill whose frontmatter names a different `model` is a switch for that turn, with the session model resuming on the next prompt.
+
+**Changing effort, on most models.** On Opus 5.5, Sonnet 5.5, Haiku 5.5 and Fable 5.1, with an API key or a Claude subscription, effort changes keep the cache. On Bedrock, Google Cloud's Agent Platform, a Claude apps gateway, with `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` set, or under a HIPAA configuration, they do not. Before v2.1.260, effort changes on Fable 5.1 invalidated the cache too.
+
+**Turning on fast mode.** The first enablement in a conversation reads the whole conversation uncached at fast-mode rates. Automatic fallback to standard speed after a rate limit, and the return to fast mode, count as toggles.
+
+**Changing the tool set, when tools load upfront.** Tool definitions are in the first layer. With tool search deferring MCP tools (the default on supported models), Claude Code keeps the tool list from the conversation's first request for the whole conversation, and a server that connects later supplies deferred definitions loaded on demand. Without tool search, a server connecting or a dynamic tool update adding tools invalidates the cache, as does deliberately removing a tool. Denying a whole tool by bare name behaves the same way: harmless with tool search, a full re-read without it. Scoped rules like `Bash(rm *)` never change the tool list, because they are checked at call time.
+
+**Compaction.** By design it replaces the conversation layer. The system prompt layer stays cached, and the project context layer stays cached only if CLAUDE.md and memory are unchanged since session start. The summarisation request itself repeats the parent's system prompt, tools and history, so with a warm cache it reads the prefix; after a break longer than the TTL it reprocesses that history uncached, which is why compacting a resumed old session is the expensive case.
+
+**Image eviction.** Near the request's image or PDF limits, Claude Code removes a batch of the oldest images, and the conversation is reprocessed from the earliest changed message: one slow turn per batch.
+
+**Upgrades.** A new version usually changes the system prompt or tool definitions, so the first conversation after an upgrade, which applies on next launch, builds from the top.
+
+## What does not break it
+
+Editing CLAUDE.md mid-session does not invalidate the cache, and it also does not apply. Project-root and user CLAUDE.md files are read once at session start and held in memory; the new content loads on the next `/clear`, `/compact` or restart. Nested CLAUDE.md files and path-scoped rules load later, on demand, and an edit made before they load does take effect.
+
+Editing repository files appends a `<system-reminder>` noting the change; earlier reads in the history are not rewritten. Permission mode changes, output style changes (delivered as a message since v2.1.251), skill and command invocations, `/recap`, and spawning a subagent all append. `/rewind` truncates back to a prefix that every later turn has kept warm, so the next request hits an existing entry; the docs contrast this with compaction, which builds a new prefix.
+
+## The same rule in Codex
+
+OpenAI's post on the Codex agent loop (January 2026) lists the Codex events that can cause a miss: changing the tools available mid-conversation; changing the model; and changing the sandbox configuration, approval mode or working directory. Its mitigation is the pattern Claude Code uses. When the sandbox or approval mode changes, Codex inserts a new developer message in the same format as the original permissions block, and a working-directory change becomes a new user message in the format of the original environment context. State changes are appended, never edited in place.
+
+The post also records a bug worth remembering: Codex's initial MCP support did not enumerate tools in a consistent order, and every reordering was a miss. MCP servers can also change their tool list at any time (the protocol's `notifications/tools/list_changed`), and the post calls honouring that mid-conversation an expensive cache miss. Anthropic's Claude Code team reports the same class of mistakes in its own harness: a detailed timestamp in the static system prompt, tool definitions shuffled non-deterministically, and changed parameters on the Agent tool. The team alerts on cache hit rate and declares a SEV when it drops.
+
+Two rules fall out, both harness code rather than prompt text. Serialize tool definitions in a stable order and freeze the list at the first request. Represent mode changes as tools or appended messages: Claude Code's plan mode is a pair of always-present `EnterPlanMode` and `ExitPlanMode` tools, and deferred MCP tools are name-only stubs with `defer_loading: true` in a fixed order.
+
+## Predicting a session's hit rate
+
+The arithmetic needs the event list, the context size and the prices. A scenario, with numbers chosen to keep the sums visible: a Claude Code session on Opus 5.5 with an API key, so every request gets the five-minute TTL. Twenty requests, close enough together that the cache never expires. Hold the context at 100,000 input tokens per request, of which 2,000 are new each time (the previous turn's output and the new message). A warm request reads 98,000 tokens and writes 2,000; a cold request writes all 100,000.
+
+The events: at request 6 the user edits CLAUDE.md. At request 11 they run `/model` to switch to Sonnet 5.5. At request 16 an MCP server finishes connecting, with tool search on. At request 18 they turn on fast mode and leave it on; Sonnet does not support fast mode, so Claude Code also switches the session to Opus.
+
+<Predict id="hrn-cache-session-rate" question="What share of this session's input tokens are cache reads, in percent?" answer={83.3} tolerance={1} unit="%">
+<p>Requests 1, 11 and 18 are cold. The CLAUDE.md edit neither breaks the cache nor applies; the deferred MCP server leaves the tool list as it was at request 1. That leaves 17 warm requests: 17 × 98,000 = 1,666,000 tokens read out of 20 × 100,000 = 2,000,000, which is <b>83.3%</b>.</p>
+<p>Now price it, in dollars per million tokens. A warm Opus request costs 98,000 × $0.20 + 2,000 × $5, which is $0.0296; a cold one writes 100,000 × $5, $0.50, about 17 times as much. The switch writes 100,000 tokens at Sonnet 5.5's $2.50, $0.25, and the six warm Sonnet requests cost $0.0148 each. Fast mode doubles Opus input to $8 and the caching multipliers stack on it, so request 18 writes 100,000 tokens at $10: $1.00. The session's input bill is $2.22, of which the three cold requests are $1.75, or 79%. A hit rate of 83% by tokens coexists with most of the input spend going to misses.</p>
+</Predict>
+
+The same calculation as code, so a harness team can run it over real per-request usage instead of a flat context:
+
+```python
+# List prices, USD per million tokens (checked 2026-10-28)
+PRICES = {
+    "opus-5.5": {"write_5m": 5.00, "read": 0.20},
+    "opus-5.5-fast": {"write_5m": 10.00, "read": 0.40},  # fast input $8; caching multipliers stack
+    "sonnet-5.5": {"write_5m": 2.50, "read": 0.10},
+}
+BREAKS = {"tools_changed_upfront", "image_eviction", "compaction"}
+
+
+def session(requests, context=100_000, new=2_000):
+    """requests: (event, model) per request. Context held flat to keep the arithmetic visible.
+    A change of model or speed is a miss on its own: each has a separate cache."""
+    read = written = 0
+    dollars = 0.0
+    previous = None
+    for event, model in requests:
+        cold = model != previous or event in BREAKS
+        r = 0 if cold else context - new
+        w = context - r
+        read, written = read + r, written + w
+        dollars += (r * PRICES[model]["read"] + w * PRICES[model]["write_5m"]) / 1e6
+        previous = model
+    return read / (read + written), dollars
+
+
+events = [(None, "opus-5.5")] * 10 + [(None, "sonnet-5.5")] * 7 + [(None, "opus-5.5-fast")] * 3
+events[5] = ("claude_md_edit", "opus-5.5")
+events[15] = ("mcp_connect_deferred", "sonnet-5.5")
+print("hit rate {:.1%}, input bill ${:.4f}".format(*session(events)))
+# hit rate 83.3%, input bill $2.2236
+```
+
+In production, use the usage fields on every response instead: `cache_read_input_tokens`, `cache_creation_input_tokens` and `input_tokens` sum to the request's total input. Claude Code's `/usage` adds a `Prompt cache (main)` line with the session's hit ratio and miss count (v2.1.251 and later), and since v2.1.260 it names the likely cause of the last miss, for example `tool definitions changed`. The OpenTelemetry exporter carries cache read and creation tokens per user and session for fleet views.
+
+## TTL is a second budget
+
+A cache entry lives five minutes by default or one hour on request, and each hit resets the timer. The Claude API docs add a detail that matters for agents: the lifetime runs from the start of the request that wrote or read the entry, not from the end of its response, so a response that streams for four minutes leaves about one minute for the follow-up.
+
+The write premium is the price of the longer TTL: 1.25 times base input for five minutes, 2 times for one hour. With reads at 0.1 times base, the pricing page notes that the five-minute write pays off after one read and the one-hour write after two. Claude Code gives the main conversation one hour only on a subscription within plan usage, and five minutes everywhere else unless `promptCacheTtl` (v2.1.242 and later) says otherwise. A headless fleet on an API key whose tool calls routinely take longer than five minutes pays for a full rewrite after every slow tool call, and the one-hour TTL fixes that at the cost of a larger write premium on every turn.
+
+Placement also leaks across the network boundary: behind an LLM gateway that strips `cache_control` markers while returning success, Claude Code's docs say the entire history bills as uncached input on every turn. A two-turn session and the usage fields will show it.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your platform runs headless coding agents on an API key. Last month's release added a per-repository MCP server whose tool list changes with the checked-out branch, and a router that sends short follow-ups to a cheaper model. Product wants both kept. Agent spend is up and finance wants it back to the old level within two weeks. What do you change, and in what order?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Measure before changing: split each request's input into cache reads, cache writes and uncached input, and attribute every cold request to the event before it. Both features are cache breakers by construction. The branch-dependent tool list invalidates the first layer whenever it changes, unless tools are deferred or frozen at the first request; the router is a model switch, and each switch re-reads the whole history at the new model's write price. Freeze or defer the MCP tools first, because that keeps the feature and removes the miss. Replace the router with a subagent that gets a short hand-off, so the cheaper model starts from a small prefix instead of the full history.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Attribution comes first because the two features have different fixes. Pull a week of per-request usage, mark each request where reads drop to zero, and join against tool-list hashes and model IDs. That gives misses by cause and the dollar cost of each.</p>
+<p>For the MCP server: with Claude Code's tool search on, mid-session changes arrive as deferred definitions and the prefix survives; with it off, every branch change is a full re-read. In a custom harness, use deterministic order, a list frozen at the first request, and changes announced as appended messages or reached through a search tool. What you give up: a tool added on a new branch costs the model a search call.</p>
+<p>For the router: compute the break-even per model pair and context size. Switching re-reads the whole context at the new model's write price; staying pays the old model's read and output prices. Where the switch loses, a subagent with a hand-off message keeps the parent's cache and gives the cheaper model a short prefix.</p>
+<p>The risk note: deferring tools can lower task success if the model fails to search for a tool it needs, so ship behind a flag and compare resolved-task rate as well as spend.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Finance accepts the fix, but the security team requires that a revoked MCP tool disappear from the agent's tool list immediately, which invalidates the prefix. How do you satisfy both, and what does each revocation cost at your context sizes?</li>
+<li>The router's model is cheaper to rewrite on than your main model's warm turn at every context size you see. Does your recommendation reverse, and what would you measure to decide?</li>
+<li>Your hit rate is 90% by tokens but misses are 70% of input spend. Which number goes on the dashboard, and which one pages someone?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The event lists are vendor documentation for specific versions: Claude Code's output-style and Fable effort behaviour both changed within v2.1.x, and the Codex list is from January 2026. Verify with the usage fields, not the docs.
+
+The flat-context arithmetic misprices misses: real sessions grow, so a model switch at request 30 costs more than one at request 3.
+
+The economics depend on the price ratio, which moves. With reads at 0.05 times base on Opus 5.5 and Sonnet 5.5, warm turns are cheaper and each miss is a larger share of the bill. The blog's Opus-to-Haiku rule depends on the pair. With Opus 4.6 and Haiku 4.5, rewriting 100,000 tokens on Haiku costs $0.125 against about $0.06 for a warm Opus turn's input (98,000 at $0.50 plus 2,000 at $6.25 per million). With Opus 5.5 and Haiku 5.5 under its 100K-token tier, the rewrite costs $0.0125 against $0.0296 and the switch wins on input; at 150,000 tokens the upper tier makes the rewrite $0.094 against $0.0396, and the rule holds again.
+
+Finally, the cache lives wherever the model is served. On Amazon Bedrock, caching support, minimum prefix length and the one-hour TTL vary by model and region, and a gateway decides whether caching works at all. Claude Code's own scope rules (machine, directory, and the git status snapshot taken at startup) mean two sequential sessions in the same repository can miss each other's cache.
+
+<SelfRate id="lesson:harness/cache-cost-latency/harness-caching" />

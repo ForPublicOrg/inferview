@@ -1,0 +1,123 @@
+---
+id: wfl-027
+title: Invoice to ERP with typed handoffs and payload limits
+track: workflows
+module: approvals-handoffs
+type: workflow
+difficulty: hard
+seniority: [senior, staff]
+minutes: 40
+tags: [claim-check, payload-limits, temporal, contracts, idempotency, approvals]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Temporal Cloud limits
+    url: https://docs.temporal.io/cloud/limits
+    note: 2 MB maximum payload for a single request; 4 MB per gRPC message; Event History limited to 51,200 events or 50 MB, with a warning at 10,240 events or 10 MB (checked 2026-10-28)
+  - title: Inngest usage limits
+    url: https://www.inngest.com/docs/usage-limits/inngest
+    note: 4 MiB returned by one step; 32 MiB of run state across event data, step data, function return data and metadata; 1,000 steps per function (checked 2026-10-28)
+  - title: Cloudflare Workflows, rules of workflows
+    url: https://developers.cloudflare.com/workflows/build/rules-of-workflows/
+    note: a non-stream step.do() return value can persist up to 1 MiB and a larger one fails the step; store large outputs externally (for example in R2) and pass a reference; check before a non-idempotent call (checked 2026-10-28)
+  - title: Anthropic, How we built our multi-agent research system (2025-06-13)
+    url: https://www.anthropic.com/engineering/multi-agent-research-system
+    note: subagents store their work in external systems and pass lightweight references back to the coordinator (checked 2026-10-28)
+checklist:
+  - Moves PDFs and large extraction output by reference with a content hash, and keeps every step payload under the engine's limit with a margin
+  - Chooses and defends a size for inline versus by-reference, or defends always passing references, and states the cost of the choice
+  - Gives every step boundary a typed contract with a version, and says what a workflow paused across a deploy does with an older version
+  - Makes stored artefacts immutable and keeps them longer than the longest approval wait plus the retry window
+  - Deduplicates vendor resends on vendor and invoice number at intake, not on the file hash
+  - Records an intent before the ERP post, checks the ERP for the invoice before posting, and reconciles an ambiguous result instead of retrying it
+  - Retries model extraction within a per-invoice budget, and never retries the ERP post blindly
+  - Validates extraction against arithmetic and the purchase order before any posting step trusts it
+  - Sends only exceptions to a clerk, with a stated variance tolerance and a named approver for each exception type
+  - Puts access control and deletion on the artefact store, since workflow history no longer holds the invoice data
+  - Has a rollout with a shadow period and named rollback triggers that respects the month-end freeze
+  - States what is given up, such as payloads no longer visible in workflow history when debugging
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The round">
+"Design the workflow that takes a vendor invoice from the inbox to a posted entry in our ERP. A model does the extraction. Walk me through the steps, what each step hands the next, and where a person comes in."
+</Callout>
+
+The constraints, as a scenario:
+
+- Invoices arrive by email as PDFs, many of them scans; the largest last quarter was tens of megabytes. Vendors often resend the same invoice.
+- Extraction output per invoice is a header, line items, and for each field the page and bounding box it came from, so a clerk can check it against the scan. For long invoices that output alone runs past a megabyte.
+- The workflow runs on Temporal Cloud. A second team runs a similar flow on Cloudflare Workflows, and the two teams want one contract between the steps.
+- The ERP's posting API cannot be changed. It takes no client reference, so posting the same invoice twice creates two entries.
+- No changes to the posting path in the last three business days of the month.
+
+Design the steps, the state and the contract each step returns, the retries, the approvals and the rollout. Choose a size rule for what travels inline, and defend it.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the size distribution of last quarter's PDFs and extraction outputs, not only the largest.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the ERP returns when you search for an invoice by vendor and invoice number, and how soon after a post the search sees it.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask how long an invoice has waited for a clerk in the worst case this year.</p></details>
+
+## Answer
+
+### The steps
+
+1. **Intake.** Store the PDF in object storage under its SHA-256, then start the workflow with a reference. Workflow ID is derived from the message ID so a re-delivered email does not start a second run.
+2. **Extract.** A model call returns the typed extraction. The full output, with bounding boxes, goes to object storage; the step returns the header and a reference to the rest.
+3. **Deduplicate.** Look up vendor and invoice number in the workflow's own table and in the ERP. A resend is a new file with a new hash and the same natural key, so the file hash cannot catch it.
+4. **Validate.** Line totals sum to the subtotal, tax and total agree, currency matches the purchase order, and quantities and prices match the purchase order and goods receipt within a tolerance.
+5. **Approve exceptions.** Only failures from steps 3 and 4, new vendors and changed bank details go to a clerk. Everything else proceeds.
+6. **Post.** Record a posting intent, search the ERP for the invoice, post only if it is absent, then record the ERP document number.
+
+### The contract between steps
+
+Each step returns an envelope: `schema` (for example `invoice.extracted`), a major and minor `version`, the small fields inline, and references for anything large as `{uri, sha256, bytes, media_type}`. Consumers reject an unknown major version and ignore unknown fields within a known major. A workflow that paused at the approval step before a deploy resumes under new code holding an envelope of the older version; the new code keeps reading that version until no paused workflow holds it. Both teams can share this envelope because it does not depend on either engine.
+
+### What travels inline: two defensible rules
+
+The limits differ by engine. Temporal Cloud caps a single request payload at 2 MB, Inngest caps one step's return at 4 MiB, and Cloudflare Workflows at 1 MiB (1,048,576 bytes), past which the step fails. A shared contract has to fit the smallest, so 1 MiB is the ceiling for anything returned inline.
+
+**Always by reference.** Every artefact larger than the header goes to object storage, whatever its size. One code path, payloads that never grow with the invoice, and no step that starts failing the month a vendor sends a longer invoice. The cost: every step does a storage read, workflow history shows hashes and URIs instead of data when you debug, and the artefact store needs its own access control, retention and deletion.
+
+**Inline below a threshold.** Return small outputs inline and switch to a reference above a size you pick. Debugging is easier and most invoices touch storage only at intake. The cost is two code paths, and history grows: if six steps each pass a 1 MB extraction inline in their inputs and results, that is about 12 MB of payload in one workflow's history, past Temporal's 10 MB warning and a quarter of the way to its 50 MB limit, from one long invoice.
+
+I would pass references always for the PDF and the full extraction, and inline only the header, which is bounded by its schema (a few kilobytes). The threshold rule is reasonable if the threshold is well under the 1 MiB ceiling, for example 256 KiB, so that an envelope plus metadata never approaches it. A threshold at 1 MiB is unreasonable: the first output a few bytes over fails the step on Cloudflare in production.
+
+### The ERP post
+
+The posting API takes no reference, so the workflow supplies the idempotency. The step writes an intent row keyed by vendor and invoice number, searches the ERP, and posts only if the invoice is absent; the Cloudflare rules give the same order for a charge. If the post times out, the step does not retry. It searches again after a delay, and if the ERP still cannot say, the invoice is marked unknown and a clerk reconciles it. A double post costs a reversal and a vendor overpayment risk; a delayed post costs a day.
+
+### Retries and budgets
+
+Extraction is retried with backoff up to a per-invoice budget in model calls; when it runs out, the invoice goes to a clerk as an exception rather than looping. Storage reads are retried freely. The ERP post is never retried by the engine's default policy, so its activity has retries disabled and its own logic above.
+
+### Approvals
+
+The clerk sees the scan with the extracted fields highlighted at their bounding boxes, the purchase order and the specific failure. The tolerance for price variance is a number to choose with AP: a few percent of the line or a small fixed amount, whichever is lower, is a reasonable start; a tolerance in the tens of percent approves the errors the check exists to catch. Bank-detail changes go to a different approver from price variances.
+
+### Where this fails
+
+The reference outlives its object. A lifecycle rule deletes artefacts after 30 days, an invoice waits 40 days for a disputed purchase order, and the resumed workflow holds a URI that returns 404. Retention must exceed the longest approval wait plus the retry window, the hash in the envelope is checked on every read so that a replaced object fails loudly, and the store is write-once.
+
+### What you give up, and the rollout
+
+Given up: payloads in workflow history, which made debugging a matter of reading one screen; a single store for invoice data, which now lives in object storage with its own deletion path; and same-day posting when the ERP search is ambiguous.
+
+Rollout: two weeks in shadow, where the workflow extracts and validates every invoice but clerks still post by hand, comparing the workflow's decision with the clerk's on each invoice. Then live for invoices with a purchase order and a known vendor, then the rest. Rollback triggers: any double post, or exceptions per day exceeding what clerks can clear in that day. No go-live step lands in the month-end freeze.
+
+## Follow-ups
+
+- *Shadow mode shows the model's extraction disagrees with clerks on one invoice in twenty, and AP wants to go live anyway for month end. Which invoices do you let through, and what do you accept in writing?*
+- *What would you need to see in a quarter of production data to drop the ERP search before every post?*
+- *The ERP vendor adds a client reference to the posting API next year. What do you remove, and what do you keep?*
+- *The other team wants the contract to carry the full extraction inline because their engine allows 4 MiB. How do you settle it without deciding by rank?*
+
+## Common mistakes
+
+- Deduplicating on the file hash. A rescanned or re-exported invoice has a new hash.
+- Letting the engine's default retry policy cover the ERP post.
+- Passing the PDF through the workflow as bytes because the first test invoice was small.
+- Versioning the contract but deploying a consumer that reads only the newest version while workflows are paused on the old one.

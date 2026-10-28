@@ -1,0 +1,125 @@
+---
+title: Context parallelism and ring attention
+track: training
+module: distributed
+order: 6
+kind: lesson
+level: staff
+minutes: 13
+summary: Context parallelism splits one long sequence across GPUs and exchanges keys and values so each shard can attend to the whole sequence, causal masking unbalances the work unless chunks are paired early with late, and its traffic hides behind attention compute that grows with the square of the length.
+prerequisites: [training/distributed/tensor-sequence]
+updated: 2026-10-28
+sources:
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: CP shards activations along the sequence; attention needs keys and values from the full sequence; Ring Attention overlaps computation and communication; naive causal splitting leaves early GPUs with less work, Zig-Zag assigns a mix of early and late tokens to each GPU to balance it; all-gather variant is simpler with more temporary memory, ring variant stores one extra chunk at a time with extra latency per step; CP is most valuable at 128k+ tokens; CP and FlashAttention both use online softmax; CP can raise the global batch for long sequences; full recomputation typically costs up to 30-40% more compute. Checked 2026-10-28.
+  - title: Dubey et al., The Llama 3 Herd of Models (arXiv 2407.21783)
+    url: https://arxiv.org/html/2407.21783
+    note: 405B configurations, 8,192 GPUs TP 8 CP 1 PP 16 DP 64 at 8,192 tokens and 430 TFLOPs/GPU, 43% MFU; 16,384 GPUs DP 128, 400 TFLOPs, 41%; 16,384 GPUs TP 8 CP 16 PP 16 DP 8 at 131,072 tokens, 380 TFLOPs, 38%; 16M tokens per batch in all three; dimensions ordered TP, CP, PP, DP; CP splits each sequence into 2 x CP chunks for load balance and all-gathers keys and values instead of a ring, justified by small K and V under GQA. Checked 2026-10-28.
+  - title: Liang et al., TorchTitan (arXiv 2410.06511v3)
+    url: https://arxiv.org/html/2410.06511v3
+    note: CP on Llama 3.1 8B with 8 H100s to 262,144 tokens; throughput 3,890 tokens/s at 32,768 tokens and 548 at 262,144, memory about 84 GiB; Llama 3.1 405B on 512 GPUs with 4D parallelism at 262,144 tokens, 16 tokens/s per GPU at 84.9 GiB; CP applies in the next outer mesh dimension after TP. Checked 2026-10-28.
+  - title: Korthikanti et al., Reducing Activation Recomputation in Large Transformer Models (arXiv 2205.05198)
+    url: https://arxiv.org/html/2205.05198
+    note: activation bytes per layer with TP, SP and selective recomputation sbh x 34/t. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The problem only long sequences have
+
+Every layer except attention treats tokens independently: projections, MLPs, norms. Shard the sequence across c GPUs and those layers need no communication at all, the same as data parallelism on tokens. Attention is the exception. Each query needs every earlier key and value, so a GPU holding tokens 96K to 128K cannot finish attention with its own K and V alone.
+
+The need appears at a specific scale. Take a scenario dense model with h = 8192, trained with tensor and sequence parallelism at t = 8 and selective recomputation. Korthikanti's sbh x 34/t gives, for one 131,072-token sequence, 131,072 x 8192 x 34 / 8 = 4.56 GB of activations per layer. A pipeline stage of 8 such layers needs 36.5 GB per micro-batch, before any model state and with one micro-batch in flight. The usual levers have been spent: TP is at the node size, the micro-batch is already one sequence, and full recomputation costs up to 30 to 40% more compute by the Playbook's figure. The remaining move is to split the sequence itself. With c = 16, each GPU holds 8,192 tokens and 285 MB per layer.
+
+The Playbook puts the threshold in the same place: CP is most valuable at extreme lengths, 128K tokens and above.
+
+## Two ways to get K and V where they are needed
+
+**All-gather.** Before each attention layer, every GPU all-gathers the full K and V from its c - 1 peers, then computes attention for its own queries against everything. Simple, and the attention kernel needs few changes; the Playbook's caveat is temporary memory for the whole sequence's K and V.
+
+**Ring.** Arrange the c GPUs in a ring. Each starts with its own K/V chunk, computes attention of its queries against it, then passes the chunk to its neighbour and receives the next, c - 1 times. The partial results merge with the same online-softmax rescaling FlashAttention uses across tiles: keep a running max and running denominator per query, rescale on each new chunk. Only one extra chunk is in memory at a time, and each transfer overlaps with the computation on the previous chunk. The cost is c - 1 sequential steps, each with its own latency.
+
+Llama 3 chose all-gather for its 405B run. The report justifies it by the small size of K and V under grouped-query attention, and the arithmetic shows why. With 8 KV heads of dimension 128 in BF16, a token's K and V take 2 x 8 x 128 x 2 = 4,096 bytes per layer.
+
+<Predict id="trn-dist-cp-kv" question="For a 131,072-token sequence at 4,096 bytes of K and V per token per layer, split across c = 16 GPUs, how many MiB does each GPU receive per layer in an all-gather of K and V?" answer={480} tolerance={2} unit=" MiB">
+<p>The full sequence's K and V are 131,072 x 4,096 = 536,870,912 bytes, 512 MiB. Each GPU already has 1/16 and receives the other 15/16: <b>480 MiB</b> per layer. Now the compute it hides behind. Causal attention for the whole sequence is about 2 x s^2 x h forward FLOPs for the score and value matmuls, 2 x 131,072^2 x 8192 = 2.8e14 per layer, 1.76e13 per GPU. At the 380 TFLOP/s per GPU Llama 3 reports for its long-context configuration, that is 46 ms. Receiving 480 MiB at an assumed 50 GB/s per GPU, a 400 Gb/s NIC not taken from the Llama report, takes 10 ms. Attention's quadratic compute is what makes CP's linear traffic cheap.</p>
+</Predict>
+
+Without GQA the bytes scale with the number of KV heads: 64 KV heads would be eight times the traffic, 80 ms at the same bandwidth, longer than the attention it should hide behind. CP's cost depends on the attention variant, which is a modelling decision the systems team does not control.
+
+## Causal masking unbalances the ring
+
+Split a causal sequence into c contiguous chunks and give chunk i to GPU i. GPU 0's queries attend only to chunk 0. GPU c - 1's queries attend to all c chunks. Counting attention work in chunk-pairs, GPU i does i + 1 units, so the total is c(c + 1)/2 and the busiest GPU does c of them. Every collective step waits on the busiest GPU.
+
+<Predict id="trn-dist-cp-imbalance" question="With contiguous chunks over c = 8 GPUs under a causal mask, what is the ratio of the busiest GPU's attention work to the average, 2c/(c + 1)?" answer={1.78} tolerance={0.02} unit="x">
+<p>The busiest GPU does 8 units, the average is 36 / 8 = 4.5, and the ratio is <b>1.78</b>. At c = 16 it is 32 / 17 = 1.88. Almost half the attention capacity of the group sits idle.</p>
+</Predict>
+
+The fix is to give every GPU an equal mix of early and late tokens. Cut the sequence into 2c chunks and give GPU i chunks i and 2c - 1 - i. Chunk j needs j + 1 units of work, so GPU i does (i + 1) + (2c - i) = 2c + 1 units, the same for every GPU. The Playbook calls this Zig-Zag attention; Llama 3's report describes splitting each sequence into 2 x CP chunks for load balancing, which is the same pairing.
+
+```python
+def causal_work(c, zigzag):
+    """Units of attention work per GPU: query chunk j attends to key chunks 0..j."""
+    if not zigzag:
+        return [i + 1 for i in range(c)]                        # chunk i on GPU i
+    n = 2 * c                                                   # 2c chunks, GPU i gets i and n-1-i
+    return [(i + 1) + (n - 1 - i + 1) for i in range(c)]
+
+
+for z in (False, True):
+    w = causal_work(8, z)
+    print("zigzag" if z else "contiguous", w, round(max(w) / (sum(w) / len(w)), 3))
+# contiguous [1, 2, 3, 4, 5, 6, 7, 8] 1.778
+# zigzag [17, 17, 17, 17, 17, 17, 17, 17] 1.0
+```
+
+Balance in a ring implementation is subtler than total work, because each ring step must be balanced too: at step k, every GPU computes against the chunk it just received, and with zig-zag some of those blocks are fully masked and some are full. Implementations skip masked blocks and split diagonal ones, and that bookkeeping is where most CP bugs live. Packed training sequences make it worse: a document mask inside a 128K sequence changes which blocks are empty, so a layout that balances a single causal document need not balance a pack of short ones.
+
+## What it costs in published runs
+
+Llama 3's 405B table is the cleanest measurement. At 8,192 tokens on 16,384 GPUs with TP 8, PP 16 and DP 128, it reports 400 TFLOP/s per GPU and 41% MFU. Its long-context stage at 131,072 tokens on the same 16,384 GPUs used TP 8, CP 16, PP 16 and DP 8 and reported 380 TFLOP/s and 38% MFU, with 16M tokens per batch in both. CP 16 at sixteen times the sequence length cost 3 points of MFU.
+
+Note what happened to data parallelism: it went from 128 to 8. CP consumes GPUs that data parallelism would otherwise use, and since the batch in tokens stayed at 16M, each sequence is 16 times longer and there are 16 times fewer of them. The Playbook lists CP among the levers for reaching a target global batch for long sequences for the same reason: at 128K tokens, data parallelism alone runs out of sequences before it runs out of GPUs.
+
+TorchTitan's CP numbers show the other side. On Llama 3.1 8B on 8 H100s, throughput fell from 3,890 tokens per second at 32,768 tokens to 548 at 262,144, 7.1 times lower for 8 times the length, with memory flat at about 84 GiB. CP kept memory constant; it did not make long sequences cheap, because attention FLOPs per token grow linearly with length.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"A 70B dense model with grouped-query attention has finished pretraining at 8K. You have 512 H100s for two weeks to extend it to 128K. The current layout is TP 8, PP 8, DP 8. The data team says long documents are scarce and most 128K training sequences will be packs of shorter documents. Choose the CP degree and the layout, and say what you give up."**
+</Callout>
+
+<p class="tiny">The model, cluster and data situation are a scenario.</p>
+
+<Depth>
+<Fragment slot="short">
+<p>CP 8 in place of DP 8: TP 8, PP 8, CP 8, DP 1, so each GPU holds 16K tokens. That keeps the per-GPU activation footprint at twice the 8K stage, which selective recomputation absorbed, and K/V traffic with GQA hides behind attention. The global batch becomes 8 times fewer sequences per step at constant tokens; with DP 1, every step needs enough micro-batches per pipeline to keep the bubble down, so I would cut PP to 4 if memory allows. Packed sequences need a document-aware mask and a balance check, or zig-zag balance is lost.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Memory sets the floor: at 128K the activations per sequence are 16 times those at 8K. Splitting the sequence 8 ways brings each GPU to 16K tokens, twice the 8K footprint; whether that fits depends on the headroom measured in the 8K stage, so I would confirm with one layer at 16K before committing. CP 16 would halve it again but takes the GPUs from PP or TP, since DP is already gone.</p>
+<p>The cost of CP 8 replacing DP 8 is the batch structure. With DP 1, a pipeline replica must take every sequence in the step, so m equals the number of sequences per step. If the global batch is 4M tokens, that is 32 sequences of 128K, m = 32 and a PP 8 bubble of 7/32 = 22%. Cutting PP to 4 gives 3/32 = 9% but doubles per-GPU parameters. That is the decision to test on day one.</p>
+<p>Packing changes the balance argument. A pack of short documents has a block-diagonal mask, so most cross-chunk blocks are empty and the ring steps carry K/V that no query needs. Either use a document-aware kernel that skips empty blocks, or accept that CP traffic is wasted on packed data and keep the share of packed sequences in mind when reading throughput. Failure mode of the plan: if the long-document share is small, the model learns 128K attention mostly from packs whose documents never attend across the boundary, which is a data problem CP cannot fix. Written down: CP degree, PP degree, expected MFU against the 8K stage, and the fraction of genuinely long documents.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Day one shows MFU at 25% against 40% in the 8K stage. Which three measurements separate imbalance, exposed K/V traffic and pipeline bubble?</li>
+<li>The modelling lead wants full multi-head attention for the extension. Redo the K/V traffic and say whether CP 8 still hides.</li>
+<li>Two weeks is not enough for 128K at this MFU. Would you ship 64K instead, or 128K on fewer tokens, and who decides?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The hiding argument compares forward attention FLOPs to one all-gather. The backward pass sends gradients of K and V back around the group, and in a ring each step carries latency. At moderate lengths attention is not yet large enough to hide that, which is why the Playbook places CP's value at 128K tokens and above.
+
+The balance argument assumes one causal document per sequence. Sliding-window attention, document masks in packed sequences and mixtures of local and global layers each change which blocks have work, and each needs its own assignment.
+
+CP shards activations, not parameters. A model whose states do not fit still needs ZeRO, TP or PP, and CP only helps when activations, which grow with sequence length, are the binding term.
+
+Finally, the published MFU figures come from runs where long context was a short final stage. A model trained at long context throughout pays CP's cost on every token, and the 3-point gap in Llama 3's table is not evidence about that regime.
+
+<SelfRate id="lesson:training/distributed/context-parallel" />

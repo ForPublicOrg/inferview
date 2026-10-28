@@ -1,0 +1,531 @@
+---
+title: An eval and SFT data pipeline for production logs
+track: llmops
+module: data-curation
+kind: lab
+minutes: 100
+summary: Grow one curation program over five steps that removes exact and near-duplicate log records, redacts emails, card numbers and phone numbers with a checksum to spare order numbers, fails a batch on gate thresholds, and splits by user with a leakage check against the training side.
+updated: 2026-10-28
+sources:
+  - title: "Lee et al., Deduplicating Training Data Makes Language Models Better (arXiv 2107.06499, ACL 2022)"
+    url: https://arxiv.org/abs/2107.06499
+    note: "MinHash near-duplicate detection with banding, candidate pairs confirmed by a second similarity check; 4.60% of C4 validation examples have a near-duplicate in the training split. Checked 2026-10-28"
+  - title: Presidio documentation, home (checked 2026-10-28)
+    url: https://presidio.dataprivacystack.org/
+    note: "detection by named-entity recognition, regular expressions, rules and checksums with context; the project states there is no guarantee it finds all sensitive information"
+  - title: NVIDIA NeMo Curator documentation, About (v1.4.0, 26.09, checked 2026-10-28)
+    url: https://docs.nvidia.com/nemo/curator/latest/about/index.html
+    note: "text curation stages: download, extraction, language detection, heuristic filters, exact, fuzzy and semantic deduplication, classifier filters"
+steps:
+  - title: Exact dedup by normalised hash
+    brief: |
+      Two log records that differ only in case, Unicode width or whitespace are one training example. Write `normalise` and `exact_dedup`, which keeps the earliest copy of each normalised text and records which copy every dropped record lost to, so a later audit can explain each removal. The hidden test deduplicates 30,000 records in under five seconds, which a pairwise comparison does not finish.
+    starter: |
+      import hashlib
+      import re
+      import unicodedata
+
+
+      def normalise(text):
+          """Return text in the form two copies of one message share: NFKC, casefolded, whitespace collapsed, stripped."""
+          raise NotImplementedError
+
+
+      def exact_dedup(records):
+          """records: dicts with id, user, ts, text. Return (kept, dropped).
+
+          kept: the earliest record (by ts, then id) of each normalised text, in input order.
+          dropped: (id, "exact", kept_id) for every other record.
+          """
+          raise NotImplementedError
+    tests: |
+      def rec(i, user, ts, text):
+          return {"id": i, "user": user, "ts": ts, "text": text}
+
+      batch = [
+          rec("a", "u1", 3, "How do I  reset my password?"),
+          rec("b", "u2", 1, "how do i reset my password?"),
+          rec("c", "u3", 2, "Where is my invoice?"),
+          rec("d", "u1", 5, "HOW DO I RESET MY PASSWORD?\n"),
+      ]
+      kept, dropped = exact_dedup(batch)
+      assert [r["id"] for r in kept] == ["b", "c"]
+      assert sorted(dropped) == [("a", "exact", "b"), ("d", "exact", "b")]
+      assert normalise("\uFF26\uFF55\uFF4C\uFF4C  width	TEXT ") == "full width text"
+    hidden: |
+      import random as _r
+      import time as _t
+
+      _rng = _r.Random(7)
+      _texts = ["ticket %d about billing" % i for i in range(3000)]
+      _big = [{"id": "r%d" % i, "user": "u%d" % _rng.randrange(500), "ts": _rng.randrange(10**6),
+               "text": _rng.choice(["", " ", "  "]) + _rng.choice(_texts).upper() if i % 2 else _rng.choice(_texts)}
+              for i in range(30000)]
+      _start = _t.perf_counter()
+      _kept, _dropped = exact_dedup(_big)
+      assert _t.perf_counter() - _start < 5, "30,000 records must deduplicate in under 5 seconds"
+      assert len(_kept) + len(_dropped) == len(_big)
+      assert len({normalise(r["text"]) for r in _kept}) == len(_kept)
+      assert {normalise(r["text"]) for r in _kept} == {normalise(r["text"]) for r in _big}
+      _by_id = {r["id"]: r for r in _big}
+      _kept_ids = {r["id"] for r in _kept}
+      for _i, _why, _k in _dropped:
+          assert _why == "exact" and _k in _kept_ids
+          assert normalise(_by_id[_i]["text"]) == normalise(_by_id[_k]["text"])
+          assert (_by_id[_k]["ts"], _k) <= (_by_id[_i]["ts"], _i)
+      assert [r["id"] for r in _kept] == [r["id"] for r in _big if r["id"] in _kept_ids]
+      _shuffled = _big[:]
+      _rng.shuffle(_shuffled)
+      assert {r["id"] for r in exact_dedup(_shuffled)[0]} == _kept_ids
+    solution: |
+      import hashlib
+      import re
+      import unicodedata
+
+      _WS = re.compile(r"\s+")
+
+
+      def normalise(text):
+          return _WS.sub(" ", unicodedata.normalize("NFKC", text).casefold()).strip()
+
+
+      def _order(record):
+          return (record["ts"], record["id"])
+
+
+      def exact_dedup(records):
+          first = {}
+          for r in sorted(records, key=_order):
+              h = hashlib.sha256(normalise(r["text"]).encode()).hexdigest()
+              first.setdefault(h, r["id"])
+          keep_ids = set(first.values())
+          kept, dropped = [], []
+          for r in records:
+              if r["id"] in keep_ids:
+                  kept.append(r)
+              else:
+                  h = hashlib.sha256(normalise(r["text"]).encode()).hexdigest()
+                  dropped.append((r["id"], "exact", first[h]))
+          return kept, dropped
+  - title: Near-dedup with MinHash and banding
+    brief: |
+      Paraphrased tickets and retried messages share most of their character 5-grams without being identical. Write the shingler, a MinHash signature, and `near_dedup`, which finds candidates through band buckets and confirms each with the exact Jaccard similarity of the shingle sets. With 16 bands of 4 rows, a pair at similarity s becomes a candidate with probability 1 - (1 - s^4)^16: 0.988 at s = 0.7 and 0.9998 at s = 0.8, so the hidden tests check that no two kept records reach max(threshold, 0.85) and that every dropped record really is within the threshold of the record it lost to. Character shingles are the choice here because support messages are a sentence or two, too short for word 5-grams.
+    starter: |
+      import random
+
+
+      def shingles(text, k=5):
+          """Return the set of character k-grams of normalise(text); a text of k characters or fewer is one shingle."""
+          raise NotImplementedError
+
+
+      def jaccard(a, b):
+          raise NotImplementedError
+
+
+      def minhash(shingle_set, num_perm=64, seed=1):
+          """Return num_perm minimum hash values; the same set and seed always give the same signature."""
+          raise NotImplementedError
+
+
+      def near_dedup(records, threshold=0.8, bands=16, rows=4):
+          """Return (kept, dropped) as in exact_dedup, with reason "near".
+
+          Use bands x rows signature values to find candidates without comparing every pair, confirm a candidate by
+          its exact shingle Jaccard, and keep the earliest record of each group. Whether a record is compared with
+          every earlier record or only with kept ones is yours to decide; no two kept records may be near-duplicates.
+          """
+          raise NotImplementedError
+    tests: |
+      def rec(i, user, ts, text):
+          return {"id": i, "user": user, "ts": ts, "text": text}
+
+
+      base = "My order 4471 arrived damaged and I would like a replacement sent to the same address please"
+      batch = [
+          rec("n1", "u1", 1, base),
+          rec("n2", "u2", 2, base.replace("damaged", "damaged!!")),
+          rec("n3", "u3", 3, "Can I change the billing email on my account to a shared team inbox?"),
+          rec("n4", "u4", 4, base.replace("same address", "same address, thanks")),
+      ]
+      kept, dropped = near_dedup(batch)
+      assert [r["id"] for r in kept] == ["n1", "n3"]
+      assert {d[0] for d in dropped} == {"n2", "n4"} and all(d[1:] == ("near", "n1") for d in dropped)
+      assert minhash(shingles(base)) == minhash(shingles(base))
+      assert len(minhash(shingles(base), num_perm=32)) == 32
+    hidden: |
+      import random as _r
+
+      _rng = _r.Random(11)
+      _words = "account billing refund invoice password plan seat upgrade export team login card address order".split()
+      def _sentence(n):
+          return " ".join(_rng.choice(_words) for _ in range(n))
+      _errs = []
+      for _ in range(40):
+          _a = shingles(_sentence(25))
+          _b = shingles(_sentence(25)) if _rng.random() < 0.5 else set(list(_a)[: len(_a) * 3 // 4]) | {"zzzz%d" % _rng.randrange(99)}
+          _est = sum(x == y for x, y in zip(minhash(_a, 128), minhash(_b, 128))) / 128
+          _errs.append(abs(_est - jaccard(_a, _b)))
+      assert sum(_errs) / len(_errs) < 0.06, "the signature should estimate Jaccard similarity"
+      _base = [_sentence(20) for _ in range(60)]
+      _recs = []
+      for _i in range(300):
+          _t = _rng.choice(_base)
+          if _rng.random() < 0.5:
+              _w = _t.split()
+              _w[_rng.randrange(len(_w))] = _rng.choice(_words)
+              _t = " ".join(_w)
+          _recs.append({"id": "x%03d" % _i, "user": "u", "ts": _rng.randrange(1000), "text": _t})
+      for _thr in (0.7, 0.8):
+          _kept, _dropped = near_dedup(_recs, threshold=_thr)
+          _by = {r["id"]: r for r in _recs}
+          _kid = [r["id"] for r in _kept]
+          assert len(_kept) + len(_dropped) == len(_recs)
+          for _i, _why, _k in _dropped:
+              assert _k in _kid and _why == "near"
+              assert jaccard(shingles(_by[_i]["text"]), shingles(_by[_k]["text"])) >= _thr
+              assert (_by[_k]["ts"], _k) <= (_by[_i]["ts"], _i)
+          for _x in range(len(_kept)):
+              for _y in range(_x + 1, len(_kept)):
+                  assert jaccard(shingles(_kept[_x]["text"]), shingles(_kept[_y]["text"])) < max(_thr, 0.85), "two kept records are near-duplicates"
+    solution: |
+      import random
+
+      _P = (1 << 61) - 1
+
+
+      def shingles(text, k=5):
+          t = normalise(text)
+          if len(t) <= k:
+              return {t}
+          return {t[i:i + k] for i in range(len(t) - k + 1)}
+
+
+      def jaccard(a, b):
+          return len(a & b) / len(a | b) if a or b else 1.0
+
+
+      def _perms(num_perm, seed):
+          rng = random.Random(seed)
+          return [(rng.randrange(1, _P), rng.randrange(0, _P)) for _ in range(num_perm)]
+
+
+      def minhash(shingle_set, num_perm=64, seed=1):
+          xs = [int.from_bytes(hashlib.blake2b(s.encode(), digest_size=8).digest(), "big") for s in shingle_set]
+          return [min((a * x + b) % _P for x in xs) for a, b in _perms(num_perm, seed)]
+
+
+      def near_dedup(records, threshold=0.8, bands=16, rows=4):
+          sh = {r["id"]: shingles(r["text"]) for r in records}
+          buckets = {}
+          kept_ids, dropped = set(), []
+          for r in sorted(records, key=_order):
+              sig = minhash(sh[r["id"]], num_perm=bands * rows)
+              keys = [(b, tuple(sig[b * rows:(b + 1) * rows])) for b in range(bands)]
+              candidates = set()
+              for key in keys:
+                  candidates.update(buckets.get(key, ()))
+              best = None
+              for c in sorted(candidates):
+                  s = jaccard(sh[r["id"]], sh[c])
+                  if s >= threshold and (best is None or s > best[0]):
+                      best = (s, c)
+              if best:
+                  dropped.append((r["id"], "near", best[1]))
+                  continue
+              kept_ids.add(r["id"])
+              for key in keys:
+                  buckets.setdefault(key, []).append(r["id"])
+          return [r for r in records if r["id"] in kept_ids], dropped
+  - title: PII detectors with a checksum, and redaction
+    brief: |
+      Scrubbing runs before deduplication in the pipeline, so two tickets that differ only in the customer's email become exact duplicates. Write regex detectors for emails, card numbers and phone numbers. A 16-digit order number and a card number have the same shape, and only the card passes the Luhn check, so the detector checks it: redacting order numbers would destroy the field the support data is about. The hidden tests generate valid and invalid card numbers with every separator and check that redaction is idempotent and that spans never overlap.
+    starter: |
+      def luhn_ok(digits):
+          """True when the digit string passes the Luhn checksum."""
+          raise NotImplementedError
+
+
+      def detect(text):
+          """Return sorted, non-overlapping (start, end, kind) spans with kind in EMAIL, CARD, PHONE.
+
+          CARD is 13 to 19 digits, optionally separated by spaces or hyphens, that pass the Luhn check.
+          When two detections overlap, keep one by a rule you choose and can defend.
+          """
+          raise NotImplementedError
+
+
+      def redact(text):
+          """Replace every detected span with <KIND>."""
+          raise NotImplementedError
+    tests: |
+      def rec(i, user, ts, text):
+          return {"id": i, "user": user, "ts": ts, "text": text}
+
+      assert luhn_ok("4111111111111111") and not luhn_ok("4111111111111112")
+      assert redact("mail ana.p+bills@example.co.uk now") == "mail <EMAIL> now"
+      assert redact("card 4111 1111 1111 1111 expired") == "card <CARD> expired"
+      assert redact("order 4111111111111112 is late") == "order 4111111111111112 is late"
+      assert redact("call +1 415 555 0199 or (415) 555-0134") == "call <PHONE> or <PHONE>"
+      assert [k for _, _, k in detect("a@b.io 4111-1111-1111-1111")] == ["EMAIL", "CARD"]
+      t1 = redact("Refund to jo@acme.com please, order 77")
+      t2 = redact("Refund to sam.lee@acme.com please, order 77")
+      assert len(exact_dedup([rec("p", "u1", 1, t1), rec("q", "u2", 2, t2)])[0]) == 1
+    hidden: |
+      import random as _r
+
+      _rng = _r.Random(5)
+      def _card():
+          body = [_rng.randrange(10) for _ in range(15)]
+          for check in range(10):
+              s = "".join(map(str, body + [check]))
+              if luhn_ok(s):
+                  return s
+      def _sep(s):
+          g = _rng.choice(["", " ", "-"])
+          return g.join(s[i:i + 4] for i in range(0, len(s), 4))
+      _checked = 0
+      for _ in range(200):
+          _c = _card()
+          _bad = _c[:-1] + str((int(_c[-1]) + _rng.randrange(1, 10)) % 10)
+          _txt = "pay %s ref %s by mail x%d@shop.example" % (_sep(_c), _bad, _rng.randrange(999))
+          _out = redact(_txt)
+          assert _c not in re.sub(r"\D", "", _out.split(" ref ")[0]), "a Luhn-valid card number survived redaction"
+          assert _bad in _out, "a Luhn-invalid number was redacted"
+          assert "@" not in _out
+          assert redact(_out) == _out, "redaction is not idempotent"
+          for _s, _e, _k in detect(_txt):
+              assert 0 <= _s < _e <= len(_txt)
+          _spans = detect(_txt)
+          assert all(_spans[i][1] <= _spans[i + 1][0] for i in range(len(_spans) - 1)), "spans overlap"
+          _checked += 1
+      assert _checked == 200
+    solution: |
+      _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+      _CARD = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
+      _PHONE = re.compile(r"(?<![\d+])\+?(?:\d{1,3}[ .-]?)?\(?\d{3}\)?[ .-]?\d{3}[ .-]?\d{4}(?!\d)")
+      _PRIORITY = {"CARD": 0, "EMAIL": 1, "PHONE": 2}
+
+
+      def luhn_ok(digits):
+          total = 0
+          for i, ch in enumerate(reversed(digits)):
+              d = int(ch)
+              if i % 2:
+                  d = d * 2 - 9 if d > 4 else d * 2
+              total += d
+          return total % 10 == 0
+
+
+      def detect(text):
+          found = [(m.start(), m.end(), "EMAIL") for m in _EMAIL.finditer(text)]
+          for m in _CARD.finditer(text):
+              digits = re.sub(r"\D", "", m.group())
+              if 13 <= len(digits) <= 19 and luhn_ok(digits):
+                  found.append((m.start(), m.end(), "CARD"))
+          found += [(m.start(), m.end(), "PHONE") for m in _PHONE.finditer(text)]
+          found.sort(key=lambda f: (-(f[1] - f[0]), _PRIORITY[f[2]], f[0]))
+          chosen = []
+          for f in found:
+              if all(f[1] <= c[0] or f[0] >= c[1] for c in chosen):
+                  chosen.append(f)
+          return sorted(chosen)
+
+
+      def redact(text):
+          out, last = [], 0
+          for start, end, kind in detect(text):
+              out.append(text[last:start])
+              out.append("<%s>" % kind)
+              last = end
+          out.append(text[last:])
+          return "".join(out)
+  - title: Gates that fail the batch
+    brief: |
+      A pipeline that always succeeds hides upstream breakage: a scrubber removed from the logging service shows up as a jump in the share of records with PII, and a retry storm shows up as a jump in exact duplicates. Write `run_batch`, which runs redaction and both deduplication stages without touching its input, reports the counts, and raises `GateFailed` naming every gate that tripped, so the on-call engineer sees all of them at once. Near-duplicate rate is measured on what exact dedup left, so one fault does not trip two gates.
+    starter: |
+      class GateFailed(Exception):
+          def __init__(self, report):
+              super().__init__("gates failed: " + ", ".join(report["failures"]))
+              self.report = report
+
+
+      def run_batch(records, gates):
+          """Redact, then exact_dedup, then near_dedup, without modifying the input records.
+
+          Return (kept, report); report has input, pii_records, exact_dropped, near_dropped, kept and failures.
+          gates may hold max_pii_rate (records with any detection / input), max_exact_rate (exact_dropped / input),
+          max_near_rate (near_dropped / records left after exact dedup) and min_kept. A rate equal to its limit
+          passes. Raise GateFailed(report) listing every failing gate name, sorted.
+          """
+          raise NotImplementedError
+    tests: |
+      def rec(i, user, ts, text):
+          return {"id": i, "user": user, "ts": ts, "text": text}
+
+      batch = [rec("g%d" % i, "u%d" % i, i, "question %d about seat %d" % (i, i * 7)) for i in range(8)]
+      batch += [rec("g8", "u8", 8, "question 0 about seat 0"), rec("g9", "u9", 9, "write to me at kim@example.org")]
+      kept, report = run_batch(batch, {"max_exact_rate": 0.2, "max_pii_rate": 0.2, "min_kept": 5})
+      assert report["exact_dropped"] == 1 and report["pii_records"] == 1 and report["failures"] == []
+      assert all("@" not in r["text"] for r in kept)
+      assert batch[9]["text"] == "write to me at kim@example.org", "run_batch must not modify its input"
+      try:
+          run_batch(batch, {"max_exact_rate": 0.05})
+          raise AssertionError("a 10% duplicate rate passed a 5% gate")
+      except GateFailed as e:
+          assert e.report["failures"] == ["max_exact_rate"]
+    hidden: |
+      _b = [{"id": "h%d" % i, "user": "u", "ts": i, "text": "unique message number %d with tail %d" % (i, i * 31)} for i in range(10)]
+      _b[3] = dict(_b[3], text=_b[0]["text"])
+      _b[4] = dict(_b[4], text="reach me on (212) 555-0101")
+      _k, _rep = run_batch(_b, {"max_exact_rate": 0.1, "max_pii_rate": 0.1})
+      assert _rep["input"] == _rep["kept"] + _rep["exact_dropped"] + _rep["near_dropped"]
+      assert _rep["exact_dropped"] == 1, "a rate equal to the threshold passes"
+      try:
+          run_batch(_b, {"max_exact_rate": 0.0, "max_pii_rate": 0.0, "min_kept": 50, "max_near_rate": 1.0})
+          raise AssertionError("expected GateFailed")
+      except GateFailed as _e:
+          assert _e.report["failures"] == ["max_exact_rate", "max_pii_rate", "min_kept"], "report every failing gate"
+          assert _e.report["kept"] == len(_k)
+      _k2, _ = run_batch(_b, {})
+      assert {r["id"] for r in _k2} == {r["id"] for r in _k}
+      try:
+          run_batch([dict(r, text="same text") for r in _b], {"max_near_rate": 0.0})
+      except GateFailed as _e:
+          raise AssertionError("exact duplicates must not count toward the near-duplicate rate")
+    solution: |
+      class GateFailed(Exception):
+          def __init__(self, report):
+              super().__init__("gates failed: " + ", ".join(report["failures"]))
+              self.report = report
+
+
+      def run_batch(records, gates):
+          n = len(records)
+          scrubbed, pii = [], 0
+          for r in records:
+              if detect(r["text"]):
+                  pii += 1
+              scrubbed.append({**r, "text": redact(r["text"])})
+          after_exact, exact = exact_dedup(scrubbed)
+          kept, near = near_dedup(after_exact)
+          report = {"input": n, "pii_records": pii, "exact_dropped": len(exact),
+                    "near_dropped": len(near), "kept": len(kept), "failures": []}
+          rates = {
+              "max_pii_rate": pii / n if n else 0.0,
+              "max_exact_rate": len(exact) / n if n else 0.0,
+              "max_near_rate": len(near) / len(after_exact) if after_exact else 0.0,
+          }
+          for name, value in rates.items():
+              if name in gates and value > gates[name]:
+                  report["failures"].append(name)
+          if "min_kept" in gates and len(kept) < gates["min_kept"]:
+              report["failures"].append("min_kept")
+          report["failures"].sort()
+          if report["failures"]:
+              raise GateFailed(report)
+          return kept, report
+  - title: Split by user, then check for leakage
+    brief: |
+      A random row split puts one user's repeated questions on both sides. Assign each user to a side by a keyed hash of the user id, so the split is stable across runs and cannot be predicted from the id alone. Then index the training side with MinHash and report every eval record that has a near-duplicate in training: two customers pasting the same error message survive any user split. Resolve each leak by removing a record from one side; the hidden tests check invariants, not which side you chose.
+    starter: |
+      def side(user, eval_fraction, key):
+          """Return "train" or "eval" for a user: stable across runs and input order, and changed by the key."""
+          raise NotImplementedError
+
+
+      def split(records, eval_fraction, key, threshold=0.8, bands=16, rows=4):
+          """Return (train, eval, leaks).
+
+          Split by user. leaks lists (eval_id, train_id, jaccard) for every eval record with a near-duplicate in train,
+          found through a MinHash index of train, not by comparing every pair. Then resolve each leak so no eval record
+          has a near-duplicate in train; which side gives up the record is your policy.
+          """
+          raise NotImplementedError
+    tests: |
+      def rec(i, user, ts, text):
+          return {"id": i, "user": user, "ts": ts, "text": text}
+
+      assert side("u42", 0.2, "k1") == side("u42", 0.2, "k1")
+      users = ["user%d" % i for i in range(1000)]
+      share = sum(side(u, 0.2, "k1") == "eval" for u in users) / len(users)
+      assert 0.15 < share < 0.25
+      msg = "The export to CSV drops every column after the twentieth one when the report has filters"
+      recs = [rec("s%d" % i, users[i % 50], i, "%s question %d on seat %d" % ("billing" if i % 2 else "login", i, i * 13)) for i in range(200)]
+      ev_user = next(u for u in users if side(u, 0.2, "k1") == "eval")
+      tr_user = next(u for u in users if side(u, 0.2, "k1") == "train")
+      recs += [rec("L1", tr_user, 900, msg), rec("L2", ev_user, 901, msg.replace("filters", "filters."))]
+      train, evals, leaks = split(recs, 0.2, "k1")
+      assert ("L2", "L1") in [(e, t) for e, t, _ in leaks]
+      assert "L2" not in {r["id"] for r in train + evals}
+      assert not ({r["user"] for r in train} & {r["user"] for r in evals}), "a user appears on both sides"
+    hidden: |
+      import random as _r
+
+      _rng = _r.Random(3)
+      _words = "account billing refund invoice password plan seat upgrade export team login card address order csv".split()
+      _base = [" ".join(_rng.choice(_words) for _ in range(18)) for _ in range(80)]
+      _recs = []
+      for _i in range(400):
+          _t = _rng.choice(_base)
+          if _rng.random() < 0.4:
+              _w = _t.split()
+              _w[_rng.randrange(len(_w))] = _rng.choice(_words)
+              _t = " ".join(_w)
+          _recs.append({"id": "z%03d" % _i, "user": "cust%d" % _rng.randrange(120), "ts": _i, "text": _t})
+      for _thr in (0.7, 0.8):
+          _tr, _ev, _lk = split(_recs, 0.25, "secret", threshold=_thr)
+          _tids, _eids = {r["id"] for r in _tr}, {r["id"] for r in _ev}
+          assert not (_tids & _eids)
+          assert not ({r["user"] for r in _tr} & {r["user"] for r in _ev}), "a user appears on both sides"
+          _removed = {r["id"] for r in _recs} - _tids - _eids
+          assert _removed <= {x for e, t, _ in _lk for x in (e, t)}, "records removed without a leak to explain them"
+          _by = {r["id"]: r for r in _recs}
+          for _e, _t, _s in _lk:
+              assert jaccard(shingles(_by[_e]["text"]), shingles(_by[_t]["text"])) >= _thr
+          for _a in _ev:
+              for _b in _tr:
+                  assert jaccard(shingles(_a["text"]), shingles(_b["text"])) < max(_thr, 0.85), "eval item has a near-duplicate in train"
+          assert _ev, "the eval side is empty"
+      _shuf = _recs[:]
+      _rng.shuffle(_shuf)
+      assert {r["id"] for r in split(_shuf, 0.25, "secret")[1]} == {r["id"] for r in split(_recs, 0.25, "secret")[1]}
+      _a1 = [side("cust%d" % i, 0.5, "k-a") for i in range(200)]
+      _a2 = [side("cust%d" % i, 0.5, "k-b") for i in range(200)]
+      assert _a1 != _a2, "the key must change the assignment"
+    solution: |
+      def side(user, eval_fraction, key):
+          h = hashlib.sha256((key + "\x00" + user).encode()).digest()
+          return "eval" if int.from_bytes(h[:8], "big") / 2 ** 64 < eval_fraction else "train"
+
+
+      def split(records, eval_fraction, key, threshold=0.8, bands=16, rows=4):
+          train = [r for r in records if side(r["user"], eval_fraction, key) == "train"]
+          evals = [r for r in records if side(r["user"], eval_fraction, key) == "eval"]
+          sh = {r["id"]: shingles(r["text"]) for r in records}
+          index = {}
+          for r in train:
+              sig = minhash(sh[r["id"]], num_perm=bands * rows)
+              for b in range(bands):
+                  index.setdefault((b, tuple(sig[b * rows:(b + 1) * rows])), []).append(r["id"])
+          leaks = []
+          for r in evals:
+              sig = minhash(sh[r["id"]], num_perm=bands * rows)
+              candidates = set()
+              for b in range(bands):
+                  candidates.update(index.get((b, tuple(sig[b * rows:(b + 1) * rows])), ()))
+              for c in sorted(candidates):
+                  s = jaccard(sh[r["id"]], sh[c])
+                  if s >= threshold:
+                      leaks.append((r["id"], c, s))
+          leaked = {e for e, _, _ in leaks}
+          return train, [r for r in evals if r["id"] not in leaked], leaks
+---
+
+This lab builds the pipeline from the lesson on [curating eval and SFT data from production](/learn/llmops/data-curation/curation-pipeline) as one program. Each step adds functions to the same file and runs its tests against everything written so far, so the gates in step 4 call the deduplication from steps 1 and 2 and the redaction from step 3.
+
+Records are dictionaries with `id`, `user`, `ts` and `text`, the shape of a logged user turn after the logging service has replaced the account id with a pseudonym. The test corpora are generated in the browser with planted duplicates, paraphrases and personal data; no real log text is involved.
+
+The detectors in step 3 are a floor, not a scrubber you can ship. Presidio, which adds named-entity recognition and context rules to the same regex and checksum approach, states that it cannot guarantee finding all sensitive information, and names, addresses and free-text account details pass every regex here. Measure a production scrubber's miss rate on a labelled sample before relying on it.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

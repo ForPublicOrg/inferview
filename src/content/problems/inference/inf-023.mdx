@@ -1,0 +1,163 @@
+---
+id: inf-023
+title: Disaggregate or tune, on sixteen GPUs with two SLOs
+subtitle: chat and long documents on one fleet, and a launch that triples the long ones
+track: inference
+module: faster-cheaper
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 50
+core: true
+tags: [disaggregation, chunked-prefill, prefill, decode, goodput, slo, capacity-planning]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Zhong et al., DistServe, Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving
+    url: https://arxiv.org/abs/2401.09670
+    note: "Prefill and decode on separate GPUs remove their interference, with resources and parallelism chosen per phase and placement by cluster bandwidth; against the systems it compares, the abstract reports 7.4x more requests or a 12.6x tighter SLO with over 90% of requests within latency limits. Checked 2026-10-28."
+  - title: Agrawal et al., Sarathi-Serve, Taming Throughput-Latency Tradeoff in LLM Inference
+    url: https://arxiv.org/abs/2403.02310
+    note: "Chunked prefills scheduled alongside ongoing decodes; under tail-latency constraints against vLLM, the abstract reports 2.6x serving capacity for Mistral-7B on one A100, up to 3.7x for Yi-34B on two A100s and up to 5.6x for Falcon-180B with pipeline parallelism. Checked 2026-10-28."
+  - title: vLLM documentation, disaggregated prefilling
+    url: https://docs.vllm.ai/en/latest/features/disagg_prefill.html
+    note: "Marked experimental and subject to change; separates prefill and decode instances to tune TTFT and ITL separately; described as a more reliable way to control tail ITL than chunked prefill; states that it does not improve throughput; lists KV transfer connectors including NixlConnector, LMCacheConnectorV1 and MooncakeConnector. Checked 2026-10-28."
+  - title: vLLM documentation, optimization and tuning
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: "Chunked prefill is on by default in V1 where possible; smaller max_num_batched_tokens (for example 2048) gives better ITL, larger gives better TTFT; above 8192 recommended for throughput. Checked 2026-10-28."
+  - title: Qwen2.5-72B-Instruct model card and config
+    url: https://huggingface.co/Qwen/Qwen2.5-72B-Instruct
+    note: "72.7B parameters, 70.0B non-embedding; 80 layers; 64 query heads and 8 KV heads; hidden size 8,192; BF16. Checked 2026-10-28."
+  - title: NVIDIA H100 product page
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: "H100 SXM: 80 GB, 3.35 TB/s, 1,979 TFLOPS BF16 with sparsity (about 990 dense), NVLink 900 GB/s. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+A mixed chat and long-document workload shares sixteen GPUs and misses one of its two SLOs. Do you disaggregate prefill and decode, or tune the pool you have? Decide, size it, and write the memo.
+</Callout>
+
+Scenario inputs, not a real deployment.
+
+**Fleet.**
+
+- Qwen2.5-72B-Instruct in BF16 on 16 H100 SXM: two nodes of 8, NVLink inside each node, and one 400 Gb/s InfiniBand NIC per GPU.
+- Today: 4 replicas at tensor parallel 4, vLLM, chunked prefill with `max_num_batched_tokens: 8192`, round-robin routing.
+
+**Peak traffic.**
+
+| | Rate | Prompt (mean) | Output (mean) |
+|---|---|---|---|
+| Chat | 6 requests/s | 2,000 tokens | 250 tokens |
+| Long-document analysis | 0.1 requests/s | 40,000 tokens (30,000 to 50,000) | 400 tokens |
+
+**SLOs, and where peak stands today.**
+
+| SLO | Target | Today at peak |
+|---|---|---|
+| Chat TTFT p90 | 1 s | 0.7 s |
+| Chat inter-token latency p99 | 60 ms | 640 ms (missed) |
+| Long-document TTFT p90 | 10 s | 6 s |
+
+**Constraints.**
+
+- No new GPUs for two quarters.
+- Two serving engineers.
+- An enterprise launch in six weeks that sales expects to triple long-document traffic to 0.3 requests per second.
+- The platform lead objects to running anything the vendor marks experimental in production.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the step-time trace on one replica during a long-document arrival, and how many prefill tokens the slowest steps carried.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Work out how much of the fleet's compute prefill needs at peak, today and after the launch, before choosing any layout.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask sales whether the new long-document traffic arrives spread through the day or in batches from a few customers.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>The miss is prefill interference. A step that carries 8,192 prefill tokens takes about 0.6 s on a TP4 group, and every chat sequence on that replica waits for it. Prefill needs about 1.25 TP4 groups of compute today and about 2 after the launch; decode needs less than one. I would split the fleet by workload for the launch: chat on groups with a 512-token step budget, long documents on groups with large chunks. That needs no experimental feature and holds both SLOs at the launch rate. Prefill/decode disaggregation (three prefill groups, one decode group) is the better end state on paper and is what I would prototype next quarter. The cost of the workload split is that the split is static: a burst of long documents queues on its own pool, and capacity cannot move between pools without a redeploy.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>Where the time goes. All compute figures assume 50% of dense BF16 peak during prefill and 70% of memory bandwidth during decode; both are my choices. The conclusion holds from about 45% to 60%; at 35%, prefill after the launch needs 2.9 groups and no split of these 16 GPUs meets both SLOs.</b></p>
+<ul>
+<li><b>Prefill rate.</b> A prompt token costs 2 × 70.0B = 1.4 × 10^11 FLOPs through the non-embedding weights. A TP4 group peaks at 4 × 990 = 3.96 PFLOP/s dense, so it runs prefill at about 1.98 × 10^15 / 1.4 × 10^11 ≈ 14,100 tokens per second.</li>
+<li><b>Prefill cost of a long document.</b> Causal attention adds 2 × n² × 8,192 FLOPs per layer. For n = 40,000 over 80 layers that is 2.1 × 10^15, on top of 40,000 × 1.4 × 10^11 = 5.6 × 10^15: 7.7 × 10^15 in total, about 3.9 s on one group. A chat prompt is 2.85 × 10^14, about 0.14 s.</li>
+<li><b>Decode step.</b> Reading 145 GB of weights across four GPUs at 70% of 3.35 TB/s takes about 15.5 ms. The KV cache adds 327,680 bytes per token: 2 × 80 layers × 8 heads × 128 × 2 bytes. Fleet-wide about 40 sequences are decoding, so each group adds a few milliseconds of KV reads.</li>
+<li><b>Why inter-token latency is 640 ms.</b> A step carrying 8,192 prefill tokens costs 8,192 × 1.4 × 10^11 / 1.98 × 10^15 ≈ 0.58 s plus the decode work, which is the observed number. Each long document produces five such steps. Chat prompts alone fill about a fifth of each group's time with steps near 160 ms. The p99 cannot reach 60 ms with this chunk size, whatever the routing.</li>
+</ul>
+<p><b>Demand, in TP4 groups of prefill.</b></p>
+<ul>
+<li>Today: chat is 6 × 2.85 × 10^14 = 1.71 PFLOP/s and long documents 0.1 × 7.7 × 10^15 = 0.77, so 2.48 PFLOP/s, 1.25 groups.</li>
+<li>After the launch: long documents become 2.31, so 4.02 PFLOP/s, 2.0 groups.</li>
+<li>Decode needs well under one group in either case.</li>
+</ul>
+<p>This is a prefill-heavy fleet. That matters for every option.</p>
+<p><b>Option 1: one pool, smaller chunks.</b> To keep a step under 60 ms with about 17 ms of decode in it, a step may carry about (60 - 17) ms × 1.98 × 10^15 / 1.4 × 10^11 ≈ 600 prefill tokens. I would choose 512.</p>
+<ul>
+<li>A 512-token step takes about 53 ms, so prefill runs at 512 / 0.053 ≈ 9,700 tokens per second per group, about 68% of the large-chunk rate.</li>
+<li>Small chunks also lower the efficiency of each matmul, which this estimate does not count.</li>
+<li>Today the four groups run at about 46% of that reduced capacity. After the launch the load reaches about 74%. A 40,000-token document alone needs about 5.7 s of a group's reduced capacity, counting attention, and at that load it shares the budget with chat prefills, so its TTFT p90 is likely past 10 s.</li>
+</ul>
+<p>Option 1 fixes today's chat latency and fails the launch.</p>
+<p><b>Option 2: split by workload, tune each pool.</b> Long documents go to their own groups with large chunks; chat stays on groups with the 512-token budget.</p>
+<ul>
+<li>At the launch rate, long documents need 2.31 / 1.98 = 1.17 groups, so two groups, at 58% load. TTFT is 3.9 s plus queueing, inside 10 s at that load for documents arriving independently.</li>
+<li>Chat gets the other two groups at 12,000 / 2 = 6,000 tokens per second each, 62% of the 9,700 capacity. That holds the 60 ms p99 and leaves TTFT around 0.2 to 0.4 s.</li>
+<li>Long-document inter-token latency is poor, with 0.6 s steps during prefill. It has no SLO; say so in the memo.</li>
+</ul>
+<p><b>Option 3: prefill/decode disaggregation.</b> Three prefill groups and one decode group.</p>
+<ul>
+<li><i>Prefill.</i> Three groups run large chunks at the full rate: 3 × 14,100 = 42,300 tokens per second against 17,500 today and about 28,500 after the launch, counting attention, 67%.</li>
+<li><i>Decode.</i> One group carries about 40 chat sequences and up to three long documents. 40 × 2,125 tokens × 327,680 bytes is 28 GB of KV, plus 13 GB per long document, inside its 175 GB after weights. Steps of about 23 ms, with no prefill in them.</li>
+<li><i>KV transfer.</i> A 40,000-token prompt is 13.1 GB of KV. Each of four GPUs sends a quarter over its own 400 Gb/s NIC, about 66 ms across nodes. A chat prompt is about 3 ms. Placement should keep one prefill group on the decode group's node.</li>
+</ul>
+<p>DistServe's reported gains (7.4 times more requests or a 12.6 times tighter SLO) are against the systems it compared, at the SLOs it chose. Sarathi-Serve reports 2.6 to 5.6 times the capacity of vLLM with chunked prefill alone. Neither is a forecast for this fleet. vLLM's own page says disaggregation does not improve throughput; it buys tail inter-token latency.</p>
+<p><b>The decision.</b> Options 2 and 3 are both defensible.</p>
+<ul>
+<li><i>Option 3 costs</i> a feature the vendor marks experimental, against the platform lead's stated objection, plus a KV transfer path to build and monitor with two engineers in six weeks. A single decode group is a single point of failure: if it goes down, no request completes until a prefill group is reconfigured to serve both phases.</li>
+<li><i>Option 2 costs</i> static capacity. The two pools cannot lend to each other, so a long-document burst queues while chat groups sit at 62%. Chat prefill also runs at about 68% of the large-chunk rate.</li>
+</ul>
+<p>With the deadline, the team size and the objection on the table, I would ship Option 2 for the launch and prototype Option 3 on one node next quarter, measured against Option 2 on replayed traffic.</p>
+<p><b>What you give up.</b> Elasticity between workloads, prefill efficiency on the chat pool, and inter-token latency for long documents.</p>
+<p><b>How Option 2 fails.</b></p>
+<ul>
+<li>Sales's "triple" is an average. If an enterprise customer submits 10 documents at once, the long-document pool needs 10 × 3.9 / 2 ≈ 20 s to clear them, and the tenth waits past the SLO. The memo needs admission control or a batch tier for bulk submissions, and that question goes to sales before launch.</li>
+<li>Losing one chat group puts the other at about 124% of its capacity. The failover plan must say whether chat spills into the long-document pool, which runs a different chunk budget.</li>
+</ul>
+<p><b>The memo.</b></p>
+<ul>
+<li><i>Decision.</i> Workload split, chunk budgets of 512 (chat) and 8,192 (long documents), routing by request type at the gateway.</li>
+<li><i>Rollout.</i> One chat group and one long-document group first, for a week of shadow comparison against the old pool.</li>
+<li><i>Rollback triggers.</i> Chat inter-token latency p99 above 60 ms for 15 minutes at peak, or long-document TTFT p90 above 10 s for a day.</li>
+<li><i>Owners.</i> Serving for the pools, gateway for routing.</li>
+<li><i>Written risks.</i> Burst queueing for long documents, single-group chat failover, and the disaggregation prototype with its exit criterion.</li>
+</ul>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Finance asks you to give one of the two chat groups back to a research team. Which SLO do you relax, by how much, and what do you write down as the accepted risk?</em> One chat group at 12,000 tokens per second is over its 9,700 capacity, so the honest options are a larger chunk budget with a looser inter-token target, or a TTFT target that admits queueing; neither is free.</li>
+<li><em>What would you need to see in production to reverse the split and move to disaggregation?</em> The long-document pool idle more than half of peak hours while the chat pool runs above 70%, or a long-document share that keeps moving week to week, plus the prototype holding both SLOs on replayed traffic with the decode group failed over at least once.</li>
+<li><em>The platform lead and the serving lead disagree about running an experimental feature. How do you decide without deciding by rank?</em> Agree the exit criteria first: a soak test length, a failure drill, and the version pin. Then let the prototype's results against them decide.</li>
+<li><em>Mean prompt length for long documents grows from 40,000 to 120,000 tokens. What breaks first?</em> Prefill cost per document roughly quintuples, because attention grows with the square of the length. The long-document pool's TTFT target fails before anything else does.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *A tenth of the long documents are follow-up questions on a document already analysed. What does prefix caching change in your sizing, and on which pool must the cache live?*
+- *The decode group in Option 3 is at 30% utilisation. Do you shrink it to tensor parallel 2 and add a prefill group, and what happens to KV capacity?*
+- *How do you measure goodput for this fleet, so the next decision is made on one number per SLO rather than on throughput?*
+
+## Common mistakes
+
+- Treating disaggregation as a throughput gain. Here it buys inter-token isolation and full-size prefill chunks, and the fleet is prefill-bound either way.
+- Sizing from today's traffic when the launch doubles prefill demand within the deadline.
+- Shrinking the chunk budget without computing what it does to prefill capacity and long-document TTFT.
+- Ignoring KV transfer, or overstating it. At 13 GB for the longest prompt it is tens of milliseconds over per-GPU links and seconds over a single shared link, so placement decides which.
+- A memo without rollback triggers, or without the bulk-submission question for sales.

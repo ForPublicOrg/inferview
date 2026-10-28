@@ -1,0 +1,192 @@
+---
+title: "PagedAttention: virtual memory for the KV cache"
+track: inference
+module: batching
+order: 2
+kind: lesson
+level: senior
+minutes: 15
+summary: PagedAttention stores each sequence's KV cache in fixed-size blocks reached through a block table, which bounds waste to one partial block per sequence, lets samples and requests share blocks by reference count, and turns running out of memory into a preemption decision.
+prerequisites: [inference/batching/continuous-batching]
+updated: 2026-10-28
+sources:
+  - title: "Efficient Memory Management for Large Language Model Serving with PagedAttention (Kwon et al., SOSP 2023)"
+    url: https://arxiv.org/abs/2309.06180
+    note: "Figure 2: 20.4% to 38.2% of KV memory holds token states in the Orca variants, 96.3% in vLLM; reserved, internal and external fragmentation; OPT-13B needs 800 KB of KV per token; 2-4x throughput over FasterTransformer and Orca at the same latency; ShareGPT 1.7-2.7x request rate over Orca (Oracle), 2.7-8x over Orca (Max), up to 22x over FasterTransformer; 2.2x more concurrent requests than Orca (Oracle) on OPT-13B; 20-26% higher attention kernel latency than FasterTransformer; block sizes 16 to 128 best on ShareGPT, 16 and 32 on Alpaca, default 16; sharing saves 6.1-9.8% (parallel sampling) and 37.6-55.2% (beam search) on Alpaca, 16.2-30.5% and 44.3-66.3% on ShareGPT; all-or-nothing eviction, FCFS with the latest requests preempted first; recomputation never above 20% of swapping's latency, comparable for block sizes 16 to 64. Checked 2026-10-28."
+  - title: vLLM docs, Automatic prefix caching design
+    url: https://docs.vllm.ai/en/latest/design/prefix_caching.html
+    note: "Block hash of parent hash, block tokens and extra keys (LoRA id, multimodal hashes, cache salt); only full blocks are cached; free queue with LRU eviction, blocks of a finished request added in reverse order; sha256 by default via pickle, not reproducible across Python or vLLM versions; cache_salt against timing attacks; worked example with block size 4. Checked 2026-10-28."
+  - title: vLLM V1 alpha release blog (2025-01-27)
+    url: https://vllm.ai/blog/2025-01-27-v1-alpha-release
+    note: "Prefix caching on by default in V1, with less than 1% throughput loss at a 0% hit rate. Checked 2026-10-28."
+  - title: vllm/v1/core/kv_cache_manager.py at v0.32.0 (commit 5df63a7)
+    url: https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/kv_cache_manager.py
+    note: "On a full prefix hit the last token is recomputed to get logits, which can recompute a whole block because allocation is block-aligned."
+  - title: vllm/config/cache.py at v0.32.0 (commit 5df63a7)
+    url: https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/cache.py
+    note: "DEFAULT_BLOCK_SIZE = 16; gpu_memory_utilization defaults to 0.92; enable_prefix_caching defaults to True; separate fields for effective attention, hash and Mamba block sizes."
+  - title: vllm/v1/core/sched/scheduler.py at v0.32.0 (commit 5df63a7)
+    url: https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py
+    note: "_preempt_request frees the request's blocks, sets num_computed_tokens to 0 and puts the request at the front of the waiting queue."
+  - title: vllm/config/scheduler.py at v0.32.0 (commit 5df63a7)
+    url: https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/scheduler.py
+    note: "watermark: a fraction of KV blocks kept free when admitting waiting or preempted requests, 0.0 (off) by default; disable_hybrid_kv_cache_manager for models that mix full and sliding-window attention."
+  - title: vLLM docs, Optimization and tuning
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: "V1 default preemption mode is RECOMPUTE rather than SWAP because recomputation has lower overhead in the V1 architecture; to reduce preemptions raise gpu_memory_utilization, lower max_num_seqs or max_num_batched_tokens, or raise tensor or pipeline parallelism. Checked 2026-10-28."
+  - title: vLLM docs, Metrics design
+    url: https://docs.vllm.ai/en/latest/design/metrics.html
+    note: "vllm:num_requests_swapped and vllm:cpu_cache_usage_perc belong to swap-based preemption, which no longer applies in V1; the --swap-space flag has been removed. Checked 2026-10-28."
+  - title: The Llama 3 Herd of Models (arXiv 2407.21783, Table 3)
+    url: https://arxiv.org/abs/2407.21783
+    note: "8B: 32 layers, model dimension 4,096, 32 attention heads, 8 KV heads; 70B: 80 layers, 8,192, 64 heads, 8 KV heads. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The allocation problem continuous batching created
+
+Once requests join and leave every step, the KV cache becomes a heap with thousands of allocations whose final size is unknown at allocation time. Before vLLM, serving systems stored each request's KV cache in one contiguous region sized for the longest output it might produce. The PagedAttention paper (SOSP 2023) breaks the resulting waste into three parts: slots reserved for tokens not generated yet, internal fragmentation from over-provisioning for the maximum length, and external fragmentation from the allocator between regions. Profiling Orca-style allocation, it found that only 20.4% to 38.2% of KV memory held actual token states. vLLM's paged layout reached 96.3% in the same experiment.
+
+The sizes make the waste expensive. The paper computes OPT-13B's KV cache at 2 (key and value) × 5,120 (hidden size) × 40 (layers) × 2 bytes = 819,200 bytes, about 800 KB, per token. Models with grouped-query attention store far less: Llama 3 70B has 80 layers and 8 KV heads of dimension 128 (8,192 / 64), so one token costs 2 × 80 × 8 × 128 × 2 = 327,680 bytes in BF16, and Llama 3 8B costs 2 × 32 × 8 × 128 × 2 = 131,072. Either way, the batch size of a decode-bound server is set by how many tokens of KV fit, and every wasted slot is a request that could not be admitted.
+
+## Blocks and block tables
+
+PagedAttention applies the page table idea. The KV cache is divided into fixed-size blocks, each holding the keys and values of a fixed number of tokens (16 by default in vLLM). Each sequence has a block table that maps its logical blocks, filled left to right, to physical blocks anywhere in GPU memory, with a count of filled slots per entry. A new physical block is allocated only when the last one is full, so a sequence wastes at most one partially filled block, and a finished sequence returns whole blocks that any other sequence can use. External fragmentation disappears because every allocation is the same size.
+
+The difference from an operating system's pages is who reads them. The attention kernel itself walks the block table, so the indirection sits inside the hottest kernel in the model. The paper measures 20% to 26% higher attention kernel latency than FasterTransformer's contiguous kernel, and wins end to end anyway because the batch grows: on OPT-13B it holds 2.2 times as many requests concurrently as Orca (Oracle), a baseline that is told each request's true output length in advance.
+
+<Predict id="inf-paged-blocks" question="Block size 16. A request has a 1,000-token prompt and has generated 300 tokens so far. How many KV blocks does it hold?" answer={82} tolerance={0} unit="blocks">
+<p>1,300 tokens / 16 = 81.25, so the request holds <b>82 blocks</b> (1,312 slots) and wastes 12 slots in its last block. A contiguous scheme that reserved the 2,048-token maximum up front would hold 748 slots that no token has used, and would have held them since the request was admitted.</p>
+</Predict>
+
+The headline result is 2 to 4 times the throughput of FasterTransformer and Orca at the same latency. On the ShareGPT trace the paper reports 1.7 to 2.7 times the request rate of Orca (Oracle), 2.7 to 8 times that of Orca (Max), which reserves the full 2,048 tokens, and up to 22 times that of FasterTransformer. The gains are larger for longer sequences, because that is where reservation and fragmentation waste the most.
+
+## Block size
+
+Block size trades kernel efficiency against fragmentation and sharing. Small blocks give the kernel less contiguous data per read and leave GPU parallelism unused; large blocks waste more slots in each sequence's last block and match fewer shared prefixes, because sharing works in whole blocks. The paper's ablation found block sizes from 16 to 128 best on ShareGPT, while on Alpaca's shorter sequences only 16 and 32 did well and larger blocks degraded throughput. vLLM chose 16, and `vllm/config/cache.py` still defaults to 16 when no size is given in v0.32.0. The same file carries separate fields for the attention block size, the hash block size and a Mamba block size, so on hybrid models or some attention backends the effective size can differ; read the value the engine logs at startup.
+
+## Sharing by reference count
+
+Because the table is an indirection, two sequences can point at the same physical block. The paper uses this for parallel sampling and beam search. All samples of one prompt map their prompt blocks to the same physical blocks, each block carries a reference count, and a write to a block whose count is above one triggers copy-on-write of that block only. Beam search shares more, because candidates share whole histories and the sharing pattern changes as beams are pruned; blocks whose count reaches zero are freed. The paper measures memory savings of 6.1% to 9.8% for parallel sampling and 37.6% to 55.2% for beam search on Alpaca, and 16.2% to 30.5% and 44.3% to 66.3% on ShareGPT, where prompts are longer.
+
+<Predict id="inf-paged-cow" question="Block size 16. Four parallel samples share a 1,000-token prompt. After each sample writes its first generated token, how many physical blocks are in use?" answer={66} tolerance={0} unit="blocks">
+<p>1,000 = 62 × 16 + 8, so the prompt fills 62 blocks and 8 slots of a 63rd. The 62 full blocks stay shared. Each sample's first token lands in the shared partial block: the first three writers each copy it to a new block, and the fourth finds the reference count back at 1 and writes in place. That is 62 + 4 = <b>66 blocks</b>, against 4 × 63 = 252 without sharing.</p>
+</Predict>
+
+The allocator behind both predictions is short. This is the part the paged design makes simple; the policy questions (who gets preempted, when to admit) live in the scheduler.
+
+```python
+BLOCK = 16
+
+class PagedKV:
+    def __init__(self, num_blocks):
+        self.free = list(range(num_blocks))
+        self.refs = [0] * num_blocks
+        self.table = {}    # seq id -> physical block ids, in logical order
+        self.length = {}   # seq id -> tokens written
+
+    def _take(self):
+        if not self.free:
+            raise MemoryError("out of KV blocks: preempt a sequence")
+        b = self.free.pop()
+        self.refs[b] = 1
+        return b
+
+    def append(self, seq, copy=lambda src, dst: None):
+        n = self.length.get(seq, 0)
+        blocks = self.table.setdefault(seq, [])
+        if n % BLOCK == 0:                    # last block full, or first token
+            blocks.append(self._take())
+        elif self.refs[blocks[-1]] > 1:       # shared partial block: copy on write
+            new = self._take()
+            copy(blocks[-1], new)
+            self.refs[blocks[-1]] -= 1
+            blocks[-1] = new
+        self.length[seq] = n + 1
+
+    def fork(self, parent, child):            # parallel sampling: share every block
+        self.table[child] = list(self.table[parent])
+        self.length[child] = self.length[parent]
+        for b in self.table[child]:
+            self.refs[b] += 1
+
+    def release(self, seq):                    # finish or preempt: all or nothing
+        for b in self.table.pop(seq):
+            self.refs[b] -= 1
+            if self.refs[b] == 0:
+                self.free.append(b)
+        del self.length[seq]
+
+kv = PagedKV(num_blocks=300)
+for _ in range(1000):                          # a 1,000-token prompt
+    kv.append("s0")
+for i in range(1, 4):
+    kv.fork("s0", f"s{i}")                     # four samples of one prompt
+for i in range(4):
+    kv.append(f"s{i}")                         # each sample writes its first token
+print("blocks in use:", 300 - len(kv.free))    # 66, against 4 x 63 = 252 unshared
+```
+
+A real engine writes a whole step's tokens per sequence at once and allocates before the forward pass, not per token; [problem inf-006](/problems/inf-006) asks for that version with invariant tests.
+
+## Prefix caching: sharing across requests by hash
+
+Sharing inside one request needs no lookup, because the fork knows its parent. Sharing across requests needs a way to find a block that already holds the same prefix. vLLM's automatic prefix caching gives every full block a hash of its parent block's hash, its own token ids, and extra keys that change the KV contents or must isolate it: the LoRA adapter id, multimodal input hashes, and an optional per-request `cache_salt`. Chaining the parent hash makes a block's hash identify the entire prefix up to and including that block, so a lookup walks the new prompt's blocks in order until the first miss.
+
+The design doc spells out the rules that decide hit rates in practice:
+
+- Only full blocks are cached. In the doc's example with block size 4, a second request whose first 10 tokens match the first request hits only 8 of them, because the third block matches in 2 positions out of 4.
+- A finished request's blocks are not erased. Blocks whose reference count reaches zero go to the tail of a free queue with their hashes intact, in reverse order so a sequence's last block (the least likely to be reused) is evicted first. Allocation takes from the head, which makes eviction least recently used.
+- A full hit still computes something. `kv_cache_manager.py` caps the hit at the prompt length minus one so the model produces logits for the last token, and because allocation is block-aligned, that can mean recomputing a whole block.
+- The default hash is SHA-256 over pickled data, which the doc says may not be reproducible across Python or vLLM versions; `sha256_cbor` exists for reproducible hashes. The `cache_salt` exists because a shared cache leaks timing: a fast first token reveals that someone else sent the same prefix.
+
+V1 turned prefix caching on by default, and its release post reports less than 1% throughput loss at a 0% hit rate. The faster-cheaper module covers when prefix caching pays and how to shape prompts for it.
+
+## When blocks run out: preemption
+
+Paging makes running out of memory a scheduling event instead of an out-of-memory error. When a running sequence needs a block and none is free, the engine evicts a whole sequence. The paper argues for all-or-nothing eviction because every block of a sequence is read at every step, so evicting part of one only guarantees it stalls; sequences in one request, like beams, are gang-scheduled for the same reason. The paper's policy is first come, first served, preempting the latest arrivals first.
+
+An evicted sequence can come back two ways. Swapping copies its blocks to CPU memory and back. Recomputation drops them and, on readmission, runs the prompt and the tokens generated so far as one new prompt, which a single prefill handles efficiently. The paper measured that swapping suffers at small block sizes, where many small PCIe transfers waste bandwidth, while recomputation's cost does not depend on block size; recomputation was never more than 20% slower than swapping, and the two were comparable end to end for block sizes 16 to 64.
+
+vLLM V1 recomputes by default, and the optimization docs give the reason as lower overhead in the V1 architecture. The `--swap-space` flag is gone and the swap metrics no longer apply. In v0.32.0, `_preempt_request` frees the victim's blocks, sets its computed-token count to zero and puts it at the front of the waiting queue. With prefix caching on, the victim's full blocks sit in the free queue with their hashes until something evicts them, so a request readmitted soon after preemption can find part of its own prefix still cached.
+
+<Callout kind="gotcha">
+Preemption is invisible in request errors and very visible in latency. A sequence preempted during decode recomputes its whole context before it emits another token, and the metrics design doc assigns that time to inter-token latency, not TTFT. A rising `vllm:num_preemptions` next to a rising p99 ITL usually means admission is outrunning memory.
+</Callout>
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Scenario: a Llama 3 70B deployment shows `vllm:num_preemptions` climbing every afternoon while p99 inter-token latency doubles. There is no budget for more GPUs this quarter, and product owns a p99 ITL objective. What do you change?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>The engine admits more concurrent context than its KV blocks hold, and recompute-based preemption turns that into latency spikes. With no new hardware, I would cap admission to what memory holds (lower <code>max_num_seqs</code>, or a watermark of free blocks at admission), take back memory where it is cheap (raise <code>gpu_memory_utilization</code> if activation headroom allows, or an FP8 KV cache if a quality check passes), and accept longer queue time in the peak instead of preemption.</p>
+</Fragment>
+<Fragment slot="long">
+<p>First confirm the mechanism: KV usage pinned near 1, preemptions rising with running requests, and ITL spikes on requests with a nonzero preemption count. If the spikes are on requests that were never preempted, the cause is elsewhere, probably long prefills sharing steps with decodes.</p>
+<p>The options trade different things. Lowering <code>max_num_seqs</code> turns preemption into queueing: TTFT rises for new arrivals, but running requests stop paying recomputation, which protects the ITL objective product owns. Raising <code>gpu_memory_utilization</code> from the 0.92 default gives more blocks for free until the engine runs out of activation memory at startup or under large batches, so it needs a load test at the peak shape. An FP8 KV cache roughly doubles the tokens that fit and costs a quality evaluation, because it changes numerics for every request. Shorter <code>max_model_len</code> per tier stops a few very long contexts from crowding everyone.</p>
+<p>My order: admission cap now because it is reversible in minutes, the memory fraction after a load test, FP8 KV only behind an evaluation on our own traffic. What we give up is peak throughput and TTFT for new arrivals in the afternoon; I would write that down with the queue-time number so product sees the trade it is getting.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The admission cap fixes ITL but afternoon TTFT p95 doubles and a customer complains. Which objective wins, and who decides?</em></li>
+<li><em>A colleague proposes switching preemption to swap to save recomputation. What would you measure before agreeing, given that V1 removed swap?</em></li>
+<li><em>What would you need to see to reverse the FP8 KV cache decision after it ships?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The paper's multiples are 2023 numbers against Orca-style contiguous allocation, which no production engine uses any more. Today every serious engine pages its KV cache, so the comparison that matters is between paged engines with different block sizes, kernels and eviction policies, and the paper's numbers do not answer it.
+
+Sharing is exact and block-granular. Prefix caching hits only on identical token ids in whole blocks with identical extra keys; a timestamp in the system prompt, a different LoRA adapter or a different tokenizer version produces zero hits with no error. The block size also caps how much of a short shared prefix can ever be reused.
+
+The one-table-per-sequence picture is a simplification for hybrid models. Models that mix full attention with sliding-window attention or state-space layers keep different kinds of state per layer group, which is why v0.32.0 carries a hybrid KV cache manager and a separate Mamba block size. The byte counts above assume BF16 KV with no compression; quantized or compressed KV changes every capacity number in this lesson.
+
+<SelfRate id="lesson:inference/batching/paged-attention" />

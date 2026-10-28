@@ -1,0 +1,92 @@
+---
+id: trn-015
+title: Memory per GPU for an 8B model under ZeRO-3
+subtitle: model state, activations, logits and buffers, with and without recomputation
+track: training
+module: distributed
+type: estimate
+difficulty: hard
+seniority: [senior, staff]
+minutes: 25
+core: false
+tags: [zero, fsdp, activation-memory, recomputation, estimation]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Rajbhandari et al., ZeRO, Memory Optimizations Toward Training Trillion Parameter Models (arXiv 1910.02054)
+    url: https://ar5iv.labs.arxiv.org/html/1910.02054
+    note: "mixed-precision Adam needs 2 + 2 + 12 = 16 bytes per parameter; partitioning parameters too (Pos+g+p) brings model state to 16 bytes x parameters / Nd; 3 units of communication against 2 for standard data parallelism. Checked 2026-10-28."
+  - title: Korthikanti et al., Reducing Activation Recomputation in Large Transformer Models (arXiv 2205.05198)
+    url: https://ar5iv.labs.arxiv.org/html/2205.05198
+    note: "activation bytes per layer sbh(34 + 5as/h) without parallelism; 34sbh when the attention scores are recomputed; 2sbh per layer with full recomputation; coefficients derived for a GPT-style block with a 4h MLP and 16-bit activations. Checked 2026-10-28."
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "16 bytes per parameter, 20 with FP32 gradient accumulation; activation memory grows linearly with batch and quadratically with sequence length without recomputation of attention; full recomputation adds up to 30-40% compute. Checked 2026-10-28."
+  - title: Llama 3.1 8B config.json (unsloth mirror of Meta-Llama-3.1-8B-Instruct)
+    url: https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct/blob/main/config.json
+    note: "hidden 4096, intermediate 14336, 32 layers, 32 heads, 8 key-value heads, head_dim 128, vocabulary 128256, untied embeddings. Checked 2026-10-28."
+range: { low: 40, high: 62, unit: GB per GPU }
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"We train a Llama 3.1 8B-shaped model on 32 H100-80GB GPUs with ZeRO-3 across all of them, no tensor or pipeline parallelism. Sequence length 8,192, one sequence per GPU per micro-batch, BF16 with FlashAttention. What is the peak memory per GPU without activation recomputation, and what does full recomputation buy? Do we need it?"
+</Callout>
+
+Published inputs: the Llama 3.1 8B config (hidden 4,096, intermediate 14,336, 32 layers, 32 heads with 8 key-value heads of 128, vocabulary 128,256, untied embeddings), which gives 8,030,261,248 parameters. Scenario inputs: the GPU count, sequence length, micro-batch and precision above. Everything else is yours to choose and state: bytes per parameter, the activation coefficient for this block, the precision of the logits in the loss, and how many gathered layers ZeRO-3 holds at once. Answer in GB per GPU for the case without recomputation.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask whether gradients are accumulated in FP32 across micro-batches in this training stack.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask whether the loss upcasts the logits to FP32 before the softmax.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask for a memory snapshot of one step at a shorter sequence length, to calibrate the activation term.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>About 44 to 59 GB. Model state is 16 x 8.03e9 / 32 = 4.0 GB (5.0 at 20 bytes). Activations dominate: with FlashAttention the scores are never stored, so Korthikanti's 34sbh per layer gives 34 x 8,192 x 4,096 x 32 layers = 36.5 GB, or about 44 GB if the SwiGLU block stores more than a GPT block. The logits are 8,192 x 128,256 = 1.05e9 values, 2.1 GB in BF16 or 4.2 GB in FP32, and ZeRO-3's gathered layers and gradient buckets add 1 to 2 GB. It fits without recomputation. Full recomputation stores 2sbh per layer, 2.1 GB, and brings the peak to about 10 to 18 GB, which this run does not need.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>Model state.</b> ZeRO-3 shards weights, gradients and optimizer states over all 32 ranks: 16 bytes x 8,030,261,248 / 32 = 4.02 GB, or 5.02 GB at 20 bytes with an FP32 gradient buffer. This is the term people expect to dominate, and at 32-way sharding it is the smallest real term.</p>
+<p><b>Activations.</b> ZeRO-3 does not shard activations; every GPU holds its own micro-batch's. Korthikanti et al. give sbh(34 + 5as/h) bytes per layer. The 5as/h term is the stored attention scores, 5 x 32 x 8,192 / 4,096 = 320 against 34; FlashAttention recomputes the scores in the backward pass instead of storing them, which leaves 34sbh = 34 x 8,192 x 4,096 = 1.14 GB per layer and 36.5 GB over 32 layers. The 34 is for a GPT-style block with a 4h MLP. A Llama block stores the gate and up projections at 3.5h each and their product for the down projection, and its key and value tensors are a quarter of a full multi-head attention's. My count, tensor by tensor, gives a coefficient between 34 and about 41, so 36.5 to 44 GB.</p>
+<p><b>Logits and loss.</b> The output layer produces 8,192 x 128,256 = 1,050,673,152 values per sequence: 2.1 GB in BF16, 4.2 GB if the loss upcasts to FP32, and up to twice that while the gradient of the logits exists alongside them. This term is invisible in per-layer formulas and is the second largest here.</p>
+<p><b>ZeRO-3 buffers.</b> One gathered layer is 218,112,000 parameters, 0.44 GB in BF16; with the next layer prefetched, 0.87 GB, plus a gradient bucket of similar size waiting for its reduce-scatter. The embedding and output matrices are 525M parameters each, 1.05 GB when gathered. Call it 1 to 2 GB at peak.</p>
+<p><b>Total without recomputation.</b> Low: 4.0 + 36.5 + 2.1 + 1.0 = 43.6 GB. High: 5.0 + 44 + 8.4 + 2.0 = 59.4 GB. Both fit in 80 GB with room for the allocator.</p>
+<p><b>With full recomputation.</b> Only each layer's input is stored, 2sbh = 2 x 8,192 x 4,096 = 67 MB per layer, 2.1 GB in all, plus one layer's full activations while it is recomputed, 1.1 to 1.4 GB. The peak falls to about 10 to 18 GB, now dominated by the logits and the model state, and the playbook puts the price at up to 30 to 40% more compute.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The team wants sequence length 32,768. Which terms grow, by how much, and what do you do instead of recomputing everything?</li>
+<li>A memory snapshot shows 71 GB at the peak. Which of your terms do you suspect first, and what would you check?</li>
+<li>Would you spend the headroom on a second sequence per micro-batch or on a shorter step? What decides it?</li>
+</ul>
+</Fragment>
+</Depth>
+
+**The dominant term** is activations: 36.5 to 44 GB against 4 to 5 GB of model state. Sharding the state 32 ways moved the problem from parameters to activations, and the logits are the term most estimates miss.
+
+**Reasonable choices** land between about 43 and 60 GB: 16 or 20 bytes per parameter, a coefficient of 34 to 41, BF16 or FP32 logits with or without their gradient, and one or two gathered layers. **Unreasonable choices:** keeping the 5as/h term with FlashAttention on, which gives 380 GB of activations and a wrong conclusion that recomputation is mandatory; dividing activations by 32 as if ZeRO-3 sharded them, which gives about 1 GB and a run that fails at the first step; and using 12 bytes per parameter by forgetting either the BF16 weights or the gradients.
+
+**The decision with two defensible answers.** Without recomputation the run fits at about 50 GB and pays no recompute. With full recomputation it fits at about 15 GB and could take 3 or 4 sequences per micro-batch, which raises arithmetic intensity per kernel and halves or quarters the number of ZeRO-3 gathers per token, at up to 30 to 40% more compute. For this model at this length the first is cheaper unless profiling shows the per-layer all-gathers exposed, in which case the larger micro-batch can win back more than the recompute costs. Measure both for 200 steps rather than argue.
+
+**The assumption that flips the conclusion** is sequence length. Activations grow linearly with it once the scores are not stored: at 32,768 tokens they are 146 to 176 GB and the logits 8 to 34 GB, so recomputation or context parallelism becomes mandatory. A second flip is FlashAttention itself: on a kernel path that materialises the scores, nothing fits.
+
+**How this estimate fails.** It ignores fragmentation and the allocator's cached blocks, which on long runs with variable shapes can hold several GB the model never uses, and it treats the logit gradient as freed immediately. Calibrate against a memory snapshot at 2,048 tokens before trusting the 8,192 number.
+
+## Follow-ups
+
+- *Your estimate says no recomputation is needed, and the first run OOMs at step 1,800 on a few ranks. What do you check before reaching for recomputation, and what would you write in the incident note if it was the allocator?*
+- *A colleague proposes ZeRO-2 instead, since the model state is small. What does each GPU then hold, does it still fit, and what would make you reverse to ZeRO-3?*
+- *You can cut the logits term by computing the loss in chunks of the sequence. What does that cost, and when is it worth more than recomputation?*
+
+## Common mistakes
+
+- Treating model state as the dominant term after sharding it 32 ways.
+- Forgetting the logits, which at a 128,256-token vocabulary take as much memory as about two layers of activations in BF16 and nearly four in FP32.
+- Applying the 5as/h attention-score term when FlashAttention is in use.
+- Assuming ZeRO-3 shards activations.
+- Quoting full recomputation's memory without its compute price.

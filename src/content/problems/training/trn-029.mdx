@@ -1,0 +1,139 @@
+---
+id: trn-029
+title: The loss is worse after the restart
+subtitle: three thousand steps after a clean-looking restore
+track: training
+module: reliability
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [checkpointing, distributed-checkpoint, optimizer-state, debugging]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: PyTorch 2.14 docs, Distributed Checkpoint (torch.distributed.checkpoint)
+    url: https://docs.pytorch.org/docs/2.14/distributed.checkpoint.html
+    note: "DCP loads in place and each rank reads the least data needed to fulfill the requested state_dict; Stateful objects have state_dict called before load and load_state_dict after; get_optimizer_state_dict and set_optimizer_state_dict use canonical FQN keys; set_state_dict only before backward() or after step(), otherwise optimizer states are not initialized correctly; async_save returns staging_completion and upload_completion futures. Checked 2026-10-28."
+  - title: TorchTitan (arXiv 2410.06511), section 2.3.1
+    url: https://arxiv.org/abs/2410.06511
+    note: "DCP matches stored shards with the current model parameters and optimizer states at load. The paper reports. Checked 2026-10-28."
+choices:
+  - text: The restore rebuilt Adam moments from zero, so the first updates were full-size steps
+    correct: true
+    why: On restart the state dict passed to load comes from a fresh optimizer with no per-parameter state, so DCP requests and restores no moments, and the step after 41,001 is a full-learning-rate step on every coordinate.
+  - text: The data loader restarted at shard zero, so the run is re-reading tokens it trained on
+    correct: false
+    why: The loader is indeed missing from the state dict, but re-read data lowers training loss and leaves held-out loss alone; it cannot produce a gradient-norm spike two steps after the restart.
+  - text: The async upload was still running at the crash, so restore read a partly written step
+    correct: false
+    why: The discarded future is a real risk, but the crash came 200 steps after the save, and step 41,001 reproduces the pre-crash loss, so the weights that loaded are the step-41,000 weights.
+  - text: The scheduler state was lost on restore, so the learning rate restarted its warmup
+    correct: false
+    why: The scheduler is in the state dict and the logged learning rate is 2.40e-4 on both sides of the restart; a restarted warmup would log a tiny rate and give a slower, not spikier, start.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Our run crashed at step 41,200 and restored from the 41,000 checkpoint without errors. Three thousand steps later the loss is above where it was heading. What happened, what else is wrong in this code, and do we roll back?"
+</Callout>
+
+The run (scenario) trains a 7B model with FSDP2 on 256 GPUs and AdamW. Last month the team moved from `torch.save` to Distributed Checkpoint. This is the diff, trimmed to the checkpoint code:
+
+```diff
++from torch.distributed.checkpoint.state_dict import get_model_state_dict, set_model_state_dict
++from torch.distributed.checkpoint.stateful import Stateful
++import torch.distributed.checkpoint as dcp
++
++class AppState(Stateful):
++    def __init__(self, model, optimizer, scheduler, loader, step=0):
++        self.model, self.optimizer, self.scheduler, self.loader = model, optimizer, scheduler, loader
++        self.step = step
++
++    def state_dict(self):
++        return {
++            "model": get_model_state_dict(self.model),
++            "optim": self.optimizer.state_dict(),
++            "sched": self.scheduler.state_dict(),
++            "step": self.step,
++        }
++
++    def load_state_dict(self, sd):
++        set_model_state_dict(self.model, sd["model"])
++        self.optimizer.load_state_dict(sd["optim"])
++        self.scheduler.load_state_dict(sd["sched"])
++        self.step = sd["step"]
+
+ def main():
+     model = build_fsdp_model(cfg)
+     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, 0.95))
+     scheduler = build_cosine(optimizer, cfg)
+     loader = build_loader(cfg, rank)
+-    state = AppState(model, optimizer, scheduler, loader)
+-    if latest := find_latest(cfg.ckpt_dir):
+-        load_full(latest, state)
++    app = AppState(model, optimizer, scheduler, loader)
++    if latest := find_latest(cfg.ckpt_dir):
++        dcp.load({"app": app}, checkpoint_id=latest)
+     for batch in loader:
+         loss = train_step(model, optimizer, scheduler, batch)
+         app.step += 1
+         if app.step % cfg.ckpt_every == 0:
+-            save_full(state, cfg.ckpt_dir)
++            dcp.async_save({"app": app}, checkpoint_id=f"{cfg.ckpt_dir}/step-{app.step}")
+```
+
+The training log around the restart:
+
+```
+step 40990  loss 2.112  grad_norm 0.31  lr 2.40e-04
+step 41000  checkpoint step-41000 requested
+step 41200  NCCL watchdog timeout, job exits
+--- restart, load step-41000, no warnings ---
+step 41001  loss 2.115  grad_norm 0.30  lr 2.40e-04
+step 41002  loss 2.131  grad_norm 0.94  lr 2.40e-04
+step 41005  loss 2.274  grad_norm 3.80  lr 2.40e-04
+step 41020  loss 2.190  grad_norm 0.52  lr 2.40e-04
+step 41200  loss 2.141  grad_norm 0.33  lr 2.39e-04
+step 44000  loss 2.118  grad_norm 0.30  lr 2.31e-04
+```
+
+The pre-crash trend projects a training loss of 2.086 at step 44,000, and held-out loss at 44,000 is 0.03 above its own projection. Nobody has inspected the checkpoint files or the optimizer after loading. This is the first restore since the migration.
+
+Which defect explains the symptom?
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the number of entries in the optimizer's per-parameter state immediately after the load, and the same number just before the crash.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the list of keys stored in the step-41000 checkpoint metadata, and compare it with the keys the restarted job asked to load.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask which signals would move if the training data had repeated, and whether held-out loss would be one of them.</p></details>
+
+## Answer
+
+**The cause.** `dcp.load` calls `app.state_dict()` first to learn what to read, then reads into it. In the restarted process the optimizer has never stepped, so `self.optimizer.state_dict()` returns its parameter groups and no per-parameter state; AdamW creates its moment tensors on the first step. DCP reads the least data needed to fulfil the requested state dict, so it reads the parameter groups and none of the saved moments. `optimizer.load_state_dict` then receives a state dict with no state, and nothing fails. The checkpoint on disk is probably fine; the restore asked for less than was saved. The save path wrote the moments correctly because, at step 41,000, the optimizer had state.
+
+**Why the log looks like this.** Step 41,001's loss is computed with the restored weights before any update, so it matches the pre-crash trend. Its update is the first AdamW step with fresh moments, and bias correction makes that first step about one learning rate per coordinate in the direction of the gradient's sign, regardless of the gradient's size. Every parameter moves by roughly 2.4 × 10⁻⁴ at once, which is far larger than steady-state updates for most coordinates. Loss and gradient norm spike over the next few steps, the moments rebuild within tens of steps (with β₂ = 0.95 the second-moment average spans roughly 20 steps), and the run settles onto a slightly worse trajectory. Held-out loss moving with training loss says the model got worse, not that the data changed.
+
+**Why each wrong option is tempting.** The loader really is missing from the state dict, so after the restart the run re-reads the start of its data; that is a real defect, but it lowers training loss on repeated data and does not touch held-out loss or produce a spike at step 41,002. The `async_save` future is discarded, so a save can still be uploading when the next one starts or when the job dies; that is a real defect too, but the crash was 200 steps after the save and the restored weights reproduce the pre-crash loss. The scheduler option is the classic restart bug, ruled out here by the logged learning rate.
+
+**What to collect, and what to do without it.** First, `len(optimizer.state)` after load against the parameter count, and the stored keys in the checkpoint metadata: if the metadata holds the moments and the restarted job did not request them, the diagnosis is confirmed. Second, a fork test on a small model: save at step k, restore in a fresh process, and compare the next steps bitwise. Without that evidence, the fix is still clear: build the optimizer state dict with `get_optimizer_state_dict` and restore it with `set_optimizer_state_dict` (canonical keys, with the docs' rule that the set happens before `backward()` or after `step()`), and assert after every load that every parameter has optimizer state.
+
+**Roll back or continue.** Two defensible answers. Roll back to step 41,000 with the fixed restore and redo 3,000 steps on 256 GPUs: the cost is known and the trajectory is the one the run was on. Or continue: the spike recovered within 200 steps, the remaining gap is 0.03 in held-out loss, and an LR schedule with most of its length left often absorbs a gap like that, but nobody can promise it. The conflict is a known compute cost against an unmeasured quality risk that would show up only at the end of the run. I would roll back if the run is in its first half and the redo costs under a day, and continue with a written note and a comparison checkpoint otherwise. Failure mode of rolling back: if the step-41,000 checkpoint is itself incomplete, because nothing waited on its upload, the rollback fails too, so verify it loads with the fixed code before discarding the 44,000 state.
+
+**Ranking the other defects.** Second is the discarded `async_save` future: wait on the previous `upload_completion` before starting the next save and before exit, or the next failure may find no complete checkpoint. Third is the missing loader state: add the loader position to the state dict, or every restart re-reads the start of the data.
+
+## Follow-ups
+
+- *The research lead says 0.03 of held-out loss is within noise and refuses to roll back. What measurement settles it, and how long do you wait for it?*
+- *Your fix adds an assertion that fails the job if any parameter lacks optimizer state after load. A frozen embedding table has none by design. What do you change, and who reviews it?*
+- *What would make you trust the restore path enough to remove the post-load assertion?* A fork test in CI on every change to the checkpoint code, passing bitwise on the same layout and within tolerance after a reshard.
+
+## Common mistakes
+
+- Concluding the checkpoint file is corrupt without inspecting it, when the evidence points at what the load asked for.
+- Blaming the scheduler without checking the logged learning rate.
+- Fixing only the optimizer and leaving the discarded `async_save` future, which breaks the next restore instead.
+- Treating "loaded with no warnings" as proof of a correct restore.

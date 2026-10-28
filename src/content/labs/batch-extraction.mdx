@@ -1,0 +1,722 @@
+---
+title: Build a batch extraction pipeline with a review queue
+track: workflows
+module: batch-pipelines
+kind: lab
+minutes: 150
+summary: Grow one invoice extraction pipeline over six steps, from a validator to a batch submitter that accounts for every document, a confidence score, a review threshold and the morning cost report.
+updated: 2026-10-28
+sources:
+  - title: Claude docs, Batch processing
+    url: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+    note: 100,000 requests or 256 MB per batch; results in any order, matched on custom_id, which must match ^[a-zA-Z0-9_-]{1,64}$; succeeded, errored, canceled and expired result types; invalid_request_error needs a fixed request, other errors can be retried; errored, canceled and expired requests are not billed; Sonnet 5.5 batch prices $1 and $5 per million tokens; checked 2026-10-28
+  - title: Claude docs, Rate limits
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: a limit on batch requests in the processing queue (300,000 on the Build tier), the model for max_queued in step 3; checked 2026-10-28
+  - title: OpenAI API docs, Batch API
+    url: https://developers.openai.com/api/docs/guides/batch
+    note: output line order may not match input order; unfinished requests in an expired batch return batch_expired; checked 2026-10-28
+  - title: Instacart, Scaling catalog attribute extraction with multi-modal LLMs (2025-08-01)
+    url: https://company.instacart.com/tech-innovation/scaling-catalog-attribute-extraction-with-multi-modal-llms
+    note: confidence from a self-verification prompt as the probability of "yes" as the first generated token, with low-confidence values sent to people; the method in step 4; checked 2026-10-28
+  - title: Uber Engineering, Advancing invoice document processing at Uber using GenAI (2025-04-17)
+    url: https://www.uber.com/blog/advancing-invoice-document-processing-using-genai/
+    note: an invoice pipeline with business-rule post-processing and human review before the ERP, the shape this lab builds at toy scale; checked 2026-10-28
+  - title: Claude docs, Pricing
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: Sonnet 5.5 standard prices $2 and $10 per million tokens, used for the verify call in step 6; checked 2026-10-28
+steps:
+  - title: "A typed extraction schema and validator"
+    brief: >-
+      The validator is the contract between model output and the system of record, and everything later trusts it. It checks the schema (every field present, no unknown fields, non-empty strings, a real calendar date as YYYY-MM-DD, a known currency code, amounts that are numbers and not booleans) and one business rule: the lines add up to the total within one cent. Each error starts with the field it is about, so a review screen can highlight it. Its input is model output, so it never raises.
+    starter: |
+      import re
+      from datetime import date
+
+      FIELDS = ("vendor", "invoice_number", "invoice_date", "currency", "total", "lines")
+      CURRENCIES = {"USD", "EUR", "GBP", "INR", "JPY"}
+
+
+      def validate(record):
+          """Return a list of error strings, each starting with the name of the field it is about ("record" when the
+          input is not an object). An empty list means the record may be written. Never raise, whatever record is."""
+          raise NotImplementedError
+    tests: |
+      GOOD = {"vendor": "Acme Tools", "invoice_number": "INV-1042", "invoice_date": "2026-09-30", "currency": "USD",
+              "total": 150.0, "lines": [{"description": "Drill bits", "amount": 100.0}, {"description": "Gloves", "amount": 50.0}]}
+      named = lambda errors, field: any(e.startswith(field) for e in errors)
+      assert validate(GOOD) == [], validate(GOOD)
+      assert named(validate({**GOOD, "invoice_date": "2026-02-30"}), "invoice_date"), "February has no 30th"
+      assert named(validate({k: v for k, v in GOOD.items() if k != "currency"}), "currency"), "a missing field is an error"
+      assert named(validate({**GOOD, "total": 160.0}), "total"), "the lines sum to 150.00"
+      assert named(validate({**GOOD, "total": True}), "total"), "a bool is not an amount"
+      assert validate(None) and validate("{}") and validate([]), "garbage is an error, not an exception"
+    hidden: |
+      assert named(validate({**GOOD, "tax_id": "X1"}), "tax_id")
+      assert named(validate({**GOOD, "lines": []}), "lines")
+      assert named(validate({**GOOD, "lines": [{"description": "Drill bits", "amount": "100.00"}]}), "lines")
+      assert named(validate({**GOOD, "currency": "usd"}), "currency")
+      assert named(validate({**GOOD, "invoice_date": "2026-9-30"}), "invoice_date") and named(validate({**GOOD, "invoice_date": "20260930"}), "invoice_date")
+      assert named(validate({**GOOD, "total": float("nan")}), "total") and named(validate({**GOOD, "total": -5.0}), "total")
+      assert named(validate({**GOOD, "vendor": "  "}), "vendor") and named(validate({**GOOD, "invoice_number": 1042}), "invoice_number")
+      assert validate({**GOOD, "total": 150.004}) == [], "a rounding difference under one cent is not an error"
+      assert validate({**GOOD, "total": 0.3, "lines": [{"description": "a", "amount": 0.1}, {"description": "b", "amount": 0.2}]}) == []
+      assert all(isinstance(e, str) for e in validate({"lines": None, "total": None, "invoice_date": 5}))
+      assert all(named(validate({}), f) for f in FIELDS), "every missing field is named"
+    solution: |
+      import re
+      from datetime import date
+
+      FIELDS = ("vendor", "invoice_number", "invoice_date", "currency", "total", "lines")
+      CURRENCIES = {"USD", "EUR", "GBP", "INR", "JPY"}
+      DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+      def _amount(x):
+          # bool is a subclass of int; x == x is False only for NaN; the bound rules out infinity
+          return isinstance(x, (int, float)) and not isinstance(x, bool) and x == x and abs(x) < 1e15
+
+
+      def validate(record):
+          if not isinstance(record, dict):
+              return ["record: expected an object"]
+          errors = [f"{k}: unknown field" for k in record if k not in FIELDS]
+          errors += [f"{k}: missing" for k in FIELDS if k not in record]
+          for k in ("vendor", "invoice_number"):
+              if k in record and not (isinstance(record[k], str) and record[k].strip()):
+                  errors.append(f"{k}: expected a non-empty string")
+          if "invoice_date" in record:
+              d = record["invoice_date"]
+              try:
+                  if not (isinstance(d, str) and DATE_RE.match(d)):
+                      raise ValueError
+                  date.fromisoformat(d)
+              except ValueError:
+                  errors.append("invoice_date: expected a real date as YYYY-MM-DD")
+          if "currency" in record and record["currency"] not in CURRENCIES:
+              errors.append("currency: expected one of " + ", ".join(sorted(CURRENCIES)))
+          total_ok = "total" in record and _amount(record["total"]) and record["total"] >= 0
+          if "total" in record and not total_ok:
+              errors.append("total: expected a non-negative number")
+          lines = record.get("lines")
+          lines_ok = isinstance(lines, list) and len(lines) > 0 and all(
+              isinstance(l, dict) and set(l) == {"description", "amount"}
+              and isinstance(l["description"], str) and l["description"].strip() and _amount(l["amount"])
+              for l in lines
+          )
+          if "lines" in record and not lines_ok:
+              errors.append("lines: expected a non-empty list of {description, amount}")
+          if total_ok and lines_ok and abs(sum(l["amount"] for l in lines) - record["total"]) > 0.01 + 1e-9:
+              errors.append("total: does not equal the sum of the lines")
+          return errors
+  - title: "A mock model with seeded errors"
+    brief: >-
+      The starter adds make_docs, which builds synthetic invoices, and MockModel, a deterministic stand-in for the extraction model. Which documents come back wrong is fixed by a hash of the document id, so every run sees the same errors. Some errors break the schema (a reply cut off at max_tokens, a misplaced decimal point, a date left in the document's own format) and some pass it (a dropped digit in the invoice number, two line descriptions swapped). Write parse_output and extract: one model call per document, and an outcome for every reply, however broken.
+    starter: |
+      import json, random
+
+      VENDORS = ["Acme Tools", "Northwind Foods", "Globex Logistics", "Initech Office", "Umbrella Labs"]
+
+
+      def make_docs(n, seed=1):
+          """n synthetic invoices. The id has slashes, as many ERP document numbers do. Only the mock model and the
+          tests read "truth"; your code reads the model's output."""
+          rng = random.Random(seed)
+          docs = []
+          for i in range(n):
+              lines = [{"description": f"Item {j + 1}", "amount": round(rng.uniform(5, 500), 2)} for j in range(rng.randint(1, 4))]
+              truth = {"vendor": rng.choice(VENDORS), "invoice_number": f"INV-{100000 + i}",
+                       "invoice_date": f"2026-{rng.randint(1, 9):02d}-{rng.randint(1, 28):02d}",
+                       "currency": rng.choice(["USD", "EUR", "GBP"]),
+                       "total": round(sum(l["amount"] for l in lines), 2), "lines": lines}
+              text = f"{truth['vendor']}\nInvoice {truth['invoice_number']}\n" + "\n".join(f"{l['description']} {l['amount']:.2f}" for l in lines)
+              docs.append({"id": f"AP/2026/{i:06d}", "text": text, "truth": truth})
+          return docs
+
+
+      class MockModel:
+          """A deterministic stand-in for the extraction model. Which documents come back wrong is fixed by a hash of
+          the seed and the document id, so every run sees the same errors. Some errors break the schema; some do not."""
+
+          def __init__(self, seed=7):
+              self.seed = seed
+              self.calls = []
+
+          def _roll(self, doc_id, salt):
+              return random.Random(f"{self.seed}:{salt}:{doc_id}").random()
+
+          def extract(self, doc):
+              self.calls.append(("extract", doc["id"]))
+              rec = json.loads(json.dumps(doc["truth"]))
+              r = self._roll(doc["id"], "extract")
+              if r < 0.04:
+                  return json.dumps(rec)[:40]                          # output cut off at max_tokens
+              if r < 0.10:
+                  rec["total"] = round(rec["total"] * 10, 2)          # decimal point misread
+              elif r < 0.15:
+                  y, m, d = rec["invoice_date"].split("-")
+                  rec["invoice_date"] = f"{d}/{m}/{y}"                # the document's own date format
+              elif r < 0.22:
+                  rec["invoice_number"] = rec["invoice_number"][:-1]  # a digit dropped; the schema cannot see it
+              elif r < 0.27 and len(rec["lines"]) > 1:
+                  a, b = rec["lines"][0], rec["lines"][1]
+                  a["description"], b["description"] = b["description"], a["description"]  # also invisible to the schema
+              return json.dumps(rec)
+
+
+      def parse_output(doc_id, text):
+          """Turn one model output into an outcome {"id", "status", "record", "errors"}. status is "ok" (passes
+          validate), "invalid" (parsed, fails validate) or "unparseable"; record is None when unparseable. Never raise."""
+          raise NotImplementedError
+
+
+      def extract(model, doc):
+          """One model call for one document, parsed with parse_output."""
+          raise NotImplementedError
+    tests: |
+      docs = make_docs(200)
+      m = MockModel()
+      outs = [extract(m, d) for d in docs]
+      assert len(m.calls) == 200, "one model call per document"
+      assert {o["status"] for o in outs} == {"ok", "invalid", "unparseable"}, {o["status"] for o in outs}
+      assert [o["id"] for o in outs] == [d["id"] for d in docs]
+      assert all(o["errors"] == [] for o in outs if o["status"] == "ok") and all(o["errors"] for o in outs if o["status"] != "ok")
+      silent = [o for o, d in zip(outs, docs) if o["status"] == "ok" and o["record"] != d["truth"]]
+      assert silent, "some wrong records pass the schema; step 4 exists to catch them"
+    hidden: |
+      assert parse_output("x", None)["status"] == "unparseable" and parse_output("x", '{"vendor": "Ac')["record"] is None
+      o = parse_output("x", "[1, 2]")
+      assert o["status"] in ("invalid", "unparseable") and o["errors"]
+      REC = {"vendor": "Acme Tools", "invoice_number": "INV-7", "invoice_date": "2026-01-31", "currency": "EUR", "total": 12.5, "lines": [{"description": "Tape", "amount": 12.5}]}
+      o = parse_output("x", json.dumps(REC))
+      assert o["status"] == "ok" and o["record"] == REC and o["id"] == "x"
+      assert all(o["status"] != "ok" for o in outs if o["record"] is not None and validate(o["record"]))
+      assert all(o["record"] == json.loads(MockModel().extract(d)) for o, d in zip(outs, docs) if o["status"] != "unparseable")
+    solution: |
+      import json, random
+
+      VENDORS = ["Acme Tools", "Northwind Foods", "Globex Logistics", "Initech Office", "Umbrella Labs"]
+
+
+      def make_docs(n, seed=1):
+          """n synthetic invoices. The id has slashes, as many ERP document numbers do. Only the mock model and the
+          tests read "truth"; your code reads the model's output."""
+          rng = random.Random(seed)
+          docs = []
+          for i in range(n):
+              lines = [{"description": f"Item {j + 1}", "amount": round(rng.uniform(5, 500), 2)} for j in range(rng.randint(1, 4))]
+              truth = {"vendor": rng.choice(VENDORS), "invoice_number": f"INV-{100000 + i}",
+                       "invoice_date": f"2026-{rng.randint(1, 9):02d}-{rng.randint(1, 28):02d}",
+                       "currency": rng.choice(["USD", "EUR", "GBP"]),
+                       "total": round(sum(l["amount"] for l in lines), 2), "lines": lines}
+              text = f"{truth['vendor']}\nInvoice {truth['invoice_number']}\n" + "\n".join(f"{l['description']} {l['amount']:.2f}" for l in lines)
+              docs.append({"id": f"AP/2026/{i:06d}", "text": text, "truth": truth})
+          return docs
+
+
+      class MockModel:
+          """A deterministic stand-in for the extraction model. Which documents come back wrong is fixed by a hash of
+          the seed and the document id, so every run sees the same errors. Some errors break the schema; some do not."""
+
+          def __init__(self, seed=7):
+              self.seed = seed
+              self.calls = []
+
+          def _roll(self, doc_id, salt):
+              return random.Random(f"{self.seed}:{salt}:{doc_id}").random()
+
+          def extract(self, doc):
+              self.calls.append(("extract", doc["id"]))
+              rec = json.loads(json.dumps(doc["truth"]))
+              r = self._roll(doc["id"], "extract")
+              if r < 0.04:
+                  return json.dumps(rec)[:40]                          # output cut off at max_tokens
+              if r < 0.10:
+                  rec["total"] = round(rec["total"] * 10, 2)          # decimal point misread
+              elif r < 0.15:
+                  y, m, d = rec["invoice_date"].split("-")
+                  rec["invoice_date"] = f"{d}/{m}/{y}"                # the document's own date format
+              elif r < 0.22:
+                  rec["invoice_number"] = rec["invoice_number"][:-1]  # a digit dropped; the schema cannot see it
+              elif r < 0.27 and len(rec["lines"]) > 1:
+                  a, b = rec["lines"][0], rec["lines"][1]
+                  a["description"], b["description"] = b["description"], a["description"]  # also invisible to the schema
+              return json.dumps(rec)
+
+
+      def parse_output(doc_id, text):
+          try:
+              record = json.loads(text)
+          except (TypeError, ValueError):
+              return {"id": doc_id, "status": "unparseable", "record": None, "errors": ["output: not valid JSON"]}
+          errors = validate(record)
+          return {"id": doc_id, "status": "invalid" if errors else "ok", "record": record, "errors": errors}
+
+
+      def extract(model, doc):
+          return parse_output(doc["id"], model.extract(doc))
+  - title: "A batch submitter that reconciles every document"
+    brief: >-
+      MockBatchAPI follows the shape of Claude's Message Batches API: a cap on requests and on bytes per batch, a limit on requests sitting in batches you have not collected, results in shuffled order, and succeeded, errored and expired outcomes. Document ids contain slashes, which the documented custom_id pattern rejects, so choose your own custom_id scheme and keep a map back. Pack batches by count and by bytes, collect before the queue overflows, join results on custom_id, re-send expired requests and api_error failures up to max_rounds attempts in all, and treat invalid_request_error as final. A document too large for any batch becomes an outcome, not an exception. The tests check that every document ends with exactly one outcome joined to the right document.
+    starter: |
+      import re
+
+
+      class MockBatchAPI:
+          """A stand-in for a provider batch endpoint, shaped like Claude's Message Batches API. A batch holds at most
+          max_requests requests and max_bytes of JSON (len(json.dumps(request)) summed over its requests), and at most
+          max_queued requests may sit in batches whose results you have not collected. results() returns each request's
+          result once, in shuffled order. A seeded share of requests expire or fail with a retryable api_error; a
+          document marked "poison" fails with invalid_request_error every time. A request is {"custom_id", "doc"}."""
+          ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+          def __init__(self, model, max_requests=100_000, max_bytes=256_000_000, max_queued=300_000, seed=11):
+              self.model, self.seed = model, seed
+              self.max_requests, self.max_bytes, self.max_queued = max_requests, max_bytes, max_queued
+              self.pending, self.sizes, self.attempts = {}, [], {}
+
+          def create(self, requests):
+              ids = [r["custom_id"] for r in requests]
+              if not requests or len(requests) > self.max_requests:
+                  raise ValueError(f"a batch holds 1 to {self.max_requests} requests, got {len(requests)}")
+              if sum(len(json.dumps(r)) for r in requests) > self.max_bytes:
+                  raise ValueError("batch is larger than max_bytes")
+              if len(set(ids)) != len(ids) or not all(self.ID_RE.match(i) for i in ids):
+                  raise ValueError("custom_id values must be unique and match ^[a-zA-Z0-9_-]{1,64}$")
+              if sum(map(len, self.pending.values())) + len(requests) > self.max_queued:
+                  raise RuntimeError("429: processing queue is full; collect results first")
+              batch_id = f"msgbatch_{len(self.sizes) + 1:04d}"
+              self.pending[batch_id] = requests
+              self.sizes.append(len(requests))
+              return batch_id
+
+          def results(self, batch_id):
+              out = []
+              for req in self.pending.pop(batch_id):
+                  doc = req["doc"]
+                  n = self.attempts[doc["id"]] = self.attempts.get(doc["id"], 0) + 1
+                  roll = random.Random(f"{self.seed}:{doc['id']}:{n}").random()
+                  if doc.get("poison"):
+                      res = {"type": "errored", "error": {"type": "invalid_request_error"}}
+                  elif roll < 0.08:
+                      res = {"type": "expired"}
+                  elif roll < 0.11:
+                      res = {"type": "errored", "error": {"type": "api_error"}}
+                  else:
+                      text = self.model.extract(doc)
+                      res = {"type": "succeeded", "text": text,
+                             "usage": {"input_tokens": 900 + len(doc["text"]) // 4, "output_tokens": len(text) // 4}}
+                  out.append({"custom_id": req["custom_id"], "result": res})
+              random.Random(f"{self.seed}:{batch_id}").shuffle(out)
+              return out
+
+
+      def run_batches(api, docs, max_rounds=3):
+          """Send every document through api and return {doc_id: outcome} with exactly one outcome per document.
+          A succeeded result becomes parse_output's outcome plus "usage". An expired request or an api_error is sent
+          again in a later round, up to max_rounds attempts in all; invalid_request_error is final. A document still
+          unresolved at the end keeps status "expired" or "errored". Every outcome carries "attempts". Stay inside
+          api.max_requests, api.max_bytes and api.max_queued."""
+          raise NotImplementedError
+    tests: |
+      docs = make_docs(1200, seed=3)
+      docs[5]["poison"] = True
+      api = MockBatchAPI(MockModel(), max_requests=500, max_bytes=400_000, max_queued=1000)
+      out = run_batches(api, docs)
+      assert set(out) == {d["id"] for d in docs}, "every document gets exactly one outcome"
+      assert max(api.sizes) <= 500 and len(api.sizes) >= 3, api.sizes
+      assert out[docs[5]["id"]]["status"] == "errored" and out[docs[5]["id"]]["attempts"] == 1, "an invalid request is not retried"
+      assert all(out[d["id"]]["record"] == json.loads(MockModel().extract(d)) for d in docs if out[d["id"]]["status"] in ("ok", "invalid")), "results are joined to the right document"
+      assert any(o["attempts"] > 1 and o["status"] == "ok" for o in out.values()), "expired and api_error requests are sent again"
+      assert all(1 <= o["attempts"] <= 3 for o in out.values())
+    hidden: |
+      d2 = make_docs(900, seed=4)
+      api2 = MockBatchAPI(MockModel(), max_requests=500, max_bytes=60_000, max_queued=300)
+      o2 = run_batches(api2, d2)
+      assert set(o2) == {d["id"] for d in d2} and len(api2.sizes) > len(d2) // 300, "the byte cap binds before the count cap"
+      api7 = MockBatchAPI(MockModel(), max_requests=500, max_queued=300)
+      assert set(run_batches(api7, d2)) == {d["id"] for d in d2} and max(api7.sizes) <= 300, "a batch never holds more than the queue allows"
+      assert all(o["status"] in ("ok", "invalid", "unparseable", "expired", "errored") for o in o2.values())
+      d3 = make_docs(400, seed=5)
+      o3 = run_batches(MockBatchAPI(MockModel()), d3, max_rounds=1)
+      assert all(o["attempts"] == 1 for o in o3.values()) and any(o["status"] == "expired" for o in o3.values())
+      assert all("usage" in o for o in o3.values() if o["status"] in ("ok", "invalid", "unparseable"))
+      d4 = make_docs(50, seed=6)
+      d4[0]["text"] = "x" * 80_000
+      o4 = run_batches(MockBatchAPI(MockModel(), max_bytes=50_000), d4)
+      assert set(o4) == {d["id"] for d in d4} and o4[d4[0]["id"]]["status"] == "errored", "one oversized document must not sink the run"
+      d5 = make_docs(30, seed=7)
+      for i, d in enumerate(d5): d["id"] = "VENDOR-REMITTANCE/" + "9" * 70 + f"/{i}"
+      assert set(run_batches(MockBatchAPI(MockModel()), d5)) == {d["id"] for d in d5}
+      assert run_batches(MockBatchAPI(MockModel()), []) == {}
+      api6 = MockBatchAPI(MockModel(), seed=12)
+      o6 = run_batches(api6, make_docs(600, seed=8), max_rounds=3)
+      assert all(o["attempts"] == api6.attempts[i] for i, o in o6.items())
+      assert all(o["status"] != "expired" or o["attempts"] == 3 for o in o6.values())
+    solution: |
+      import re
+
+
+      class MockBatchAPI:
+          """A stand-in for a provider batch endpoint, shaped like Claude's Message Batches API. A batch holds at most
+          max_requests requests and max_bytes of JSON (len(json.dumps(request)) summed over its requests), and at most
+          max_queued requests may sit in batches whose results you have not collected. results() returns each request's
+          result once, in shuffled order. A seeded share of requests expire or fail with a retryable api_error; a
+          document marked "poison" fails with invalid_request_error every time. A request is {"custom_id", "doc"}."""
+          ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+          def __init__(self, model, max_requests=100_000, max_bytes=256_000_000, max_queued=300_000, seed=11):
+              self.model, self.seed = model, seed
+              self.max_requests, self.max_bytes, self.max_queued = max_requests, max_bytes, max_queued
+              self.pending, self.sizes, self.attempts = {}, [], {}
+
+          def create(self, requests):
+              ids = [r["custom_id"] for r in requests]
+              if not requests or len(requests) > self.max_requests:
+                  raise ValueError(f"a batch holds 1 to {self.max_requests} requests, got {len(requests)}")
+              if sum(len(json.dumps(r)) for r in requests) > self.max_bytes:
+                  raise ValueError("batch is larger than max_bytes")
+              if len(set(ids)) != len(ids) or not all(self.ID_RE.match(i) for i in ids):
+                  raise ValueError("custom_id values must be unique and match ^[a-zA-Z0-9_-]{1,64}$")
+              if sum(map(len, self.pending.values())) + len(requests) > self.max_queued:
+                  raise RuntimeError("429: processing queue is full; collect results first")
+              batch_id = f"msgbatch_{len(self.sizes) + 1:04d}"
+              self.pending[batch_id] = requests
+              self.sizes.append(len(requests))
+              return batch_id
+
+          def results(self, batch_id):
+              out = []
+              for req in self.pending.pop(batch_id):
+                  doc = req["doc"]
+                  n = self.attempts[doc["id"]] = self.attempts.get(doc["id"], 0) + 1
+                  roll = random.Random(f"{self.seed}:{doc['id']}:{n}").random()
+                  if doc.get("poison"):
+                      res = {"type": "errored", "error": {"type": "invalid_request_error"}}
+                  elif roll < 0.08:
+                      res = {"type": "expired"}
+                  elif roll < 0.11:
+                      res = {"type": "errored", "error": {"type": "api_error"}}
+                  else:
+                      text = self.model.extract(doc)
+                      res = {"type": "succeeded", "text": text,
+                             "usage": {"input_tokens": 900 + len(doc["text"]) // 4, "output_tokens": len(text) // 4}}
+                  out.append({"custom_id": req["custom_id"], "result": res})
+              random.Random(f"{self.seed}:{batch_id}").shuffle(out)
+              return out
+
+
+      def _failed(doc_id, status, kind):
+          return {"id": doc_id, "status": status, "record": None, "errors": [kind]}
+
+
+      def _batches(api, cids, by_cid, outcomes):
+          """Pack requests under every cap. A request too big for any batch is resolved here instead of crashing the run."""
+          cap = min(api.max_requests, api.max_queued)
+          batch, size = [], 0
+          for cid in cids:
+              req = {"custom_id": cid, "doc": by_cid[cid]}
+              n = len(json.dumps(req))
+              if n > api.max_bytes:
+                  outcomes[by_cid[cid]["id"]] = {**_failed(by_cid[cid]["id"], "errored", "request_too_large"), "attempts": 0}
+                  continue
+              if batch and (len(batch) == cap or size + n > api.max_bytes):
+                  yield batch
+                  batch, size = [], 0
+              batch.append(req)
+              size += n
+          if batch:
+              yield batch
+
+
+      def run_batches(api, docs, max_rounds=3):
+          # custom_id is our own key: document ids can break the provider's pattern, so keep a map back to them.
+          by_cid = {f"d{i}": doc for i, doc in enumerate(docs)}
+          tries = dict.fromkeys(by_cid, 0)
+          outcomes, todo = {}, list(by_cid)
+          for _ in range(max_rounds):
+              again, pending = [], []
+
+              def collect():
+                  for batch_id in pending:
+                      for item in api.results(batch_id):
+                          cid, res = item["custom_id"], item["result"]
+                          doc_id = by_cid[cid]["id"]
+                          tries[cid] += 1
+                          if res["type"] == "succeeded":
+                              out = {**parse_output(doc_id, res["text"]), "usage": res["usage"]}
+                          else:
+                              kind = res.get("error", {}).get("type", res["type"])
+                              out = _failed(doc_id, "expired" if res["type"] == "expired" else "errored", kind)
+                              if kind in ("expired", "api_error"):
+                                  again.append(cid)
+                          out["attempts"] = tries[cid]
+                          outcomes[doc_id] = out
+                  pending.clear()
+
+              queued = 0
+              for batch in _batches(api, todo, by_cid, outcomes):
+                  if queued + len(batch) > api.max_queued:
+                      collect()
+                      queued = 0
+                  pending.append(api.create(batch))
+                  queued += len(batch)
+              collect()
+              todo = again
+          return outcomes
+  - title: "Confidence from a second verify call"
+    brief: >-
+      Instacart's PARSE scores an extracted value with a second, yes-or-no verification prompt and uses the probability of yes as the first generated token. VerifyingModel adds that call. Like a real API it returns only the top few first-token log probabilities, with case and spacing variants as separate tokens, and sometimes the first token is neither yes nor no. Write p_yes (add up the variants, renormalise over yes and no, stay finite when log probabilities are very negative) and score, which spends a verify call only on outcomes that passed the schema.
+    starter: |
+      import math
+
+
+      class VerifyingModel(MockModel):
+          """Adds the second call: given the document and an extracted record, answer yes or no to "is this record
+          correct?". Like a real API it returns only the top few first-token log probabilities, with case and spacing
+          variants as separate tokens, and sometimes the first token is neither yes nor no. Correct records tend to
+          score higher, but the two populations overlap."""
+
+          def verify(self, doc, record):
+              self.calls.append(("verify", doc["id"]))
+              r = self._roll(doc["id"], "verify")
+              p = 0.70 + 0.29 * r if record == doc["truth"] else 0.15 + 0.80 * r
+              top = {"Yes": math.log(p * 0.8), " yes": math.log(p * 0.2), "No": math.log((1 - p) * 0.9), "The": math.log((1 - p) * 0.1)}
+              if r > 0.97:
+                  top = {"The": math.log(0.6), "Based": math.log(0.3)}
+              return {"top_logprobs": top, "usage": {"input_tokens": 700 + len(doc["text"]) // 4, "output_tokens": 1}}
+
+
+      def p_yes(top_logprobs):
+          """Probability of yes from first-token log probabilities: add up every variant of yes and of no (ignore case
+          and surrounding spaces), then renormalise over the two. Return 0.0 when neither appears. Stay finite when
+          the log probabilities are very negative."""
+          raise NotImplementedError
+
+
+      def score(model, doc, outcome):
+          """Confidence for one outcome. Without a model call, 0.0 unless status is "ok"; otherwise one verify call on
+          outcome["record"], whose usage is stored as outcome["verify_usage"]."""
+          raise NotImplementedError
+    tests: |
+      assert abs(p_yes({"Yes": math.log(0.6), "No": math.log(0.2)}) - 0.75) < 1e-9
+      assert abs(p_yes({"Yes": math.log(0.3), " yes": math.log(0.3), "NO ": math.log(0.2)}) - 0.75) < 1e-9, "add up the variants"
+      assert p_yes({"The": -0.1, "Based": -1.5}) == 0.0, "no yes and no no: send it to a person"
+      docs = make_docs(300, seed=5)
+      m = VerifyingModel()
+      outs = [extract(m, d) for d in docs]
+      conf = [score(m, d, o) for d, o in zip(docs, outs)]
+      assert sum(k == "verify" for k, _ in m.calls) == sum(o["status"] == "ok" for o in outs), "verify only what passed the schema, once each"
+      assert all(c == 0.0 for c, o in zip(conf, outs) if o["status"] != "ok")
+      right = [c for c, o, d in zip(conf, outs, docs) if o["status"] == "ok" and o["record"] == d["truth"]]
+      wrong = [c for c, o, d in zip(conf, outs, docs) if o["status"] == "ok" and o["record"] != d["truth"]]
+      assert sum(right) / len(right) > sum(wrong) / len(wrong), "correct records score higher on average"
+    hidden: |
+      assert abs(p_yes({"Yes": -800.0, "No": -801.0}) - 1 / (1 + math.exp(-1))) < 1e-9
+      assert p_yes({"yes": -0.01}) == 1.0 and p_yes({"No": -0.01}) == 0.0
+      rng = random.Random(3)
+      samples = [{t: -rng.uniform(0, 30) for t in rng.sample(["Yes", "yes", " Yes", "No", " no", "The", "Maybe"], 4)} for _ in range(300)]
+      assert all(0.0 <= p_yes(s) <= 1.0 for s in samples)
+      assert all(p_yes({**s, "Yes": max(s.get("Yes", -50.0), -50.0) + 1.0}) >= p_yes(s) - 1e-12 for s in samples), "more yes never lowers confidence"
+      assert all(isinstance(c, float) for c in conf)
+      assert all("verify_usage" in o for o in outs if o["status"] == "ok") and not any("verify_usage" in o for o in outs if o["status"] != "ok")
+      assert sum(k == "extract" for k, _ in m.calls) == 300, "scoring makes no extraction calls"
+    solution: |
+      import math
+
+
+      class VerifyingModel(MockModel):
+          """Adds the second call: given the document and an extracted record, answer yes or no to "is this record
+          correct?". Like a real API it returns only the top few first-token log probabilities, with case and spacing
+          variants as separate tokens, and sometimes the first token is neither yes nor no. Correct records tend to
+          score higher, but the two populations overlap."""
+
+          def verify(self, doc, record):
+              self.calls.append(("verify", doc["id"]))
+              r = self._roll(doc["id"], "verify")
+              p = 0.70 + 0.29 * r if record == doc["truth"] else 0.15 + 0.80 * r
+              top = {"Yes": math.log(p * 0.8), " yes": math.log(p * 0.2), "No": math.log((1 - p) * 0.9), "The": math.log((1 - p) * 0.1)}
+              if r > 0.97:
+                  top = {"The": math.log(0.6), "Based": math.log(0.3)}
+              return {"top_logprobs": top, "usage": {"input_tokens": 700 + len(doc["text"]) // 4, "output_tokens": 1}}
+
+
+      def _logsumexp(xs):
+          m = max(xs)
+          return m + math.log(sum(math.exp(x - m) for x in xs))
+
+
+      def p_yes(top_logprobs):
+          yes = [lp for tok, lp in top_logprobs.items() if tok.strip().lower() == "yes"]
+          no = [lp for tok, lp in top_logprobs.items() if tok.strip().lower() == "no"]
+          if not yes:
+              return 0.0
+          if not no:
+              return 1.0
+          # p = Y / (Y + N) computed in log space, so tiny probabilities do not underflow to 0 / 0
+          return 1.0 / (1.0 + math.exp(_logsumexp(no) - _logsumexp(yes)))
+
+
+      def score(model, doc, outcome):
+          if outcome["status"] != "ok":
+              return 0.0
+          reply = model.verify(doc, outcome["record"])
+          outcome["verify_usage"] = reply["usage"]
+          return p_yes(reply["top_logprobs"])
+  - title: "A review threshold chosen on a labelled sample"
+    brief: >-
+      choose_threshold takes a labelled audit sample of (confidence, correct) pairs and returns the threshold that auto-accepts the most items while the accepted error rate stays within the target. Items with equal confidence go the same way. The accepted error rate is not monotone in the threshold, so every candidate has to be checked, and the hidden tests pass 50,000 pairs, which rules out recounting the sample for each candidate. route splits documents into auto-accepted and review, and reviewer_hours turns the review count into the number the operations lead staffs against.
+    starter: |
+      def choose_threshold(sample, max_error):
+          """sample: (confidence, correct) pairs from a labelled audit. Return the threshold t that auto-accepts the most
+          items (confidence >= t) while the error rate among accepted items stays at or below max_error. Items with equal
+          confidence are accepted or reviewed together. Return float("inf") when no threshold qualifies, which sends
+          everything to review. It must handle 50,000 pairs within the test's time limit."""
+          raise NotImplementedError
+
+
+      def route(items, t):
+          """items: (doc_id, confidence) pairs. Return (auto, review): two lists of doc ids."""
+          raise NotImplementedError
+
+
+      def reviewer_hours(n_review, seconds_each):
+          raise NotImplementedError
+    tests: |
+      S = [(0.95, True), (0.9, True), (0.9, False), (0.8, True), (0.7, False), (0.6, True)]
+      assert choose_threshold(S, 0.25) == 0.8, "accept 4 with 1 error; 0.9 fails (1 in 3) but 0.8 passes"
+      assert choose_threshold(S, 0.0) == 0.95
+      assert choose_threshold([(0.9, False)], 0.1) == float("inf")
+      assert route([("a", 0.95), ("b", 0.5), ("c", 0.8)], 0.8) == (["a", "c"], ["b"])
+      assert reviewer_hours(1200, 45) == 15.0, "1,200 reviews at 45 seconds is 15 hours"
+    hidden: |
+      import time
+
+
+      def _brute(sample, max_error):
+          best_n, best_t = 0, float("inf")
+          for t in sorted({c for c, _ in sample}, reverse=True):
+              acc = [ok for c, ok in sample if c >= t]
+              if acc and acc.count(False) <= max_error * len(acc) + 1e-12 and len(acc) > best_n:
+                  best_n, best_t = len(acc), t
+          return best_t
+
+
+      rng = random.Random(21)
+      cases = [[(round(rng.random(), 2), rng.random() < 0.85) for _ in range(rng.randint(1, 300))] for _ in range(40)]
+      assert all(choose_threshold(c, e) == _brute(c, e) for c in cases for e in (0.0, 0.02, 0.1, 0.3))
+      assert choose_threshold([], 0.1) == float("inf")
+      big = [(rng.random(), rng.random() < 0.9) for _ in range(50_000)]
+      t0 = time.perf_counter()
+      tb = choose_threshold(big, 0.05)
+      elapsed = time.perf_counter() - t0 if "tb" in globals() else None
+      assert elapsed is not None and elapsed < 3.0, "50,000 pairs: sort once and sweep"
+      acc = [ok for c, ok in big if c >= tb]
+      assert acc.count(False) <= 0.05 * len(acc) + 1e-9
+      a, r = route([(i, c) for i, (c, _) in enumerate(big)], tb)
+      assert len(a) + len(r) == 50_000 and not set(a) & set(r)
+    solution: |
+      def choose_threshold(sample, max_error):
+          # One sort, one sweep from the most confident down; a threshold is only checked at the end of a run of ties.
+          ranked = sorted(sample, key=lambda p: -p[0])
+          best, accepted, errors = float("inf"), 0, 0
+          for i, (conf, correct) in enumerate(ranked):
+              accepted += 1
+              errors += not correct
+              last_of_tie = i + 1 == len(ranked) or ranked[i + 1][0] != conf
+              if last_of_tie and errors <= max_error * accepted + 1e-12:
+                  best = conf
+          return best
+
+
+      def route(items, t):
+          auto = [doc_id for doc_id, conf in items if conf >= t]
+          review = [doc_id for doc_id, conf in items if conf < t]
+          return auto, review
+
+
+      def reviewer_hours(n_review, seconds_each):
+          return n_review * seconds_each / 3600
+  - title: "A cost and accuracy report per document"
+    brief: >-
+      The report the pipeline owner reads each morning. Extraction is billed at batch prices and verify calls at standard prices; errored and expired batch requests are not billed, as the Claude docs state. The tests use Claude Sonnet 5.5 prices ($1 and $5 per million input and output tokens in a batch, $2 and $10 standard). Failed documents go to people as well, so the share that needs a person is review plus failed over all documents. Accuracy is measured only on labelled auto-accepted rows, and the expected number of wrong auto-accepted documents follows from it.
+    starter: |
+      def report(rows, prices, seconds_per_review):
+          """rows: one dict per document with
+               "usage": usage of the succeeded batch extraction, or None (errored and expired requests are not billed),
+               "verify_usage": usage of the verify call, or None,
+               "route": "auto", "review" or "failed" (failed documents go to people too),
+               "correct": True or False for labelled documents, None otherwise.
+             prices: dollars per million tokens under batch_in, batch_out (extraction) and sync_in, sync_out (verify).
+             Return a dict with docs, cost, cost_per_doc, cost_per_auto, review_rate (review plus failed, over docs),
+             reviewer_hours, auto_accuracy (over labelled auto rows; None without any) and expected_auto_errors
+             (auto count times (1 - auto_accuracy); None without labels). Use None for a ratio with a zero denominator."""
+          raise NotImplementedError
+    tests: |
+      PRICES = {"batch_in": 1.0, "batch_out": 5.0, "sync_in": 2.0, "sync_out": 10.0}
+      U, V = {"input_tokens": 1000, "output_tokens": 200}, {"input_tokens": 1200, "output_tokens": 1}
+      ROWS = [
+          {"usage": U, "verify_usage": V, "route": "auto", "correct": True},
+          {"usage": U, "verify_usage": V, "route": "review", "correct": False},
+          {"usage": None, "verify_usage": None, "route": "failed", "correct": None},
+          {"usage": U, "verify_usage": None, "route": "failed", "correct": None},
+      ]
+      rep = report(ROWS, PRICES, 60)
+      assert abs(rep["cost"] - 0.01082) < 1e-12, "3 billed extractions at $0.002 plus 2 verify calls at $0.00241"
+      assert abs(rep["cost_per_doc"] - 0.002705) < 1e-12 and abs(rep["cost_per_auto"] - 0.01082) < 1e-12
+      assert rep["review_rate"] == 0.75 and abs(rep["reviewer_hours"] - 0.05) < 1e-12, "3 documents need a person, 60 seconds each"
+      assert rep["auto_accuracy"] == 1.0 and rep["expected_auto_errors"] == 0.0
+    hidden: |
+      docs = make_docs(2000, seed=9)
+      model = VerifyingModel()
+      out = run_batches(MockBatchAPI(model, max_requests=800, max_bytes=2_000_000, max_queued=1600), docs)
+      conf = {d["id"]: score(model, d, out[d["id"]]) for d in docs}
+      audit = docs[:500]
+      t = choose_threshold([(conf[d["id"]], out[d["id"]]["record"] == d["truth"]) for d in audit], 0.02)
+      auto, review = route([(d["id"], conf[d["id"]]) for d in docs if out[d["id"]]["status"] == "ok"], t)
+      auto = set(auto)
+      rows = [{"usage": out[d["id"]].get("usage"), "verify_usage": out[d["id"]].get("verify_usage"),
+               "route": "auto" if d["id"] in auto else ("review" if out[d["id"]]["status"] == "ok" else "failed"),
+               "correct": (out[d["id"]]["record"] == d["truth"]) if i < 500 else None} for i, d in enumerate(docs)]
+      rep = report(rows, PRICES, 45)
+      assert rep["docs"] == 2000 and 0 < rep["review_rate"] < 1 and rep["cost"] > 0
+      assert abs(rep["reviewer_hours"] - rep["review_rate"] * 2000 * 45 / 3600) < 1e-9
+      assert rep["cost_per_auto"] >= rep["cost_per_doc"]
+      assert rep["auto_accuracy"] >= 0.98 - 1e-12, "on the audit rows the threshold holds the error target"
+      e = report([], PRICES, 45)
+      assert e["docs"] == 0 and e["cost"] == 0 and e["cost_per_doc"] is None and e["review_rate"] is None
+      n = report([{"usage": None, "verify_usage": None, "route": "auto", "correct": None}], PRICES, 45)
+      assert n["auto_accuracy"] is None and n["expected_auto_errors"] is None and n["cost"] == 0
+    solution: |
+      def _usd(usage, price_in, price_out):
+          if not usage:
+              return 0.0
+          return (usage["input_tokens"] * price_in + usage["output_tokens"] * price_out) / 1_000_000
+
+
+      def report(rows, prices, seconds_per_review):
+          cost = sum(_usd(r.get("usage"), prices["batch_in"], prices["batch_out"])
+                     + _usd(r.get("verify_usage"), prices["sync_in"], prices["sync_out"]) for r in rows)
+          auto = [r for r in rows if r["route"] == "auto"]
+          people = len(rows) - len(auto)
+          labelled = [r["correct"] for r in auto if r.get("correct") is not None]
+          accuracy = sum(labelled) / len(labelled) if labelled else None
+          return {
+              "docs": len(rows),
+              "cost": cost,
+              "cost_per_doc": cost / len(rows) if rows else None,
+              "cost_per_auto": cost / len(auto) if auto else None,
+              "review_rate": people / len(rows) if rows else None,
+              "reviewer_hours": reviewer_hours(people, seconds_per_review),
+              "auto_accuracy": accuracy,
+              "expected_auto_errors": None if accuracy is None else len(auto) * (1 - accuracy),
+          }
+---
+
+This lab builds the pipeline from the batch-pipelines lessons as one program: a validator, a model call, a batch stage, a confidence score, a review threshold and a report. Each step adds functions to the same file and its tests run against everything written so far, so step 6 runs documents through the `run_batches` you wrote in step 3.
+
+There is no real model or provider here. The starters bring deterministic mocks: a model that corrupts a fixed set of invoices, some in ways the schema catches and some in ways it cannot, and a batch endpoint with the limits and failure types of Claude's Message Batches API, returning results out of order, with expiries and errors seeded by document id. The tests check behaviour rather than wording: every document ends with exactly one outcome, results land on the right document, retries stop where they should, verify calls are spent only where they can matter, and the review and cost arithmetic adds up.
+
+Two steps carry the decisions: step 3 decides whether a batch stage accounts for every document, and step 5 decides how large the review queue is. The other steps give those two something realistic to work on.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

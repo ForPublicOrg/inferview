@@ -1,0 +1,113 @@
+---
+id: fnd-019
+title: A fine-tune that keeps talking in production
+subtitle: rank the defects
+track: foundations
+module: tokens
+type: debug
+difficulty: hard
+seniority: [staff]
+minutes: 30
+core: false
+tags: [chat-templates, special-tokens, fine-tuning, serving]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Hugging Face TRL docs, SFT Trainer (v1.16.0)
+    url: https://huggingface.co/docs/trl/sft_trainer
+    note: for base models with a predefined chat template the EOS token must be aligned with the template, for example eos_token="<|im_end|>" for Qwen/Qwen2.5-1.5B; assistant_only_loss requires generation markers in the template; checked 28 Oct 2026
+  - title: Qwen/Qwen2.5-1.5B, tokenizer_config.json
+    url: https://huggingface.co/Qwen/Qwen2.5-1.5B/raw/main/tokenizer_config.json
+    note: eos_token is <|endoftext|> (id 151643); <|im_start|> is 151644 and <|im_end|> 151645; the chat template ends every message with <|im_end|> and a newline; checked 28 Oct 2026
+choices:
+  - text: Generation stops only on the base end-of-text id, so the end-of-turn token the model emits never ends the response
+    correct: true
+    why: The fine-tune ends turns with <|im_end|> (151645); the server stops on 151643 only, so after the answer the model writes a new user turn until max_tokens, and skip_special_tokens hides the marker.
+  - text: The training template's generation block excluded the end-of-turn token, so the fine-tune never learned to stop
+    correct: false
+    why: The same weights stop cleanly offline under the tokenizer's own template, so the model did learn to emit the end-of-turn token.
+  - text: Serving injects a default system prompt the fine-tune never saw, which pushes the model off its trained distribution
+    correct: false
+    why: A real mismatch that can lower answer quality, but a shifted prompt does not make the model write a fake user turn and run to the token limit.
+  - text: Production samples at temperature 1.0 where the offline eval decoded greedily, which lets the answer wander past its end
+    correct: false
+    why: A real difference worth fixing, but sampling noise does not explain responses that hit max_tokens with role names in the text.
+---
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+A contract-review model is a supervised fine-tune of Qwen2.5-1.5B (base) trained with TRL on a conversational dataset:
+
+```python
+SFTConfig(
+    assistant_only_loss=True,
+    eos_token="<|im_end|>",
+    max_length=1024,
+)
+```
+
+The offline eval loads the checkpoint with `transformers` and calls the pipeline with message lists; answers end where they should. Production serves the same checkpoint behind the platform team's inference server with this deployment file:
+
+```yaml
+model: acme/contract-review-qwen2.5-1.5b-sft
+chat_template: templates/chatml.jinja
+system_prompt_default: "You are a helpful assistant."
+sampling:
+  temperature: 1.0
+  max_tokens: 2048
+  stop_token_ids: [151643]
+  skip_special_tokens: true
+```
+
+In the first week, 31% of production responses (scenario) report `finish_reason: "length"`. One of them, as the client received it:
+
+```text
+The clause caps liability at fees paid in the prior 12 months, which excludes indirect damages.
+user
+Does the cap apply to the indemnity in section 9?
+assistant
+Section 9 carves the indemnity out of the cap, so ...
+```
+
+Output spend for the feature is 3.8 times the forecast (scenario). Which defect explains the symptom? Then rank the others, and say what you would collect before changing anything.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the raw token ids of one long completion, with special tokens kept.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask which token ids the fine-tuned checkpoint's own generation config treats as end of sequence, and which ids the server stops on.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask whether the offline eval and the server render the same conversation to the same token ids.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>The server stops on 151643, the base model's <code>&lt;|endoftext|&gt;</code>. The fine-tune was trained to end each assistant turn with <code>&lt;|im_end|&gt;</code>, id 151645, as TRL's docs say Qwen2.5 base models need. The model does stop its answer; nothing stops the decoder, so it continues the ChatML pattern with a new user turn, and <code>skip_special_tokens</code> strips the markers so the client sees bare role names. The fix is to stop on 151645, and to make the checkpoint carry its stop ids so no deployment file has to know them.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Ranking. The stop-id mismatch explains every observation: the answer text is correct and complete, the continuation has the shape of the next ChatML turn, the response runs to max_tokens, and the offline path stops because <code>transformers</code> reads the checkpoint's generation config and template. The default system prompt is second: a real distribution shift the fine-tune never saw, likely to cost quality on the eval, and invisible in this symptom. Temperature 1.0 against a greedy eval is third: it widens variance and should match whatever the eval measured, but it does not produce role names. The training-template hypothesis is ruled out by the offline behaviour of the same weights.</p>
+<p>What to collect first, because the evidence is a client-side string: the raw ids of one long completion with special tokens kept, which should show 151645 right after the answer; the checkpoint's <code>generation_config.json</code> and the <code>eos_token_id</code> the server resolved; and a diff of the token ids that the offline template and <code>templates/chatml.jinja</code> produce for one fixed conversation. If the raw ids cannot be pulled this week, ship the stop-id change behind the existing canary anyway: it is reversible and the cost of waiting is the 3.8 times output bill.</p>
+<p>The ownership decision has two defensible answers. Fix it in the deployment file: one line, live today, and the platform team keeps control of serving config, at the cost that the next fine-tune with a different template repeats the bug. Or make the training pipeline publish the template, the stop ids and a golden rendering as part of the checkpoint, and have the server refuse to load a model whose rendering of the golden conversation differs: this closes the class of bug, at the cost of a cross-team contract and a release gate that someone must own. The recommendation is both, in that order, with the contract test owned by the training team because they choose the template.</p>
+<p>The failure mode of the quick fix is that it hides the second defect. Once responses stop at the right place, the system-prompt mismatch remains, and nothing in the latency or cost dashboards will show it; only the eval on production-rendered prompts will.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The platform team says per-model stop ids in the deployment file are their contract and the training team should conform. How do you decide without deciding by rank?</li>
+<li>The golden-rendering gate blocks a release on a Friday because a whitespace change in the template moved one token. Do you ship, and who signs?</li>
+<li>What would you need to see to remove the default system prompt from every deployment, not only this one?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Pushback:* "Adding 151645 to the stop list is enough; a contract test is process for its own sake." Name the next change that the stop list does not catch.
+- *Reversal:* after the fix, the eval on production-rendered prompts is 4 points below the offline eval (scenario). Which defect do you now chase, and how do you show it is the cause?
+- *Cost:* 31% of responses ran to 2,048 output tokens for a week. How do you estimate the overspend from the logs you have, and what alert would have caught it on day one?
+
+## Common mistakes
+
+- Concluding the model never learned to stop, when the same weights stop offline.
+- Fixing the symptom by lowering max_tokens, which truncates long legitimate answers and leaves the cause.
+- Copying a template file between repositories without a test that compares token ids, not strings.
+- Reading the client-side text as the model's output; special tokens are removed before the client sees it.

@@ -1,0 +1,158 @@
+---
+title: Debugging a prompt that fails in production
+track: apis
+module: prompting
+order: 3
+kind: lesson
+level: senior
+minutes: 12
+summary: Production prompt failures cluster by input slice, so the fix starts with sampled traces, coded failures and a slice table, separates near ties from consistent errors, and ends as an eval case that gates the change.
+prerequisites: [apis/prompting/prompt-structure]
+updated: 2026-10-28
+sources:
+  - title: LLM Evals FAQ (Hamel Husain and Shreya Shankar)
+    url: https://hamel.dev/blog/posts/evals-faq/
+    note: "start with 100 diverse traces and annotate at least the first 30 yourself; note the first failure in each trace; open coding then axial coding into a counted taxonomy; stop at saturation; binary pass or fail over Likert; one domain expert as the quality owner; fix obvious prompt gaps first and build evaluators for failures that persist; label 100 to 200 examples per failure mode for an LLM judge; the authors report spending 60 to 80% of development time on error analysis and evaluation. Checked 2026-10-28."
+  - title: How is ChatGPT's behavior changing over time? (Chen, Zaharia, Zou, 2023)
+    url: https://arxiv.org/abs/2307.09009
+    note: "GPT-3.5 and GPT-4 compared between March and June 2023 on seven tasks; GPT-4 prime-versus-composite accuracy 84% then 51%; more code formatting mistakes in June for both; GPT-4 less willing to answer sensitive questions; the authors conclude continuous monitoring is needed"
+  - title: What We've Learned From A Year of Building with LLMs (Yan, Bischof, Frye, Husain, Liu, Shankar, 2024-06-08)
+    url: https://applied-llms.org/
+    note: "pin model versions; Voiceflow saw a roughly 10% drop in intent classification after a model version switch and caught it with evals; log inputs and outputs and review a sample daily; run each test input several times; relax assertions to the weakest assumption any valid answer satisfies"
+  - title: Defeating Nondeterminism in LLM Inference (Horace He, Thinking Machines, 2025-09-10)
+    url: https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+    note: "1,000 temperature-0 completions of Qwen3-235B-A22B-Instruct-2507 gave 80 unique outputs, identical for 102 tokens and split 992 to 8 at token 103; the cause is kernels that are not batch invariant while server load changes batch size; batch-invariant kernels made all 1,000 identical; on Qwen3-8B the run took 26 s by default, 55 s deterministic unoptimised, 42 s with an improved attention kernel"
+  - title: Claude docs, migrating to API version 2026-10-21
+    url: https://platform.claude.com/docs/en/api/migration-2026-10-21
+    note: "sampling parameters return 400; requests sample at their defaults including temperature 1.0; models that already accept only the defaults, such as Claude 4.7 and later, sample as before. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Failures cluster, rewording does not find the cluster
+
+A prompt that fails in production rarely fails uniformly. It fails on long inputs, on one language, on tickets that mention two products, on the template version a single customer still sends. Rewording the prompt against the three examples in the bug report changes behaviour everywhere to fix a cluster nobody has measured, so the next report comes from a slice the rewording broke.
+
+The method is the one used for any production defect with a long tail: sample, classify, count by dimension, fix the largest cluster, add a regression test. What differs for prompts is that the classification step is manual reading, the system under test is non-deterministic, and part of the system is versioned by someone else.
+
+## The loop
+
+**Sample traces, not complaints.** Hamel Husain and Shreya Shankar's evals FAQ starts error analysis at 100 diverse traces, with at least the first 30 annotated by a person who knows the domain. Complaints over-sample angry users and the visible failure; a stratified sample of traffic, plus every complaint, gives both the rate and the worst cases.
+
+**Code the first failure in each trace.** Open coding is a free-text note on what went wrong; upstream errors cause downstream ones, so the FAQ notes only the first. Axial coding then groups the notes into a taxonomy and counts each category. Keep reading until new traces stop producing new categories.
+
+**Label pass or fail.** The FAQ recommends binary labels over 1-to-5 scales, which invite middle values and need larger samples to compare. Several specific binary checks track progress better than one scale.
+
+**One owner for "correct".** A single domain expert decides what passes. Disagreement between labellers is a specification bug and the expert resolves it into a rule.
+
+**Fix obvious gaps directly.** A missing length or format rule is a prompt edit, not an evaluator. The FAQ's advice is to build automated evaluators only for failures that persist after the prompt fix.
+
+The authors report spending 60 to 80% of their development time on error analysis and evaluation. That is their practice, not a benchmark, but it calibrates the expectation: the reading is the work.
+
+## Slicing by input feature
+
+Once failures are coded, count them against features of the input and the request: input length bucket, language, input source or template, presence and size of retrieved context, tool results, customer tier, prompt version, model ID, API version, time. The question for each feature is whether the failure rate in one value is far from the rest and whether that slice is a large share of all failures.
+
+<Predict id="api-slice-share" question="A week has 10,000 traced requests and 4.24% fail. One slice, tickets over 2,000 tokens, is 800 of the requests and fails 30% of the time; the other 9,200 fail 2% of the time. What percentage of all failures come from the long-ticket slice?" answer={57} tolerance={2} unit="%">
+<p><b>About 57%.</b> The slice has 800 × 0.30 = 240 failures, the rest 9,200 × 0.02 = 184, for 424 in total (4.24%). 240 / 424 = 56.6%. A slice holding 8% of traffic holds over half the failures, and a prompt edit judged on overall pass rate could double the failure rate on short tickets and still look like a win.</p>
+</Predict>
+
+A slice table is short code once traces carry their features.
+
+```python
+from collections import defaultdict
+
+def slice_table(traces, feature, min_count=30):
+    total_fail = sum(1 for t in traces if not t["pass"])
+    groups = defaultdict(lambda: [0, 0])          # value -> [count, failures]
+    for t in traces:
+        g = groups[feature(t)]
+        g[0] += 1
+        g[1] += 0 if t["pass"] else 1
+    rows = []
+    for value, (n, f) in groups.items():
+        if n >= min_count:
+            rows.append((value, n, round(f / n, 3), round(f / max(total_fail, 1), 3)))
+    return sorted(rows, key=lambda r: -r[3])     # largest share of failures first
+
+def length_bucket(t):
+    return "over 2k" if t["input_tokens"] > 2000 else "2k or less"
+
+traces = ([{"input_tokens": 2500, "pass": i % 10 >= 3} for i in range(800)] +
+          [{"input_tokens": 400, "pass": i % 50 != 0} for i in range(9200)])
+for row in slice_table(traces, length_bucket):
+    print(row)
+```
+
+It prints `('over 2k', 800, 0.3, 0.566)` then `('2k or less', 9200, 0.02, 0.434)`: value, count, failure rate, share of failures. The `min_count` floor matters: with a few dozen traces per value, a slice's failure rate has a wide confidence interval and the table ranks noise.
+
+## Near ties: when the label is a coin the server flips
+
+Some failures are not consistent. The same input passes on one run and fails on the next, and a team without a method rewrites the prompt until the one bad run goes away.
+
+Thinking Machines measured how far identical requests diverge. Running Qwen3-235B 1,000 times at temperature 0 with one prompt gave 80 distinct completions; all were identical for 102 tokens, and at token 103 992 runs wrote one continuation and 8 another. The cause was kernels whose numerics depend on batch size, while server load changes batch size from request to request; batch-invariant kernels made all 1,000 identical, at a cost (26 s by default against 42 s with the improved deterministic kernels, on Qwen3-8B in their test). On a hosted API that choice is the provider's. And under Anthropic's API version 2026-10-21, temperature cannot be set at all; requests sample at 1.0.
+
+The practical reading: a decision that flips between runs sat on a near tie, where two outputs were almost equally likely. A near tie is evidence about the input and the specification, not about the wording. Measure it per input:
+
+- Repeat each failing input k times (10 is enough to separate 10-of-10 from 6-of-10) and record the agreement rate. The applied-llms.org authors make the same point for tests: run each input several times, because rare anomalies only appear occasionally.
+- Where the API returns token log probabilities, the margin between the top two label tokens measures the same thing in one call.
+
+Consistent errors (10 of 10 wrong) are specification or capability problems and respond to prompt or example changes. Near ties (6 of 10) on inputs that are genuinely ambiguous respond to a tie-break rule, a new label, or routing to a person; rewording only moves which side of the tie wins this week.
+
+## Changes behind a name
+
+Some slices are not about the input at all; they are about time. Chen, Zaharia and Zou compared GPT-3.5 and GPT-4 between March and June 2023 under the same names: GPT-4's accuracy on identifying prime numbers went from 84% to 51%, both models made more formatting mistakes in generated code, and GPT-4 became less willing to answer sensitive questions. The applied-llms.org authors report that Voiceflow saw roughly a 10% drop in intent classification after switching model versions, and caught it because they had evals.
+
+The debugging consequences:
+
+- Log the model identifier the provider reports back, the API version, the SDK version and the rendered prompt hash on every request. A failure-rate step on a date then lines up with exactly one of: your deploy, the provider's model or API change, or a traffic mix change.
+- Pin dated model versions where the provider offers them and treat moving the pin as a release.
+- Watch client-side adaptations. Under API version 2026-10-21, sending `temperature` returns a 400. A wrapper that silently drops the parameter to avoid the error changes sampling for any older model that previously ran at a lower temperature; Anthropic notes that Claude 4.7 and later already accept only the defaults and sample as before.
+
+## From failure to gated fix
+
+A fix is done when it is a test. Each confirmed failure category becomes eval cases built from the real traces, with the expected property written as the weakest assertion any valid answer would satisfy (the label set, a cited clause, a forbidden phrase), because exact-string expectations fail on valid rephrasings.
+
+For failures a code check cannot detect, the FAQ's guidance for an LLM judge is 100 to 200 labelled examples per failure mode, split so the judge is tuned on one part and measured on a held-out part. That is a real cost; most categories in a first pass are cheaper to catch with code.
+
+The gate compares old and new prompts on the same cases, so the comparison is paired: count the cases that flip from fail to pass and from pass to fail. A change that fixes 15 long-ticket cases and breaks 6 short-ticket cases has a net of 9 and a regression in a slice that may carry more revenue. Report flips per slice and let the owner of each slice decide, rather than reporting one pass rate.
+
+<Callout kind="gotcha">
+A case that fails 4 of 10 runs passes a single-run gate 60% of the time. Run the slice's cases several times in the gate, or the gate's verdict is itself a near tie.
+</Callout>
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Escalations on Spanish-language tickets doubled since Tuesday. Nobody changed the prompt. The support lead wants the prompt reworded today; you have one day of a bilingual reviewer's time. What do you do with the day?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Spend the first hour on attribution, not wording: compare model identifier, API and SDK version, prompt hash and traffic mix for Spanish tickets before and after Tuesday. Spend the reviewer on a sample of Spanish traces from both sides of the date, coded for the first failure. Ship a wording change only if the coding shows a specification gap, and gate it on Spanish and English cases together.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Two defensible plans. Rewording today answers the support lead and may stop the bleed if the cause is a specification gap, and it risks breaking English traffic and hiding the real cause if the change was the provider's or a traffic shift. Spending the day on attribution and coding delays a fix by a day, and it costs a day of doubled escalations, which has a staffing cost the support lead carries.</p>
+<p>The constraint conflict is speed against a labelling budget of one reviewer-day. Choose the sample size: around 100 Spanish traces split across the date is what one reviewer can code in a day at a few minutes each, and it is the FAQ's starting size. If the model identifier or API version changed on Tuesday, pin back if possible and treat the move as a release that needs its own eval; if a new customer or template arrived, the slice is new traffic, not a regression.</p>
+<p>The written artefact is a short incident note: what changed on Tuesday, the coded failure counts, the mitigation (pin, route Spanish escalations to the bilingual queue, or prompt change) and its rollback trigger. Failure mode of this plan: if the cause is a near tie on ambiguous tickets, coding a single run per trace undercounts it; re-run the escalated traces several times before labelling.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The support lead says one day of doubled escalations costs more than any regression risk. How do you answer without ranking?</em> Offer a mitigation that is not a prompt change, such as routing Spanish escalations to the bilingual queue for a day, and put the cost of each option side by side.</li>
+<li><em>Nothing changed on your side and the provider's model identifier is identical. What next?</em> Compare the input distribution: length, product mentions and template for Spanish tickets before and after; a new customer onboarding looks exactly like a regression in aggregate.</li>
+<li><em>What would make you skip the coding and reword immediately?</em> A clear specification gap visible in the first ten traces, such as a policy the prompt never states, with the fix gated the same afternoon on both languages.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Slicing finds clusters only along features you logged. A failure driven by something absent from the trace, such as a cache serving a stale retrieved document, shows up as a uniform rate across every slice you have. When no feature separates the failures, the next step is adding features to the trace, not more slicing.
+
+The 100-trace starting point assumes failures are common enough to appear in 100 traces. For a 0.5% failure, 100 random traces contain about one failure; sample from complaints, low agreement rates or judge flags instead, and keep the random sample for estimating the rate.
+
+Repeat-run agreement separates near ties from consistent errors only if the repeats are independent. Repeats sent in one burst may share batch composition, server and cache state, and agree more than separate production requests would.
+
+<SelfRate id="lesson:apis/prompting/prompt-debugging" />

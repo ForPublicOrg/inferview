@@ -1,0 +1,129 @@
+---
+title: A shared eval platform
+track: system-design
+module: case-platforms
+order: 3
+kind: lesson
+level: staff
+minutes: 10
+summary: A shared eval platform runs versioned datasets through durable workflows with deterministic graders first and calibrated judges second, and is judged by the regressions it catches before launch.
+prerequisites: [system-design/case-platforms/agent-platform]
+updated: 2026-10-28
+sources:
+  - title: Duolingo blog, making production-ready agents the default (Guadalupe Aliseda-Canton, 2026-08-04)
+    url: https://blog.duolingo.com/production-ready-ai-agent-platform/
+    note: agents declared in a registry; AgentWorkflow on Temporal; evals run the real agent against authored scenarios and capture output, changed files and git diff; graders structured_output, diff_assertions, no_op_consistency and an optional LLM judge where diff assertions are too brittle; "deterministic graders are the foundation"; suite workflow starts a child workflow per case and repetition; agent setup from several weeks to about 10 minutes; checked 2026-10-28
+  - title: techinterview.org, LangChain interview guide (study guide, 2026-04-24, updated 2026-07-12)
+    url: https://www.techinterview.org/companies/langchain/
+    note: sample prompt "Design the evaluation platform supporting async runs across thousands of datasets with LLM-graders"; the page presents sample prompts, not candidate reports; checked 2026-10-28
+  - title: Hamel Husain and Shreya Shankar, AI evals FAQ (2026-09-18, modified 2026-09-21)
+    url: https://hamel.dev/blog/posts/evals-faq/
+    note: binary pass/fail over Likert; 100 to 200 labelled examples per failure mode for an LLM judge; train 10 to 20, dev 40 to 45, test 40 to 45 percent; one judge per failure type; CI favours deterministic checks; cheap checks on every trace and an expensive judge on a nightly sample; serve one team and one use case first; checked 2026-10-28
+  - title: Anthropic Engineering, demystifying evals for AI agents (2026-01-09)
+    url: https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents
+    note: task, trial, grader, transcript, outcome; grade outcomes in the environment; clean environment per trial; 20 to 50 tasks from real failures as a start; CORE-Bench score moved from 42 to 95 percent after grading and task fixes; checked 2026-10-28
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision: what the platform owns and what teams own
+
+A shared eval platform is asked for in one sentence, as in a LangChain study guide's sample prompt: "Design the evaluation platform supporting async runs across thousands of datasets with LLM-graders." The sentence hides the decision that shapes everything else: which parts are platform and which stay with product teams.
+
+Hamel Husain and Shreya Shankar's FAQ gives one answer for internal platforms: standardise the process (error analysis, judge validation) but let teams build their own metrics, and start by serving one team and one use case well. Their reason is that generic metrics rarely capture what matters for a given product and "create false confidence". So the platform owns execution, versioning, isolation, grader calibration and reporting. Teams own their tasks, their failure taxonomy and most of their graders. A platform that ships a library of generic quality scores and asks teams to adopt them has taken the wrong half.
+
+## A working reference: Duolingo's eval runner
+
+Duolingo's agent platform, described in August 2026, is a small, concrete version of the design. Agents are declared once in a registry (name, owner, system prompt, model, MCP servers, output type) and run inside a Temporal workflow, `AgentWorkflow`. Evals run the real agent against authored scenarios and capture three things before grading: the agent's output, the files it changed and the git diff. A case is a YAML file naming a repository fixture, a prompt and graders.
+
+The graders are ordered by trust:
+
+- `structured_output` checks fields in the agent's structured response.
+- `diff_assertions` checks the diff for required or forbidden changes, a maximum number of changed files, and path restrictions.
+- `no_op_consistency` fails when the reported outcome contradicts the repository state, for example an agent that reports a fix and changed nothing.
+- An LLM judge is optional, used where exact diff assertions are too brittle.
+
+The post states that "deterministic graders are the foundation", and the team does not want one model judging another to be the only signal. The suite itself is a workflow: it loads cases, starts a child workflow per case and repetition, aggregates results and renders a report. Repetitions run in parallel.
+
+The `no_op_consistency` grader is the one to copy. It grades the outcome in the environment, which Anthropic's guide makes the definition of an outcome (the reservation exists in the database, not the agent saying it booked), and it catches the failure that transcript-only grading cannot: an agent that describes work it did not do.
+
+## The data model
+
+Everything that can change a score is a version, and every result row is keyed by all of them:
+
+- **Dataset version.** Content-addressed: the hash of the task set. A team adding ten tasks creates a new version; results on the old version stay comparable with each other.
+- **Task.** Inputs, an environment fixture (repository snapshot, database seed, user role and permissions) and success criteria.
+- **Subject.** What is being evaluated: the agent manifest from the previous lesson (harness, model, tools, skills, configuration).
+- **Grader version.** Code graders are versioned like code. A judge is versioned as model plus prompt plus rubric, and its calibration record is stored with that version.
+- **Trial.** One attempt, with its transcript and the final environment state.
+
+A result is keyed by (task hash, subject hash, grader version, trial index). That key makes three things cheap. Re-runs are idempotent: a crashed suite resumes and skips completed keys, which is what a durable workflow gives you for free if each trial is one activity. Re-grading is separate from re-running: a new judge version re-grades stored transcripts and environment snapshots without calling the agent again. And comparisons are honest: the report refuses to compare two numbers whose keys differ in anything except the subject.
+
+## Execution
+
+Thousands of datasets with async runs make this a batch scheduler with three constrained resources: model quota, sandbox capacity and judge quota. Durable workflows (Temporal in Duolingo's case) give retries, resumability and visibility per trial. The platform adds:
+
+- **Quota per team.** Model rate limits are per provider account; a large nightly suite cannot be allowed to starve another team's CI gate. CI runs get reserved capacity and a priority above scheduled suites.
+- **Isolation per trial.** Each trial starts from a fresh environment built from the fixture. Anthropic's guide reports a model gaining an unfair advantage by reading git history from earlier trials, and shared state between trials produces correlated failures that make repeats look independent when they are not.
+- **Cost before run.** The scheduler computes tasks × trials × subjects × (agent cost + grader cost) and shows it before a suite starts. Hamel and Shreya's guidance is that CI suites favour deterministic checks because they run on every change, while an expensive judge can run on a nightly sample.
+
+## Judges are instruments; calibrate them
+
+An LLM judge has error rates, and the platform's job is to measure them and correct for them. The FAQ's recipe: binary pass/fail rather than a 1 to 5 scale, one judge per failure mode, 100 to 200 human-labelled examples per failure mode, split into a small training set for prompt examples (10 to 20 percent) and dev and test sets (40 to 45 percent each), and report how often the judge agrees with humans on passes and on failures separately.
+
+With those two rates the platform can correct an observed pass rate. Let s be the share of truly good outputs the judge passes and t the share of truly bad outputs it fails. If the true pass rate is θ, the judge reports p = sθ + (1 − t)(1 − θ), so θ = (p + t − 1) / (s + t − 1).
+
+<Predict id="sys-platforms-judge-correction" question="A judge passes 95 percent of outputs that humans label good and fails 60 percent of outputs humans label bad. It reports an 85 percent pass rate on a run. What is the corrected pass rate, in percent?" answer={81.8} tolerance={1.5} unit="percent">
+θ = (0.85 + 0.60 − 1) / (0.95 + 0.60 − 1) = 0.45 / 0.55 ≈ 0.818. The judge inflates the pass rate by about 3 points because it lets 40 percent of bad outputs through. Two subjects compared through the same judge share the bias, but a regression made of exactly the failures the judge misses would be invisible. That is the case for one judge per failure mode, each with its own measured t.
+</Predict>
+
+The calibration record goes on every report that uses the judge, and a judge whose test-set agreement is much lower than its dev-set agreement has been overfitted to the dev labels.
+
+## What the platform reports, and its own success metric
+
+The report is per task, paired: old subject against new on the same tasks, with per-task differences, repeats, and a confidence interval on the difference. The FAQ recommends a "pass all" rate that drills down into per-check rates grouped by severity, so a release-blocking check is never averaged away by many cosmetic ones.
+
+The platform's own success metric cannot be activity (suites run, datasets hosted). Candidates, each with a cost:
+
+- **Escaped regressions:** production incidents traced to a change that passed the platform's gate. This measures what the platform exists for, but it is slow and needs incident attribution.
+- **Time from change to verdict** for CI gates. This measures whether teams will keep using the gate, but a fast, useless gate scores well.
+- **Judge agreement with humans** across all judges in use, which measures whether results are trustworthy but not whether they are used.
+
+A defensible choice is escaped regressions as the goal, with time to verdict as a guardrail, reviewed quarterly against the incident log.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+"Design a shared eval platform for twenty product teams. Today each team has its own scripts, one team's nightly suite costs more than the others combined, and leadership wants a single quality number per product by next quarter."
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>The platform owns execution, versioning, isolation, judge calibration and reporting; teams own tasks and most graders. Every result is keyed by dataset, subject, grader version and trial, so runs resume, re-grading does not re-run agents, and only like is compared with like. Graders are deterministic first, with judges per failure mode and their measured error rates on every report. Quota and cost are shown before a run. I would push back on one number per product: each product gets a pass-all rate on its release-blocking checks with drill-down, and the platform is measured by escaped regressions.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The conflict is standardisation against relevance. A single quality number per product is what leadership asked for; generic metrics are what produce false confidence. Two defensible answers. Give leadership one composite score: easy to read, easy to game, and a weighted average that hides a release-blocking regression under cosmetic gains. Or give each product a pass-all rate on checks its own team marks release-blocking, plus the per-check table: harder to compare across products, but a drop means something broke.</p>
+<p>I would take the second and write a decision memo explaining why products are not ranked against each other. For the expensive team, the platform's cost-before-run view and per-team quota turn a cost argument into a scheduling policy: deterministic checks on every change, the judge on a nightly sample, saturated suites run less often.</p>
+<p>Migration is the operating constraint: twenty teams' scripts cannot be rewritten at once. Start with the team whose gate blocks releases most often, wrap its existing graders as versioned graders rather than rewriting them, and onboard the next team only when the first one's CI gate runs on the platform.</p>
+<p>Failure mode of this design: re-grading stored transcripts with a new judge version makes old results look different without the agent changing. Reports must show the grader version and refuse silent re-grades of a published baseline.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Leadership insists on one number and will not read a table. What do you give up to provide it, and what do you put in writing next to it?</em></li>
+<li><em>A team's judge agrees with humans on 92 percent of dev labels and 71 percent of test labels. Do you block its results from release reports this week?</em></li>
+<li><em>What would make you reverse the decision to let teams own their graders?</em> For example, three teams writing incompatible graders for the same shared failure mode.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+A platform is premature with one or two consumers. The FAQ's advice to serve one team well first is also a reason to delay the platform: a notebook and a custom annotation view can serve one team for a long time, and building shared infrastructure before the second team's needs are known fixes the wrong interfaces.
+
+Deterministic-first grading assumes outcomes that code can check, as in Duolingo's diff assertions. For open-ended output (summaries, conversations) most checks are judgements, the judge is the primary signal, and calibration cost (100 to 200 labels per failure mode) dominates the platform's running cost.
+
+Anthropic's CORE-Bench note is a warning about the platform's own defects: a reported score moved from 42 to 95 percent once rigid grading, ambiguous specifications and irreproducible tasks were fixed. A platform that reports scores without auditing failed trials publishes its own bugs as model regressions.
+
+<SelfRate id="lesson:system-design/case-platforms/eval-platform" />

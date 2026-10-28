@@ -1,0 +1,1085 @@
+---
+id: inf-033
+title: "A credit ledger for token usage, specified in four stages"
+subtitle: "expiry, holds for requests in flight, and refunds arrive after the first design"
+track: inference
+module: fleet
+type: multistage
+difficulty: hard
+seniority: [senior, staff]
+minutes: 60
+core: true
+tags: [progressive-spec, credits, quotas, ledger, holds, refunds, billing]
+companies:
+  - name: "OpenAI"
+    url: https://www.hellointerview.com/guides/openai/l5
+  - name: "Perplexity"
+    url: https://prachub.com/companies/perplexity-ai
+updated: 2026-10-28
+sources:
+  - title: "Hello Interview, OpenAI L5 interview guide"
+    url: https://www.hellointerview.com/guides/openai/l5
+    note: "candidate report: lists \"Design a credit tracking service for user token balances\" among the most commonly asked coding questions and says to think of small databases, credit-tracking services and resumable iterators; no stage details; the guide is undated (a living document). The stages here are original. Checked 2026-10-28"
+  - title: "PracHub, Perplexity interview questions"
+    url: https://prachub.com/companies/perplexity-ai
+    note: "candidate report: \"Design a CreditTracker with expirations\" (coding and algorithms, heaps and priority queues), dated 2025-08-10; the visible text names add_credit and subtract_credit methods. The stages here are original. Checked 2026-10-28"
+  - title: "Stripe docs, record usage for billing with the API"
+    url: https://docs.stripe.com/billing/subscriptions/usage-based/recording-usage-api
+    note: "meter events carry an identifier for deduplication; timestamps must be within the past 35 calendar days and no more than 5 minutes in the future; an event accepted after invoice finalisation is not added to that invoice or the next; events are processed asynchronously. Checked 2026-10-28"
+code:
+  starter: |
+    class Ledger:
+        """Token credits per account. Every method takes the time `at`; time never goes backwards."""
+
+        def __init__(self):
+            pass
+
+        def grant(self, account, amount, at):
+            raise NotImplementedError
+
+        def consume(self, account, amount, at):
+            raise NotImplementedError
+
+        def balance(self, account, at):
+            raise NotImplementedError
+  solution: |
+    import heapq
+    import itertools
+
+    INF = float("inf")
+
+
+    class _Grant:
+        __slots__ = ("remaining", "expires_at", "seq", "queued")
+
+        def __init__(self, remaining, expires_at, seq):
+            self.remaining = remaining
+            self.expires_at = expires_at
+            self.seq = seq
+            self.queued = True
+
+
+    class _Account:
+        __slots__ = ("balance", "held", "queue", "holds", "hold_expiries", "log")
+
+        def __init__(self):
+            self.balance = 0          # live credits, including held ones
+            self.held = 0             # credits reserved by open holds
+            self.queue = []           # heap of (expires_at, seq, grant): spend order and expiry order are the same
+            self.holds = {}           # hold id -> [amount, deadline, open]
+            self.hold_expiries = []   # heap of (deadline, hold id)
+            self.log = []
+
+
+    class Ledger:
+        """Credits per account: grants with optional expiry, spent soonest-expiring first."""
+
+        def __init__(self):
+            self.accounts = {}
+            self.last_at = None
+            self.ids = itertools.count(1)
+            self.charges = {}         # charge id -> [account, [(grant, units), ...] in spend order, refundable units]
+            self.refund_keys = {}
+            self.hold_owner = {}
+
+        def _clock(self, account, at):
+            if self.last_at is not None and at < self.last_at:
+                raise ValueError("time went backwards")
+            self.last_at = at
+            acct = self.accounts.get(account)
+            if acct is None:
+                acct = self.accounts[account] = _Account()
+            queue = acct.queue
+            while queue and queue[0][0] <= at:
+                expires_at, _, grant = heapq.heappop(queue)
+                grant.queued = False
+                if grant.remaining:
+                    acct.balance -= grant.remaining
+                    acct.log.append({"at": expires_at, "kind": "expire", "delta": -grant.remaining})
+                    grant.remaining = 0
+            heap = acct.hold_expiries
+            while heap and heap[0][0] <= at:
+                _, hold_id = heapq.heappop(heap)
+                hold = acct.holds.get(hold_id)
+                if hold is not None and hold[2]:
+                    hold[2] = False
+                    acct.held -= hold[0]
+            return acct
+
+        @staticmethod
+        def _positive(amount):
+            if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+                raise ValueError("amounts are positive integers")
+
+        @staticmethod
+        def _available(acct):
+            return max(0, acct.balance - acct.held)
+
+        def _spend(self, acct, amount):
+            parts = []
+            queue = acct.queue
+            while amount:
+                expires_at, seq, grant = queue[0]
+                take = min(amount, grant.remaining)
+                grant.remaining -= take
+                amount -= take
+                parts.append((grant, take))
+                if not grant.remaining:
+                    heapq.heappop(queue)
+                    grant.queued = False
+            return parts
+
+        def grant(self, account, amount, at, expires_at=None):
+            self._positive(amount)
+            acct = self._clock(account, at)
+            if expires_at is not None and expires_at <= at:
+                raise ValueError("expires_at must be after at")
+            g = _Grant(amount, INF if expires_at is None else expires_at, next(self.ids))
+            heapq.heappush(acct.queue, (g.expires_at, g.seq, g))
+            acct.balance += amount
+            acct.log.append({"at": at, "kind": "grant", "delta": amount})
+            return g.seq
+
+        def balance(self, account, at):
+            return self._clock(account, at).balance
+
+        def available(self, account, at):
+            return self._available(self._clock(account, at))
+
+        def consume(self, account, amount, at):
+            self._positive(amount)
+            acct = self._clock(account, at)
+            if amount > self._available(acct):
+                return None
+            charge_id = next(self.ids)
+            self.charges[charge_id] = [account, self._spend(acct, amount), amount]
+            acct.balance -= amount
+            acct.log.append({"at": at, "kind": "consume", "delta": -amount, "charge": charge_id})
+            return charge_id
+
+        def hold(self, account, amount, at, ttl):
+            self._positive(amount)
+            if ttl <= 0:
+                raise ValueError("ttl must be positive")
+            acct = self._clock(account, at)
+            if amount > self._available(acct):
+                return None
+            hold_id = next(self.ids)
+            acct.holds[hold_id] = [amount, at + ttl, True]
+            self.hold_owner[hold_id] = account
+            acct.held += amount
+            heapq.heappush(acct.hold_expiries, (at + ttl, hold_id))
+            return hold_id
+
+        def _close(self, hold_id, at):
+            account = self.hold_owner[hold_id]        # KeyError for an unknown or closed hold
+            acct = self._clock(account, at)
+            del self.hold_owner[hold_id]
+            hold = acct.holds.pop(hold_id)
+            if hold[2]:
+                acct.held -= hold[0]
+            return account, acct
+
+        def settle(self, hold_id, actual, at):
+            if not isinstance(actual, int) or actual < 0:
+                raise ValueError("actual is a non-negative integer")
+            account, acct = self._close(hold_id, at)
+            charged = min(actual, self._available(acct))
+            parts = self._spend(acct, charged) if charged else []
+            self.charges[hold_id] = [account, parts, charged]
+            acct.balance -= charged
+            acct.log.append({"at": at, "kind": "settle", "delta": -charged, "charge": hold_id})
+            return charged
+
+        def release(self, hold_id, at):
+            self._close(hold_id, at)
+
+        def refund(self, charge_id, amount, at, key):
+            if key in self.refund_keys:
+                return self.refund_keys[key]
+            self._positive(amount)
+            charge = self.charges[charge_id]            # KeyError for an unknown charge
+            account, parts, refundable = charge
+            if amount > refundable:
+                raise ValueError("refund exceeds what is left of the charge")
+            acct = self._clock(account, at)
+            charge[2] -= amount
+            left, restored = amount, 0
+            while left:                                  # latest-expiring source first
+                grant, units = parts[-1]
+                back = min(left, units)
+                if back == units:
+                    parts.pop()
+                else:
+                    parts[-1] = (grant, units - back)
+                left -= back
+                if grant.expires_at > at:
+                    grant.remaining += back
+                    restored += back
+                    if not grant.queued:
+                        grant.queued = True
+                        heapq.heappush(acct.queue, (grant.expires_at, grant.seq, grant))
+            acct.balance += restored
+            acct.log.append({"at": at, "kind": "refund", "delta": restored, "charge": charge_id})
+            self.refund_keys[key] = restored
+            return restored
+
+        def audit(self, account, at):
+            return list(self._clock(account, at).log)
+stages:
+  - title: "Grants and consumption"
+    brief: "Implement grant(account, amount, at), consume(account, amount, at) and balance(account, at). Amounts are positive integers; anything else raises ValueError. consume is all or nothing: it returns an id for the charge, or None and changes nothing when the balance is too small. An unknown account has a balance of 0. A call whose at is earlier than the latest at the ledger has seen raises ValueError and changes nothing. The visible tests end with 20,000 grants and 20,000 consumes, each followed by a balance read, within 3 seconds."
+    tests: |
+      import time
+
+      led = Ledger()
+      led.grant("acme", 100, at=0)
+      led.grant("acme", 50, at=1)
+      assert led.balance("acme", at=2) == 150
+      first = led.consume("acme", 120, at=3)
+      assert first is not None and led.balance("acme", at=3) == 30
+      assert led.consume("acme", 31, at=4) is None, "a consume larger than the balance is refused"
+      assert led.balance("acme", at=4) == 30, "a refused consume changes nothing"
+      second = led.consume("acme", 30, at=4)
+      assert second is not None and second != first, "every charge gets its own id"
+      assert led.balance("acme", at=4) == 0
+      assert led.balance("nobody", at=5) == 0, "an unknown account holds no credits"
+
+      def raises(exc, fn, *a, **k):
+          try:
+              fn(*a, **k)
+          except exc:
+              return True
+          return False
+
+      assert raises(ValueError, led.grant, "acme", 0, at=6) and raises(ValueError, led.consume, "acme", 2.5, at=6), "amounts are positive integers"
+      assert raises(ValueError, led.balance, "acme", at=1), "time never goes backwards"
+
+      big = Ledger()
+      t0 = time.perf_counter()
+      for i in range(20000):
+          big.grant("acme", 3, at=i)
+          assert big.balance("acme", at=i) == 3 * (i + 1)
+      for i in range(20000):
+          assert big.consume("acme", 2, at=20000 + i) is not None
+          assert big.balance("acme", at=20000 + i) == 60000 - 2 * (i + 1)
+      elapsed = time.perf_counter() - t0
+      assert elapsed < 3, f"20,000 grants and 20,000 consumes, each followed by a balance read, took {elapsed:.1f} s; the budget is 3 s"
+    hidden: |
+      import random as _r
+
+      def _raises(exc, fn, *a, **k):
+          try:
+              fn(*a, **k)
+          except exc:
+              return True
+          return False
+
+
+      class _Model:
+          """A slow, plain model of the rules: lists scanned on every call."""
+
+          def __init__(self):
+              self.grants = {}      # account -> list of [remaining, expires_at, seq]
+              self.holds = {}       # hold id -> [account, amount, deadline]
+              self.charges = {}     # charge id -> [account, [[grant, units], ...], refundable]
+              self.keys = {}
+              self.seq = 0
+              self.expired = {}
+
+          def tick(self, acct, now):
+              for g in self.grants.setdefault(acct, []):
+                  if g[1] is not None and g[1] <= now and g[0]:
+                      self.expired[acct] = self.expired.get(acct, 0) + g[0]
+                      g[0] = 0
+
+          def live(self, acct, now):
+              return [g for g in self.grants.get(acct, []) if g[0] and (g[1] is None or now < g[1])]
+
+          def balance(self, acct, now):
+              return sum(g[0] for g in self.live(acct, now))
+
+          def held(self, acct, now, skip=None):
+              return sum(h[1] for i, h in self.holds.items() if h[0] == acct and now < h[2] and i != skip)
+
+          def available(self, acct, now, skip=None):
+              return max(0, self.balance(acct, now) - self.held(acct, now, skip))
+
+          def grant(self, acct, amount, now, exp=None):
+              self.tick(acct, now)
+              self.seq += 1
+              self.grants.setdefault(acct, []).append([amount, exp, self.seq])
+
+          def spend(self, acct, amount, now):
+              parts = []
+              order = sorted(self.live(acct, now), key=lambda g: (float("inf") if g[1] is None else g[1], g[2]))
+              for g in order:
+                  if not amount:
+                      break
+                  take = min(amount, g[0])
+                  g[0] -= take
+                  amount -= take
+                  parts.append([g, take])
+              assert amount == 0
+              return parts
+
+          def consume(self, acct, amount, now, cid):
+              self.tick(acct, now)
+              if amount > self.available(acct, now):
+                  return False
+              self.charges[cid] = [acct, self.spend(acct, amount, now), amount]
+              return True
+
+          def hold(self, acct, amount, now, ttl, hid):
+              self.tick(acct, now)
+              if amount > self.available(acct, now):
+                  return False
+              self.holds[hid] = [acct, amount, now + ttl]
+              return True
+
+          def settle(self, hid, actual, now):
+              acct = self.holds[hid][0]
+              self.tick(acct, now)
+              charged = min(actual, self.available(acct, now, skip=hid))
+              del self.holds[hid]
+              self.charges[hid] = [acct, self.spend(acct, charged, now) if charged else [], charged]
+              return charged
+
+          def release(self, hid, now):
+              self.tick(self.holds[hid][0], now)
+              del self.holds[hid]
+
+          def refund(self, cid, amount, now, key):
+              if key in self.keys:
+                  return self.keys[key]
+              acct, parts, refundable = self.charges[cid]
+              self.tick(acct, now)
+              self.charges[cid][2] -= amount
+              left, restored = amount, 0
+              for p in sorted(parts, key=lambda p: (float("inf") if p[0][1] is None else p[0][1]), reverse=True):
+                  back = min(left, p[1])
+                  p[1] -= back
+                  left -= back
+                  if p[0][1] is None or now < p[0][1]:
+                      p[0][0] += back
+                      restored += back
+              self.keys[key] = restored
+              return restored
+
+      def _run1(seed, n=3000):
+          rng = _r.Random(seed)
+          led, m, now, ids = Ledger(), _Model(), 0, set()
+          for _ in range(n):
+              now += rng.choice([0, 0, 1, 2])
+              acct = rng.choice(["a", "b", "c"])
+              op = rng.random()
+              if op < 0.35:
+                  amt = rng.randrange(1, 40)
+                  led.grant(acct, amt, at=now)
+                  m.grant(acct, amt, now)
+              elif op < 0.7:
+                  amt = rng.randrange(1, 60)
+                  cid = led.consume(acct, amt, at=now)
+                  if (cid is not None) != m.consume(acct, amt, now, cid):
+                      return False
+                  if cid is not None:
+                      if cid in ids:
+                          return False
+                      ids.add(cid)
+              elif led.balance(acct, at=now) != m.balance(acct, now):
+                  return False
+          return True
+
+      assert all(_run1(s) for s in range(4))
+      _l = Ledger()
+      _l.grant("x", 10, at=5)
+      assert _raises(ValueError, _l.consume, "x", 1, at=4)
+      assert _l.balance("x", at=5) == 10, "a call rejected for going backwards changes nothing"
+      assert _raises(ValueError, _l.grant, "x", -3, at=6) and _raises(ValueError, _l.consume, "x", 0, at=6)
+      assert _l.consume("x", 10, at=5) is not None and _l.consume("x", 1, at=5) is None
+  - title: "Expiry, soonest-expiring first"
+    brief: "grant takes expires_at=None. Credits are live while at < expires_at, and a grant whose expires_at is not after at raises ValueError. consume spends the live credits that expire soonest first, and credits without an expiry last; between grants with the same expiry, the order is yours. The tests grant 20,000 single credits with shuffled expiries, then consume 10,000 of them one at a time within 3 seconds, and check that the 10,000 soonest-expiring were the ones spent."
+    tests: |
+      import random
+      import time
+
+      led = Ledger()
+      led.grant("acme", 100, at=0, expires_at=10)
+      led.grant("acme", 100, at=0, expires_at=20)
+      led.grant("acme", 100, at=0)
+      assert led.balance("acme", at=9.5) == 300
+      assert led.balance("acme", at=10) == 200, "credits expire at exactly expires_at"
+      assert led.balance("acme", at=1000) == 100, "a grant without expires_at never expires"
+
+      led = Ledger()
+      led.grant("acme", 100, at=0, expires_at=20)
+      led.grant("acme", 100, at=1, expires_at=10)
+      assert led.consume("acme", 150, at=5) is not None
+      assert led.balance("acme", at=15) == 50, "the grant expiring at 10 is spent first, whatever the grant order"
+
+      led = Ledger()
+      led.grant("acme", 100, at=0)
+      led.grant("acme", 100, at=1, expires_at=10)
+      led.consume("acme", 100, at=2)
+      assert led.balance("acme", at=11) == 100, "credits that never expire are spent last"
+
+      led = Ledger()
+      led.grant("acme", 50, at=0, expires_at=5)
+      assert led.consume("acme", 50, at=5) is None, "expired credits cannot be spent"
+
+      def raises(exc, fn, *a, **k):
+          try:
+              fn(*a, **k)
+          except exc:
+              return True
+          return False
+
+      assert raises(ValueError, led.grant, "acme", 10, at=6, expires_at=6), "a grant must expire after it is made"
+
+      expiries = list(range(1000, 21000))
+      random.Random(7).shuffle(expiries)
+      big = Ledger()
+      t0 = time.perf_counter()
+      for i, exp in enumerate(expiries):
+          big.grant("acme", 1, at=0, expires_at=exp)
+      for i in range(10000):
+          assert big.consume("acme", 1, at=500) is not None
+          assert big.balance("acme", at=500) == 20000 - (i + 1)
+      elapsed = time.perf_counter() - t0
+      assert big.balance("acme", at=10999) == 10000, "the 10,000 soonest-expiring credits were the ones spent"
+      assert elapsed < 3, f"20,000 grants and 10,000 consumes took {elapsed:.1f} s; the budget is 3 s"
+    hidden: |
+      import random as _r
+
+      def _raises(exc, fn, *a, **k):
+          try:
+              fn(*a, **k)
+          except exc:
+              return True
+          return False
+
+
+      class _Model:
+          """A slow, plain model of the rules: lists scanned on every call."""
+
+          def __init__(self):
+              self.grants = {}      # account -> list of [remaining, expires_at, seq]
+              self.holds = {}       # hold id -> [account, amount, deadline]
+              self.charges = {}     # charge id -> [account, [[grant, units], ...], refundable]
+              self.keys = {}
+              self.seq = 0
+              self.expired = {}
+
+          def tick(self, acct, now):
+              for g in self.grants.setdefault(acct, []):
+                  if g[1] is not None and g[1] <= now and g[0]:
+                      self.expired[acct] = self.expired.get(acct, 0) + g[0]
+                      g[0] = 0
+
+          def live(self, acct, now):
+              return [g for g in self.grants.get(acct, []) if g[0] and (g[1] is None or now < g[1])]
+
+          def balance(self, acct, now):
+              return sum(g[0] for g in self.live(acct, now))
+
+          def held(self, acct, now, skip=None):
+              return sum(h[1] for i, h in self.holds.items() if h[0] == acct and now < h[2] and i != skip)
+
+          def available(self, acct, now, skip=None):
+              return max(0, self.balance(acct, now) - self.held(acct, now, skip))
+
+          def grant(self, acct, amount, now, exp=None):
+              self.tick(acct, now)
+              self.seq += 1
+              self.grants.setdefault(acct, []).append([amount, exp, self.seq])
+
+          def spend(self, acct, amount, now):
+              parts = []
+              order = sorted(self.live(acct, now), key=lambda g: (float("inf") if g[1] is None else g[1], g[2]))
+              for g in order:
+                  if not amount:
+                      break
+                  take = min(amount, g[0])
+                  g[0] -= take
+                  amount -= take
+                  parts.append([g, take])
+              assert amount == 0
+              return parts
+
+          def consume(self, acct, amount, now, cid):
+              self.tick(acct, now)
+              if amount > self.available(acct, now):
+                  return False
+              self.charges[cid] = [acct, self.spend(acct, amount, now), amount]
+              return True
+
+          def hold(self, acct, amount, now, ttl, hid):
+              self.tick(acct, now)
+              if amount > self.available(acct, now):
+                  return False
+              self.holds[hid] = [acct, amount, now + ttl]
+              return True
+
+          def settle(self, hid, actual, now):
+              acct = self.holds[hid][0]
+              self.tick(acct, now)
+              charged = min(actual, self.available(acct, now, skip=hid))
+              del self.holds[hid]
+              self.charges[hid] = [acct, self.spend(acct, charged, now) if charged else [], charged]
+              return charged
+
+          def release(self, hid, now):
+              self.tick(self.holds[hid][0], now)
+              del self.holds[hid]
+
+          def refund(self, cid, amount, now, key):
+              if key in self.keys:
+                  return self.keys[key]
+              acct, parts, refundable = self.charges[cid]
+              self.tick(acct, now)
+              self.charges[cid][2] -= amount
+              left, restored = amount, 0
+              for p in sorted(parts, key=lambda p: (float("inf") if p[0][1] is None else p[0][1]), reverse=True):
+                  back = min(left, p[1])
+                  p[1] -= back
+                  left -= back
+                  if p[0][1] is None or now < p[0][1]:
+                      p[0][0] += back
+                      restored += back
+              self.keys[key] = restored
+              return restored
+
+      def _run2(seed, n=3000):
+          rng = _r.Random(seed)
+          led, m, now = Ledger(), _Model(), 0
+          for _ in range(n):
+              now += rng.choice([0, 0, 1, 2, 5])
+              acct = rng.choice(["a", "b"])
+              op = rng.random()
+              if op < 0.35:
+                  amt = rng.randrange(1, 40)
+                  exp = rng.choice([None, now + 1, now + 3, now + 10, now + 30])
+                  led.grant(acct, amt, at=now, expires_at=exp)
+                  m.grant(acct, amt, now, exp)
+              elif op < 0.7:
+                  amt = rng.randrange(1, 60)
+                  cid = led.consume(acct, amt, at=now)
+                  if (cid is not None) != m.consume(acct, amt, now, cid):
+                      return False
+              elif led.balance(acct, at=now) != m.balance(acct, now):
+                  return False
+          return True
+
+      assert all(_run2(s) for s in range(4))
+      _l = Ledger()
+      _l.grant("x", 5, at=0, expires_at=10)
+      _l.grant("x", 5, at=0, expires_at=10)
+      _l.grant("x", 5, at=0, expires_at=4)
+      assert _l.consume("x", 7, at=1) is not None
+      assert _l.balance("x", at=4) == 8 and _l.balance("x", at=10) == 0
+  - title: "Holds for requests in flight"
+    brief: "Add hold(account, amount, at, ttl), settle(hold_id, actual, at), release(hold_id, at) and available(account, at). A hold reserves amount credits for a request whose cost is not yet known, and returns an id, or None when amount exceeds what is available. available is the balance minus open holds, never below 0, and consume and hold can only use available credits. A hold is open while at < its start + ttl and stops counting after that. settle charges min(actual, what is available once this hold is set aside), closes the hold and returns the amount charged; release closes it without a charge. Settling or releasing an unknown or closed hold raises KeyError; a hold that timed out can still be settled. Held credits still expire. The tests open 20,000 holds and settle them, reading available after each, within 3 seconds."
+    tests: |
+      import time
+
+      def raises(exc, fn, *a, **k):
+          try:
+              fn(*a, **k)
+          except exc:
+              return True
+          return False
+
+      led = Ledger()
+      led.grant("acme", 100, at=0)
+      h = led.hold("acme", 60, at=1, ttl=30)
+      assert h is not None
+      assert led.balance("acme", at=1) == 100 and led.available("acme", at=1) == 40, "held credits stay in the balance but are not available"
+      assert led.consume("acme", 50, at=2) is None, "a consume cannot spend held credits"
+      assert led.hold("acme", 50, at=2, ttl=30) is None, "and neither can another hold"
+      assert led.settle(h, 45, at=3) == 45
+      assert led.balance("acme", at=3) == 55 and led.available("acme", at=3) == 55, "settling releases the rest of the hold"
+      assert raises(KeyError, led.settle, h, 1, at=3), "a hold is settled once"
+      h2 = led.hold("acme", 20, at=4, ttl=30)
+      assert led.settle(h2, 70, at=5) == 55, "a request that cost more than its hold is charged up to what is available"
+      assert led.balance("acme", at=5) == 0
+
+      led = Ledger()
+      led.grant("acme", 100, at=0)
+      h3 = led.hold("acme", 80, at=10, ttl=10)
+      assert led.available("acme", at=19.5) == 20
+      assert led.available("acme", at=20) == 100, "a hold times out at at + ttl"
+      assert led.settle(h3, 30, at=21) == 30, "a late settle still charges, from what is available"
+      h4 = led.hold("acme", 50, at=22, ttl=10)
+      led.release(h4, at=23)
+      assert led.available("acme", at=23) == 70 and raises(KeyError, led.release, h4, at=24)
+
+      led = Ledger()
+      led.grant("acme", 100, at=0, expires_at=50)
+      h5 = led.hold("acme", 80, at=40, ttl=100)
+      assert led.balance("acme", at=50) == 0 and led.available("acme", at=50) == 0, "a hold does not stop credits expiring"
+      assert led.settle(h5, 80, at=51) == 0
+
+      big = Ledger()
+      big.grant("acme", 20000, at=0)
+      t0 = time.perf_counter()
+      holds = []
+      for i in range(20000):
+          holds.append(big.hold("acme", 1, at=1, ttl=100))
+          assert big.available("acme", at=1) == 20000 - (i + 1)
+      for hid in holds:
+          big.settle(hid, 1, at=2)
+          assert big.available("acme", at=2) == 0
+      elapsed = time.perf_counter() - t0
+      assert big.balance("acme", at=3) == 0
+      assert elapsed < 3, f"20,000 holds and settles, each followed by an available read, took {elapsed:.1f} s; the budget is 3 s"
+    hidden: |
+      import random as _r
+
+      def _raises(exc, fn, *a, **k):
+          try:
+              fn(*a, **k)
+          except exc:
+              return True
+          return False
+
+
+      class _Model:
+          """A slow, plain model of the rules: lists scanned on every call."""
+
+          def __init__(self):
+              self.grants = {}      # account -> list of [remaining, expires_at, seq]
+              self.holds = {}       # hold id -> [account, amount, deadline]
+              self.charges = {}     # charge id -> [account, [[grant, units], ...], refundable]
+              self.keys = {}
+              self.seq = 0
+              self.expired = {}
+
+          def tick(self, acct, now):
+              for g in self.grants.setdefault(acct, []):
+                  if g[1] is not None and g[1] <= now and g[0]:
+                      self.expired[acct] = self.expired.get(acct, 0) + g[0]
+                      g[0] = 0
+
+          def live(self, acct, now):
+              return [g for g in self.grants.get(acct, []) if g[0] and (g[1] is None or now < g[1])]
+
+          def balance(self, acct, now):
+              return sum(g[0] for g in self.live(acct, now))
+
+          def held(self, acct, now, skip=None):
+              return sum(h[1] for i, h in self.holds.items() if h[0] == acct and now < h[2] and i != skip)
+
+          def available(self, acct, now, skip=None):
+              return max(0, self.balance(acct, now) - self.held(acct, now, skip))
+
+          def grant(self, acct, amount, now, exp=None):
+              self.tick(acct, now)
+              self.seq += 1
+              self.grants.setdefault(acct, []).append([amount, exp, self.seq])
+
+          def spend(self, acct, amount, now):
+              parts = []
+              order = sorted(self.live(acct, now), key=lambda g: (float("inf") if g[1] is None else g[1], g[2]))
+              for g in order:
+                  if not amount:
+                      break
+                  take = min(amount, g[0])
+                  g[0] -= take
+                  amount -= take
+                  parts.append([g, take])
+              assert amount == 0
+              return parts
+
+          def consume(self, acct, amount, now, cid):
+              self.tick(acct, now)
+              if amount > self.available(acct, now):
+                  return False
+              self.charges[cid] = [acct, self.spend(acct, amount, now), amount]
+              return True
+
+          def hold(self, acct, amount, now, ttl, hid):
+              self.tick(acct, now)
+              if amount > self.available(acct, now):
+                  return False
+              self.holds[hid] = [acct, amount, now + ttl]
+              return True
+
+          def settle(self, hid, actual, now):
+              acct = self.holds[hid][0]
+              self.tick(acct, now)
+              charged = min(actual, self.available(acct, now, skip=hid))
+              del self.holds[hid]
+              self.charges[hid] = [acct, self.spend(acct, charged, now) if charged else [], charged]
+              return charged
+
+          def release(self, hid, now):
+              self.tick(self.holds[hid][0], now)
+              del self.holds[hid]
+
+          def refund(self, cid, amount, now, key):
+              if key in self.keys:
+                  return self.keys[key]
+              acct, parts, refundable = self.charges[cid]
+              self.tick(acct, now)
+              self.charges[cid][2] -= amount
+              left, restored = amount, 0
+              for p in sorted(parts, key=lambda p: (float("inf") if p[0][1] is None else p[0][1]), reverse=True):
+                  back = min(left, p[1])
+                  p[1] -= back
+                  left -= back
+                  if p[0][1] is None or now < p[0][1]:
+                      p[0][0] += back
+                      restored += back
+              self.keys[key] = restored
+              return restored
+
+      def _run3(seed, n=2500):
+          rng = _r.Random(seed)
+          led, m, now, open_ids = Ledger(), _Model(), 0, []
+          for _ in range(n):
+              now += rng.choice([0, 0, 1, 2, 4])
+              acct = rng.choice(["a", "b"])
+              op = rng.random()
+              if op < 0.25:
+                  amt = rng.randrange(1, 40)
+                  exp = rng.choice([None, now + 2, now + 8, now + 30])
+                  led.grant(acct, amt, at=now, expires_at=exp)
+                  m.grant(acct, amt, now, exp)
+              elif op < 0.4:
+                  amt = rng.randrange(1, 40)
+                  cid = led.consume(acct, amt, at=now)
+                  if (cid is not None) != m.consume(acct, amt, now, cid):
+                      return False
+              elif op < 0.6:
+                  amt, ttl = rng.randrange(1, 30), rng.choice([1, 3, 10])
+                  hid = led.hold(acct, amt, at=now, ttl=ttl)
+                  if (hid is not None) != m.hold(acct, amt, now, ttl, hid):
+                      return False
+                  if hid is not None:
+                      open_ids.append(hid)
+              elif op < 0.75 and open_ids:
+                  hid = open_ids.pop(rng.randrange(len(open_ids)))
+                  if rng.random() < 0.75:
+                      actual = rng.randrange(0, 50)
+                      if led.settle(hid, actual, at=now) != m.settle(hid, actual, now):
+                          return False
+                  else:
+                      led.release(hid, at=now)
+                      m.release(hid, now)
+              else:
+                  if led.balance(acct, at=now) != m.balance(acct, now):
+                      return False
+                  if led.available(acct, at=now) != m.available(acct, now):
+                      return False
+          return True
+
+      assert all(_run3(s) for s in range(4))
+      _l = Ledger()
+      _l.grant("x", 10, at=0)
+      _h = _l.hold("x", 10, at=0, ttl=5)
+      assert _l.consume("x", 1, at=1) is None and _l.consume("x", 1, at=5) is not None
+      assert _raises(KeyError, _l.settle, "no-such-hold", 1, at=6) and _raises(KeyError, _l.release, "no-such-hold", at=6)
+      _l.release(_h, at=6)
+      assert _raises(KeyError, _l.settle, _h, 1, at=6), "a released hold cannot be settled"
+      assert _l.balance("x", at=6) == 9
+  - title: "Refunds and the audit log"
+    brief: "Add refund(charge_id, amount, at, key) and audit(account, at). A charge id is one returned by consume, or a settled hold's id. A refund returns credits to the grants the charge drew from, latest-expiring source first; credits whose grant has expired by at are not restored. It returns the number of credits restored to the balance. A refund repeated with the same key returns the first result and changes nothing; refunding more than is left of a charge raises ValueError, and an unknown charge raises KeyError. audit returns the account's entries in time order, each with at, kind and delta (the signed change to the balance), with kind one of grant, consume, settle, refund and expire. An expiry is logged at its expiry time, and the deltas sum to the balance. The timed test refunds one credit at a time against a charge spread over 20,000 grants."
+    tests: |
+      import time
+
+      def raises(exc, fn, *a, **k):
+          try:
+              fn(*a, **k)
+          except exc:
+              return True
+          return False
+
+      led = Ledger()
+      led.grant("acme", 100, at=0, expires_at=50)
+      led.grant("acme", 100, at=0, expires_at=100)
+      c = led.consume("acme", 150, at=10)
+      assert led.refund(c, 60, at=20, key="r1") == 60
+      assert led.balance("acme", at=20) == 110
+      assert led.refund(c, 60, at=21, key="r1") == 60, "a retried refund returns the first result"
+      assert led.balance("acme", at=21) == 110, "and changes nothing"
+      assert led.balance("acme", at=50) == 100, "refunded credits go back to the latest-expiring source first"
+      assert raises(ValueError, led.refund, c, 100, at=51, key="r2"), "a charge cannot be refunded past what it charged"
+      assert led.refund(c, 90, at=60, key="r3") == 0, "credits whose grant has expired are not restored"
+      assert raises(KeyError, led.refund, "no-such-charge", 1, at=60, key="r4")
+
+      h = led.hold("acme", 30, at=61, ttl=10)
+      assert led.settle(h, 20, at=62) == 20
+      assert led.refund(h, 20, at=63, key="r5") == 20, "a settled hold is a charge too"
+
+      log = led.audit("acme", at=200)
+      assert sum(e["delta"] for e in log) == led.balance("acme", at=200) == 0, "replaying the log gives the balance"
+      times = [e["at"] for e in log]
+      assert times == sorted(times), "entries are in time order"
+      assert sum(e["delta"] for e in log if e["kind"] == "expire") == -110, "expired credits are logged at their expiry time"
+      assert {"grant", "consume", "settle", "refund", "expire"} <= {e["kind"] for e in log}
+
+      big = Ledger()
+      for i in range(20000):
+          big.grant("acme", 1, at=0, expires_at=1000 + i)
+      whole = big.consume("acme", 20000, at=1)
+      t0 = time.perf_counter()
+      for i in range(10000):
+          assert big.refund(whole, 1, at=2, key=("bulk", i)) == 1
+      elapsed = time.perf_counter() - t0
+      assert big.balance("acme", at=2) == 10000
+      assert big.balance("acme", at=10999) == 10000, "each refund went to the latest-expiring source left"
+      assert elapsed < 3, f"10,000 refunds against one charge spread over 20,000 grants took {elapsed:.1f} s; the budget is 3 s"
+    hidden: |
+      import random as _r
+
+      def _raises(exc, fn, *a, **k):
+          try:
+              fn(*a, **k)
+          except exc:
+              return True
+          return False
+
+
+      class _Model:
+          """A slow, plain model of the rules: lists scanned on every call."""
+
+          def __init__(self):
+              self.grants = {}      # account -> list of [remaining, expires_at, seq]
+              self.holds = {}       # hold id -> [account, amount, deadline]
+              self.charges = {}     # charge id -> [account, [[grant, units], ...], refundable]
+              self.keys = {}
+              self.seq = 0
+              self.expired = {}
+
+          def tick(self, acct, now):
+              for g in self.grants.setdefault(acct, []):
+                  if g[1] is not None and g[1] <= now and g[0]:
+                      self.expired[acct] = self.expired.get(acct, 0) + g[0]
+                      g[0] = 0
+
+          def live(self, acct, now):
+              return [g for g in self.grants.get(acct, []) if g[0] and (g[1] is None or now < g[1])]
+
+          def balance(self, acct, now):
+              return sum(g[0] for g in self.live(acct, now))
+
+          def held(self, acct, now, skip=None):
+              return sum(h[1] for i, h in self.holds.items() if h[0] == acct and now < h[2] and i != skip)
+
+          def available(self, acct, now, skip=None):
+              return max(0, self.balance(acct, now) - self.held(acct, now, skip))
+
+          def grant(self, acct, amount, now, exp=None):
+              self.tick(acct, now)
+              self.seq += 1
+              self.grants.setdefault(acct, []).append([amount, exp, self.seq])
+
+          def spend(self, acct, amount, now):
+              parts = []
+              order = sorted(self.live(acct, now), key=lambda g: (float("inf") if g[1] is None else g[1], g[2]))
+              for g in order:
+                  if not amount:
+                      break
+                  take = min(amount, g[0])
+                  g[0] -= take
+                  amount -= take
+                  parts.append([g, take])
+              assert amount == 0
+              return parts
+
+          def consume(self, acct, amount, now, cid):
+              self.tick(acct, now)
+              if amount > self.available(acct, now):
+                  return False
+              self.charges[cid] = [acct, self.spend(acct, amount, now), amount]
+              return True
+
+          def hold(self, acct, amount, now, ttl, hid):
+              self.tick(acct, now)
+              if amount > self.available(acct, now):
+                  return False
+              self.holds[hid] = [acct, amount, now + ttl]
+              return True
+
+          def settle(self, hid, actual, now):
+              acct = self.holds[hid][0]
+              self.tick(acct, now)
+              charged = min(actual, self.available(acct, now, skip=hid))
+              del self.holds[hid]
+              self.charges[hid] = [acct, self.spend(acct, charged, now) if charged else [], charged]
+              return charged
+
+          def release(self, hid, now):
+              self.tick(self.holds[hid][0], now)
+              del self.holds[hid]
+
+          def refund(self, cid, amount, now, key):
+              if key in self.keys:
+                  return self.keys[key]
+              acct, parts, refundable = self.charges[cid]
+              self.tick(acct, now)
+              self.charges[cid][2] -= amount
+              left, restored = amount, 0
+              for p in sorted(parts, key=lambda p: (float("inf") if p[0][1] is None else p[0][1]), reverse=True):
+                  back = min(left, p[1])
+                  p[1] -= back
+                  left -= back
+                  if p[0][1] is None or now < p[0][1]:
+                      p[0][0] += back
+                      restored += back
+              self.keys[key] = restored
+              return restored
+
+      def _run4(seed, n=2500):
+          rng = _r.Random(seed)
+          led, m, now = Ledger(), _Model(), 0
+          open_ids, charges, keys, granted = [], [], [], {}
+          for _ in range(n):
+              now += rng.choice([0, 0, 1, 2, 4])
+              acct = rng.choice(["a", "b"])
+              op = rng.random()
+              if op < 0.22:
+                  amt = rng.randrange(1, 40)
+                  exp = rng.choice([None, now + 2, now + 8, now + 30])
+                  led.grant(acct, amt, at=now, expires_at=exp)
+                  m.grant(acct, amt, now, exp)
+                  granted[acct] = granted.get(acct, 0) + amt
+              elif op < 0.37:
+                  amt = rng.randrange(1, 40)
+                  cid = led.consume(acct, amt, at=now)
+                  if (cid is not None) != m.consume(acct, amt, now, cid):
+                      return False
+                  if cid is not None:
+                      charges.append(cid)
+              elif op < 0.5:
+                  amt, ttl = rng.randrange(1, 30), rng.choice([1, 3, 10])
+                  hid = led.hold(acct, amt, at=now, ttl=ttl)
+                  if (hid is not None) != m.hold(acct, amt, now, ttl, hid):
+                      return False
+                  if hid is not None:
+                      open_ids.append(hid)
+              elif op < 0.6 and open_ids:
+                  hid = open_ids.pop(rng.randrange(len(open_ids)))
+                  actual = rng.randrange(0, 50)
+                  if led.settle(hid, actual, at=now) != m.settle(hid, actual, now):
+                      return False
+                  charges.append(hid)
+              elif op < 0.75 and charges:
+                  if keys and rng.random() < 0.2:
+                      key, cid, amt, first = rng.choice(keys)
+                      if led.refund(cid, amt, at=now, key=key) != first:
+                          return False
+                      continue
+                  cid = rng.choice(charges)
+                  left = m.charges[cid][2]
+                  if left == 0:
+                      if not _raises(ValueError, led.refund, cid, 1, at=now, key=("over", len(keys), now)):
+                          return False
+                      continue
+                  amt = rng.randrange(1, left + 1)
+                  key = ("k", len(keys))
+                  got = led.refund(cid, amt, at=now, key=key)
+                  if got != m.refund(cid, amt, now, key):
+                      return False
+                  keys.append((key, cid, amt, got))
+              else:
+                  bal = led.balance(acct, at=now)
+                  if bal != m.balance(acct, now) or led.available(acct, at=now) != m.available(acct, now):
+                      return False
+                  log = led.audit(acct, at=now)
+                  if sum(e["delta"] for e in log) != bal:
+                      return False
+                  if [e["at"] for e in log] != sorted(e["at"] for e in log):
+                      return False
+                  if sum(e["delta"] for e in log if e["kind"] == "grant") != granted.get(acct, 0):
+                      return False
+                  m.tick(acct, now)
+                  if -sum(e["delta"] for e in log if e["kind"] == "expire") != m.expired.get(acct, 0):
+                      return False
+          return True
+
+      assert all(_run4(s) for s in range(4))
+      _l = Ledger()
+      _l.grant("x", 10, at=0)
+      _c = _l.consume("x", 4, at=1)
+      assert _l.refund(_c, 3, at=2, key="once") == 3
+      assert _raises(ValueError, _l.refund, _c, 2, at=3, key="twice"), "only 1 of the 4 is left to refund"
+      assert _l.refund(_c, 3, at=4, key="once") == 3 and _l.balance("x", at=4) == 9
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Coding round">
+"Build the credit ledger behind a model API: customers buy token credits, requests spend them. I'll give you the requirements in stages. Each stage has tests, and the next one opens when they pass."
+</Callout>
+
+Four stages grow one `Ledger` class. Every method takes the time `at` as an argument, and time never goes backwards across the whole ledger. Credits are integers. Stage n runs its visible tests and then hidden tests against your whole program, and each stage's brief appears only after the stage before it passes. Plan for about an hour.
+
+The hidden tests check rules and invariants, not one canonical trace. These are yours to choose:
+
+- The format of grant, charge and hold ids, and which of two grants with the same expiry is spent first.
+- The structures that keep spending, expiry and hold timeouts inside the time budgets.
+- What an audit entry carries beyond `at`, `kind` and `delta`.
+
+Two quantities are yours to choose and defend in writing, because no test can pick them for you:
+
+- Before stage 3: how large a hold is for a model request with a known prompt and a `max_tokens` cap, and how long the hold lives compared with the request timeout.
+- Before stage 4: how long you keep a charge refundable, and what that costs in memory at 1,000 charges per second.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how often the balance is read compared with how often it changes, and for how many grants per account.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the business wants when a request turns out to cost more than its hold and the account cannot cover the difference.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask finance whether refunded credits keep the expiry they were bought with.</p></details>
+
+## Answer
+
+The reference keeps, per account, a running `balance`, a running `held` total and one min-heap of live grants keyed by `(expires_at, sequence)`. One heap serves two jobs, because the spending order and the expiry order are the same order: every call first pops the grants whose expiry has passed (logging each unspent remainder as an `expire` entry at its expiry time), and `consume` then spends from the top of the same heap. Grants without an expiry sort last. A second heap holds hold deadlines, so a timed-out hold leaves `held` on the first call after its deadline. Each charge records which grants it drew from and how much, in spending order, so a refund can walk that list from the end. Every balance change appends to the account's log, which is why the log replays to the balance.
+
+Each stage is built to break the design that only fitted the stage before:
+
+- **Stage 1 breaks the summed balance.** Recomputing the balance by summing grants on every read is 20,000 reads over a list that grows to 20,000 grants, then 20,000 more over the spent list.
+- **Stage 2 breaks the sort per spend.** Sorting live grants by expiry on every `consume` costs a sort of 20,000 grants, 10,000 times.
+- **Stage 3 breaks the summed holds.** Adding up open holds on every `hold` and `available` call is quadratic in the number of requests in flight.
+- **Stage 4 breaks the rescanned refund.** Scanning a charge's sources from the end on every refund, skipping sources already refunded, turns 10,000 one-credit refunds into about 50 million skipped entries.
+
+A plain version that rescans every grant on each call did not finish stage 1 within the local harness's 60-second limit. The reference ran the four timed sections in 0.063 s, 0.084 s, 0.068 s and 0.014 s in CPython 3.12.6; Pyodide in the browser is slower, which is what the 3-second budgets leave room for.
+
+### Three rules with two defensible answers
+
+**What backs a hold.** The reference reserves an amount against the balance, not specific grants. It is simple and keeps `available` a subtraction. The cost: credits can expire under an open hold, and the settle then charges only what is still available, so the provider serves a request it cannot fully bill. The alternative pins the hold to grants and lets pinned credits outlive their expiry until the settle. That bills the request in full, at the cost of honouring credits after the date the customer was told they lapse, and a second data structure that must agree with the first.
+
+**A request that cost more than its hold.** The reference charges up to what is available and absorbs the rest. The alternative records the shortfall as debt and lets the balance go negative. Absorbing loses revenue on every overshoot; debt keeps the revenue but puts collections in the request path, and a customer with debt has to be blocked by some other rule.
+
+**Where a refund goes.** The reference returns credits to the grants they came from, latest-expiring source first, and credits whose grant has already expired are not restored. The alternative issues a fresh grant. A fresh grant is friendlier, and it is a leak: consume a credit the day before it expires, have the request refunded, and the credit comes back with a new expiry. Returning to the source grant closes that, at the cost of a support conversation every time a refund arrives after the source expired.
+
+### The quantities you chose
+
+**Hold size.** The worst case for a model request is the prompt's tokens at the input price plus `max_tokens` at the output price. Holding the worst case never undercharges but locks credits that are almost never spent, so a customer near the end of their balance sees requests refused while credits remain. Holding a high percentile of observed cost frees those credits and accepts an overshoot on the rare request above it, which the absorb rule turns into lost revenue. Either is reasonable if it is written down with the measured percentile; holding nothing, or holding a flat amount independent of `max_tokens`, is not.
+
+**Hold lifetime.** The hold must outlive the request. A TTL shorter than the request timeout lets a long streaming request lose its hold mid-flight, and another request can then spend the same credits. Set the TTL to the request timeout plus the settle path's own worst latency, and alert on settles that arrive for timed-out holds.
+
+**Refund window.** Every charge must be kept while it can be refunded. At 1,000 charges per second, 30 days is 1,000 × 86,400 × 30 = 2.592 billion charges. At an assumed 200 bytes per charge record that is about 518 GB, which does not belong in one process. A short window (a day or two, covering retries and failed requests) fits in memory; longer windows move charges to a store keyed by charge id.
+
+### The constraint conflict
+
+The round's clock against the business rules: a full ledger with pinned holds, debt and fresh-grant refunds does not fit an hour, and the stages reward the version whose rules are simple enough to state in one sentence each. In production the same conflict is revenue against availability: every rule that protects revenue (worst-case holds, debt) refuses or blocks a paying customer somewhere.
+
+**How the recommended design fails.** The auto-released hold is the weak point. A request that outlives its hold is served against credits another request may already have spent, and the settle charges what is left, so a slow request at the end of a balance is under-billed with no error anywhere. The second weak point is memory: the reference keeps every charge, so a long-running process grows without bound until charges past the refund window are dropped or moved out.
+
+## Follow-ups
+
+- *What changes to run this as a real service?* The balance and the holds move into a store with atomic conditional updates per account (a row with a version, or a single-writer partition per account), because two API servers spending the last credits at once is the race the single process hides. Usage goes to billing from the log, keyed by charge id so a retry reports once; Stripe's meter events, for example, accept timestamps up to 35 days old but say an event accepted after an invoice finalises does not update that invoice, so the reporting job must run inside the billing period's own window. Time comes from the request's server-side timestamp, never from a client.
+- *Pushback: finance says absorbing overshoot is lost revenue and wants debt. Engineering says debt needs collections. Which do you build, and what do you accept in writing?* Absorb, with the overshoot logged as its own entry kind and reported weekly; accept in writing the measured overshoot total, and agree the number at which debt becomes worth building.
+- *Reversal: what would you need to see in production to move from amount holds to pinned holds?* Settles charging less than the actual cost because credits expired under a hold, at a rate finance considers material, or a customer contract promising that a started request is always billed from the credits it started with.
+- *Events now arrive out of order: a refund can be recorded with an `at` earlier than the last consume. What changes?* The ledger becomes an event log sorted by event time with a replay from a checkpoint, and every balance read is "as of" a time. Expiry is the hard part: a late refund for a grant that has since expired changes whether that credit was live when it was spent.
+
+## Common mistakes
+
+- Spending in grant order instead of expiry order, which lets early-expiring credits lapse while later ones are spent.
+- Letting `consume` spend credits that an open hold has reserved.
+- Treating a refund retry as a second refund because it has no idempotency key.
+- Restoring refunded credits as a new grant with a fresh expiry.
+- Recomputing the balance from all grants on every read, or summing open holds on every call.
+- Logging expiries at the time they were noticed instead of the time they happened, which breaks a replay of the log.

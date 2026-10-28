@@ -1,0 +1,158 @@
+---
+title: A fine-tuning run end to end
+track: llmops
+module: fine-tuning
+order: 2
+kind: lesson
+level: senior
+minutes: 15
+summary: A LoRA run is a base model chosen for licence, size and chat template, data in a format whose loss mask you have checked, hyperparameters taken from named sources, and an evaluation against the prompted base on held-out cases.
+prerequisites: [llmops/fine-tuning/should-we-fine-tune]
+updated: 2026-10-28
+sources:
+  - title: Hugging Face TRL documentation, SFT Trainer (v1.16.0, checked 2026-10-28)
+    url: https://huggingface.co/docs/trl/sft_trainer
+    note: "formats: language modeling and prompt-completion, each standard or conversational, plus tool calling with a tools column; completion_only_loss None means loss on the completion for prompt-completion datasets and on the full sequence for language modeling datasets; assistant_only_loss defaults to False and requires {% generation %} and {% endgeneration %} in the chat template, which TRL patches automatically for known families such as Qwen3; SFTConfig learning_rate defaults to 2e-5 (TrainingArguments 5e-5), num_train_epochs 3.0, max_length 1024 with truncation_mode keep_start, packing False, gradient_checkpointing True; adapters typically use about 1e-4; EOS token must match the chat template's end of turn (Qwen2.5 example eos_token <|im_end|>)."
+  - title: Unsloth documentation, LoRA hyperparameters guide (checked 2026-10-28)
+    url: https://unsloth.ai/docs/get-started/fine-tuning-llms-guide/lora-hyperparameters-guide
+    note: "learning rate 2e-4 as a starting point for LoRA and QLoRA; 1 to 3 epochs, more than 3 gives diminishing returns; rank 8 or 16 for fast fine-tunes, up to 128; lora_alpha equal to rank or twice rank; all major linear layers (q, k, v, o, gate, up, down); batch size 2 with gradient accumulation 8; warmup 5 to 10% of steps; training loss below 0.2 likely means overfitting; QLoRA uses about 4x less VRAM and is marginally less accurate."
+  - title: OpenAI API docs, Supervised fine-tuning (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/guides/supervised-fine-tuning
+    note: "minimum 10 examples; improvements seen from 50 to 100 examples; start with 50 well-crafted demonstrations and evaluate; carve holdout data from the same dataset with the same diversity of inputs; compare with the base model using evals; the page says OpenAI is winding down the fine-tuning platform, with eligible existing customers able to create jobs until 6 January 2027."
+  - title: Thinking Machines Lab, LoRA Without Regret (John Schulman and others, 2025-09-29)
+    url: https://thinkingmachines.ai/blog/lora/
+    note: "optimal LoRA learning rate consistently about 10x the full fine-tuning one (fitted multiplier 9.8); alpha 32 with alpha/r scaling; constant learning rate, no warmup; LoRA less tolerant of large batches; LoRA costs slightly more than 2/3 of full fine-tuning FLOPs per pass. Checked 2026-10-28."
+  - title: "Biderman et al., LoRA Learns Less and Forgets Less (arXiv 2405.09673, TMLR 2024)"
+    url: https://arxiv.org/abs/2405.09673
+    note: "best LoRA learning rates 5e-4 (code) and 2e-4 (math); recommends sweeping 1e-5 to 5e-4 and taking the highest stable value; alpha = 2r. Read via the arXiv HTML version, checked 2026-10-28."
+  - title: NVIDIA H100 product page (checked 2026-10-28)
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: "H100 SXM BF16 Tensor Core 1,979 teraFLOPS, footnoted as with sparsity; 80 GB; 3.35 TB/s."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import FoundationsLoraMemory from '../../../../components/widgets/FoundationsLoraMemory.astro';
+
+## The run as five decisions
+
+A supervised fine-tuning run is a build with five inputs, and most failed runs fail on an input, not in training: the base model, the data format, the loss mask, the hyperparameters and the evaluation. Each has a default in the library you use, and each default is right for someone else's dataset. This lesson uses Hugging Face TRL (documentation for v1.16.0, read on 2026-10-28) because its defaults are written down; the decisions are the same in Unsloth, Axolotl or a hosted service.
+
+## The base
+
+**Licence first.** The weights' licence decides whether you may serve the tuned model commercially, whether outputs of another provider's model may be in your training data, and what attribution you owe. Legal reads it before anyone downloads 16 GB.
+
+**Size from memory and serving.** Mixed-precision Adam holds 16 bytes of model state per trained parameter, so a full fine-tune of an 8B model needs about 128 GB before activations and does not fit one 80 GB GPU. LoRA freezes the base in bf16 (2 bytes per parameter) and trains a few tens of millions of adapter parameters; QLoRA stores the frozen base in 4 bits. The widget computes model-state memory for the Llama 3.1 8B shape; activations come on top and grow with sequence length and batch size.
+
+<FoundationsLoraMemory title="Model states for an 8B fine-tune" />
+
+**Instruct or base.** An instruct checkpoint already has a chat template, a turn-ending token and refusal behaviour; you are adjusting it. A base checkpoint has none of these, and you supply the template. TRL warns about the trap in the second case: when a model already ships a template, the EOS token has to match the template's end-of-turn marker (its example is setting `eos_token="<|im_end|>"` for Qwen2.5-1.5B), or the tuned model does not stop at the end of its turn.
+
+**Template and tokenizer travel to serving.** The template used in training is the one the inference server must apply, token for token. If you pass a Jinja file as `chat_template_path`, TRL's documentation says any special tokens it references have to be added to the tokenizer and the embedding layer resized. Pin the template file in the same artefact as the adapter, and diff it against the serving stack's template before the first eval.
+
+## The data format and the loss mask
+
+TRL accepts four shapes: language modeling (`text`, or `messages` for conversations) and prompt-completion (`prompt` and `completion`), each in a standard or conversational form, plus tool-calling examples that carry `tool_calls`, `tool` role messages and a `tools` column of JSON schemas.
+
+The format sets the default loss mask, and this is where runs go wrong quietly:
+
+- **Prompt-completion.** `completion_only_loss` defaults to `None`, which TRL resolves to loss on the completion only. Prompt tokens are masked without you asking.
+- **Conversational language modeling (`messages`).** The same default resolves to loss on the full sequence: system, user and assistant tokens alike. Training only on assistant turns needs `assistant_only_loss=True`, and that needs the chat template to wrap assistant content in `{% generation %}` and `{% endgeneration %}`. TRL patches the template for known families such as Qwen3; for any other template, including one your team edited, you add the markers.
+
+A model trained on user turns learns to produce user turns: it restates questions, writes in the customer's voice, and fits whatever the users typed. Unsloth's guide reports that training on completions only increases accuracy, especially for multi-turn conversational fine-tunes, and cites the QLoRA paper's gain of about one point from masking inputs. The check costs one line: after preprocessing, count the share of tokens whose label is not the ignore index (TRL uses -100). On a chat dataset that share should be roughly the assistant share of tokens. If it is 1.0, the mask is off.
+
+```python
+IGNORE = -100
+
+def build_labels(segments):
+    """segments: list of (role, token_ids); only assistant tokens are trained."""
+    input_ids, labels = [], []
+    for role, ids in segments:
+        input_ids += ids
+        labels += ids if role == "assistant" else [IGNORE] * len(ids)
+    return input_ids, labels
+
+def trained_share(label_rows):
+    total = sum(len(row) for row in label_rows)
+    trained = sum(1 for row in label_rows for t in row if t != IGNORE)
+    return trained / total
+
+conv = [("system", [1] * 40), ("user", [2] * 120), ("assistant", [3] * 60),
+        ("user", [4] * 80), ("assistant", [5] * 50)]
+_, labels = build_labels(conv)
+print(round(trained_share([labels]), 3))  # 110 / 350 = 0.314
+```
+
+Two more defaults belong in the same review. `max_length` is 1024 with `truncation_mode="keep_start"`, so a 3,000-token support conversation keeps its opening and loses its last turns, which are usually where the resolution is; measure the token-length distribution and set the limit from it. Packing is off by default; turning it on changes how many examples share a sequence, not which tokens are trained.
+
+## Hyperparameters, with where each number comes from
+
+| Setting | Value | Source and condition |
+|---|---|---|
+| Learning rate, full SFT | 2e-5 | TRL's `SFTConfig` default (the parent `TrainingArguments` default is 5e-5) |
+| Learning rate, LoRA | about 1e-4 | TRL's adapter tip |
+| Learning rate, LoRA | 2e-4 to start | Unsloth's guide |
+| Learning rate, LoRA | about 10× the full fine-tuning optimum | Thinking Machines, fitted multiplier 9.8 |
+| Learning rate, LoRA | sweep 1e-5 to 5e-4, take the highest stable | Biderman et al. (their best: 5e-4 code, 2e-4 maths) |
+| Epochs | 1 to 3; more gives diminishing returns | Unsloth; TRL's default is 3.0 |
+| Rank and alpha | r 8 or 16 for fast runs, up to 128; alpha r or 2r | Unsloth; Biderman et al. use alpha 2r; Thinking Machines fixes alpha 32 with alpha/r scaling |
+| Target modules | all linear layers: q, k, v, o, gate, up, down | Unsloth; Thinking Machines found attention-only LoRA underperforms |
+| Batch | 2 per device with 8 accumulation steps | Unsloth's starting point; Thinking Machines found LoRA less tolerant of large batches |
+| Overfitting sign | training loss below 0.2 | Unsloth |
+
+The sources agree more than the table suggests. TRL's full-SFT default of 2e-5 times the Thinking Machines multiplier of about 10 is 2e-4, Unsloth's starting point. The disagreement that matters is the schedule: Thinking Machines ran a constant rate with no warmup, Unsloth suggests 5 to 10% warmup with a linear or cosine decay. Pick one, write it in the run config, and do not compare runs that differ in it.
+
+<Predict id="ops-ft-steps" question="2,000 training conversations, 2 per device with 8 accumulation steps on one GPU, 3 epochs. How many optimizer steps does the run take?" answer={375} tolerance={0} unit="steps">
+The effective batch is 2 × 8 = 16 conversations, so one epoch is 2,000 / 16 = 125 steps and three epochs are 375. Unsloth's 5 to 10% warmup is 19 to 38 of them. With so few steps, each logging interval TRL reports (every 10 steps by default) covers 160 conversations, and an evaluation every 25 steps gives 15 points on the curve.
+</Predict>
+
+The run itself is short. LoRA costs a little over two thirds of the FLOPs of full fine-tuning per pass, by the Thinking Machines count, so about 4 FLOPs per parameter per token against the usual 6. If those 2,000 conversations average 700 tokens (a scenario figure), three epochs are 4.2M tokens and 4 × 8×10⁹ × 4.2×10⁶ ≈ 1.3×10¹⁷ FLOPs. NVIDIA lists the H100 SXM at 1,979 BF16 teraFLOPS with sparsity, about 990 dense; at a scenario 35% utilisation that is about 350 teraFLOPS, so the run takes 1.3×10¹⁷ / 3.5×10¹⁴ ≈ 380 seconds. Model download, data preparation and evaluation take longer than training. The budget question is how many runs you do, not how long one takes.
+
+## Evaluation against the prompted base
+
+OpenAI's supervised fine-tuning guide sets the floor at 10 examples, reports improvements from 50 to 100, and recommends starting with 50 well-crafted demonstrations and evaluating before adding more. The guide is for a platform OpenAI is winding down, but the order of work transfers: a small clean set, an eval, then more data where the eval says the model is weak.
+
+Three rules for the eval set:
+
+1. **Held out from the same source, split before any processing.** The guide says to carve holdout data from the same dataset with the same diversity of inputs. Split by user, account or time, not by row, so near-duplicate conversations do not land on both sides.
+2. **The baseline is the prompted base, not the bare base.** The tuned model has to beat what you would ship without training: the best prompt you have on the same base, or the hosted model you are replacing. Beating the untuned base with no system prompt proves only that training happened.
+3. **Paired, on the same cases, with the regressions you care about.** Score both models on every held-out case, and add a slice for behaviour outside the task the product still needs: refusals, tool-call validity, the output schema. Training loss and eval loss are diagnostics, not the decision metric.
+
+A loss curve that keeps falling while the held-out task metric peaks and then drops is the overfitting signature. With Unsloth's threshold, a chat dataset whose training loss reaches 0.15 by epoch three is the first place to look; keep the checkpoint from the eval peak, not the last one.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+"You have one rented H100 for a week, 3,000 labelled extraction examples, and a prompted frontier model at 88% field-level accuracy that legal wants replaced by something self-hosted by month end. Walk me through the run, and tell me what would make you stop."
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Split first: 2,500 for training, 500 held out by customer, scored field by field for both the tuned model and the prompted frontier model. Base: an instruct model in the 7B to 8B range with a licence legal has cleared, LoRA on all linear layers in bf16, prompt-completion format so the prompt is masked by default, 2e-4 with a constant rate, three epochs, and an eval every 25 steps. Stop when two consecutive configurations fail to move held-out accuracy and the tuned model is still more than two points under 88%; then the answer to legal is a self-hosted prompted model, not a fine-tune.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The week is a run budget. One run is minutes of GPU, so the constraint is evaluation and my time: I plan five or six configurations, not one. Day one is the split, the scorer and the baseline numbers, including the prompted frontier model on the 500 held-out examples, so 88% is measured on my cases.</p>
+<p>Two defensible base choices. A 7B to 8B instruct model with LoRA in bf16 fits with room for long documents and serves cheaply; a 13B to 14B model under QLoRA may extract better, at the cost of 4-bit base weights during training and a larger serving bill. I would start small and move up only if the error analysis shows reading errors, not format errors.</p>
+<p>The failure mode of this plan: 500 held-out examples from the same labelling pass share the labellers' mistakes, so the tuned model can match the labels and still be wrong. I would have 50 of the held-out cases re-labelled by someone else and report agreement next to accuracy.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Pushback: the tuned model reaches 87% and costs a tenth as much to serve. Legal's deadline is in nine days. Do you ship one point below the frontier model, and who signs for the point?</li>
+<li>Reversal: what would the error analysis have to show for you to switch from LoRA to a full fine-tune on a rented 8-GPU node?</li>
+<li>Your training loss is 0.08 at epoch three and held-out accuracy is still rising. Is that overfitting?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Unsloth's 0.2 threshold assumes outputs with real entropy. A classification or extraction set whose completions are a few tokens from a small vocabulary can sit below 0.2 while held-out accuracy still rises; the held-out curve decides, not the threshold.
+
+The hyperparameter table mixes contexts. Thinking Machines' 10× ratio came from sweeps on the models in their post with a constant schedule, Biderman et al. trained Llama-2-7B on code and maths at around 100,000 examples, and Unsloth's numbers are starting points for its own stack. On a new base or a much smaller dataset, a three-point learning-rate sweep is cheaper than trusting any of them.
+
+Assistant-only loss is the right default for chat products, not a law. If the model must learn to read an unusual input format, such as a log dialect or a domain notation, there is an argument for some loss on inputs; make it a measured choice with an eval, not a default nobody checked.
+
+The 50-example starting point is OpenAI's advice for its hosted models, whose bases were already strong instruction followers. Smaller open-weight bases and harder tasks can need more before the eval moves at all, which is why the first eval decides how much to label, not a rule of thumb.
+
+<SelfRate id="lesson:llmops/fine-tuning/fine-tuning-run" />

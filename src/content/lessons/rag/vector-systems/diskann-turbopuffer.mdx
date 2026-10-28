@@ -1,0 +1,183 @@
+---
+title: "Teardown: vector indexes on SSD and object storage"
+track: rag
+module: vector-systems
+order: 5
+kind: teardown
+level: staff
+minutes: 13
+summary: DiskANN and turbopuffer answer the RAM cost of vector search in two different ways, a graph laid out for SSD reads with compressed vectors in memory and a centroid index on object storage behind NVMe and memory caches, and their published numbers show what each costs on a cold query.
+prerequisites: [rag/vector-systems/vector-scale]
+updated: 2026-10-28
+sources:
+  - title: "Subramanya, Devvrit, Simhadri, Krishnaswamy and Kadekodi, DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node (NeurIPS 2019)"
+    url: https://proceedings.neurips.cc/paper/2019/hash/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Abstract.html
+    note: "authors at Microsoft Research India, CMU and UT Austin; billion points on a workstation with 64 GB RAM and an SSD; over 5,000 QPS with mean latency under 3 ms at 95%+ 1-recall@1 on SIFT1B, 16 cores; 5 to 10x more points per node than HNSW and NSG at high recall; FAISS and IVFOADC+G+P at similar memory plateau near 50% 1-recall@1; retail SSD serves a random read in a few hundred microseconds and about 300K random reads per second; targets a few dozen random reads and under ten, preferably five, round trips; Vamana prunes with alpha > 1 (HNSW and NSG implicitly use 1) for long-range edges and smaller diameter; PQ codes (e.g. 32 bytes per point) in RAM, full vector followed by R neighbour ids on SSD; BeamSearch fetches W (4 or 8) neighbourhoods per round trip, W of 16 or more wastes compute and bandwidth; SSD at 30 to 40% load factor; caches nodes 3 or 4 hops from the start; full vectors read in the same 4 KB sector as the neighbour list, so re-ranking costs no extra reads; single index L 125, R 128, alpha 2: about 2 days, 1,100 GB peak memory; merged index from 40 overlapping partitions: 348 GB, about 5 days under 64 GB, at most 20% extra latency; single index 98.68% 1-recall@1 under 5 ms; IVFOADC+G+P-32 reaches 62.74% 1-recall@1, DiskANN above 95% in under 3.5 ms at the same memory footprint"
+  - title: turbopuffer docs, Architecture (checked 2026-10-28)
+    url: https://turbopuffer.com/docs/architecture
+    note: "API routes to a cluster of Rust binaries; object storage as the durable store, one prefix per namespace, WAL at s3://tpuf/{namespace_id}/wal; each write adds a file to the WAL directory; one WAL commit per namespace per second, batched; write p50 165 ms for 500 kB; separate indexer processes build indexes asynchronously; vector index based on SPFresh, centroid-based, fewer round trips and less write amplification than HNSW or DiskANN; BM25 inverted index and exact metadata indexes; query nodes cache on NVMe SSD and memory after the first query, later queries routed to the same node, any node can serve any namespace; strong consistency by default, unindexed WAL searched exhaustively; eventual consistency optional, sub-10 ms warm, staleness up to about one hour; cold p50 874 ms and warm p50 14 ms at 1M documents; object storage round trip about 100 ms; cold query downloads the centroid index, finds the nearest centroids and fetches the clusters in one large round trip, often about 400 ms in 3 to 4 round trips; pre-flight query to warm the cache; binaries are multi-tenant, enterprise customers can request single-tenant clusters or BYOC"
+  - title: turbopuffer docs, Limits (checked 2026-10-28)
+    url: https://turbopuffer.com/docs/limits
+    note: "max ingested unindexed data 2 GB; write throughput per namespace 10k writes/s at 32 MB/s; max documents per shard 500M at 1 TB; max shards per namespace 256; max concurrent queries per unpinned namespace 16; max pinned namespaces 256; vector search recall@10 90-100%; max inactive time in cache listed as hours"
+  - title: "Xu et al., SPFresh: Incremental In-Place Update for Billion-Scale Vector Search (arXiv 2410.14452, SOSP 2023)"
+    url: https://arxiv.org/abs/2410.14452
+    note: "in-place updates with LIRE, which splits partitions and reassigns vectors at partition boundaries, instead of buffering updates and rebuilding globally"
+  - title: "Douze et al., The Faiss Library (arXiv 2401.08281 v4, 2025-10-23)"
+    url: https://arxiv.org/abs/2401.08281
+    note: "DiskANN built for hybrid RAM and flash; in flash-backed or distributed settings the metric is IOPS, since each read fetches a whole page; a slower storage tier can hold the second index of a refinement step; IVF cost K_IVF + P_IVF x N / K_IVF distance computations"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Diagram from '../../../../components/Diagram.astro';
+import Trace from '../../../../components/Trace.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What it is and who runs it
+
+Two systems that move vector search off RAM, by different routes. DiskANN is a research system from a NeurIPS 2019 paper by authors at Microsoft Research India, Carnegie Mellon and UT Austin: a graph index, Vamana, laid out so that a query on a local SSD needs few reads, with compressed vectors in RAM to steer it. turbopuffer is a hosted search engine run by the company of the same name; its architecture page describes a design in which object storage is the only durable tier and NVMe and memory are caches. Everything below comes from the paper and from turbopuffer's architecture and limits pages as checked on 28 October 2026. turbopuffer's engine is closed source, so where its docs stop, this page stops.
+
+The two are not competitors in the usual sense. DiskANN is an index layout for one machine with an SSD; turbopuffer is a service whose page names DiskANN as an example of the graph indexes it chose not to use on object storage. Reading them together shows what each storage tier punishes: SSD punishes dependent reads by hundreds of microseconds, object storage by about 100 ms.
+
+## The system
+
+<Diagram
+  title="DiskANN on one machine, as described in the NeurIPS 2019 paper"
+  nodes={[
+    { id: 'q', label: 'Query' },
+    { id: 'pq', label: 'PQ codes in RAM', note: 'e.g. 32 bytes per point' },
+    { id: 'hot', label: 'Cached nodes in RAM', note: '3 or 4 hops from the start' },
+    { id: 'beam', label: 'Beam search', note: 'W of 4 or 8 reads per round trip' },
+    { id: 'ssd', label: 'Vamana graph on SSD', note: 'full vector and R neighbour ids per node' },
+    { id: 'out', label: 'Top k', note: 'ranked by full-precision distance' },
+  ]}
+  edges={[
+    { from: 'q', to: 'beam' },
+    { from: 'pq', to: 'beam', label: 'approximate distances' },
+    { from: 'hot', to: 'beam', label: 'first hops' },
+    { from: 'beam', to: 'ssd', label: 'batched reads' },
+    { from: 'ssd', to: 'beam', label: 'neighbours, full vectors' },
+    { from: 'beam', to: 'out' },
+  ]}
+  rows={[['q'], ['pq', 'beam', 'hot'], ['ssd'], ['out']]}
+/>
+
+**Vamana graph on SSD.** A single-layer proximity graph. Its pruning rule has a parameter alpha; the paper notes that HNSW and NSG implicitly use alpha = 1, and that a larger alpha keeps long-range edges and gives the graph a smaller diameter, so the walk needs fewer hops. Fewer hops is the whole goal, because each hop is an SSD round trip. On disk each node is a fixed-size record: its full-precision vector followed by up to R neighbour ids, padded, so a node's offset is computed rather than looked up.
+
+**PQ codes in RAM.** Every point's product-quantised code (32 bytes per point in the paper's example, so 32 GB for a billion points) stays in memory. The walk uses these approximate distances to choose which nodes to read next; the paper notes that the graph itself was built with full-precision vectors, which is why compressed distances can still steer it to the right region.
+
+**Beam search.** Instead of reading one node per step, the search reads the neighbourhoods of the W closest unvisited candidates in one batch; the paper says fetching a few random sectors takes almost the same time as one. W of 2, 4 or 8 balanced latency and throughput in their runs, with the SSD at a 30 to 40% load factor; W of 16 or more wasted compute and bandwidth.
+
+**Cached nodes.** The nodes within 3 or 4 hops of the starting point, or chosen from a known query distribution, are held in RAM, which removes the first few round trips of every query. The node count grows exponentially with the hop radius, which bounds how far this goes.
+
+**Re-ranking for free.** A node's neighbour list (4 x 128 bytes at degree 128) and its full vector fit in one 4 KB sector, and reading 4 KB costs no more than reading 512 bytes. So every node the walk reads also delivers its full vector, and the final top k is ranked by exact distance without extra reads. This is the verification pass from the quantisation lesson, folded into the walk.
+
+<Diagram
+  title="turbopuffer, as described in its architecture docs (October 2026)"
+  nodes={[
+    { id: 'client', label: 'Client' },
+    { id: 'router', label: 'API and routing' },
+    { id: 'node', label: 'Query node', note: 'tpuf binary, multi-tenant' },
+    { id: 'mem', label: 'Memory cache' },
+    { id: 'nvme', label: 'NVMe SSD cache' },
+    { id: 'wal', label: 'WAL per namespace', note: 'object storage prefix' },
+    { id: 'idx', label: 'Centroid index and clusters', note: 'SPFresh-based' },
+    { id: 'indexer', label: 'Indexer', note: 'asynchronous' },
+  ]}
+  edges={[
+    { from: 'client', to: 'router' },
+    { from: 'router', to: 'node', label: 'same node per namespace' },
+    { from: 'node', to: 'mem' },
+    { from: 'node', to: 'nvme' },
+    { from: 'node', to: 'wal', label: 'writes, unindexed tail' },
+    { from: 'node', to: 'idx', label: 'cold reads' },
+    { from: 'wal', to: 'indexer' },
+    { from: 'indexer', to: 'idx', label: 'builds' },
+  ]}
+  rows={[['client'], ['router'], ['mem', 'node', 'nvme'], ['wal', 'idx'], ['indexer']]}
+/>
+
+**WAL per namespace on object storage.** Each namespace is a prefix in object storage, and its write-ahead log is a directory under it; every committed batch adds a file. A write that returns has been durably stored. A namespace commits at most one log entry per second, so concurrent writes in the same second are batched, and the docs give a write p50 of 165 ms for 500 kB.
+
+**Indexer.** Separate processes read the log and build indexes asynchronously. Until they catch up, the committed tail is searchable by an exhaustive scan, and the limits page caps ingested, unindexed data at 2 GB per namespace.
+
+**Centroid index.** The vector index is based on SPFresh, a partition (centroid) design with in-place updates: clusters split as they grow and only vectors near partition boundaries are reassigned. The architecture page gives the reason for choosing it over a graph: centroid indexes need fewer round trips and less write amplification on object storage than HNSW or DiskANN. A graph walk is a chain of dependent reads; a centroid lookup is "read the centroids, then read the chosen clusters together". Full-text search uses a BM25 inverted index, and metadata filters use exact indexes.
+
+**NVMe and memory caches.** After a namespace's first query, a query node caches its data on NVMe and in memory, and routing sends later queries for that namespace to the same node, although any node can serve any namespace. The binaries are multi-tenant; the docs say enterprise customers can request single-tenant clusters or run it in their own cloud.
+
+## One query, cold and warm
+
+<Trace
+  title="Two searches on a 1M-document turbopuffer namespace"
+  note="steps follow the architecture page; the published latencies are p50"
+  steps={[
+    { actor: 'user', text: 'First search against a namespace no query node has cached.' },
+    { actor: 'system', text: 'Routing picks a query node; it has nothing for this namespace in memory or on NVMe.' },
+    { actor: 'tool', text: 'Round trip to object storage for the centroid index.', note: 'About 100 ms per object-storage round trip.' },
+    { actor: 'system', text: 'The node finds the centroids nearest the query.' },
+    { actor: 'tool', text: 'One large round trip fetches all the clusters the query needs.' },
+    { actor: 'tool', text: 'Strong consistency adds a check of the log, and any unindexed tail is scanned exhaustively.', note: 'Consistency checks are extra round trips.' },
+    { actor: 'assistant', text: 'Results return; the namespace is now cached on that node.', note: 'Published cold p50 874 ms; often about 400 ms when 3 to 4 round trips suffice.' },
+    { actor: 'user', text: 'The next search on the same namespace.' },
+    { actor: 'system', text: 'Routing sends it to the same node, which serves it from memory and NVMe.', note: 'Published warm p50 14 ms; eventually consistent warm queries under 10 ms.' },
+  ]}
+/>
+
+The DiskANN equivalent has no cold tier in the same sense: the index is on a local SSD and the paper reports a mean under 3 ms at 95%+ 1-recall@1 on a billion points. Its first query still pays SSD reads for every hop beyond the cached nodes, which the beam search batches into a handful of round trips.
+
+## Data placement
+
+The two designs answer one question, which bytes must be in RAM, with different answers. DiskANN keeps a compressed copy of every vector in RAM, permanently, plus a small set of hot nodes; RAM scales with the corpus at 32 bytes per point in the paper's setup, and the SSD holds the rest. turbopuffer keeps nothing in RAM permanently; RAM and NVMe hold whichever namespaces were queried recently, so RAM scales with the active working set, not the corpus. That difference is why the second design suits many small tenants and the first suits one large corpus queried continuously.
+
+The Faiss paper describes the same split from the other side: in flash-backed or distributed settings the metric is I/O operations rather than distance computations, because every read fetches a whole page. Both designs are page-aware; they differ in how expensive one page is.
+
+## Writes, consistency and tenancy
+
+DiskANN, as published, is a build-then-serve index: the single billion-point build took about 2 days with a peak memory of 1,100 GB, and the merged alternative (40 overlapping k-means partitions, each point sent to its 2 nearest, graphs merged by edge union) took about 5 days on the 64 GB workstation and produced a 348 GB index. Incremental updates are outside the 2019 paper.
+
+turbopuffer's write path is the log. Strong consistency is the default, so a query after a successful write sees it; eventual consistency is an option that lowers warm latency and can be stale by up to about an hour. Tenancy is the namespace: one prefix per namespace in object storage, unlimited namespaces in the limits page, at most 16 concurrent queries per unpinned namespace, and up to 256 pinned namespaces. A namespace too large for one index is sharded internally across indexes sharing one log, up to 500M documents per shard and 256 shards.
+
+## Cost and latency
+
+DiskANN's numbers are the paper's, on SIFT1B (128-dimension uint8 vectors) and 2019 hardware: over 5,000 queries per second on 16 cores with mean latency under 3 ms at 95%+ 1-recall@1, and 98.68% 1-recall@1 under 5 ms for the single index. At the same memory footprint, the paper reports IVFOADC+G+P with 32-byte codes plateauing at 62.74% 1-recall@1 while DiskANN passed 95% in under 3.5 ms, and 5 to 10 times more points per node than in-memory HNSW and NSG at high recall. The reason is the free re-ranking: compression-only indexes are capped by the error of their codes, while DiskANN reads full vectors on the way.
+
+turbopuffer's latency numbers are its own, at 1M documents: cold p50 874 ms, warm p50 14 ms, with an object-storage round trip of about 100 ms. The limits page states a vector search recall@10 of 90 to 100%. The cost argument is structural: object storage is the durable tier, so the price of a stored gigabyte is set by object storage plus whatever fraction is cached, and a namespace nobody queries costs only its stored bytes.
+
+## Failure modes
+
+- **Cold-start bursts.** On the object-storage design, many namespaces going warm at once (a time zone starting work) means many concurrent cold paths, each several round trips long. The pre-flight warm query moves the cost earlier; it does not remove it.
+- **A large unindexed tail.** Strong consistency scans the unindexed log exhaustively. A write burst that outruns the indexer turns cheap queries into scans until the tail is indexed, with the 2 GB cap as the hard stop.
+- **Per-namespace write ceiling.** One commit per second per namespace and 10k writes a second per namespace mean a single hot tenant's write rate is bounded by its namespace, whatever the cluster's capacity.
+- **SSD queue depth.** DiskANN's own analysis: an SSD driven at peak throughput with backlogged queues serves reads in over a millisecond, so the design runs at a 30 to 40% load factor. A co-located workload that fills the queues raises every query's latency.
+- **Rebuild time.** The billion-point builds took days. A new embedding model, or a delete-heavy period that degrades the graph, has a recovery time measured in those days unless the index supports in-place updates.
+
+## What is not public
+
+The cost per query of either design is not published. DiskANN's paper reports hardware and throughput, not a price, and turbopuffer's architecture and limits pages give no per-query cost; a cost per query derived from them would require pricing inputs this page does not use.
+
+turbopuffer's cache sizing and eviction policies are not described beyond the architecture page: how much NVMe and memory a node has, how namespaces are evicted, and the limits page's "hours" of maximum inactive time in cache, without a number. The routing algorithm beyond cache locality, the parameters of its SPFresh-based index (cluster sizes, number of centroids, probe counts), how it differs from the SPFresh paper, and which percentiles beyond p50 hold for cold and warm queries are also not stated. Production deployments of DiskANN beyond the paper are outside the sources used here.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your corpus is 2B 768-dimension vectors in one logical index, queried continuously at 2,000 queries per second with a p95 target of 20 ms and recall@10 of 0.95. A colleague proposes moving it to an object-storage engine to cut cost. You have two quarters and a budget that allows either a few large SSD machines or a managed service. Which design do you choose?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>An SSD-resident graph in the DiskANN layout. One continuously queried corpus is always warm, so object storage's cheap cold bytes buy nothing, while its cold path is hundreds of milliseconds. The DiskANN layout needs RAM only for the compressed codes and hot nodes, and its published latencies are in the low milliseconds; I would confirm p95 at 2,000 QPS on our data before committing.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Working set. A corpus queried at 2,000 QPS across its whole range has a working set equal to the corpus. On an object-storage engine it would live in the cache tier permanently, so the bill is the cache plus the storage, and every cache loss is a 100 ms-per-round-trip cold path against a 20 ms p95.</p>
+<p>The SSD layout. PQ codes at 32 bytes per point are 64 GB for 2B vectors, plus hot nodes; full vectors at 768 float32 dimensions are 3,072 bytes each, about 6.1 TB, plus neighbour ids, on SSD across a few machines. The 2019 numbers (mean under 3 ms on a billion points, 16 cores) were on 128-byte SIFT vectors. At 768 float32 dimensions a node record is 3,072 bytes plus 4 x R of neighbour ids, 3,584 bytes at R = 128, still inside one 4 KB sector, so reads per hop hold. What changes is the steering: 32-byte codes compress a 3,072-byte vector 96 times instead of a 128-byte one 4 times, so the walk may need a wider beam or more hops, and that is the first thing I would measure.</p>
+<p>What I give up: rebuilds measured in days and machines we operate. Written down: the measured p95 at target QPS and recall, the rebuild time on full data, and the condition under which we would revisit, which is the query pattern concentrating on a small fraction of the corpus.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Traffic analysis shows 90% of queries touch 5% of the vectors, partitioned by customer. Does that change the answer?</em> Yes: that is a working set the cache tier holds cheaply, and per-customer namespaces on object storage become worth pricing against the SSD fleet.</li>
+<li><em>The embedding model changes every six months. Which design hurts more?</em> The build-then-serve graph, whose rebuild takes days per the paper; a log-structured engine re-ingests into a new namespace while the old one serves.</li>
+<li><em>The vendor quotes a recall@10 of 90 to 100%. Is that enough to sign?</em> No: it is the vendor's range under its own conditions; I would measure recall at our filters and namespace sizes against exact search.</li>
+</ul>
+</Fragment>
+</Depth>
+
+<SelfRate id="lesson:rag/vector-systems/diskann-turbopuffer" />

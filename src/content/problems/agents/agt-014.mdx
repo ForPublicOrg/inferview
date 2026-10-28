@@ -1,121 +1,279 @@
 ---
 id: agt-014
-title: Guard the memory tool's paths
+title: Guard the memory tool's paths, links included
 track: agents
 module: memory-state
 type: code
 difficulty: medium
-seniority: [mid, senior]
-minutes: 25
+seniority: [senior]
+minutes: 35
 core: false
-tags: [memory, security, path-traversal, tool-design]
+tags: [memory, security, path-traversal, symlinks, tool-design]
 companies: []
 updated: 2026-10-28
 sources:
-  - title: Claude docs, memory tool
+  - title: Claude docs, memory tool (checked 2026-10-28)
     url: https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool
-    note: memory_20250818 is client-side, paths live under /memories, and the docs warn about traversal such as /memories/../../secrets.env and URL-encoded sequences
-  - title: Python docs, pathlib.PurePosixPath
-    url: https://docs.python.org/3/library/pathlib.html#pathlib.PurePosixPath
-    note: pure path objects split paths into parts without touching the filesystem
-  - title: Python docs, urllib.parse.unquote
-    url: https://docs.python.org/3/library/urllib.parse.html#urllib.parse.unquote
-    note: decodes percent-encoded sequences
+    note: "memory_20250818 is client-side and the handler maps the /memories prefix onto storage it controls; the docs warn that a path such as /memories/../../secrets.env reaches files outside /memories, list URL-encoded sequences (%2e%2e%2f) among the safeguards, and say to reject delete and rename of the /memories root"
+  - title: Linux man-pages, path_resolution(7) (checked 2026-10-28)
+    url: https://man7.org/linux/man-pages/man7/path_resolution.7.html
+    note: "the maximum number of symbolic links followed while resolving a pathname is 40, with ELOOP past it; after a link resolves to a directory, lookup continues from that directory; \"/..\" is the same as \"/\""
+  - title: Linux man-pages, openat2(2) (checked 2026-10-28)
+    url: https://man7.org/linux/man-pages/man2/openat2.2.html
+    note: "RESOLVE_BENEATH fails resolution when any component is not a descendant of dirfd and rejects absolute symlinks; RESOLVE_IN_ROOT treats dirfd as the root; EXDEV on an escape; EAGAIN when the kernel could not rule out a .. escape due to a race; first in Linux 5.6"
 code:
   starter: |
-    from pathlib import PurePosixPath
     from urllib.parse import unquote
 
-    ROOT = PurePosixPath("/memories")
+    ROOT = "/memories"
 
-    def safe_memory_path(raw):
-        """Return the normalized path as a string if it stays inside /memories.
-        Raise PermissionError otherwise."""
+
+    def safe_memory_path(raw, links=None):
+        """Return the path the store would open for raw, if it is /memories or below.
+        links maps an absolute logical path to a link target (absolute, or relative to
+        the link's directory). Raise PermissionError for anything else.
+
+        State your two policies here: the link limit, and whether a walk that leaves
+        /memories and comes back is accepted."""
         raise NotImplementedError
   tests: |
-    def refused(raw):
+    import time
+    def refused(raw, links=None):
         try:
-            safe_memory_path(raw)
+            safe_memory_path(raw, links)
         except PermissionError:
             return True
         return False
     assert safe_memory_path("/memories/notes.md") == "/memories/notes.md", "a plain path inside the root is allowed"
-    assert safe_memory_path("/memories") == "/memories", "the root itself is allowed (the view command lists it)"
-    assert safe_memory_path("/memories/a/../b.md") == "/memories/b.md", "dot-dot inside the root resolves and stays allowed"
-    assert safe_memory_path("/memories/./projects//x.md") == "/memories/projects/x.md", "dot segments and doubled slashes are normalized"
-    assert safe_memory_path("memories/notes.md") == "/memories/notes.md", "a relative path is anchored at the filesystem root"
+    assert safe_memory_path("/memories") == "/memories", "the root itself is allowed (view lists it)"
+    assert safe_memory_path("/memories/./projects//a/../x.md") == "/memories/projects/x.md", "dot segments, doubled slashes and dot-dot inside the root resolve"
+    assert safe_memory_path("memories/notes.md") == "/memories/notes.md", "a relative path is anchored at /"
     assert refused("/memories/../../secrets.env"), "dot-dot that climbs out of the root is refused"
-    assert refused("/memories/%2e%2e/%2e%2e/etc/passwd"), "URL-encoded dot-dot is decoded before checking"
-    assert refused("/memoriesX/notes.md"), "a sibling directory that shares the prefix is refused"
-    assert refused("/etc/passwd"), "an absolute path elsewhere is refused"
-    assert refused("/memories/" + chr(92) + ".." + chr(92) + "secrets.env"), "backslashes are refused"
+    assert refused("/memories/%2e%2e/%2e%2e/etc/passwd"), "percent-encoded dot-dot is decoded before checking"
+    assert refused("/memoriesX/notes.md"), "a sibling that shares the prefix is refused"
+    assert refused("/memories/" + chr(92) + ".." + chr(92) + "secrets.env"), "a backslash is refused"
     assert refused("/memories/notes.md" + chr(0) + ".txt"), "a NUL byte is refused"
+    assert refused("/memories/l/passwd", {"/memories/l": "/etc"}), "a link that points outside the root is refused"
+    assert safe_memory_path("/memories/l/../x.md", {"/memories/l": "a/b"}) == "/memories/a/x.md", "dot-dot after a link applies to the link's target, not to the link"
+    assert refused("/memories/a/x.md", {"/memories/a": "b", "/memories/b": "a"}), "a link cycle is refused"
+    chain = {f"/memories/l{i}": f"l{i + 1}" for i in range(7)}
+    chain["/memories/l7"] = "real"
+    assert safe_memory_path("/memories/l0/f.md", chain) == "/memories/real/f.md", "a chain of eight links resolves"
+    def answered_within(seconds, raw, links=None):
+        start = time.perf_counter()
+        try:
+            safe_memory_path(raw, links)
+        except PermissionError:
+            pass
+        return time.perf_counter() - start < seconds
+    assert answered_within(3.0, "/memories/" + "a/" * 500_000 + "x.md"), "a path of a million characters is answered, either way, in under 3 seconds"
+  hidden: |
+    import random, time
+
+    def _ref(raw, links, limit=100):
+        # Final-only resolution, plus flags under which a stricter policy may refuse.
+        pending = raw.split("/")[::-1]
+        stack, hops = [], 0
+        climbed = escaped = entered = False
+        while pending:
+            seg = pending.pop()
+            if seg in ("", "."):
+                continue
+            if seg == "..":
+                if stack:
+                    stack.pop()
+                else:
+                    climbed = True
+            else:
+                key = "/" + "/".join(stack + [seg])
+                if key in links:
+                    hops += 1
+                    if hops > limit:
+                        return None, True, climbed, hops
+                    target = links[key]
+                    if target.startswith("/"):
+                        stack = []
+                        if entered:
+                            escaped = True
+                    pending.extend(target.split("/")[::-1])
+                    continue
+                stack.append(seg)
+            if stack and stack[0] == "memories":
+                entered = True
+            elif entered or stack:
+                escaped = True
+        ok = bool(stack) and stack[0] == "memories"
+        return ("/" + "/".join(stack) if ok else None), escaped, climbed, hops
+
+    def _outcome(raw, links=None):
+        try:
+            return safe_memory_path(raw, links), None
+        except PermissionError as e:
+            return None, e
+
+    def _consistent(raw, links):
+        got, err = _outcome(raw, links)
+        want, escaped, climbed, hops = _ref(raw, links)
+        if err is None:
+            if want is None or got != want:
+                return False
+            if "//" in got or "/./" in got + "/" or "/../" in got + "/" or got.endswith("/"):
+                return False
+            again, err2 = _outcome(got, links)
+            return err2 is None and again == got
+        return want is None or escaped or climbed or hops > 8
+
+    _SEGS = ["memories", "a", "b", "c", "..", ".", "", "etc", "x.md", "l", "m"]
+
+    def _random_paths_agree(n, with_links):
+        rnd = random.Random(1729 if with_links else 42)
+        for _ in range(n):
+            links = {}
+            if with_links:
+                for _ in range(rnd.randint(1, 4)):
+                    key = "/memories/" + rnd.choice(["l", "m", "a/l", "b"])
+                    target = "/".join(rnd.choice(_SEGS) for _ in range(rnd.randint(1, 3)))
+                    if rnd.random() < 0.4:
+                        target = "/" + target
+                    links[key] = target
+            raw = "/" + "/".join(rnd.choice(_SEGS) for _ in range(rnd.randint(1, 8)))
+            if rnd.random() < 0.5:
+                raw = "/memories/" + raw.lstrip("/")
+            if not _consistent(raw, links):
+                return False
+        return True
+
+    assert _random_paths_agree(3000, False)
+    assert _random_paths_agree(3000, True)
+    assert _outcome("/memories/%252e%252e/x")[0] == "/memories/%2e%2e/x"
+    assert _outcome("/memories/%5c..%5csecrets")[1] is not None
+    assert _outcome("/memories/a%00.md")[1] is not None
+    assert _outcome("/memories/a/x", {"/memories/a": "a"})[1] is not None
+    assert _outcome("/memories/l/x", {"/memories/l": "/memories/../memories/d"})[0] in (None, "/memories/d/x")
+
+    def _many_links_fast():
+        links = {f"/memories/dir{i}/l": f"../dir{i + 1}" for i in range(20_000)}
+        raw = "/memories/" + "d/" * 200_000 + "x.md"
+        start = time.perf_counter()
+        got, _ = _outcome(raw, links)
+        return got == raw and time.perf_counter() - start < 3.0
+
+    assert _many_links_fast()
+
+    def _long_chain_fast():
+        links = {f"/memories/n{i}": f"n{i + 1}" for i in range(50_000)}
+        start = time.perf_counter()
+        got, err = _outcome("/memories/n0/x", links)
+        return time.perf_counter() - start < 3.0
+
+    assert _long_chain_fast()
   solution: |
-    from pathlib import PurePosixPath
     from urllib.parse import unquote
 
-    ROOT = PurePosixPath("/memories")
+    ROOT = "/memories"
+    MAX_HOPS = 40   # the per-lookup symlink limit Linux uses; any limit of 8 or more passes
 
-    def safe_memory_path(raw):
-        decoded = unquote(raw)
-        if chr(92) in decoded or chr(0) in decoded:
-            raise PermissionError(f"bad character in path: {raw!r}")
-        parts = []
-        for part in PurePosixPath(decoded).parts:
-            if part in ("/", "."):
+
+    def _trie(links):
+        root = {}
+        for key, target in links.items():
+            node = root
+            for seg in key.split("/"):
+                if seg:
+                    node = node.setdefault(seg, {})
+            node[None] = target   # None never collides with a segment name
+        return root
+
+
+    def safe_memory_path(raw, links=None):
+        """Resolve raw the way the store will (decode once, follow links, then . and ..)
+        and return it if it is /memories or below; raise PermissionError otherwise.
+        Policy: only the final path is checked, as realpath does, and .. at / stays at /."""
+        path = unquote(raw)
+        if chr(92) in path or chr(0) in path:
+            raise PermissionError("backslash or NUL in path")
+        trie = _trie(links or {})
+        pending = path.split("/")[::-1]   # segments still to walk; the next one is last
+        stack, nodes = [], [trie]          # resolved segments, and the trie node of each prefix
+        hops = 0
+        while pending:
+            seg = pending.pop()
+            if seg in ("", "."):
                 continue
-            if part == "..":
-                if not parts:
-                    raise PermissionError(f"escapes the filesystem root: {raw!r}")
-                parts.pop()
-            else:
-                parts.append(part)
-        resolved = PurePosixPath("/", *parts)
-        if resolved != ROOT and ROOT not in resolved.parents:
-            raise PermissionError(f"outside /memories: {raw!r}")
-        return str(resolved)
+            if seg == "..":
+                if stack:
+                    stack.pop()
+                    nodes.pop()
+                continue
+            node = nodes[-1].get(seg) if nodes[-1] is not None else None
+            if node is not None and None in node:
+                hops += 1
+                if hops > MAX_HOPS:
+                    raise PermissionError("too many links")
+                target = node[None]
+                if target.startswith("/"):
+                    stack, nodes = [], [trie]
+                pending.extend(target.split("/")[::-1])
+                continue
+            stack.append(seg)
+            nodes.append(node)
+        if not stack or stack[0] != "memories":
+            raise PermissionError(f"outside {ROOT}: {raw[:80]!r}")
+        return "/" + "/".join(stack)
 ---
 import Callout from '../../../components/Callout.astro';
 
 ## Question
 
 <Callout kind="interview" label="Interview question">
-"Your agent has a file-based memory tool. The model chooses the paths. Make it safe."
+"Your agent has a file-based memory tool, the model chooses the paths, and the store has links in it. Write the guard."
 </Callout>
 
-Anthropic's memory tool is client-side: the model sends commands such as `view`, `create` and `str_replace` with a path under `/memories`, and your code stores the files. The model's paths are untrusted input, because the model may be following instructions injected into a document it read.
+Claude's memory tool (`memory_20250818`) is client-side: the model sends `view`, `create`, `str_replace`, `insert`, `delete` and `rename` with paths under `/memories`, and your handler maps that prefix onto storage you control. The paths are untrusted input, because the model may be following text injected into a page or a file it read.
 
-Write `safe_memory_path(raw)`. It returns the normalized path as a string when the path stays inside `/memories`, and raises `PermissionError` otherwise. It must:
+In this scenario the store is a per-user directory, and a migration tool has left symbolic links in it that map old folder names to new ones. For the exercise the links arrive as a dict from an absolute logical path to its target.
 
-1. Decode percent-encoding first (`%2e%2e` is `..`).
+Write `safe_memory_path(raw, links=None)`. It returns the path the store would actually open, when that path is `/memories` or below, and raises `PermissionError` otherwise.
+
+1. Decode percent-encoding exactly once.
 2. Refuse any path containing a backslash or a NUL character.
-3. Resolve `.` and `..` segments and repeated slashes logically, without touching the filesystem, and refuse any `..` that would climb above `/`.
-4. Treat a relative path as starting from `/`.
-5. Accept `/memories` itself and anything below it, and refuse everything else, including `/memoriesX`.
+3. Treat a relative path as starting from `/`.
+4. Resolve the way the kernel does: walk the segments left to right; a segment that names a link is replaced by the link's target (an absolute target restarts from `/`, a relative one continues from the link's directory); a `..` after a link applies to where the link led; `/..` is `/`.
+5. Accept `/memories` and anything below it; refuse everything else, including `/memoriesX`.
+
+Two decisions are yours, and the docstring should state them: how many links one lookup may follow (a chain of eight must resolve and a cycle must be refused), and whether a walk that leaves `/memories` and comes back is accepted, as `realpath` would, or refused, as `openat2` with `RESOLVE_BENEATH` would.
+
+One constraint the tests enforce: the path is as long as the attacker wants. A path of a million characters must be answered, either way, in under three seconds, and so must a deep path against a store with tens of thousands of links.
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>`PurePosixPath(p).parts` splits a path into segments and drops empty and `.` segments for you, but it keeps `..`.</p></details>
-<details class="hint"><summary>Hint 2</summary><p>A string prefix check accepts `/memoriesX/notes.md`; compare path parents instead.</p></details>
-<details class="hint"><summary>Hint 3</summary><p>Decode before you validate, or the check runs on a string the storage layer will later read differently.</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask the storage team how many times the store decodes a path, and at which layer.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the store opens for <code>/memories/l/../x.md</code> when <code>l</code> links to a directory two levels down, and write that case as a test before the code.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Time your function on a path 500,000 segments deep, then again with 20,000 links in the store.</p></details>
 
 ## Answer
 
-The reference solution decodes, rejects characters that change meaning on other platforms, then walks the segments with a stack: a normal segment is pushed, `..` pops, and popping an empty stack means the path tried to climb above the filesystem root. The rebuilt path is accepted only if it equals `/memories` or has `/memories` among its parents.
+The reference decodes once, refuses the two characters, then walks with two stacks: `pending` holds segments still to visit, with the next one on top, and `stack` holds the resolved path. A normal segment moves from one to the other. `..` pops `stack`, and at `/` it does nothing, which is what the kernel does. A segment that names a link is not pushed: its target's segments go onto `pending`, after clearing `stack` if the target is absolute. That ordering is what makes `/memories/l/../x.md` land in `/memories/a/x.md` when `l` points at `a/b`. Normalizing the string first with `posixpath.normpath` would give `/memories/x.md`, a path the store never opens. The check then passes or fails on the wrong file.
 
-Each rule closes a known hole. Decoding first stops `%2e%2e%2f`, which the Claude docs call out by name. The backslash check stops `..\` on any storage layer that treats backslash as a separator. The NUL check stops truncation in code that passes the path to C APIs. Comparing parents rather than string prefixes stops `/memoriesX`. And resolving `..` logically, instead of asking whether the string contains `..`, keeps legitimate paths like `/memories/a/../b.md` working.
+The link lookup is where the time goes. Building the prefix string at each segment to look it up in `links` costs time proportional to the depth, so a path 500,000 segments deep does about 500,000 x 250,000 = 1.25 x 10^11 segment copies. Scanning every link key at each segment costs 500,000 x 20,000 = 10^10 comparisons with 20,000 links. `ROOT in PurePosixPath(p).parents` has the same quadratic shape, because it builds every ancestor. The reference builds a trie from the link keys once and keeps a trie node for every entry on `stack`, so each segment is one dict lookup, each `..` is one pop, and the whole walk is linear in the segments visited plus the link targets expanded.
 
-What this does not cover: symbolic links. Once you map the logical path onto a real directory, resolve the real path (for example `Path.resolve()` followed by `relative_to()` on the storage root) and check again, because a symlink inside the memory directory can point anywhere. Run the handler with a filesystem user that can only see the memory directory, so a bug in this function is not the last line of defence.
+Each expansion counts as a hop. The reference stops at 40, the number Linux follows for a whole pathname according to `path_resolution(7)`; the tests accept any limit of eight or more. A visited set would also stop cycles, but a hop limit bounds the work for a long acyclic chain too.
+
+The second decision is the policy for a walk that leaves the root. The reference checks only the final path, which is `realpath` semantics: it keeps absolute links such as `/memories/old` pointing at `/memories/new` working, and it refuses anything that ends outside. The strict policy refuses the moment the walk is outside `/memories`, and refuses absolute links, as `RESOLVE_BENEATH` does. It costs those absolute migration links, which the tool would have to rewrite as relative ones, and it matches what a real filesystem lookup does, where a final-only check has already let the walk read directories outside the root before it decides. Both pass the hidden tests. They compare your function against a reference resolver on random paths and random link graphs: when you return a path it must be the realpath-style result, have no empty, `.` or `..` segments, and resolve to itself; when you refuse, the path must end outside the root, leave it during the walk, climb above `/`, or need more than eight links. A length cap is also a legitimate choice, and the cheapest defence against the long-path case; the timing tests accept a refusal.
+
+The failure mode of this function is that it checks a model of the store, not the store. Between the check and the open, anything that can write in the memory directory can replace a directory with a link, and the open follows it. In production the check has to be the open: hold a directory descriptor for the user's memory root and open every path relative to it with `openat2` and `RESOLVE_IN_ROOT` or `RESOLVE_BENEATH` (Linux 5.6 or later), which fails with `EXDEV` on an escape and with `EAGAIN` when the kernel could not rule out a `..` race, in which case retry. Keep this function as the first filter, because it gives the model a readable refusal before any I/O.
 
 ## Follow-ups
 
-- *Double encoding?* `%252e%252e` decodes once to the literal name `%2e%2e`, which is harmless here as long as the storage layer does not decode again. Decode exactly once, in one place.
-- *What else should a memory handler limit?* File size, file count and total bytes per user, so the model cannot fill the disk, and which commands are allowed per agent.
-- *How does this relate to memory poisoning?* Path checks stop the model reaching other files; they do nothing about untrusted content being written into memory. That needs provenance and review.
+- *What changes to run this against a real filesystem instead of a dict of links?* Open relative to a descriptor for the user's root with `openat2` and `RESOLVE_IN_ROOT`, retry on `EAGAIN`, and stop resolving the path in Python at all, because the check and the open are then one system call.
+- *The store moves to Postgres, keyed by path, with no links. Which half of this function survives?* Decoding, the character checks and the lexical walk, plus a tenant prefix in every key. The links and the hop limit go away; the length cap stays.
+- *Which commands need which checks?* `rename` has two paths and both go through the guard, and the docs say to refuse `delete` and `rename` of `/memories` itself, which the guard accepts as a valid path, so the handler needs a rule per command on top of it.
+- *Security asks you to refuse every path that contains a link, which breaks the migration tool's links. What do you trade?* Refusing links (`RESOLVE_NO_SYMLINKS`) is simpler to reason about and costs a one-time rewrite of the migrated folders; keeping them costs the resolver above and a test suite for it.
 
 ## Common mistakes
 
+- Normalizing the string before following links, so the function approves a different file from the one the store opens.
 - Checking `raw.startswith("/memories")`, which accepts both `/memories/../../etc/passwd` and `/memoriesX`.
-- Rejecting any path containing `..`, which breaks legitimate relative segments and still misses encoded forms if you check before decoding.
-- Validating the decoded string but passing the raw one to storage.
-- Calling `os.path.realpath` on the model's string before validating, which touches the real filesystem with an attacker-chosen path.
+- Decoding twice, or validating the decoded string and passing the raw one to the store.
+- Rebuilding the prefix string or scanning every link at each segment, which is quadratic in an input the attacker sizes.
+- Calling `os.path.realpath` on the model's string before validating it, which touches the real filesystem with an attacker-chosen path and still leaves the gap between check and open.

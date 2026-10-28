@@ -6,144 +6,133 @@ track: system-design
 module: case-realtime
 type: debug
 difficulty: medium
-seniority: [mid, senior]
-minutes: 20
+seniority: [senior]
+minutes: 25
 core: false
-tags: [rate-limits, retries, backoff, circuit-breaker, fallback, incident]
+tags: [rate-limits, concurrency, littles-law, retries, prompt-caching, incident]
 companies: []
 updated: 2026-10-28
 sources:
-  - title: amitshekhariitbhu/ai-engineering-interview-questions, question bank
+  - title: amitshekhariitbhu, AI engineering interview questions (question bank)
     url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
-    note: lists "Your application is hitting LLM provider rate limits during peak hours. How do you handle it?" and a single-provider outage question
-  - title: Anthropic docs, rate limits
+    note: lists "Your application is hitting LLM provider rate limits during peak hours. How do you handle it?"; no company tagged
+  - title: Claude API docs, Rate limits (checked 2026-10-28)
     url: https://platform.claude.com/docs/en/api/rate-limits
-    note: limits enforced as token buckets, so 60 RPM may be enforced as 1 request per second; sharp increases can trigger acceleration limits; max_tokens does not count toward OTPM; spend-limit 429s carry no retry-after and last until the next month; error.details.error_code enforced_spend_limit_reached identifies the spend-cap 429
-  - title: Anthropic docs, API errors
+    note: token bucket, and 60 RPM may be enforced as 1 request per second; Build tier Claude Sonnet 5 5,000 RPM, 5,000,000 ITPM, 1,000,000 OTPM; cache reads do not count toward ITPM on most models; 429 responses describe which limit was exceeded and carry retry-after
+  - title: Claude API docs, API errors (checked 2026-10-28)
     url: https://platform.claude.com/docs/en/api/errors
-    note: 429 rate_limit_error, 529 overloaded_error; SDKs retry transient errors twice by default with exponential backoff and honour retry-after
-  - title: LiteLLM docs, router, load balancing and fallbacks
-    url: https://docs.litellm.ai/docs/routing
-    note: cooldown after allowed_fails (default 3) for cooldown_time (default 5 s); max_fallbacks default 5
-  - title: AWS Builders' Library, avoiding fallback in distributed systems (2019)
-    url: https://builder.aws.com/content/3EuS9Sakq7L3VLQIF3qzfMfke1Y/avoiding-fallback-in-distributed-systems
-    note: rarely exercised fallback paths fail when needed and can amplify outages
+    note: 429 rate_limit_error and 529 overloaded_error; every API response carries a request-id header and error bodies carry request_id; SDKs retry twice by default and honour retry-after
 choices:
-  - text: Short bursts trip the per-second enforcement of the limit, and the custom retry loop retries each 429 at once, ignoring retry-after, which multiplies the request rate
+  - text: Long summary streams fill the gateway's in-flight cap, so the gateway itself rejects new requests at peak
     correct: true
-    why: Provider requests at 18:00 are almost three times user requests, every retry in the log lands within 200 ms of the last despite retry-after=6, and the problem disappears off-peak. The retries are the load.
-  - text: The organization has hit its monthly spend limit
+    why: Provider-side 429s are 0.3 percent of calls while users see 9 percent, most user-facing 429s carry no request-id, and 30 requests a second at an 11.2 s mean duration is 336 in flight against a cap of 200.
+  - text: Cache misses after the prompt change push uncached input over the provider's input-token limit at peak
     correct: false
-    why: A spend-limit 429 carries no retry-after and keeps failing until the month rolls over, off-peak included. These 429s carry retry-after and stop at 03:00.
-  - text: The provider is overloaded across all customers at peak
+    why: The timestamp did break the cache and input-token usage doubled, but it peaks at 48 percent of the limit, and an input-token 429 from the provider would carry a request-id.
+  - text: The 5,000-request limit is enforced per second, so bursts at the top of each minute trip the request bucket
     correct: false
-    why: Provider-wide overload returns 529 overloaded_error. Every error here is a 429 rate_limit_error scoped to your organization.
-  - text: max_tokens is set to 8,192, which reserves output tokens and exhausts the output-tokens-per-minute limit
+    why: Per-second enforcement is real, but peak is 1,800 requests a minute, 36 percent of the limit, and the provider's own 429 count is small.
+  - text: The retry loop ignores retry-after, so each provider 429 becomes several more requests in the same second
     correct: false
-    why: On this provider max_tokens does not count toward the output-token limit, and the dashboard shows output-token usage at 45 percent of the limit at peak.
+    why: The loop is a real defect and visible in the log, but it multiplies only the provider's 429s, which are 0.3 percent of calls; it cannot produce 9 percent.
 ---
 import Callout from '../../../components/Callout.astro';
 
 ## Question
 
 <Callout kind="interview" label="Interview question">
-"We hit the provider's rate limits every evening at peak, even though our traffic is under the limit. Find out why."
+"Since last Monday, 9 percent of chat requests fail with 429 between 17:30 and 19:00. The provider says we are under our limits. Find the cause."
 </Callout>
 
-The organization's limit is 2,000 requests a minute. The team turned off the SDK's built-in retries last month and wrote its own:
+The product calls Claude Sonnet 5 at the Build tier (5,000 requests, 5,000,000 input tokens and 1,000,000 output tokens per minute) through an in-house gateway. Two changes shipped last Monday: a "summarise this thread" feature, and a prompt change. The gateway's configuration and the relevant part of the prompt builder:
 
-```python
-client = Anthropic(max_retries=0)
-
-def call(body):
-    for attempt in range(5):
-        try:
-            return client.messages.create(**body)
-        except RateLimitError:
-            continue
-    raise Overloaded("try again later")
+```yaml
+# gateway.yaml
+upstream: anthropic
+max_inflight: 200
+queue_timeout_ms: 2000
+on_queue_timeout: {status: 429, body: {error: "too many requests"}}
+retry:
+  on: [429, 529]
+  attempts: 3
+  backoff_ms: 0
 ```
 
-Dashboard, synthetic but consistent:
+```diff
+ def build_request(thread, mode):
+-    system = SYSTEM_PROMPT
++    system = f"Current time: {now_iso()}\n" + SYSTEM_PROMPT
+     body = {"model": "claude-sonnet-5", "system": system, "messages": thread.messages}
++    if mode == "summary":
++        body.update(stream=True, max_tokens=4096, messages=thread.all_messages())
+     return body
+```
+
+Dashboard at the 18:00 peak, before and after the release:
 
 <div class="tablewrap">
 <table>
-<thead><tr><th>Per minute</th><th>17:00</th><th>18:00 (peak)</th><th>03:00</th></tr></thead>
+<thead><tr><th>At 18:00</th><th>Week before</th><th>Last Monday on</th></tr></thead>
 <tbody>
-<tr><td>user requests</td><td>900</td><td>1,400</td><td>150</td></tr>
-<tr><td>requests sent to the provider</td><td>905</td><td>4,100</td><td>150</td></tr>
-<tr><td>responses that were 429</td><td>0.2%</td><td>38%</td><td>0%</td></tr>
-<tr><td>output-token usage, share of limit</td><td>30%</td><td>45%</td><td>5%</td></tr>
+<tr><td>user requests per second</td><td>28</td><td>30</td></tr>
+<tr><td>share that are summaries</td><td>0%</td><td>20%</td></tr>
+<tr><td>mean request duration</td><td>4.0 s</td><td>11.2 s</td></tr>
+<tr><td>429s returned to users</td><td>0.1%</td><td>9%</td></tr>
+<tr><td>provider 429s, share of provider calls</td><td>0.1%</td><td>0.3%</td></tr>
+<tr><td>requests per minute sent to the provider, share of limit</td><td>34%</td><td>36%</td></tr>
+<tr><td>input tokens per minute, share of limit</td><td>22%</td><td>48%</td></tr>
+<tr><td>output tokens per minute, share of limit</td><td>12%</td><td>31%</td></tr>
 </tbody>
 </table>
 </div>
 
-Log lines for one request at peak:
+Three log lines from 18:04, as the gateway writes them:
 
 ```text
-18:02:11.204 req=8f2a attempt=1 429 rate_limit_error retry-after=6
-18:02:11.391 req=8f2a attempt=2 429 rate_limit_error retry-after=6
-18:02:11.577 req=8f2a attempt=3 429 rate_limit_error retry-after=6
-18:02:11.760 req=8f2a attempt=4 429 rate_limit_error retry-after=5
-18:02:11.948 req=8f2a attempt=5 429 rate_limit_error retry-after=5
+18:04:09.112 route=/chat status=429 upstream_request_id=- body={"error":"too many requests"} waited_ms=2001
+18:04:09.540 route=/chat status=429 upstream_request_id=req_01H8... body={"type":"error","error":{"type":"rate_limit_error",...}} retry_after=3
+18:04:09.611 route=/chat status=429 upstream_request_id=req_01H9... body={"type":"error","error":{"type":"rate_limit_error",...}} retry_after=3
 ```
 
-Pick the root cause. The answer opens once you pick correctly.
+The gateway does not export an in-flight gauge. Pick the cause of the 9 percent. The answer opens once you pick correctly.
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>Compare user requests with requests sent to the provider in each column.</p></details>
-<details class="hint"><summary>Hint 2</summary><p>A limit of 2,000 a minute may be enforced over much shorter intervals.</p></details>
-<details class="hint"><summary>Hint 3</summary><p>What does the retry loop do with retry-after?</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask which component produced each 429 that users received, and how you would tell from one log line.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the request duration distribution split by route, not the overall mean.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the gateway does with a request while it waits.</p></details>
 
 ## Answer
 
-The provider enforces its limits as token buckets over short intervals, so 2,000 a minute behaves like about 33 a second, and the evening peak has seconds that go over even though the minute does not. The first few 429s are normal. The custom loop then retries each one immediately, five times, ignoring the retry-after header, so every rejected request becomes up to five more requests in the same second. At 18:00 the service sends 4,100 requests a minute to serve 1,400 users, and 38 percent of them fail. The loop turned a small overflow into a retry storm.
+Most of the 429s users see are the gateway's own. They have no upstream request ID and the gateway's body, and they arrive after exactly the 2-second queue timeout. The provider's 429s are 0.3 percent of calls; the users' are 9 percent. The gap is the gateway.
 
-Why the wrong picks are tempting. A spend limit also returns 429, but it carries no retry-after and does not recover at night. Provider overload is a reasonable first guess at peak, but it has its own status code, 529. And `max_tokens` feels like a reservation, but this provider does not count it toward the output-token limit, and the dashboard shows that limit far from full.
+The gateway admits at most 200 requests in flight. By Little's law, in-flight requests are arrival rate times duration. Before the release, 28 a second at 4 s is 112. After it, 20 percent of requests are summaries that stream for about 40 s each, so the mean duration becomes 0.8 × 4 + 0.2 × 40 = 11.2 s, and 30 a second at 11.2 s is 336 in flight against a cap of 200. New requests wait in the queue, time out at 2 s, and get a 429 from the gateway. The provider never sees them, which is why the provider says the organization is under its limits.
 
-### The fix
+The evidence is incomplete: there is no in-flight gauge, and the 40-second summary duration is inferred from the mean. I would ask for the duration split by route and add an in-flight metric before changing anything. Without them, the arithmetic above is enough to act on, because the rejection pattern (no upstream ID, 2,001 ms waits) points at the gateway regardless of the exact durations.
 
-```diff
--client = Anthropic(max_retries=0)
-+client = Anthropic(max_retries=2)          # SDK backoff honours retry-after
-+bucket = TokenBucket(capacity=30, refill_per_s=30)   # stay under the per-second rate
-+breaker = Breaker(fail_limit=5, cooldown_s=30)
+### The fix, and its cost
 
- def call(body):
--    for attempt in range(5):
--        try:
--            return client.messages.create(**body)
--        except RateLimitError:
--            continue
--    raise Overloaded("try again later")
-+    if not bucket.try_take(1):
-+        return queue_or_degrade(body)       # wait in a queue, or serve a labelled fallback
-+    if not breaker.allow(now()):
-+        return queue_or_degrade(body)
-+    try:
-+        r = client.messages.create(**body)
-+        breaker.record(True, now())
-+        return r
-+    except RateLimitError as e:
-+        breaker.record(False, now())
-+        code = (e.body or {}).get("error", {}).get("details", {}).get("error_code")
-+        if code == "enforced_spend_limit_reached" or e.response.headers.get("retry-after") is None:
-+            raise SpendLimitReached() from e   # will not recover by retrying; page someone
-+        return queue_or_degrade(body)
-```
+Give summaries their own concurrency pool, sized from their own rate and duration, so a long stream cannot take a chat slot; or raise the cap after checking that the provider's limits and the gateway's memory hold at the new in-flight count. The first is the safer change. It costs a decision about what summaries get when their pool is full: a queue with a visible wait, or a "try again shortly" message.
 
-Pace requests on the client to the provider's real rate, let the SDK back off with jitter and honour retry-after, and stop retrying entirely when the 429 is the kind that does not recover. Then decide what the user gets while the system is saturated: a queue with a visible wait for chat, a smaller fallback model with the response marked as degraded, or a clear "try again" for batch jobs.
+### The secondary defects, ranked
+
+1. **The prompt change broke the cache.** Putting the current time at the start of the system prompt changes the prefix on every request, so nothing after it is read from the cache. Input-token usage doubled, which costs money now and will hit the input-token limit as traffic grows. Move the timestamp to the end of the last user message.
+2. **The retry policy retries 429s three times with no backoff and ignores retry-after**, so each provider 429 becomes up to four requests in the same second. It is small today and becomes a storm the day the provider limit is reached. Honour retry-after and add jittered backoff.
+3. **Summaries send the whole thread** with `max_tokens: 4096`. On this provider `max_tokens` does not count toward the output-token limit, but long threads are input tokens that the broken cache now bills in full.
+
+### Why the wrong picks are tempting
+
+The cache regression is visible and large, and it is the change most engineers would blame first; it does not explain 429s that never reached the provider. Per-second enforcement of per-minute limits is documented and catches teams out, but the request rate is at 36 percent of the limit. The retry loop is in the log, retrying within 71 ms, but it can only multiply 429s that the provider sent.
 
 ## Follow-ups
 
-- *Should we just add a second provider?* It helps with outages and limits, but a fallback that only runs during incidents tends to fail when needed. Send a small share of real traffic through it all the time, evaluate its answers, and cap fallbacks so a failing secondary does not double the load.
-- *How do routers handle this?* LiteLLM's router, for one, puts a deployment in cooldown after a few failures (3 by default, for 5 seconds) and caps fallbacks at 5 by default; the shape is the same breaker.
-- *How do you find the real peak-second rate?* Histogram requests per second, not per minute; the minute average hides the bursts that trip the limit.
+- *The product team wants summaries to never wait. What do you give up to guarantee it?*
+- *How would you have caught this before release?* A load test with the new route mix, and an alert on in-flight requests against the cap.
+- *Should the gateway return 429 for its own queue timeouts?* A 503 with a distinct body would have separated the two sources in the first dashboard anyone opened.
 
 ## Common mistakes
 
-- Raising the retry count, which makes the storm worse.
-- Asking for a higher tier before measuring how many provider requests are retries.
-- Treating every 429 the same, including the spend-limit one that never recovers.
-- Turning off the SDK's retries without replacing what they did.
+- Asking the provider for a higher tier when the provider never saw the failing requests.
+- Fixing the cache regression and declaring the incident closed.
+- Raising `max_inflight` without checking what the higher in-flight count does to provider limits and gateway memory.
+- Treating every 429 as the provider's.

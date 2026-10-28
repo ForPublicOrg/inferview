@@ -1,0 +1,185 @@
+---
+title: Batch APIs as a workflow stage
+track: workflows
+module: batch-pipelines
+order: 1
+kind: lesson
+level: senior
+minutes: 14
+summary: A batch stage owns submit, poll, collect, reconcile and resubmit, joins results on custom_id, and gives every input exactly one terminal state in your own ledger before the provider's window or retention runs out.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Claude docs, batch processing (Message Batches API)
+    url: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+    note: "checked 2026-10-28: 100,000 requests or 256 MB per batch; expiry after 24 hours; results available 29 days after creation; results in any order, match on custom_id (1 to 64 characters, ^[a-zA-Z0-9_-]{1,64}$); result types succeeded, errored, canceled, expired, the last three not billed; params validated asynchronously; 50 percent of standard prices; Sonnet 5.5 batch $1 input and $5 output per MTok; cache hits best-effort, 30 to 98 percent typical; 1-hour cache suggested; up to 29 days of stored request and response data"
+  - title: Claude docs, rate limits (Message Batches API section)
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: "checked 2026-10-28: batch RPM 1,000, 2,000, 4,000 and batch requests in the processing queue 200,000, 300,000, 500,000 for the Start, Build and Scale tiers; 100,000 per batch on every tier"
+  - title: Claude docs, prompt caching
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: "checked 2026-10-28: 5-minute writes 1.25x, 1-hour writes 2x base input; hits on Sonnet 5.5 0.05x; multipliers stack with the Batch API discount"
+  - title: OpenAI API docs, Batch API guide
+    url: https://developers.openai.com/api/docs/guides/batch
+    note: "checked 2026-10-28: 50 percent discount; completion window 24h only; 50,000 requests and 200 MB per input file; one model per file; output order may not match input, match on custom_id; expired batches cancel unfinished requests, keep completed ones and charge only for those; expired requests appear in the error file as batch_expired; output file deleted 30 days after completion; 2,000 batches per hour"
+  - title: Gemini API docs, Batch API
+    url: https://ai.google.dev/gemini-api/docs/batch-api
+    note: "checked 2026-10-28: 50 percent of standard cost; 24-hour target; jobs pending or running over 48 hours become JOB_STATE_EXPIRED and expired jobs have no results; inline under 20 MB or a JSONL file up to 2 GB; per-line key; results kept 6 weeks; batch creation is not idempotent"
+  - title: Gemini API docs, rate limits (batch mode)
+    url: https://ai.google.dev/gemini-api/docs/rate-limits
+    note: "checked 2026-10-28: 100 concurrent batch requests; enqueued-token limit per model and tier across active batch jobs"
+  - title: OpenAI API docs, Flex processing
+    url: https://developers.openai.com/api/docs/guides/flex-processing
+    note: "checked 2026-10-28: service_tier flex, beta, limited models; billed at Batch API rates; 429 Resource Unavailable when capacity is short, not charged; SDK default timeout 10 minutes; retry with backoff or fall back to service_tier auto"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The stage, not the endpoint
+
+A batch API halves the token price and gives up two things a synchronous call gives you for free: a bounded latency and a one-to-one link between the request you sent and the answer you got. Treating it as a slow endpoint (submit, wait, read the file, done) works on the first night and silently drops items on the tenth. Treat it as a workflow stage with five steps, each with its own state: **submit**, **poll**, **collect**, **reconcile**, **resubmit**. The stage's contract is that every input row ends in exactly one terminal state in a ledger you own: written, failed permanently with a reason, or carried into the next run with an attempt count. The provider's job status is an input to that ledger, never the ledger itself.
+
+The shape is a durable job queue whose broker reorders messages, may drop the tail when a deadline passes, and deletes its dead-letter queue after a month. Everything below follows from those three properties.
+
+## What the three providers promise
+
+The limits differ enough that a stage written against one provider's semantics breaks on another's. All figures are from each provider's documentation, checked on 2026-10-28.
+
+<div class="tablewrap">
+<table>
+<thead><tr><th></th><th>Claude Message Batches</th><th>OpenAI Batch</th><th>Gemini Batch</th></tr></thead>
+<tbody>
+<tr><td>Price</td><td>50% of standard</td><td>50% of standard</td><td>50% of standard</td></tr>
+<tr><td>Size per batch</td><td>100,000 requests or 256 MB, whichever first</td><td>50,000 requests, 200 MB file, one model per file</td><td>inline under 20 MB, or a JSONL file up to 2 GB</td></tr>
+<tr><td>Window</td><td>expires if not done in 24 hours</td><td>24h, the only allowed value</td><td>24-hour target; expired after 48 hours pending or running</td></tr>
+<tr><td>Join key</td><td><code>custom_id</code>, results in any order</td><td><code>custom_id</code>, order may not match input</td><td>a <code>key</code> per input line</td></tr>
+<tr><td>Per-item outcomes</td><td>succeeded, errored, canceled, expired</td><td>output file plus an error file; expired items carry <code>batch_expired</code></td><td>response or error status per line; an expired job has no results</td></tr>
+<tr><td>Billing for unfinished items</td><td>errored, canceled and expired are not billed</td><td>charged only for completed requests</td><td>not stated on the batch page</td></tr>
+<tr><td>Result retention</td><td>29 days from creation</td><td>output file deleted 30 days after completion</td><td>6 weeks</td></tr>
+<tr><td>Queue limit</td><td>200,000 / 300,000 / 500,000 queued batch requests (Start / Build / Scale)</td><td>enqueued prompt tokens per model, on the limits page</td><td>enqueued tokens per model and tier; 100 concurrent batch requests</td></tr>
+</tbody>
+</table>
+</div>
+
+Three rows change the design. Retention is counted from different events: Claude counts 29 days from creation, OpenAI 30 days from completion, so "we will re-download later" is a bug with a calendar attached. Expiry is per item on Claude and OpenAI (finished items survive) but per job on Gemini, where an expired job returns no results at all, and on Claude the expired items cost nothing, which matters for the fallback arithmetic below. And Gemini states that batch creation is not idempotent: resubmitting the same request creates a second job.
+
+## Join on custom_id, never on position
+
+Claude's docs say outright that results "may not match the ordering of requests"; OpenAI's say the output line order may not match the input. A join by line number is correct on every small test batch and wrong at scale, and it fails silently: every row gets a plausible answer that belongs to a different document.
+
+The `custom_id` is therefore the primary key of the work item for this stage. On Claude it must be 1 to 64 characters from `[a-zA-Z0-9_-]`, so build it as a short hash of the natural key: document id, stage name and the prompt or config version. Including the config version means a rerun after a prompt change cannot be confused with yesterday's results for the same document. Keep the attempt number out of the id and in the ledger, so a resubmitted item carries the same key and the join stays trivial.
+
+Two invariants are cheap to check on every collect and catch most reconciliation bugs: the result set has no duplicate `custom_id`, and every returned id was submitted in that batch. Then the set difference runs the other way: every submitted id must appear in the results with some outcome. An id with no result line is neither success nor failure; it is a page to the on-call, because the stage's contract can no longer be proved.
+
+## Reconcile: one decision per outcome
+
+The outcome types are few, and each maps to one action:
+
+- **succeeded**: still not done. Parse and validate the output against the schema, and check the stop reason. A response that stopped on `max_tokens` is truncated JSON with a success flag; resubmitting it unchanged reproduces the truncation, so it goes to a dead-letter state that requires a config change (more `max_tokens`, a smaller unit of work).
+- **errored** with `invalid_request_error`: the request body is wrong. Claude's docs say it "must be fixed before re-sending", so retrying is spend with no chance of success. Because Claude validates `params` asynchronously and reports validation errors only when the whole batch has ended, a malformed template can cost a full batch cycle before you learn about it; send one request of each shape synchronously before submitting the batch.
+- **errored** for server-side reasons: retryable as is.
+- **expired** and **canceled**: never reached the model. Resubmit in the next batch with the attempt count incremented.
+
+Every resubmit path is bounded by a maximum attempt count, after which the item is dead with a reason. The batch analogue of a retry storm is an item that expires every night because the batch it lands in is always the last one submitted.
+
+```python
+from collections import Counter
+
+def reconcile(submitted, results, attempts, max_attempts=3):
+    """submitted: custom_ids sent in this batch; results: parsed result lines;
+    attempts: custom_id -> submissions so far. Returns the next action for every id."""
+    seen = Counter(r["custom_id"] for r in results)
+    dupes = [cid for cid, n in seen.items() if n > 1]
+    strangers = set(seen) - set(submitted)
+    if dupes or strangers:
+        raise ValueError(f"results do not match the submission: {dupes[:3]} {sorted(strangers)[:3]}")
+    by_id = {r["custom_id"]: r["result"] for r in results}
+    plan = {"validate": [], "resubmit": [], "dead": [], "missing": []}
+    for cid in submitted:
+        res = by_id.get(cid)
+        if res is None:
+            plan["missing"].append(cid)
+        elif res["type"] == "succeeded":
+            truncated = res["message"]["stop_reason"] == "max_tokens"
+            plan["dead" if truncated else "validate"].append(cid)
+        elif res["type"] == "errored" and res["error"]["error"]["type"] == "invalid_request_error":
+            plan["dead"].append(cid)
+        elif attempts.get(cid, 1) >= max_attempts:
+            plan["dead"].append(cid)
+        else:
+            plan["resubmit"].append(cid)
+    return plan
+
+results = [
+    {"custom_id": "b", "result": {"type": "expired"}},
+    {"custom_id": "a", "result": {"type": "succeeded", "message": {"stop_reason": "end_turn"}}},
+]
+print(reconcile(["a", "b", "c"], results, attempts={"b": 1}))
+# {'validate': ['a'], 'resubmit': ['b'], 'dead': [], 'missing': ['c']}
+```
+
+Submission needs the same care as collection. Write the intent row (the ids and the config version) before calling create, and record the provider's batch id after. A crash between the two leaves a batch you are paying for and do not know about; the recovery path lists the provider's recent batches and matches them before creating another. On Gemini, where creation is documented as not idempotent, skipping that step doubles the spend for the night.
+
+## The queue limit is your backpressure signal
+
+Claude's batch limits have two parts: requests per minute to the batch endpoints, and the number of batch requests that can sit in the processing queue at once, where a request counts until the model has processed it. At the Build tier that is 300,000 queued requests with at most 100,000 per batch. A nightly job larger than the queue limit cannot be submitted in one go; the submitter has to watch `request_counts` and release the next batch when processing drains below 100,000. OpenAI and Gemini express the same limit as enqueued tokens per model, which means the safe batch size depends on prompt length and changes when the prompt template grows.
+
+That makes the submitter a producer with a credit-based flow control loop, and it changes the deadline arithmetic. The docs say most Claude batches finish within an hour, and also that processing "might be slowed down based on current demand" with more requests expiring after 24 hours. The hour is the typical case; the 24 hours is the only bound. A pipeline that has to finish by a fixed time plans on the bound and treats the typical case as headroom.
+
+## Expired items and the middle lane
+
+When a night's batch ends with expired items, there are three places to send them: the next batch (cheapest, another window of up to 24 hours), the synchronous API at full price, or a cheaper interactive tier where one exists. OpenAI's flex processing is that middle lane: `service_tier: "flex"`, billed at Batch API rates, slower, in beta for a limited set of models, and able to return `429 Resource Unavailable` when capacity is short. Those 429s are not charged, and the documented choices are exponential backoff (cheapest, slowest) or falling back to `service_tier: "auto"` at standard price. The SDK's default timeout is 10 minutes, which flex calls can exceed.
+
+The cost side of that choice is arithmetic you can do before the incident.
+
+<Predict id="wfl-batch-fallback" question="One million items, 2,000 input and 300 output tokens each, on Sonnet 5.5 at batch prices ($1 and $5 per million tokens; standard is double). 8% expire and are rerun synchronously at standard price. What is the night's total in USD?" answer={3780} tolerance={40} unit="USD">
+<p>The full run at batch prices costs 2,000 million input tokens at $1 plus 300 million output tokens at $5: $2,000 + $1,500 = <b>$3,500</b>. Expired items are not billed on Claude, so the batch part costs 92% of that, $3,220. The 8% rerun at standard price costs 0.08 × $7,000 = $560. Total <b>$3,780</b>, 8% more than an all-batch night and still 46% below an all-synchronous one.</p>
+<p>In general, with a fraction <i>f</i> falling back to standard, the night costs 0.5 + 0.5<i>f</i> of the synchronous price. The discount never inverts, whatever the expiry rate. Cost is not what decides whether to keep batch; the deadline is.</p>
+</Predict>
+
+## Caching inside a batch is a bet with a break-even
+
+Batch requests that share a long prefix (instructions, the output schema, few-shot examples) can use prompt caching, and on Claude the cache multipliers stack with the batch discount. The docs also say cache hits inside batches are best-effort, because requests run concurrently and in any order, and that users "typically experience cache hit rates ranging from 30 percent to 98 percent". Because batches can run past the 5-minute default lifetime, the docs suggest the 1-hour duration. A 1-hour write costs 2x base input; a hit on Sonnet 5.5 costs 0.05x. Every miss on a block marked for caching pays the write price.
+
+<Predict id="wfl-batch-cache" question="Shared prefix on every request, 1-hour cache writes at 2x base input, hits at 0.05x. Above what hit rate, in percent, does caching the prefix cost less than not caching it?" answer={51} tolerance={2} unit="%">
+<p>Caching wins when <i>h</i> × 0.05 + (1 − <i>h</i>) × 2 &lt; 1, which gives <i>h</i> &gt; 1 / 1.95 = <b>51.3%</b>. The batch discount halves both sides, so it does not move the break-even. With 5-minute writes at 1.25x, the break-even falls to 0.25 / 1.2 = 20.8%.</p>
+<p>The documented range of 30 to 98 percent straddles the 1-hour break-even. At 30% the cached prefix costs 0.3 × 0.05 + 0.7 × 2 = 1.415 times the uncached price. Measure the hit rate from <code>usage</code> on the first night's results before keeping the cache markers, and order requests so that ones sharing a prefix are submitted together.</p>
+</Predict>
+
+## In the room
+
+<Callout kind="interview" label="Staff question">
+A nightly job enriches 2 million product descriptions on Claude; the search index must have the new values by 07:00. Finance wants the batch discount kept. Last week 6% of items expired twice. The account is on the Build tier. Design the stage and say what you promise the search team.
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Split into 20 batches of 100,000 and release them against the 300,000 queue limit from the moment inputs are ready, not at a fixed hour. Keep a ledger keyed on <code>custom_id</code>. At a cutoff set by how long the synchronous tail takes (for example 04:30), cancel what is still running, collect partial results, and send canceled and expired items to the synchronous API. Promise: by 07:00 every item has either tonight's value or yesterday's value with a staleness flag, never a missing value.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The two constraints conflict only on the tail. Cost favours batch for everything, and the arithmetic above shows the discount holds at any expiry rate because expired items are not billed. The deadline is what forces a synchronous lane. So the design is batch-first with a deadline-driven cutoff. The cutoff is computed, not guessed: the synchronous lane's throughput comes from the Messages API limits for the model (input tokens per minute divided by tokens per item), and the cutoff is 07:00 minus the time to push the expected tail through it, plus margin for the index write.</p>
+<p>Canceling is safe on Claude: canceled batches end with partial results, and canceled items are not billed. The ledger is the source of truth: per item, the config version, the batch id, the attempt count and the outcome. Write results to your own store at collect time because results disappear 29 days after creation.</p>
+<p>What I give up: a night with heavy expiry pays standard price on the tail, and with 6% expiring the tail is 120,000 items. If the synchronous lane cannot clear that before 07:00, the staleness flag is what ships. I would write that down as the promise to the search team, with the flag rate as a dashboard metric. The failure mode of this design is a cutoff that drifts: as the catalog grows the tail grows, and a fixed 04:30 stops being enough. The cutoff should be recomputed from the queue depth each night.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Finance says the synchronous tail costs too much and would rather ship stale values for 6% of products. Which products do you exempt from that, and who signs off on the list?</li>
+<li>Expiry rose from 6% to 30% over a month without a change on your side. What do you measure before you call it a provider problem, and what would make you move the job to a different hour?</li>
+<li>The prompt version changes on Tuesday afternoon. What happens to items whose Monday batch expired and are resubmitted on Tuesday night?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The model assumes items are independent single calls. A multi-turn or tool-using task needs one batch per turn, because the next request depends on the last answer, so a five-turn task can take up to five 24-hour windows. Under a deadline, those tasks belong in a synchronous or flex lane, with batch kept for the single-call steps around them.
+
+It assumes the model version is fixed across attempts. A resubmit days later may hit a different snapshot if the request names an alias; pin the snapshot and put it in the config version, or a "retry" is a different experiment.
+
+It assumes the provider is allowed to hold your data for the window. Claude's batch processing stores request and response data for up to 29 days after creation, and the docs point to a separate page for zero data retention eligibility. A retention policy written for synchronous calls may not cover a batch stage; check before the first production night, not after.
+
+And it assumes the documented limits are the ones in force. Queue limits, tiers and per-model enqueued-token limits change; the table above is dated, and the submitter should read the current limits from the provider (Claude exposes them through a rate limits API) rather than from a constant in the code.
+
+<SelfRate id="lesson:workflows/batch-pipelines/batch-stage" />

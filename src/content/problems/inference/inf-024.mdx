@@ -1,0 +1,347 @@
+---
+id: inf-024
+title: FP32 to int8, with a range policy that has to work at two bit widths
+subtitle: scale, zero point, saturation, per-channel scales and clipping
+track: inference
+module: faster-cheaper
+type: code
+difficulty: hard
+seniority: [senior, staff]
+minutes: 45
+core: false
+tags: [quantization, int8, zero-point, per-channel, clipping, outliers, memory]
+companies:
+  - name: NVIDIA
+    url: https://prachub.com/interview-questions/fp32-to-int8-tensor-quantization-scale-zero-point-clipping-and-outliers
+updated: 2026-10-28
+sources:
+  - title: PracHub, FP32 to int8 tensor quantization, scale, zero point, clipping and outliers (posted 2026-09-15)
+    url: https://prachub.com/interview-questions/fp32-to-int8-tensor-quantization-scale-zero-point-clipping-and-outliers
+    note: "Candidate report: a PracHub listing for an NVIDIA software engineer onsite; the listing does not name its submitter. The prompt asks for symmetric and asymmetric int8 quantization in vectorised NumPy, deriving scale and zero point, keeping 0.0 exact, saturation rather than wraparound, outliers and range setting, per-channel scales, and int32 accumulation. This problem is original material on the same topic, in the standard library. Checked 2026-10-28."
+  - title: Wu et al., Integer Quantization for Deep Learning Inference, Principles and Empirical Evaluation (NVIDIA, 2020)
+    url: https://arxiv.org/abs/2004.09602
+    note: "The abstract reports an 8-bit workflow that keeps accuracy within 1% of the floating-point baseline on all networks studied, including MobileNets and BERT-large. Checked 2026-10-28."
+  - title: Jacob et al., Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference (2017)
+    url: https://arxiv.org/abs/1712.05877
+    note: "A quantization scheme that runs inference with integer-only arithmetic, demonstrated on ImageNet and COCO on CPUs. Checked 2026-10-28."
+  - title: Dettmers et al., LLM.int8() (2022)
+    url: https://arxiv.org/abs/2208.07339
+    note: "Systematic emergent outlier features dominate attention and predictive performance; vector-wise scales plus a 16-bit path for outlier dimensions keep more than 99.9% of values multiplied in 8-bit, up to 175B parameters. Checked 2026-10-28."
+code:
+  starter: |
+    import math
+    from array import array
+
+
+    def choose_params(lo, hi, symmetric=False):
+        """Return (scale, zero_point) for signed int8 covering the observed range [lo, hi].
+        0.0 must be exactly representable. State what you do with a degenerate range."""
+        raise NotImplementedError
+
+
+    def quantize(xs, scale, zero_point=0):
+        """Quantize floats to int8 codes: round, add the zero point, saturate to [-128, 127].
+        Return a compact container. State your tie rule and what NaN does."""
+        raise NotImplementedError
+
+
+    def dequantize(qs, scale, zero_point=0):
+        """Return the floats the codes stand for."""
+        raise NotImplementedError
+
+
+    def quantize_rows(rows, symmetric=True):
+        """One scale and zero point per row (per output channel). Return (codes per row, (scale, zero_point) per row)."""
+        raise NotImplementedError
+
+
+    def clip_range(xs, bits=8):
+        """Return (lo, hi) to quantize xs with, at the given bit width. Your range-setting policy."""
+        raise NotImplementedError
+  tests: |
+    import random, tracemalloc
+
+    s, z = choose_params(-1.0, 1.0, symmetric=True)
+    assert z == 0 and abs(s * 127 - 1.0) < 1e-9, "symmetric: zero point 0, and the largest magnitude maps to code 127"
+    assert list(quantize([-1.0, 0.0, 1.0], 0.1)) == [-10, 0, 10]
+    assert list(quantize([20.0, -20.0], 0.1)) == [127, -128], "out-of-range values saturate, never wrap"
+
+    s, z = choose_params(0.5, 6.0)
+    assert list(dequantize(quantize([0.0], s, z), s, z)) == [0.0], "the range is widened to include 0.0, and 0.0 comes back exactly"
+    _xs = [i * 6.0 / 999 for i in range(1000)]
+    _back = dequantize(quantize(_xs, s, z), s, z)
+    assert max(abs(a - b) for a, b in zip(_back, _xs)) <= s / 2 + 1e-9, "in-range error is at most half a step"
+
+    _codes, _params = quantize_rows([[0.5, -0.25], [8.0, 2.0]])
+    assert [p[1] for p in _params] == [0, 0] and _params[1][0] > _params[0][0] * 10, "each row gets its own scale"
+
+    _rng = random.Random(11)
+    _w = [_rng.gauss(0, 0.02) for _ in range(250_000)]
+    tracemalloc.start()
+    _before = tracemalloc.get_traced_memory()[0]
+    _q = quantize(_w, 0.001, 0)
+    _held = tracemalloc.get_traced_memory()[0] - _before
+    tracemalloc.stop()
+    assert len(_q) == 250_000 and _held < 600_000, f"250,000 codes hold {_held:,} bytes; the budget is 600,000"
+
+    def _mse(xs, lo, hi, bits):
+        lo, hi = min(lo, 0.0), max(hi, 0.0)
+        top = 2 ** bits - 1
+        st = (hi - lo) / top
+        zz = round(-lo / st)
+        return sum((st * (min(top, max(0, round(x / st) + zz)) - zz) - x) ** 2 for x in xs) / len(xs)
+
+    _lap = [_rng.expovariate(1.0) * _rng.choice((-1, 1)) for _ in range(20_000)]
+    _lo, _hi = clip_range(_lap, bits=4)
+    assert _mse(_lap, _lo, _hi, 4) <= 0.6 * _mse(_lap, min(_lap), max(_lap), 4), "at 4 bits, on a long-tailed sample, the policy must beat min/max by 40% in mean squared error"
+  hidden: |
+    import math, random, tracemalloc
+
+    rng = random.Random(23)
+
+    def mse(xs, lo, hi, bits):
+        lo, hi = min(lo, 0.0), max(hi, 0.0)
+        top = 2 ** bits - 1
+        st = (hi - lo) / top
+        zz = round(-lo / st)
+        return sum((st * (min(top, max(0, round(x / st) + zz)) - zz) - x) ** 2 for x in xs) / len(xs)
+
+    def roundtrip_ok():
+        for _ in range(300):
+            a, b = sorted((rng.uniform(-50, 50), rng.uniform(-50, 50)))
+            for sym in (False, True):
+                s, z = choose_params(a, b, symmetric=sym)
+                if not (s > 0 and math.isfinite(s) and int(z) == z and -128 <= z <= 127 and (z == 0 or not sym)):
+                    return False
+                xs = [rng.uniform(min(a, 0.0), max(b, 0.0)) for _ in range(50)] + [min(a, 0.0), max(b, 0.0), 0.0]
+                back = dequantize(quantize(xs, s, z), s, z)
+                if any(abs(p - x) > s / 2 + 1e-9 * (1 + abs(x)) for p, x in zip(back, xs)):
+                    return False
+                if back[-1] != 0.0:
+                    return False
+        return True
+    assert roundtrip_ok()
+
+    xs = sorted(rng.uniform(-3, 3) for _ in range(5_000))
+    s, z = choose_params(-1.0, 2.0)
+    codes = list(quantize(xs, s, z))
+    assert all(a <= b for a, b in zip(codes, codes[1:])) and codes[0] == -128 and codes[-1] == 127
+
+    sat = list(quantize([math.inf, -math.inf, 1e30, -1e30], 0.01, 0))
+    assert sat[0] == 127 and sat[2] == 127 and sat[1] <= -127 and sat[3] <= -127
+
+    def nan_policy():
+        try:
+            out = list(quantize([1.0, math.nan], 0.1, 3))
+        except ValueError:
+            return True
+        return out[1] == 3
+    assert nan_policy()
+
+    def degenerate_ok():
+        for sym in (False, True):
+            for v in (0.0, 2.0, -3.5):
+                s, z = choose_params(v, v, symmetric=sym)
+                if not (s > 0 and math.isfinite(s) and -128 <= z <= 127):
+                    return False
+                if list(dequantize(quantize([0.0], s, z), s, z)) != [0.0]:
+                    return False
+                if abs(dequantize(quantize([v], s, z), s, z)[0] - v) > s / 2 + 1e-9:
+                    return False
+        return True
+    assert degenerate_ok()
+
+    relu = [rng.uniform(0.0, 6.0) for _ in range(20_000)]
+    sa, za = choose_params(0.0, 6.0)
+    ss, zs = choose_params(0.0, 6.0, symmetric=True)
+    err_a = max(abs(p - x) for p, x in zip(dequantize(quantize(relu, sa, za), sa, za), relu))
+    err_s = max(abs(p - x) for p, x in zip(dequantize(quantize(relu, ss, zs), ss, zs), relu))
+    assert len(set(quantize(relu, sa, za))) >= 250 and err_s >= 1.9 * err_a
+
+    rows = [[rng.gauss(0, 1) for _ in range(200)] for _ in range(6)]
+    rows[0][17] = 100.0
+    codes, params = quantize_rows(rows)
+    def rows_ok():
+        for r, c, (s, z) in zip(rows[1:], codes[1:], params[1:]):
+            if s > max(abs(x) for x in r) / 126.9:
+                return False
+            if any(abs(p - x) > s / 2 + 1e-9 for p, x in zip(dequantize(c, s, z), r)):
+                return False
+        return True
+    assert rows_ok()
+
+    g = [rng.gauss(0, 1) for _ in range(20_000)]
+    lo, hi = clip_range(g, bits=8)
+    assert mse(g, lo, hi, 8) <= 1.05 * mse(g, min(g), max(g), 8)
+
+    lap = [rng.expovariate(1.0) * rng.choice((-1, 1)) for _ in range(20_000)]
+    lo, hi = clip_range(lap, bits=8)
+    assert mse(lap, lo, hi, 8) <= 1.05 * mse(lap, min(lap), max(lap), 8)
+
+    lo, hi = clip_range(g, bits=4)
+    assert mse(g, lo, hi, 4) <= 0.7 * mse(g, min(g), max(g), 4)
+
+    assert min(min(g), 0.0) - 1e-12 <= lo <= hi <= max(max(g), 0.0) + 1e-12
+
+    big = [[rng.gauss(0, 0.02) for _ in range(500)] for _ in range(500)]
+    tracemalloc.start()
+    before = tracemalloc.get_traced_memory()[0]
+    kept = quantize_rows(big)
+    held = tracemalloc.get_traced_memory()[0] - before
+    tracemalloc.stop()
+    assert held < 700_000
+  solution: |
+    import math
+    from array import array
+
+    QMIN, QMAX = -128, 127
+
+
+    def choose_params(lo, hi, symmetric=False):
+        if not (math.isfinite(lo) and math.isfinite(hi)) or lo > hi:
+            raise ValueError("lo and hi must be finite with lo <= hi")
+        lo, hi = min(lo, 0.0), max(hi, 0.0)  # widen to include 0.0 so it has an exact code
+        if symmetric:
+            m = max(-lo, hi)
+            return (m / 127 if m > 0 else 1.0), 0  # codes -127..127 keep x and -x mirror images
+        if hi == lo:
+            return 1.0, 0  # only 0.0 was observed; any positive scale represents it exactly
+        scale = (hi - lo) / (QMAX - QMIN)
+        zp = round(QMIN - lo / scale)
+        return scale, min(QMAX, max(QMIN, zp))
+
+
+    def quantize(xs, scale, zero_point=0):
+        if not (scale > 0 and math.isfinite(scale)):
+            raise ValueError("scale must be positive and finite")
+        if int(zero_point) != zero_point or not QMIN <= zero_point <= QMAX:
+            raise ValueError("zero_point must be an integer in [-128, 127]")
+        below, above = QMIN - zero_point - 1, QMAX - zero_point + 1
+
+        def one(x):
+            v = x / scale
+            if v != v:
+                raise ValueError("NaN has no int8 code")
+            if v < below:
+                return QMIN  # saturate before round(), which cannot take an infinity
+            if v > above:
+                return QMAX
+            q = round(v) + zero_point  # Python's round: ties to even
+            return QMIN if q < QMIN else QMAX if q > QMAX else q
+
+        return array("b", [one(x) for x in xs])  # one byte per code
+
+
+    def dequantize(qs, scale, zero_point=0):
+        return [scale * (q - zero_point) for q in qs]
+
+
+    def quantize_rows(rows, symmetric=True):
+        codes, params = [], []
+        for row in rows:
+            s, z = choose_params(min(row, default=0.0), max(row, default=0.0), symmetric)
+            codes.append(quantize(row, s, z))
+            params.append((s, z))
+        return codes, params
+
+
+    def clip_range(xs, bits=8):
+        # Policy: shrink min/max by a common factor and keep the factor with the lowest squared error at this bit width.
+        xs = [x for x in xs if math.isfinite(x)]
+        if not xs:
+            return 0.0, 0.0
+        lo, hi = min(xs), max(xs)
+        top = 2 ** bits - 1
+
+        def sse(a, b):
+            a, b = min(a, 0.0), max(b, 0.0)
+            if a == b:
+                return 0.0
+            st = (b - a) / top
+            zz = round(-a / st)
+            total = 0.0
+            for x in xs:
+                q = round(x / st) + zz
+                q = 0 if q < 0 else top if q > top else q
+                total += (st * (q - zz) - x) ** 2
+            return total
+
+        best = min((sse(f * lo, f * hi), f) for f in [1 - i / 40 for i in range(33)])[1]
+        return best * lo, best * hi
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="As reported by a candidate">
+Write the numeric core of an int8 inference path: symmetric and asymmetric quantization of FP32 tensors, the scale and zero point from an observed range, saturation, per-channel scales, and what clipping and outliers do to the error.
+</Callout>
+
+The reported prompt asks for NumPy. This version uses the standard library, which makes the memory cost of the result your problem rather than NumPy's. Implement five functions:
+
+- `choose_params(lo, hi, symmetric)` returns `(scale, zero_point)` for signed int8 covering `[lo, hi]`, with 0.0 exactly representable.
+- `quantize(xs, scale, zero_point)` rounds, adds the zero point and saturates to `[-128, 127]`.
+- `dequantize(qs, scale, zero_point)` returns the floats the codes stand for.
+- `quantize_rows(rows, symmetric)` gives every row its own scale and zero point.
+- `clip_range(xs, bits)` returns the range to quantize with: your range-setting policy.
+
+The constraints:
+
+- **Memory.** 250,000 codes may hold at most 600,000 bytes, measured with `tracemalloc`. int8 exists to cut memory to a quarter of FP32, and a container that costs more than the floats did defeats it.
+- **One policy, two bit widths.** `clip_range` is graded by the mean squared error of the asymmetric quantize-dequantize round trip over the whole input, against plain min/max. At 4 bits on a long-tailed sample it must cut that error by at least 40%. The hidden tests also run it at 8 bits and require that it is never more than 5% worse than min/max.
+
+Three decisions are yours, and the starter's docstrings ask you to state them:
+
+- the tie rule;
+- what NaN does (raise `ValueError`, or map to the zero point);
+- what a range with no width returns.
+
+The hidden tests accept any of these choices. Symmetric quantization uses `scale = max(|lo|, |hi|) / 127`. Infinities and values past the range must saturate.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Measure what a Python list of 250,000 small negative ints holds before you choose a return type.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask which error the range is chosen to minimise: the mean over all values, the worst case, or the error on a downstream metric.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Run a fixed percentile clip at 4 bits and at 8 bits on the same Gaussian sample, and compare both against min/max.</p></details>
+
+## Answer
+
+**Parameters.** The reference widens the range to include 0.0, so the zero point is the integer code that 0.0 maps to and dequantizes to exactly `scale * 0`. That matters because padding and ReLU outputs are exact zeros, and an inexact zero adds a bias to every padded position. Asymmetric: `scale = (hi - lo) / 255` and `zero_point = round(-128 - lo / scale)`, clamped. Rounding the zero point moves the covered range by at most half a step, which is why the round-trip bound is `scale / 2` across the whole observed range. Symmetric: `zero_point = 0` and `scale = max(|lo|, |hi|) / 127`. The reference gives up code -128 so that x and -x map to mirror-image codes. A degenerate range returns scale 1.0, which represents the only value seen, 0.0, exactly.
+
+**Quantize.** Saturation is checked before `round()`, which raises on an infinity. Python's `round` ties to even, so 0.5 and 1.5 steps round to 0 and 2; ties away from zero is the other common rule, and any rule stays inside the half-step bound. The result is an `array('b')`, one byte per code. On CPython 3.12, `sys.getsizeof(-100)` is 28 bytes, and a list of 250,000 such codes held 5,515,808 bytes under `tracemalloc` in a measurement for this problem, against 250,108 for the array. The list is 22 times the array and about 5.5 times the 1,000,000 bytes of the FP32 values it replaced.
+
+**Per-row scales.** One scale per output channel, so the row with a weight of 100 in the hidden test does not stretch the step size of its neighbours. Per-channel suits weights because the scale of output channel j multiplies every term of that channel's dot product and factors out after the int32 accumulation: y_j = s_x s_j Σ q_x q_w. A per-channel scale on activations would vary along the reduction dimension, inside the sum, so it cannot factor out. Activations get per-tensor or per-token scales, and outlier features are handled another way. LLM.int8() moves the outlier dimensions to a 16-bit path and keeps more than 99.9% of values in 8-bit.
+
+**The decision: symmetric or asymmetric activations.** Both are defensible.
+
+- Asymmetric spends all 256 codes on a skewed range. On the hidden test's ReLU6 data its worst-case error is half of symmetric's, because symmetric wastes the negative half. The cost is in the kernel. With q̂_x = q_x - z_x, the sum Σ q̂_x q_w = Σ q_x q_w - z_x Σ q_w, and the Σ q_w term is a per-channel constant of the weights that can be precomputed. If the weights carry a zero point too, the cross terms add a per-row sum of the activations at run time.
+- Symmetric weights with asymmetric activations keep one extra term. Symmetric everywhere keeps none and accepts the lost code range.
+
+The answer depends on whether the activation range is skewed and whether the integer kernel you have supports a zero point at all. The constraint conflict is accuracy against kernel cost.
+
+**Clipping.** min/max wastes steps on values that almost never occur. Clipping shrinks the step, and every clipped value then carries an error that grows with its distance past the edge. The balance moves with the bit width.
+
+- At 4 bits the steps are coarse, and rounding error dominates. In the measurement behind the tests, a 99.9th-percentile clip cut the Laplace error to 0.47 of min/max.
+- At 8 bits the steps are fine, and clipping error dominates. The same percentile clip made the error 7.7 times worse on Laplace data and 2.7 times worse on Gaussian data.
+
+No fixed percentile passes both tests. The reference searches 33 shrink factors from 1.0 down to 0.2 and keeps the one with the lowest squared error at the requested width. That landed at 0.38 of min/max for 4-bit Laplace and at 0.94 to 0.96 for 8-bit data. Each search costs 33 passes over the data, which is fine at 20,000 values and is the first thing to replace with a histogram at calibration-set scale.
+
+**How this policy fails.** It minimises mean squared error over all values. That objective is wrong when a few large values carry the signal: LLM.int8() reports that emergent outlier features dominate attention and predictive performance. An MSE-optimal clip of an activation with such a feature removes the part the model needs and looks better on the metric it was chosen by. The check is a task metric before and after on a calibration set, per layer, not the reconstruction error.
+
+**Integer accumulation.** An int8 by int8 product is at most 128 × 128 = 16,384 = 2^14 in magnitude. An int32 accumulator holds 2^31 - 1, so a dot product of worst-case terms can overflow past 2^31 / 2^14 = 131,072 terms. Real reductions are shorter and the terms are rarely all extreme, but a test for it costs one line. Requantizing back to int8 multiplies by s_x s_w / s_y, which kernels apply as a fixed-point multiplier and shift.
+
+## Follow-ups
+
+- *Your MSE search picks a clip that cuts activation error by 30% at 8 bits, and a downstream eval drops two points on long-context tasks. Do you ship the clip, ship min/max, or keep one layer at 16 bits, and what risk do you accept in writing?*
+- *What would you need to see to move from per-tensor to per-token activation scales?* A kernel that applies a per-row scale after accumulation at no measurable cost at your batch shapes, and an eval gain on the tasks that regressed with per-tensor scales.
+- *Two engineers disagree: one wants symmetric everywhere for kernel simplicity, the other wants asymmetric activations for accuracy. How do you decide without deciding by rank?* Measure both on the activations of the layers with the most skewed ranges, and price the zero-point term in the kernel you actually ship.
+- *What changes to run this in a real engine?* Vectorised kernels with the scale applied after int32 accumulation, calibration over a few hundred representative batches with a histogram instead of 33 passes, per-channel weight scales stored next to the packed codes, and a regression test that pins rounding and saturation on the boundary values.
+
+## Common mistakes
+
+- Choosing `scale = max|x| / 127` for data that is never negative, which wastes half the codes.
+- Letting `round()` see an infinity or a NaN, or letting out-of-range values wrap through a cast instead of saturating.
+- A zero point that is not an integer, or a range that excludes 0.0, so zero padding dequantizes to a small nonzero bias.
+- Returning a list of Python ints, which holds more memory than the FP32 input.
+- One clipping percentile for every bit width, tuned on 4-bit results and applied at 8 bits.
+- Per-channel scales on activations along the reduction dimension, which cannot factor out of the dot product.

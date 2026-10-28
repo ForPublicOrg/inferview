@@ -1,0 +1,756 @@
+---
+title: "Progressive-spec in-memory database"
+track: rounds
+module: llm-app-coding
+kind: lab
+minutes: 120
+summary: "Grow one typed table over five steps: validated rows, indexed range scans, expiry on an injected clock, snapshots that keep each row's remaining time, and transactions whose rollback restores rows and indexes."
+updated: 2026-10-28
+sources:
+  - title: "Aced, Ramp AI Engineer interview experience"
+    url: https://www.aced.io/experiences/ramp-ai-engineer-interview-13abb1
+    note: "candidate report (rejected), interview about three months before the report; lists \"Implement an in-memory database in CodeSignal, with each round adding more functionality\" and \"Escape the Maze\", an HTTP crawl to an exit URL with robust error handling whose second level needs auth headers collected while crawling; no stage details. The specifications here are original; checked 2026-10-28"
+  - title: "Hello Interview, In-Memory Database: Implement SQL-Like Operations"
+    url: https://www.hellointerview.com/community/questions/memory-database-sql/cmbsl00wk004v07adwuorveqo
+    note: "community question tagged OpenAI, Two Sigma and Anthropic; an Anthropic candidate report from late April 2026 describes a CodeSignal assessment in four levels (CRUD, top-N modified, record locking, logout and undo); checked 2026-10-28"
+  - title: "PracHub, Perplexity AI interview questions"
+    url: https://prachub.com/companies/perplexity-ai
+    note: "candidate-reported questions: an in-memory file system built in stages with cd and relative paths (posted 2026-10-02), strict mkdir, touch, ls, rm and rmdir (2026-09-25), and a time-versioned key-value store with restore (2026-02-06); checked 2026-10-28"
+  - title: "Python docs, bisect"
+    url: https://docs.python.org/3/library/bisect.html
+    note: "bisect functions take key since Python 3.10; insort is O(n) because of the insertion step; the model for the step 2 index"
+steps:
+  - title: "Set, get and delete"
+    brief: "A Table has a fixed set of typed columns (int, float or str); a row is a dict over some of them, and None means no value. put checks the whole row before it changes anything: an unknown column raises ValueError, a wrong type TypeError (True is not an int), and an int in a float column is stored as a float. put returns the row it replaced, or None. get and put hand out and keep copies, so editing a returned dict cannot change the table. Route every write and every removal through one method each: steps 2, 3 and 5 hook into them."
+    starter: |
+      class Table:
+          """Rows keyed by a string id; each row is a dict over a fixed set of typed columns."""
+
+          def __init__(self, columns, **options):
+              """columns maps a name to int, float or str. Later steps pass more options."""
+              raise NotImplementedError
+
+          def put(self, row_id, row):
+              """Store row (replacing any row with this id) and return the previous row, or None."""
+              raise NotImplementedError
+
+          def get(self, row_id):
+              raise NotImplementedError
+
+          def delete(self, row_id):
+              raise NotImplementedError
+
+          def __len__(self):
+              raise NotImplementedError
+    tests: |
+      def raises(exc, fn, *args):
+          try:
+              fn(*args)
+          except exc:
+              return True
+          return False
+
+      t = Table({"name": str, "spend": float, "seats": int})
+      assert t.put("acme", {"name": "Acme", "spend": 120, "seats": 5}) is None, "a new row has no previous version"
+      assert t.get("acme") == {"name": "Acme", "spend": 120.0, "seats": 5}, "an int stored in a float column comes back as a float"
+      assert t.put("acme", {"name": "Acme", "spend": 99.5}) == {"name": "Acme", "spend": 120.0, "seats": 5}, "put returns the row it replaced"
+      assert t.get("acme") == {"name": "Acme", "spend": 99.5}, "put replaces the whole row"
+      assert raises(ValueError, t.put, "x", {"colour": "red"}), "unknown column"
+      assert raises(TypeError, t.put, "x", {"seats": "five"}), "wrong type"
+      assert t.get("x") is None and len(t) == 1, "a refused put stores nothing"
+      assert t.delete("acme") is True and t.delete("acme") is False and len(t) == 0
+    hidden: |
+      _t = Table({"n": int, "s": str})
+      assert raises(TypeError, _t.put, "b", {"n": True}), "True is not an int column value"
+      _t.put("a", {"n": 1, "s": None})
+      assert _t.get("a") == {"n": 1, "s": None}
+      _row = _t.get("a")
+      _row["n"] = 999
+      assert _t.get("a")["n"] == 1, "get hands out a copy"
+      _src = {"n": 2}
+      _t.put("c", _src)
+      _src["n"] = 3
+      assert _t.get("c") == {"n": 2}, "put stores a copy"
+      _t.put("a", {"n": 5})
+      assert raises(ValueError, _t.put, "a", {"zzz": 1})
+      assert _t.get("a") == {"n": 5}, "a refused overwrite keeps the old row"
+      assert raises(TypeError, Table, {"when": list})
+    solution: |
+      class Table:
+          """Rows keyed by a string id; each row is a dict over a fixed set of typed columns."""
+
+          def __init__(self, columns, **options):
+              for name, kind in columns.items():
+                  if kind not in (int, float, str):
+                      raise TypeError(f"column {name!r}: types are int, float and str")
+              self.columns = dict(columns)
+              self.rows = {}
+
+          def _check(self, row):
+              clean = {}
+              for name, value in row.items():
+                  if name not in self.columns:
+                      raise ValueError(f"unknown column {name!r}")
+                  kind = self.columns[name]
+                  if value is not None:
+                      if kind is float and type(value) is int:
+                          value = float(value)
+                      if type(value) is not kind:                 # rejects True for an int column
+                          raise TypeError(f"column {name!r} holds {kind.__name__}")
+                  clean[name] = value
+              return clean
+
+          # Storage hooks: later steps extend these two, so every write path keeps indexes and expiry in step.
+          def _write(self, row_id, row):
+              self.rows[row_id] = row
+
+          def _erase(self, row_id):
+              return self.rows.pop(row_id, None)
+
+          def put(self, row_id, row):
+              clean = self._check(row)                           # validate before touching anything
+              previous = self._erase(row_id)
+              self._write(row_id, clean)
+              return None if previous is None else dict(previous)
+
+          def get(self, row_id):
+              row = self.rows.get(row_id)
+              return None if row is None else dict(row)
+
+          def delete(self, row_id):
+              return self._erase(row_id) is not None
+
+          def __len__(self):
+              return len(self.rows)
+  - title: "Filtered scans"
+    brief: "create_index(column) builds a sorted index that later puts and deletes keep current. scan(where, order_by, limit) returns (row_id, row) pairs for rows matching every condition, where a condition is (column, op, value) and op is =, <, <=, > or >=; a row with no value in that column never matches. Results are ordered by order_by with rows lacking it last and ties by row id, or by row id alone; limit applies after ordering. Use an index when a condition's column has one, and combine the conditions on that column into one range: the visible test runs 600 two-sided range scans over 50,000 rows within 2 seconds."
+    starter: |
+      class Table(Table):
+          def create_index(self, column):
+              """Index column; later puts and deletes keep the index current."""
+              raise NotImplementedError
+
+          def scan(self, where=(), order_by=None, limit=None):
+              """[(row_id, row)] for rows matching every (column, op, value) in where; op is =, <, <=, > or >=."""
+              raise NotImplementedError
+    tests: |
+      import time
+
+      t = Table({"team": str, "spend": float, "seats": int})
+      t.put("a", {"team": "infra", "spend": 50.0, "seats": 3})
+      t.put("b", {"team": "evals", "spend": 10.0, "seats": 8})
+      t.put("c", {"team": "infra", "spend": 75.0})
+      t.put("d", {"team": "infra", "spend": 75.0, "seats": 1})
+      assert [rid for rid, _ in t.scan()] == ["a", "b", "c", "d"], "no order_by: ordered by row id"
+      assert [rid for rid, _ in t.scan([("team", "=", "infra"), ("spend", ">=", 60)])] == ["c", "d"], "conditions are ANDed"
+      assert [rid for rid, _ in t.scan(order_by="spend")] == ["b", "a", "c", "d"], "ties broken by row id"
+      assert [rid for rid, _ in t.scan([("seats", "<", 5)])] == ["a", "d"], "a missing value never matches"
+      assert [rid for rid, _ in t.scan(order_by="seats")] == ["d", "a", "b", "c"], "rows without the column sort last"
+      assert len(t.scan(limit=2)) == 2
+      t.create_index("spend")
+      assert [rid for rid, _ in t.scan([("spend", ">", 50)])] == ["c", "d"], "the index gives the same answer"
+      t.put("c", {"team": "infra", "spend": 5.0})
+      t.delete("d")
+      assert [rid for rid, _ in t.scan([("spend", "<", 20)])] == ["b", "c"], "the index follows overwrites and deletes"
+
+      events = Table({"ts": int, "kind": str})
+      for i in range(50000):
+          events.put(f"e{i:05d}", {"ts": i * 7 % 50000, "kind": "click" if i % 3 else "view"})
+      events.create_index("ts")
+      t0 = time.perf_counter()
+      hits = sum(len(events.scan([("ts", ">=", q), ("ts", "<", q + 20), ("kind", "=", "view")])) for q in range(0, 45000, 75))
+      elapsed = time.perf_counter() - t0
+      assert hits > 0
+      assert elapsed < 2, f"600 range scans over 50,000 rows took {elapsed:.1f} s; the budget is 2 s"
+    hidden: |
+      import random as _r
+
+      def _brute(model, where, order_by=None, limit=None):
+          ops = {"=": lambda a, b: a == b, "<": lambda a, b: a < b, "<=": lambda a, b: a <= b, ">": lambda a, b: a > b, ">=": lambda a, b: a >= b}
+          rows = [(rid, row) for rid, row in model.items() if all(row.get(c) is not None and ops[op](row[c], v) for c, op, v in where)]
+          if order_by is None:
+              rows.sort(key=lambda x: x[0])
+          else:
+              rows.sort(key=lambda x: (x[1].get(order_by) is None, x[1].get(order_by) if x[1].get(order_by) is not None else 0, x[0]))
+          return [rid for rid, _ in rows][:limit]
+
+      def _scan_check(seed):
+          rng = _r.Random(seed)
+          tb = Table({"a": int, "b": str})
+          model = {}
+          if rng.random() < 0.5:
+              tb.create_index("a")
+          for step in range(1500):
+              rid = f"r{rng.randrange(60):02d}"
+              op = rng.random()
+              if op < 0.5:
+                  row = {"a": rng.choice([None, 0, 1, 2, 3, 4]), "b": rng.choice(["x", "y", None])}
+                  tb.put(rid, row)
+                  model[rid] = row
+              elif op < 0.65:
+                  tb.delete(rid)
+                  model.pop(rid, None)
+              elif op < 0.7:
+                  tb.create_index(rng.choice(["a", "b"]))
+              else:
+                  where = [("a", rng.choice(["=", "<", "<=", ">", ">="]), rng.randrange(5))]
+                  if rng.random() < 0.4:
+                      where.append(("b", "=", rng.choice(["x", "y"])))
+                  order_by = rng.choice([None, "a", "b"])
+                  limit = rng.choice([None, 1, 5])
+                  got = [rid for rid, _ in tb.scan(where, order_by=order_by, limit=limit)]
+                  if got != _brute(model, where, order_by, limit):
+                      return False
+          return True
+
+      assert all(_scan_check(s) for s in range(6))
+      _q = Table({"v": float})
+      _q.put("one", {"v": 1})
+      _q.put("two", {"v": 2.5})
+      _q.create_index("v")
+      assert [r for r, _ in _q.scan([("v", "=", 1)])] == ["one"] and [r for r, _ in _q.scan([("v", ">", 1.0)])] == ["two"]
+      try:
+          _q.scan([("nope", "=", 1)])
+          _bad = False
+      except ValueError:
+          _bad = True
+      assert _bad
+    solution: |
+      import bisect
+      import operator
+
+      _OPS = {"=": operator.eq, "<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge}
+
+
+      class Table(Table):
+          def __init__(self, columns, **options):
+              super().__init__(columns, **options)
+              self.indexes = {}          # column -> sorted list of (value, row_id); rows with None are left out
+
+          def create_index(self, column):
+              if column not in self.columns:
+                  raise ValueError(f"unknown column {column!r}")
+              self.indexes[column] = sorted((row[column], rid) for rid, row in self.rows.items() if row.get(column) is not None)
+
+          def _write(self, row_id, row):
+              super()._write(row_id, row)
+              for column, index in self.indexes.items():
+                  if row.get(column) is not None:
+                      bisect.insort(index, (row[column], row_id))
+
+          def _erase(self, row_id):
+              old = super()._erase(row_id)
+              if old is not None:
+                  for column, index in self.indexes.items():
+                      if old.get(column) is not None:
+                          i = bisect.bisect_left(index, (old[column], row_id))
+                          del index[i]
+              return old
+
+          def _candidates(self, where):
+              """Row ids that may match: the narrowest index range over the conditions, else every row."""
+              ranges = {}                      # indexed column -> [lo, hi) after every condition on it
+              first = lambda entry: entry[0]
+              for column, op, value in where:
+                  index = self.indexes.get(column)
+                  if index is None:
+                      continue
+                  lo, hi = ranges.get(column, (0, len(index)))
+                  if op in ("=", ">="):
+                      lo = max(lo, bisect.bisect_left(index, value, key=first))
+                  elif op == ">":
+                      lo = max(lo, bisect.bisect_right(index, value, key=first))
+                  if op in ("=", "<="):
+                      hi = min(hi, bisect.bisect_right(index, value, key=first))
+                  elif op == "<":
+                      hi = min(hi, bisect.bisect_left(index, value, key=first))
+                  ranges[column] = (lo, hi)
+              if not ranges:
+                  return list(self.rows)
+              column, (lo, hi) = min(ranges.items(), key=lambda item: item[1][1] - item[1][0])
+              return [rid for _, rid in self.indexes[column][lo:hi]]
+
+          def scan(self, where=(), order_by=None, limit=None):
+              where = list(where)
+              for column, op, _ in where:
+                  if column not in self.columns or op not in _OPS:
+                      raise ValueError(f"bad condition on {column!r} with {op!r}")
+              out = []
+              for rid in self._candidates(where):
+                  row = self.rows[rid]
+                  if all(row.get(c) is not None and _OPS[op](row[c], v) for c, op, v in where):
+                      out.append((rid, row))
+              if order_by is None:
+                  out.sort(key=lambda item: item[0])
+              else:
+                  def key(item):
+                      value = item[1].get(order_by)
+                      return (value is None, 0 if value is None else value, item[0])
+                  out.sort(key=key)
+              if limit is not None:
+                  out = out[:limit]
+              return [(rid, dict(row)) for rid, row in out]
+  - title: "TTL with an injected clock"
+    brief: "The constructor takes clock (default time.monotonic) and put takes ttl. A row put with ttl at time t is live while clock() < t + ttl, and a put without ttl makes it permanent. get, delete, scan and len stop seeing a row the moment it expires, and an expired row never takes a slot under limit. purge() removes expired rows from storage and from every index and returns how many it removed; stats() reports stored rows and index entries, so the tests can check that memory comes back. ManualClock lets the tests move time."
+    starter: |
+      import time
+
+
+      class ManualClock:
+          """A clock the tests move by hand: call it for the time, set .now to move it."""
+
+          def __init__(self, now=0.0):
+              self.now = now
+
+          def __call__(self):
+              return self.now
+
+
+      class Table(Table):
+          def __init__(self, columns, clock=time.monotonic, **options):
+              super().__init__(columns, **options)
+              self.clock = clock
+
+          def put(self, row_id, row, ttl=None):
+              raise NotImplementedError
+
+          def purge(self):
+              """Drop every expired row from storage and indexes; return how many went."""
+              raise NotImplementedError
+
+          def stats(self):
+              """{"rows": rows stored, "index_entries": entries across all indexes}."""
+              raise NotImplementedError
+
+          # get, delete, scan and len must also stop seeing a row once it expires.
+    tests: |
+      clock = ManualClock(100.0)
+      t = Table({"user": str, "score": int}, clock=clock)
+      t.create_index("score")
+      t.put("s1", {"user": "ada", "score": 5}, ttl=10)
+      t.put("s2", {"user": "bob", "score": 7}, ttl=30)
+      t.put("s3", {"user": "cy", "score": 9})
+      clock.now = 109.999
+      assert t.get("s1") == {"user": "ada", "score": 5}, "live until put time + ttl"
+      clock.now = 110.0
+      assert t.get("s1") is None, "gone at exactly put time + ttl"
+      assert [rid for rid, _ in t.scan([("score", ">", 0)], limit=2)] == ["s2", "s3"], "expired rows never take a slot under limit"
+      assert len(t) == 2
+      assert t.delete("s1") is False, "an expired row cannot be deleted"
+      assert t.put("s1", {"user": "ada", "score": 6}) is None, "replacing an expired row returns no previous row"
+      t.put("s2", {"user": "bob", "score": 8})
+      clock.now = 1000.0
+      assert t.get("s2") == {"user": "bob", "score": 8}, "a put without ttl makes the row permanent"
+
+      big = Table({"n": int}, clock=ManualClock(0.0))
+      big.create_index("n")
+      for i in range(20000):
+          big.put(f"tmp{i}", {"n": i}, ttl=5)
+      big.put("keep", {"n": 1})
+      big.clock.now = 10.0
+      assert big.purge() == 20000
+      assert big.stats() == {"rows": 1, "index_entries": 1}, "expired rows leave storage and every index"
+    hidden: |
+      import random as _r
+
+      def _ttl_check(seed):
+          rng = _r.Random(seed)
+          clk = ManualClock(0.0)
+          tb = Table({"v": int}, clock=clk)
+          tb.create_index("v")
+          model = {}
+          for _ in range(2000):
+              clk.now += rng.choice([0, 0.5, 1, 2])
+              now = clk.now
+              live = {k: (r, e) for k, (r, e) in model.items() if e is None or now < e}
+              rid = f"r{rng.randrange(20)}"
+              op = rng.random()
+              if op < 0.45:
+                  row, ttl = {"v": rng.randrange(5)}, rng.choice([None, 1, 3, 6])
+                  prev = tb.put(rid, row, ttl=ttl)
+                  if prev != (live[rid][0] if rid in live else None):
+                      return False
+                  model[rid] = (row, None if ttl is None else now + ttl)
+              elif op < 0.55:
+                  if tb.delete(rid) != (rid in live):
+                      return False
+                  model.pop(rid, None)
+              elif op < 0.7:
+                  if tb.get(rid) != (live[rid][0] if rid in live else None):
+                      return False
+              elif op < 0.8:
+                  if len(tb) != len(live):
+                      return False
+              elif op < 0.85:
+                  tb.purge()
+                  if tb.stats()["rows"] != len(live) or tb.stats()["index_entries"] != len(live):
+                      return False
+              else:
+                  v, lim = rng.randrange(5), rng.choice([None, 1, 3])
+                  want = sorted(k for k, (r, e) in live.items() if r["v"] >= v)[:lim]
+                  if [k for k, _ in tb.scan([("v", ">=", v)], limit=lim)] != want:
+                      return False
+          return True
+
+      assert all(_ttl_check(s) for s in range(5))
+      _c = ManualClock(0.0)
+      _t = Table({"v": int}, clock=_c)
+      try:
+          _t.put("x", {"v": 1}, ttl=0)
+          _z = False
+      except ValueError:
+          _z = True
+      assert _z
+    solution: |
+      import heapq
+      import time
+
+
+      class ManualClock:
+          """A clock the tests move by hand: call it for the time, set .now to move it."""
+
+          def __init__(self, now=0.0):
+              self.now = now
+
+          def __call__(self):
+              return self.now
+
+
+      class Table(Table):
+          def __init__(self, columns, clock=time.monotonic, **options):
+              super().__init__(columns, **options)
+              self.clock = clock
+              self.expires = {}      # row_id -> expiry time, for rows with a ttl
+              self.heap = []         # (expiry, row_id); stale entries are skipped
+
+          def _alive(self, row_id, now):
+              exp = self.expires.get(row_id)
+              return row_id in self.rows and (exp is None or now < exp)
+
+          def _erase(self, row_id):
+              self.expires.pop(row_id, None)
+              return super()._erase(row_id)
+
+          def put(self, row_id, row, ttl=None):
+              if ttl is not None and ttl <= 0:
+                  raise ValueError("ttl must be positive")
+              now = self.clock()
+              was_alive = self._alive(row_id, now)
+              previous = super().put(row_id, row)          # validates, erases, writes (and indexes)
+              if ttl is not None:
+                  self.expires[row_id] = now + ttl
+                  heapq.heappush(self.heap, (now + ttl, row_id))
+              return previous if was_alive else None
+
+          def get(self, row_id):
+              return super().get(row_id) if self._alive(row_id, self.clock()) else None
+
+          def delete(self, row_id):
+              alive = self._alive(row_id, self.clock())
+              super().delete(row_id)                       # an expired row is dropped either way
+              return alive
+
+          def purge(self):
+              """Drop every expired row from storage and indexes; return how many went."""
+              now, gone = self.clock(), 0
+              while self.heap and self.heap[0][0] <= now:
+                  exp, row_id = heapq.heappop(self.heap)
+                  if self.expires.get(row_id) == exp:
+                      self._erase(row_id)
+                      gone += 1
+              return gone
+
+          def scan(self, where=(), order_by=None, limit=None):
+              self.purge()                                 # before the limit is applied, never after
+              return super().scan(where, order_by=order_by, limit=limit)
+
+          def __len__(self):
+              self.purge()
+              return super().__len__()
+
+          def stats(self):
+              return {"rows": len(self.rows), "index_entries": sum(len(i) for i in self.indexes.values())}
+  - title: "Backup and restore"
+    brief: "snapshot() saves the live rows and each row's remaining ttl and returns a token; restore(token) replaces every row. A row with r seconds left at snapshot time has r seconds left after the restore. Later writes never change a snapshot, one snapshot can be restored many times, and an unknown token raises KeyError. Index definitions are schema, not data: an index created after the snapshot still covers the restored rows."
+    starter: |
+      class Table(Table):
+          def snapshot(self):
+              """Save the live rows and their remaining ttl; return a token."""
+              raise NotImplementedError
+
+          def restore(self, token):
+              raise NotImplementedError
+    tests: |
+      clock = ManualClock(0.0)
+      t = Table({"plan": str, "seats": int}, clock=clock)
+      t.put("acme", {"plan": "pro", "seats": 10})
+      t.put("trial", {"plan": "free", "seats": 1}, ttl=10)
+      t.put("gone", {"plan": "free", "seats": 2}, ttl=3)
+      clock.now = 4.0
+      snap = t.snapshot()
+      t.put("acme", {"plan": "team", "seats": 50})
+      t.delete("trial")
+      t.put("new", {"plan": "pro", "seats": 3})
+      t.create_index("seats")
+      clock.now = 100.0
+      t.restore(snap)
+      assert t.get("acme") == {"plan": "pro", "seats": 10}, "later writes do not change the snapshot"
+      assert t.get("new") is None and t.get("gone") is None, "restore replaces everything; expired rows were never saved"
+      assert t.get("trial") == {"plan": "free", "seats": 1}, "6 seconds were left at snapshot time"
+      assert [rid for rid, _ in t.scan([("seats", ">=", 5)])] == ["acme"], "an index created after the snapshot covers the restored rows"
+      clock.now = 105.999
+      assert t.get("trial") is not None
+      clock.now = 106.0
+      assert t.get("trial") is None, "the remaining ttl counts from the restore"
+      t.put("acme", {"plan": "x", "seats": 0})
+      t.restore(snap)
+      assert t.get("acme") == {"plan": "pro", "seats": 10}, "a snapshot can be restored twice"
+    hidden: |
+      import random as _r
+
+      def _snap_check(seed):
+          rng = _r.Random(seed)
+          clk = ManualClock(0.0)
+          tb = Table({"v": int}, clock=clk)
+          tb.create_index("v")
+          model, saved = {}, []
+          for _ in range(1200):
+              clk.now += rng.choice([0, 1, 2])
+              now = clk.now
+              live = {k: (r, e) for k, (r, e) in model.items() if e is None or now < e}
+              rid = f"r{rng.randrange(12)}"
+              op = rng.random()
+              if op < 0.45:
+                  row, ttl = {"v": rng.randrange(4)}, rng.choice([None, 2, 5])
+                  tb.put(rid, row, ttl=ttl)
+                  model[rid] = (row, None if ttl is None else now + ttl)
+              elif op < 0.55:
+                  tb.delete(rid)
+                  model.pop(rid, None)
+              elif op < 0.65:
+                  saved.append((tb.snapshot(), {k: (dict(r), None if e is None else e - now) for k, (r, e) in live.items()}))
+              elif op < 0.72 and saved:
+                  token, snap = rng.choice(saved)
+                  tb.restore(token)
+                  model = {k: (dict(r), None if rem is None else now + rem) for k, (r, rem) in snap.items()}
+              else:
+                  v = rng.randrange(4)
+                  want = sorted(k for k, (r, e) in live.items() if r["v"] == v)
+                  if [k for k, _ in tb.scan([("v", "=", v)])] != want:
+                      return False
+                  if tb.get(rid) != (live[rid][0] if rid in live else None):
+                      return False
+          return True
+
+      assert all(_snap_check(s) for s in range(5))
+      _t = Table({"v": int}, clock=ManualClock(0.0))
+      _a = _t.snapshot()
+      _t.put("x", {"v": 1})
+      _b = _t.snapshot()
+      assert _a != _b
+      _t.restore(_a)
+      assert len(_t) == 0
+      _t.restore(_b)
+      assert _t.get("x") == {"v": 1}
+      try:
+          _t.restore("no-such-token")
+          _k = False
+      except KeyError:
+          _k = True
+      assert _k
+    solution: |
+      class Table(Table):
+          def __init__(self, columns, **options):
+              super().__init__(columns, **options)
+              self.snapshots = {}
+
+          def snapshot(self):
+              """Save the live rows and each row's remaining ttl; return a token for restore."""
+              self.purge()
+              now = self.clock()
+              saved = {}
+              for row_id, row in self.rows.items():
+                  exp = self.expires.get(row_id)
+                  saved[row_id] = (dict(row), None if exp is None else exp - now)
+              token = len(self.snapshots) + 1
+              self.snapshots[token] = saved
+              return token
+
+          def restore(self, token):
+              saved = self.snapshots[token]                 # KeyError for an unknown token
+              now = self.clock()
+              self.rows, self.expires, self.heap = {}, {}, []
+              for row_id, (row, remaining) in saved.items():
+                  self.rows[row_id] = dict(row)             # a copy: the snapshot must survive later writes
+                  if remaining is not None:
+                      self.expires[row_id] = now + remaining
+                      self.heap.append((now + remaining, row_id))
+              heapq.heapify(self.heap)
+              for column in self.indexes:                   # index definitions are schema: rebuild each over the restored rows
+                  self.create_index(column)
+  - title: "Transactions (optional stage)"
+    brief: "begin, commit and rollback, one level deep; begin inside a transaction raises RuntimeError. Reads inside a transaction see its writes, and rollback restores rows, their expiry and every index to their state at begin. A rollback costs time in proportion to the rows the transaction touched, not the table: the visible test rolls back 2,000 transactions over 50,000 rows within 2 seconds. snapshot and restore inside a transaction raise RuntimeError, because a snapshot would capture uncommitted rows."
+    starter: |
+      class Table(Table):
+          def begin(self):
+              raise NotImplementedError
+
+          def commit(self):
+              raise NotImplementedError
+
+          def rollback(self):
+              raise NotImplementedError
+    tests: |
+      import time
+
+      def raises(exc, fn, *args):
+          try:
+              fn(*args)
+          except exc:
+              return True
+          return False
+
+      clock = ManualClock(0.0)
+      t = Table({"owner": str, "amount": int}, clock=clock)
+      t.create_index("amount")
+      t.put("inv1", {"owner": "ada", "amount": 100})
+      t.put("inv2", {"owner": "bob", "amount": 250}, ttl=60)
+      t.begin()
+      t.put("inv1", {"owner": "ada", "amount": 900})
+      t.put("inv3", {"owner": "cy", "amount": 40})
+      t.delete("inv2")
+      assert t.get("inv1")["amount"] == 900 and t.get("inv2") is None, "a transaction reads its own writes"
+      t.rollback()
+      assert t.get("inv1") == {"owner": "ada", "amount": 100} and t.get("inv3") is None
+      assert t.get("inv2") == {"owner": "bob", "amount": 250}, "a deleted row comes back"
+      assert [rid for rid, _ in t.scan([("amount", ">", 50)])] == ["inv1", "inv2"], "indexes roll back with the rows"
+      clock.now = 60.0
+      assert t.get("inv2") is None, "the restored row keeps its original expiry"
+      t.begin()
+      t.put("inv4", {"owner": "di", "amount": 7})
+      t.commit()
+      assert t.get("inv4") is not None
+      assert raises(RuntimeError, t.commit) and raises(RuntimeError, t.rollback)
+      t.begin()
+      assert raises(RuntimeError, t.begin), "no nesting in this table"
+      assert raises(RuntimeError, t.snapshot), "a snapshot would capture uncommitted rows"
+      t.rollback()
+
+      big = Table({"n": int}, clock=ManualClock(0.0))
+      big.create_index("n")
+      for i in range(50000):
+          big.put(f"k{i}", {"n": i})
+      t0 = time.perf_counter()
+      for i in range(2000):
+          big.begin()
+          big.put(f"k{i}", {"n": -1})
+          big.put(f"extra{i}", {"n": i})
+          big.delete(f"k{i + 1}")
+          big.rollback()
+      elapsed = time.perf_counter() - t0
+      assert len(big) == 50000 and big.get("k5") == {"n": 5}
+      assert elapsed < 2, f"2,000 rolled-back transactions over 50,000 rows took {elapsed:.1f} s; the budget is 2 s"
+    hidden: |
+      import random as _r
+
+      def _txn_check(seed):
+          rng = _r.Random(seed)
+          clk = ManualClock(0.0)
+          tb = Table({"v": int}, clock=clk)
+          tb.create_index("v")
+          model, committed, open_ = {}, {}, False
+          for _ in range(2000):
+              clk.now += rng.choice([0, 0, 1])
+              now = clk.now
+              rid = f"r{rng.randrange(10)}"
+              op = rng.random()
+              if op < 0.4:
+                  row, ttl = {"v": rng.randrange(4)}, rng.choice([None, None, 3])
+                  tb.put(rid, row, ttl=ttl)
+                  model[rid] = (row, None if ttl is None else now + ttl)
+              elif op < 0.5:
+                  tb.delete(rid)
+                  model.pop(rid, None)
+              elif op < 0.6 and not open_:
+                  tb.begin()
+                  committed, open_ = dict(model), True
+              elif op < 0.68 and open_:
+                  tb.commit()
+                  open_ = False
+              elif op < 0.76 and open_:
+                  tb.rollback()
+                  model, open_ = dict(committed), False
+              else:
+                  live = {k: r for k, (r, e) in model.items() if e is None or now < e}
+                  v = rng.randrange(4)
+                  if [k for k, _ in tb.scan([("v", "<=", v)])] != sorted(k for k, r in live.items() if r["v"] <= v):
+                      return False
+                  if tb.get(rid) != live.get(rid):
+                      return False
+          return True
+
+      assert all(_txn_check(s) for s in range(6))
+    solution: |
+      class Table(Table):
+          def __init__(self, columns, **options):
+              super().__init__(columns, **options)
+              self.undo = None       # row_id -> (stored row or None, expiry) before the transaction first touched it
+
+          def _remember(self, row_id):
+              if self.undo is not None and row_id not in self.undo:
+                  row = self.rows.get(row_id)
+                  self.undo[row_id] = (None if row is None else dict(row), self.expires.get(row_id))
+
+          def _erase(self, row_id):
+              self._remember(row_id)                       # every path that drops a row, purge included
+              return super()._erase(row_id)
+
+          def _write(self, row_id, row):
+              self._remember(row_id)
+              super()._write(row_id, row)
+
+          def begin(self):
+              if self.undo is not None:
+                  raise RuntimeError("a transaction is already open")
+              self.undo = {}
+
+          def commit(self):
+              if self.undo is None:
+                  raise RuntimeError("no open transaction")
+              self.undo = None
+
+          def rollback(self):
+              if self.undo is None:
+                  raise RuntimeError("no open transaction")
+              undo, self.undo = self.undo, None            # restoring must not log itself
+              for row_id, (row, exp) in undo.items():
+                  super()._erase(row_id)
+                  if row is not None:
+                      super()._write(row_id, row)
+                      if exp is not None:
+                          self.expires[row_id] = exp
+                          heapq.heappush(self.heap, (exp, row_id))
+
+          def snapshot(self):
+              if self.undo is not None:
+                  raise RuntimeError("snapshot inside a transaction would save uncommitted rows")
+              return super().snapshot()
+
+          def restore(self, token):
+              if self.undo is not None:
+                  raise RuntimeError("restore inside a transaction cannot be rolled back")
+              super().restore(token)
+---
+This lab grows one table class over five steps. Each step adds a requirement that a design fitted only to the previous step tends to get wrong. Step n runs its tests against everything you have written so far, so the indexes from step 2 have to survive the expiry from step 3, the snapshots from step 4 and the rollbacks from step 5.
+
+Each step subclasses the last (`class Table(Table)`), so a step can call what came before it through `super()`. The design choice that pays off in every later step comes in step 1: route every write and every removal through one method each. Indexes, expiry and the undo log then hook into two places instead of six.
+
+Time is injected through `ManualClock`, so the expiry tests are deterministic. Three steps carry budgets that a full scan or a whole-table copy cannot meet:
+
+- **Step 2:** 600 range scans over 50,000 rows.
+- **Step 3:** a purge that must hand back memory from 20,000 expired rows.
+- **Step 5:** 2,000 rollbacks over 50,000 rows.
+
+The specifications are original. They are modelled on the progressive in-memory database rounds that candidates report from Ramp, Anthropic and Perplexity, where each round adds functionality to the same code.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser, with the standard library only.

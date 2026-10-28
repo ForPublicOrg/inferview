@@ -1,0 +1,135 @@
+---
+title: Tensor, pipeline and expert parallelism for serving
+track: inference
+module: faster-cheaper
+order: 5
+kind: lesson
+level: senior
+minutes: 13
+summary: Tensor parallelism splits every layer and synchronises twice per layer per step, so it lowers per-token latency inside an NVLink domain and nowhere else; pipeline parallelism splits layers and fits models across nodes at a latency cost; expert parallelism keeps MoE experts whole and pays an all-to-all; and the layout for a stated model and node follows from fit, latency floor and KV room per replica.
+prerequisites: [inference/inference-anatomy/roofline-serving]
+updated: 2026-10-28
+sources:
+  - title: "Shoeybi et al., Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism (arXiv 1909.08053, 2019)"
+    url: https://arxiv.org/abs/1909.08053
+    note: "Intra-layer model parallelism; the MLP block needs one all-reduce in the forward pass, and a transformer layer needs two all-reduces in the forward path and two in the backward path (Section 3, Figure 4). Checked 2026-10-28."
+  - title: "Narayanan et al., Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM (arXiv 2104.04473, SC 2021)"
+    url: https://arxiv.org/abs/2104.04473
+    note: "Composes tensor, pipeline and data parallelism to avoid expensive cross-node communication and idle devices; interleaved pipeline schedule improves throughput by 10% or more; 502 petaFLOP/s on 3,072 GPUs at 52% of peak for a 1-trillion-parameter model (training). Checked 2026-10-28."
+  - title: vLLM docs, Optimization and Tuning (latest, page dated 2026-10-27)
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: "TP shards parameters within each layer, for models too large for one GPU or to free memory for KV, most common within a single node, may cause excessive synchronisation overhead; PP distributes layers, for when efficient TP is maxed out or across nodes, may cause latency penalties; example tensor_parallel_size 4 with pipeline_parallel_size 2; EP for MoE models with enable_expert_parallel; DP replicates the model to scale throughput. Checked 2026-10-28."
+  - title: vLLM docs, Expert Parallel Deployment (latest, page dated 2026-10-02)
+    url: https://docs.vllm.ai/en/latest/serving/expert_parallel_deployment.html
+    note: "EP more efficient with DP; EP size = TP size x DP size; attention replicated across DP ranks at TP 1; all2all backends allgather_reducescatter (default), deepep_high_throughput for prefill, deepep_low_latency for decode; EPLB redistributes experts because token routing is skewed, redundant experts cost GPU memory. Checked 2026-10-28."
+  - title: DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: "671B total, 37B activated per token; 1 shared and 256 routed experts per MoE layer, 8 routed active; prefill unit 4 nodes, 32 GPUs, attention TP4 with SP and DP8, MoE EP32, 32 redundant experts re-chosen periodically; decode unit 40 nodes, 320 GPUs, attention TP4 with SP and DP80, MoE EP320; NVLink 160 GB/s against InfiniBand 50 GB/s. Checked 2026-10-28."
+  - title: gpt-oss-120b config.json
+    url: https://huggingface.co/openai/gpt-oss-120b/raw/main/config.json
+    note: "36 layers, 128 local experts, 4 experts per token, 64 attention heads, 8 KV heads. Checked 2026-10-28."
+  - title: NVIDIA H100 product page
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: "H100 SXM: 80 GB, 3.35 TB/s, NVLink 900 GB/s, PCIe Gen5 128 GB/s. Checked 2026-10-28."
+  - title: The Llama 3 Herd of Models (Meta, 2024), Table 3
+    url: https://arxiv.org/html/2407.21783
+    note: "70B: 80 layers, model dimension 8,192, 64 heads, 8 KV heads; 405B: 126 layers, model dimension 16,384, 128 heads, 8 KV heads. Checked 2026-10-28."
+  - title: "Agrawal et al., Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve (arXiv 2403.02310, 2024)"
+    url: https://arxiv.org/abs/2403.02310
+    note: "Uniform chunked batches reduce imbalance between iterations and so minimise pipeline bubbles under pipeline parallelism. Checked 2026-10-28."
+  - title: vLLM docs, Speculative Decoding (latest)
+    url: https://docs.vllm.ai/en/latest/features/speculative_decoding/
+    note: "Pipeline parallelism not composable with speculative decoding in vllm 0.15.0 and earlier. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Four ways to use more than one GPU
+
+A serving deployment uses several GPUs for one of two reasons: the model does not fit on one, or one replica is too slow per token. Data parallelism, more replicas, addresses neither; it adds throughput. The other three split a single replica, and each one moves a different cost.
+
+Tensor parallelism (TP) splits every weight matrix across the GPUs of a group, so each GPU holds and reads a slice of every layer and the group combines partial results with collectives inside every layer. Pipeline parallelism (PP) assigns contiguous layers to different GPUs, so only the activations at stage boundaries cross between them. Expert parallelism (EP) places whole experts of a mixture-of-experts model on different GPUs and routes each token to the GPUs holding its experts. vLLM's guidance follows the same lines: TP is "the most common strategy for large model inference within a single node", PP is for when efficient TP is maxed out or across nodes, EP is for MoE models, and DP replicates the model to scale throughput.
+
+## Tensor parallelism: latency for synchronisation
+
+TP is the only one of the three that lowers the latency floor of a decode step. A step reads every weight once; with TP the read is split, so each GPU reads 1/N of the bytes in parallel.
+
+<Predict id="inf-par-tp4-floor" question="Llama 3 70B in BF16 (140 GB of weights) at tensor parallel 4 on H100 SXM (3.35 TB/s each). What is the weight-read floor of one decode step, in milliseconds, ignoring KV reads and communication?" answer={10.4} tolerance={0.6} unit="ms">
+<p>Each GPU reads 140 / 4 = 35 GB: 35e9 / 3.35e12 = <b>10.4 ms</b>, against 41.8 ms if one GPU could hold all 140 GB. The same 70B in FP8 at TP4 reads 17.5 GB per GPU, 5.2 ms.</p>
+</Predict>
+
+The price is synchronisation. Megatron-LM's layout splits the first GEMM of each block by columns and the second by rows, so a transformer layer needs two all-reduces in the forward pass, one after attention and one after the MLP. Serving runs only the forward pass, so Llama 3 70B at any TP degree performs 2 × 80 = 160 all-reduces per decode step. Each carries the hidden state of every token in the step: 8,192 × 2 bytes = 16 KiB per token in BF16, so 1 MiB for a batch of 64. With a ring all-reduce each GPU sends about 2(N − 1)/N times the payload, which at TP8 and batch 64 is about 1.8 MiB per all-reduce and 294 MB per step.
+
+Two properties of that traffic decide where TP works. Volume grows with the batch, and at NVIDIA's listed 900 GB/s NVLink against 128 GB/s PCIe Gen5 per H100, the same bytes take about seven times longer over PCIe. And the count is fixed: 160 synchronisation points per token, each a barrier on the critical path, so any per-collective latency is paid 160 times per step. Across nodes, over a network instead of NVLink, both costs grow, which is why TP stays inside one NVLink domain and vLLM warns that raising it "may cause excessive synchronization overhead".
+
+TP also has a structural limit. Llama 3 70B and 405B both have 8 KV heads. At TP8 each GPU holds one KV head; beyond 8, the KV heads cannot be split further and must be replicated, so the extra GPUs add synchronisation without reducing KV bytes per GPU.
+
+## Pipeline parallelism: fit across nodes
+
+PP sends only activations between stages: one hidden state per token per boundary, rather than two collectives per layer. That tolerates slower links, which is why it is the standard way to span nodes; Megatron-LM's training work composes TP inside a node with PP across nodes for the same reason, to avoid expensive cross-node communication.
+
+For serving, PP buys capacity, not latency. A single sequence's decode step still traverses every stage in order, so its time per token is at least the sum of the stages plus the hops; vLLM lists latency penalties as the cost. To keep all stages busy, the scheduler needs at least as many micro-batches in flight as there are stages, so each stage processes a different batch at any moment. Under-filled pipelines leave stages idle, the bubble problem, which is why uneven batches hurt PP more than TP; Sarathi-Serve's uniform chunked batches were partly a fix for that. PP also composes less freely with other features: vLLM's docs state that PP and speculative decoding were not composable in vLLM 0.15.0 and earlier.
+
+The decision PP usually settles is a format question in disguise. Llama 3 405B in BF16 is 810 GB, more than one node of eight 80 GB H100s (640 GB), so BF16 needs two nodes, TP8 within each and PP2 across them. In FP8 it is 405 GB and fits one node. One token of its BF16 KV is 2 × 126 layers × 8 KV heads × 128 × 2 bytes = 516,096 bytes. With 5 GB per GPU reserved, the FP8 single node leaves 640 − 405 − 40 = 195 GB, about 378,000 tokens; the BF16 two-node pipeline leaves 1,280 − 810 − 80 = 390 GB, about 756,000 tokens, at twice the GPUs and with a cross-node hop in every step. If FP8 passes the quality floor, the single node wins on latency and cost per token; if it does not, PP is what makes BF16 possible at all.
+
+## Expert parallelism: keep experts whole
+
+An MoE layer has many small expert MLPs and routes each token to a few of them. TP would slice every expert N ways, turning already small per-expert GEMMs into tiny ones. EP instead places whole experts on different GPUs: each token's hidden state is sent to the GPUs holding its experts and the results are sent back, an all-to-all dispatch and combine in every MoE layer. DeepSeek's stated reason for wide EP is to give each expert a large enough batch.
+
+DeepSeek-V3's published deployment shows the shape at scale. The model has 671B parameters with 37B active per token, and each MoE layer has 1 shared and 256 routed experts with 8 routed experts active per token. The prefill unit is 4 nodes and 32 GPUs: attention at TP4 with sequence parallelism and DP8, MoE at EP32, plus 32 redundant copies of high-load experts, re-chosen periodically. The decode unit is 40 nodes and 320 GPUs with EP320, one expert per GPU. Tokens cross nodes over InfiniBand at 50 GB/s and are forwarded inside a node over NVLink at 160 GB/s in that cluster. Prefill and decode use different layouts because they have different bottlenecks, which is the disaggregation lesson applied to parallelism.
+
+In vLLM, EP is enabled with `enable_expert_parallel` and its size is TP × DP; with TP 1, attention is replicated across the data-parallel ranks while experts are sharded across all of them. The all-to-all backend follows the phase: `deepep_high_throughput` for prefill-heavy multi-node work, `deepep_low_latency` for decode, `allgather_reducescatter` as the default. Routing is skewed in practice, so some experts receive far more tokens than others and the GPUs holding them set the step time; vLLM's EPLB redistributes experts across ranks and can hold redundant copies, at a memory cost that comes out of KV capacity.
+
+## Picking a layout for a stated model and node
+
+The procedure: choose a format, then the smallest TP that fits the weights with enough KV room for the batch you need; raise TP inside the NVLink domain only if the latency floor misses the target; use PP only to cross nodes; use EP for MoE experts; spend remaining GPUs on replicas. For Llama 3 70B in FP8 on one node of eight H100 SXM, with 5 GB per GPU reserved:
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Layout</th><th>Weights per GPU</th><th>Decode floor (weights)</th><th>BF16 KV tokens per replica</th><th>Replicas</th><th>KV tokens on the node</th></tr></thead>
+<tbody>
+<tr><td>TP1 × 8</td><td>70 GB</td><td>20.9 ms</td><td>15,259</td><td>8</td><td>122,070</td></tr>
+<tr><td>TP2 × 4</td><td>35 GB</td><td>10.4 ms</td><td>244,141</td><td>4</td><td>976,562</td></tr>
+<tr><td>TP4 × 2</td><td>17.5 GB</td><td>5.2 ms</td><td>701,904</td><td>2</td><td>1,403,809</td></tr>
+<tr><td>TP8 × 1</td><td>8.75 GB</td><td>2.6 ms</td><td>1,617,432</td><td>1</td><td>1,617,432</td></tr>
+</tbody>
+</table>
+</div>
+
+KV tokens per replica are (N × 80 − 70 − N × 5) GB over 327,680 bytes. TP1 is ruled out by KV room: 15,259 tokens is a handful of chat sequences. Each step up in TP stores the weights once more per node instead of once per replica, which frees memory for KV, and halves the weight-read floor. Against that, it halves the number of independent replicas, so a replica failure or a slow request affects a larger share of traffic, and it adds synchronisation the floor column does not show. TP2 or TP4 is the usual answer for this model and node; the choice between them is the latency target. A 15 ms per-token target with KV reads on top rules out TP2's 10.4 ms floor in practice; a 50 ms target does not, and four replicas then give more scheduling freedom than two.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You need Llama 3 405B in production in six weeks on two nodes of eight H100 SXM. Quality requires BF16 on two of your ten evaluation slices; FP8 passes the rest. The latency target is 60 ms per output token at p99. The team proposes TP16 across both nodes because it was fastest in a single-user test. What layout do you deploy?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Not TP16: it puts 2 × 126 = 252 all-reduces per step on the cross-node network and cannot split 8 KV heads 16 ways. I would deploy FP8 at TP8 on each node, two replicas, for the slices where FP8 passes, and decide the two BF16 slices separately: either a TP8 by PP2 BF16 replica across both nodes for that traffic, or a quality exception signed off for FP8. The single-user test measured the floor, not the system at load.</p>
+</Fragment>
+<Fragment slot="long">
+<p>TP16 lowers the weight-read floor most, which is why it won a single-user test: 810 GB split 16 ways is 50.6 GB per GPU, 15 ms. At load, each step's 252 all-reduces carry the whole batch's hidden states across InfiniBand instead of NVLink, and the KV heads are replicated beyond TP8, so KV room per GPU does not improve. It also makes the whole fleet one replica.</p>
+<p>FP8 at TP8 per node: 405 GB of weights, a floor of 50.6 GB per GPU over 3.35 TB/s, also 15 ms, about 378,000 tokens of BF16 KV per replica, and two independent replicas. That meets 60 ms with room for KV reads for most traffic. The two BF16 slices are the real decision. A BF16 replica needs both nodes (TP8 within, PP2 across), leaving nothing for FP8 traffic; so the options are to time-share, buy a third node, or ship FP8 for those slices with the measured regression written down and signed by the slice owner.</p>
+<p>With six weeks, I would ship FP8 for the eight passing slices, keep the two BF16 slices on their current path if one exists, and put the third-node purchase against the measured value of those two slices. What we give up is a single deployment for all traffic, and some cost for routing by slice.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The team reruns the TP16 test at batch 32 and it still meets 60 ms. Does that change your answer, and what would you test next?</em> The p99 at the expected peak batch with production context lengths, and the failure behaviour of a single sixteen-GPU replica.</li>
+<li><em>Finance refuses the third node and the owners of the two slices refuse FP8. How do you decide without deciding by rank?</em></li>
+<li><em>What would make you move the BF16 slices to a pipeline across both nodes permanently?</em> For example, their traffic share growing past the point where time-sharing two replicas costs more in latency misses than a dedicated BF16 deployment.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The table counts only weight reads. Communication, KV reads and kernel efficiency all change with the TP degree: small per-GPU GEMMs at high TP run further from peak, and the all-reduce cost depends on message sizes that change with the batch. Measure step time against batch size for each candidate layout before choosing; the table only says which layouts are worth measuring.
+
+The MoE picture depends on routing statistics that differ between models and traffic. A workload that sends most tokens to a few experts makes EP behave like a slow TP with one hot GPU, and expert load balancers trade memory for that imbalance. DeepSeek's layout is the published design of one operator at one scale, with its own network; copy the reasoning, not the degrees.
+
+And the hardware boundary moves. Systems with NVLink domains larger than eight GPUs, such as rack-scale designs, move the edge where TP stops paying, and the "TP inside a node" rule is really "TP inside the fast interconnect domain". Check the domain size of the hardware you have before applying it.
+
+<SelfRate id="lesson:inference/faster-cheaper/serving-parallelism" />

@@ -1,0 +1,89 @@
+---
+id: wfl-033
+title: Design an inference job API
+subtitle: submit, poll, partial failure and a model change mid-flight
+track: workflows
+module: batch-pipelines
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 45
+tags: [api-design, idempotency, async-jobs, rate-limits, model-versioning]
+companies:
+  - name: Anthropic
+    url: https://prachub.com/interview-questions/design-a-batch-inference-api
+updated: 2026-10-28
+sources:
+  - title: PracHub, Design a batch inference API
+    url: https://prachub.com/interview-questions/design-a-batch-inference-api
+    note: candidate report dated 2025-09-06 (page updated 2026-06-21) of an Anthropic software engineer onsite, ML system design; the prompt asks for a POST-then-poll inference API with idempotency keys, timeouts and retries, rate limits and partial failures, and a follow-up on a model version repointed mid-flight; the design below is original; checked 2026-10-28
+  - title: Claude docs, Batch processing
+    url: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+    note: processing_status in_progress, canceling and ended; request_counts per result type; results matched on custom_id; 24-hour expiry; results kept 29 days; errored, canceled and expired requests not billed; checked 2026-10-28
+  - title: OpenAI API docs, Batch API
+    url: https://developers.openai.com/api/docs/guides/batch
+    note: an expired batch returns completed results and marks unfinished requests batch_expired; output file deleted 30 days after completion; batch creation capped at 2,000 batches per hour; checked 2026-10-28
+  - title: Gemini API docs, Batch API
+    url: https://ai.google.dev/gemini-api/docs/batch-api
+    note: sending the same creation request twice creates two separate batch jobs; jobs expire after 48 hours running or pending; results kept 6 weeks; checked 2026-10-28
+  - title: OpenAI API docs, Flex processing
+    url: https://developers.openai.com/api/docs/guides/flex-processing
+    note: flex requests can fail with 429 Resource Unavailable when capacity is short, and are not charged when that happens; checked 2026-10-28
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt, paraphrased from a public candidate report">
+Design an inference API: clients submit a job with a POST, then poll until its results are ready.
+</Callout>
+
+The version for this problem (scenario): your team of four owns model serving for internal product teams. Today they call a synchronous endpoint that times out at 60 seconds, which cannot change because forty services depend on it. Teams now want to submit jobs of 1 to 50,000 inputs (document backfills, eval runs, nightly enrichment) and collect results later. The jobs run on the same GPU pool as the synchronous traffic, which keeps priority. Models are addressed by aliases such as `summarizer-latest`, and the serving team re-points an alias to a new version every few weeks.
+
+Design the API and the system behind it: request and response shapes, statuses, idempotency, retries, rate limits, partial failure, and what happens when the alias moves while a job is running. Write the decision you would put in the design doc about model versions.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what the teams do with results from two model versions in one job: an eval run and a backfill give different answers.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask how long the serving team keeps an old version deployed after re-pointing an alias.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the distribution of job sizes and how often a client resubmits after a network error today.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>POST /v1/jobs with an Idempotency-Key header returns 202, a job id and the resolved model version; GET /v1/jobs/&#123;id&#125; returns status, per-outcome counts and a results URL once the job ends; results are per item, joined on the client's item id. A job ends when every item has an outcome, and "ended with 40 failures" is a normal result, not a job failure. The alias is resolved once, at submission, and pinned for the job. Admission is per team, in items queued, with 429 and Retry-After. The cost of pinning: old versions stay deployed until their queued jobs drain, or the jobs expire with a named error.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Submit. Body: model (alias or version), items with a client item id each (unique, length and charset bounded), optional max_tokens and an optional completion window. Response 202: job id, the model version the alias resolved to, the expiry time and the queue position estimate. A body that fails validation as a whole gets 400; per-item problems (an input over the context limit) become item outcomes, so one bad item does not reject 50,000 good ones.</p>
+<p>Idempotency. The key is scoped to the calling team. The server stores the key, a hash of the body and the job id. The same key with the same body returns the original job; the same key with a different body returns 409. Retention is a choice: I keep keys for 7 days, longer than any client retry loop and shorter than results retention. Without this, a client that times out on submit and retries creates a second job; Gemini's batch docs state exactly that behaviour for their own create call.</p>
+<p>Statuses. Job: queued, running, canceling, ended. Item outcomes: succeeded, failed (with a retryable flag and a code), canceled, expired. Counts per outcome on the job, as Claude's request_counts and OpenAI's batch statuses do. I keep the job status free of a "partially failed" value: clients branch on the counts, and a job status that flips on one failed item gets treated as a hard failure and retried whole.</p>
+<p>Execution. Items go to a durable queue; workers run them at least once; results are written keyed by (job id, item id), so a re-run after a worker crash overwrites the same row. Transient failures (OOM, preemption by synchronous traffic) are retried by the system up to a budget of 3; validation failures are not. Items not run within the completion window (24 hours by default) end as expired and are not billed, the same contract the public batch APIs give.</p>
+<p>Rate limits and fairness. Admission control in items queued per team, not jobs per minute, because one job can be 50,000 items. Over the limit: 429 with Retry-After. Scheduling is fair-share across teams in the batch lane, and the batch lane only gets GPU capacity the synchronous lane is not using; preempted items return to the queue and do not count as retries against the client. OpenAI's flex processing makes the same trade in public: a flex request can fail with 429 Resource Unavailable when capacity is short, and is not charged.</p>
+<p>Polling and results. GET returns Retry-After to pace polls; results as a paged JSONL stream, one line per item with the item id, outcome, model version and usage. Results kept 29 days (Claude keeps batch results 29 days, OpenAI deletes output files after 30, Gemini keeps 6 weeks; pick one and state it).</p>
+<p>The decision, as written in the design doc. "A job's model alias is resolved at submission and pinned. Every item records the version that ran it. When a version is retired, queued items on it expire with code model_retired after a 72-hour drain window, and clients resubmit against the alias." Two defensible alternatives and their costs: pinning keeps results comparable inside a job (an eval run or a backfill must not mix versions) and costs GPU memory to keep old versions loaded during the drain; resolving at execution lets the serving team re-point instantly and frees the old version's capacity, and costs mixed-version jobs that clients have to detect from per-item versions.</p>
+<p>What I give up: instant rollouts, and some GPU capacity for up to 72 hours after each re-point. The failure mode of pinning: a version re-pointed because of a safety or quality defect stays live for queued jobs. The override is an operator action that re-pins queued items to the new version and marks them, so clients can see which items ran where.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Keeping old versions loaded during every drain costs a fifth of the pool (scenario). The infra lead wants to re-point in-flight jobs. What do you agree to, and what do you write down?</em> Shorten the drain window and move expired items to the new version only for jobs submitted with an opt-in flag; write down which teams' jobs may mix versions.</li>
+<li><em>What would you need to see in production to switch to resolving at execution?</em> Evidence that clients read per-item versions and that no eval or backfill consumer breaks on mixed results, from a month of jobs where the version was recorded.</li>
+<li><em>A client polls every 100 ms on 2,000 jobs. What protects you, and what do you tell them?</em> Per-team poll rate limits with Retry-After, and a completion webhook or event so they stop polling.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Two senior engineers disagree on whether "ended with failures" should be a separate job status. How do you decide without deciding by rank?* Look at how the forty existing client services branch on statuses today and choose the shape that makes the common branch correct by default.
+- *The batch lane is starved for six hours during a traffic peak and a nightly job misses its consumer's deadline. Whose problem is it, and what does the API promise?* The API promises a completion window and expiry, not a time; a team that needs a deadline buys a reserved share of the pool and pays for it.
+- *An item's input contains a document from a tenant that the calling team is not allowed to read. Where is that checked?* At submission, against the caller's identity, before anything is queued; a job API that only checks at execution leaks through error messages.
+
+## Common mistakes
+
+- Treating an idempotency key as unique per job instead of per team and body.
+- One status for the job that hides per-item outcomes.
+- Resolving the alias per item without recording the version, so nobody can tell what ran.
+- Rate limiting by jobs per minute when cost is in items.
+- Retrying validation failures with the same input.

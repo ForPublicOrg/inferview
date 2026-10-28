@@ -1,0 +1,161 @@
+---
+title: State space models and why production uses hybrids
+track: multimodal
+module: architectures
+order: 2
+kind: lesson
+level: staff
+minutes: 15
+summary: A state space layer keeps a fixed-size state per sequence instead of a cache that grows with every token, a fixed state provably cannot copy arbitrarily long strings, and every shipped long-context hybrid keeps a minority of attention layers to cover that gap.
+prerequisites: ["multimodal/architectures/mla"]
+updated: 2026-10-28
+sources:
+  - title: "Mamba: Linear-Time Sequence Modeling with Selective State Spaces (arXiv 2312.00752)"
+    url: https://arxiv.org/abs/2312.00752
+    note: "SSM parameters as functions of the input; hardware-aware parallel algorithm in recurrent mode; the paper reports 5x higher inference throughput than Transformers and linear scaling in sequence length; Mamba-3B outperforms Transformers of the same size and matches Transformers twice its size. Checked 2026-10-28."
+  - title: "Transformers are SSMs, Mamba-2 (arXiv 2405.21060)"
+    url: https://arxiv.org/abs/2405.21060
+    note: "state space duality connects SSMs and attention variants through decompositions of structured semiseparable matrices; the Mamba-2 core layer is reported 2-8x faster than Mamba's and competitive with Transformers on language modelling. Checked 2026-10-28."
+  - title: "Repeat After Me: Transformers are Better than State Space Models at Copying (arXiv 2402.01032)"
+    url: https://arxiv.org/abs/2402.01032
+    note: "a two-layer transformer can copy strings of exponential length; generalized SSMs are fundamentally limited by their fixed-size latent state; on synthetic copying, transformers train more efficiently and generalise better; pretrained transformers dramatically outperform SSMs at copying and retrieving from context. Checked 2026-10-28."
+  - title: "Jamba: A Hybrid Transformer-Mamba Language Model (arXiv 2403.19887)"
+    url: https://arxiv.org/html/2403.19887
+    note: "blocks of 8 layers with an attention-to-Mamba ratio of 1:7, MoE every 2 layers with 16 experts and top-2; 4 blocks; 52B total, 12B active; 256K context; fits a single 80GB GPU at 140K tokens; no explicit positional information; Table 1 KV cache at 256K in 16-bit: Mixtral 32GB, Jamba 4GB. Checked 2026-10-28."
+  - title: Jamba-v0.1, config.json
+    url: https://huggingface.co/ai21labs/Jamba-v0.1/blob/main/config.json
+    note: "hidden 4096, 32 heads, 8 KV heads, 32 layers, attn_layer_period 8, attn_layer_offset 4, mamba_d_state 16, mamba_d_conv 4, mamba_expand 2, max_position_embeddings 262144. Checked 2026-10-28."
+  - title: Mixtral-8x7B-v0.1, config.json
+    url: https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json
+    note: "32 layers, hidden 4096, 32 heads, 8 KV heads, 8 local experts with 2 per token, bfloat16. Checked 2026-10-28."
+  - title: "MiniMax-01: Scaling Foundation Models with Lightning Attention (arXiv 2501.08313)"
+    url: https://arxiv.org/html/2501.08313
+    note: "one softmax attention block after every seven lightning attention blocks, 80 layers; 456B total, 45.9B activated; trained to 1M tokens and extrapolated to 4M at inference; at 1,024,000 tokens softmax attention is about 95% of inference latency and lightning attention under 12%. Checked 2026-10-28."
+  - title: "Kimi Linear: An Expressive, Efficient Attention Architecture (arXiv 2510.26692)"
+    url: https://arxiv.org/html/2510.26692
+    note: "3 KDA layers to 1 MLA layer; NoPE on all MLA layers; KDA extends Gated DeltaNet with finer-grained gating; 48B total, 3B activated; the paper reports up to 75% less KV cache and up to 6x decoding throughput at 1M context. Checked 2026-10-28."
+  - title: Kimi-Linear-48B-A3B-Instruct, config.json
+    url: https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct/blob/main/config.json
+    note: "27 layers: KDA layers 1-3, 5-7, ... 25-26 (20 layers) and full-attention layers 4, 8, ... 24, 27 (7 layers); kv_lora_rank 512, qk_rope_head_dim 64; KDA 32 heads of dimension 128; model_max_length 1048576. Checked 2026-10-28."
+  - title: Qwen3.8-27B model card and config.json
+    url: https://huggingface.co/Qwen/Qwen3.8-27B
+    note: "64 layers laid out as 16 × (3 × (Gated DeltaNet, FFN), 1 × (Gated Attention, FFN)); gated attention 24 query and 4 KV heads of dimension 256; Gated DeltaNet 48 value heads and 16 query-key heads of dimension 128; 262,144 tokens native, extensible to 1,000,000; card citation dated August 2026. Checked 2026-10-28."
+  - title: "Gated Delta Networks: Improving Mamba2 with Delta Rule (arXiv 2412.06464)"
+    url: https://arxiv.org/abs/2412.06464
+    note: "gating for rapid memory erasure, the delta rule for precise memory modifications; proposes hybrids with sliding window attention or Mamba2 layers; reports surpassing Mamba2 and DeltaNet including on in-context retrieval. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+A long-context model spends its serving memory on the KV cache, and the cache grows by a fixed number of bytes for every token of every live sequence. A state space layer, or any linear-attention layer, replaces that cache with a state whose size does not depend on sequence length. The question a serving or model team faces is not "transformer or SSM" but what fraction of layers can be recurrent before retrieval from context degrades, and what that buys in memory. Every shipped hybrid below answers it with one attention layer in four to one in eight.
+
+## What a selective state space layer stores
+
+A linear recurrence keeps a state `h_t = A_t h_(t-1) + B_t x_t` and reads `y_t = C_t h_t`. Classic SSMs fixed `A`, `B` and `C` per layer, which made the recurrence a convolution that trains in parallel but cannot decide, token by token, what to keep. Mamba makes `B`, `C` and the step size functions of the input, so the layer can write some tokens into the state strongly and let others pass. Input dependence rules out the convolution trick, and the paper replaces it with a hardware-aware parallel scan run in recurrent mode. The paper reports 5 times the inference throughput of Transformers and a Mamba-3B that matches Transformers twice its size.
+
+Mamba-2 recasts the same computation as multiplication by a structured semiseparable matrix, the masked attention-like matrix a linear recurrence implies. That duality is what lets the core layer run as chunked matrix multiplications on tensor cores; the paper reports it 2 to 8 times faster than Mamba's. Gated DeltaNet and Kimi's KDA are in the same family with a different update. Instead of only decaying and adding, the delta rule overwrites the value stored under a key, and a gate erases memory quickly. The Gated DeltaNet paper argues the two are complementary and reports gains over Mamba2 on in-context retrieval, among other benchmarks.
+
+For a serving engineer, the state is a fixed-size tensor per sequence per layer. Jamba's Mamba layers use `mamba_expand` 2 on a 4,096 hidden size and `d_state` 16, so each layer holds 8,192 × 16 = 131,072 state values plus a convolution buffer of 8,192 × 3 = 24,576 (kernel width 4, so three past inputs). It is a bounded-size cache entry that is overwritten in place, not appended to.
+
+## What a fixed state cannot do
+
+"Repeat After Me" proves that a two-layer transformer can copy strings of exponential length, while generalised SSMs are limited by their fixed-size latent state. The counting argument is short: a state of `S` bits can be in at most `2^S` configurations, and copying requires distinguishing every possible input string, so no state of `S` bits can copy a uniformly random string longer than `S / log2(V)` tokens from a vocabulary of `V`.
+
+At production sizes the bound is loose. Jamba's 28 Mamba layers hold 28 × 155,648 = 4,358,144 values; at 16 bits that is about 69.7 million bits, enough in principle for millions of tokens. The theorem says a limit exists; it does not say where a trained model hits it. The paper's empirical findings carry the weight: on synthetic copying tasks transformers train more efficiently and generalise better, and pretrained transformers dramatically outperform SSMs at copying and retrieving information from context. A state is a lossy summary written before the question is known. Attention keeps every token, so a question asked at the end of the context can still reach a token the recurrence never prioritised.
+
+That is the product risk: a pure recurrent model does well on perplexity and summarisation-style tasks and fails on "quote clause 14.2 exactly" or "which of these 300 functions calls `foo`".
+
+## What shipped
+
+Every production hybrid listed here keeps some full attention:
+
+| model | layout | attention layers | source |
+|---|---|---|---|
+| Jamba (AI21) | 1 attention per 7 Mamba, MoE every 2 layers | 4 of 32 | paper and config |
+| MiniMax-Text-01 | 1 softmax per 7 lightning attention | 10 of 80 | paper and config |
+| Kimi Linear 48B | 3 KDA per 1 MLA, NoPE on MLA layers | 7 of 27 | paper and config |
+| Qwen3.8-27B | 3 Gated DeltaNet per 1 gated attention | 16 of 64 | model card and config |
+
+The memory effect is computable from the configs. Jamba's 4 attention layers with 8 KV heads of dimension 128 cache 4 × 2 × 8 × 128 × 2 bytes = 16,384 bytes per token in 16-bit. Mixtral 8x7B has the same attention shape on all 32 layers, 131,072 bytes per token. At 262,144 tokens that is 4 GiB against 32 GiB, the paper's Table 1 figures, recomputed. Kimi Linear's reported "up to 75%" also falls out of its layout: 7 MLA layers of 27 cache, so against an all-MLA stack of the same depth the saving is 1 − 7/27 = 74%.
+
+<Predict id="mml-ssm-qwen-262k" question="Qwen3.8-27B has 16 full-attention layers with 4 KV heads of dimension 256. How many GiB of KV cache does one 262,144-token sequence need in 16-bit?" answer={16} tolerance={0.1} unit="GiB">
+Per token: 16 layers × 2 × 4 × 256 × 2 bytes = 65,536 bytes. Times 262,144 tokens = 17,179,869,184 bytes = 16 GiB. The 48 Gated DeltaNet layers add a fixed state of 48 × 48 value heads × 128 × 128 = 37,748,736 values, 72 MiB at 2 bytes, whatever the length.
+</Predict>
+
+The fixed state matters at the short end. Qwen3.8-27B's 72 MiB state equals its attention KV at 72 MiB / 64 KiB = 1,152 tokens, so for a chat workload with short prompts the recurrent state, not the KV cache, is most of each sequence's memory. Hybrids pay off at long context, and an engine that reserves the state per slot pays it even for a 50-token request.
+
+MiniMax-01 shows where time goes once attention is a minority. The paper reports that at 1,024,000 tokens the softmax layers are about 95% of inference latency and the lightning layers under 12%: one layer in eight dominates cost at the length the hybrid exists for.
+
+## A memory model you can run
+
+```python
+def per_sequence_bytes(tokens, attn_layers, kv_values_per_layer, state_values, bytes_per_value=2):
+    """KV that grows with tokens plus recurrent state that does not."""
+    kv = attn_layers * kv_values_per_layer * tokens * bytes_per_value
+    state = state_values * bytes_per_value
+    return kv, state
+
+GIB = 2 ** 30
+configs = {
+    # name: (attention layers, cached values per attention layer, recurrent state values)
+    "Jamba-v0.1": (4, 2 * 8 * 128, 28 * (8192 * 16 + 8192 * 3)),
+    "Mixtral-8x7B": (32, 2 * 8 * 128, 0),
+    "Kimi-Linear-48B": (7, 512 + 64, 20 * 32 * 128 * 128),
+    "Qwen3.8-27B": (16, 2 * 4 * 256, 48 * 48 * 128 * 128),
+}
+for tokens in (4_096, 131_072):
+    for name, (layers, per_layer, state) in configs.items():
+        kv, st = per_sequence_bytes(tokens, layers, per_layer, state)
+        print(f"{tokens:>7} {name:<16} kv {kv / GIB:6.2f} GiB  state {st / 2**20:6.1f} MiB")
+```
+
+Kimi Linear's line assumes the engine caches the 64-wide rotary key as DeepSeek-V3 does; the paper applies NoPE to its MLA layers, so an engine may cache 512 values instead of 576. Short convolution buffers are left out of every state figure except Jamba's.
+
+## What the state does to the rest of the serving stack
+
+Three features built for append-only KV caches need rework:
+
+- Prefix caching. A KV prefix can be truncated at any token. A recurrent state cannot be rewound, so reusing a shared system prompt requires a snapshot of every layer's state at that boundary, and a snapshot every N tokens costs a full state copy each time (72 MiB per snapshot for Qwen3.8-27B in 16-bit).
+- Speculative decoding. Rejecting drafted tokens means rolling back the state to before them, which again needs a snapshot or a recomputation.
+- Preemption and swapping. The state is small to move, which helps; the attention layers' KV still dominates at long context and behaves as before.
+
+Before adopting a hybrid, check that your engine supports the specific layer type (Mamba, Gated DeltaNet, KDA, lightning) with prefix caching and speculative decoding enabled together, and measure rather than assume.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"We serve a contract-analysis product on a dense 30B GQA model at up to 128K tokens. Memory caps us at four concurrent long sequences per GPU, and the sales team has promised 256K by next quarter. One option is a hybrid with three linear layers per attention layer; another is keeping the dense model and adding retrieval. Pick one and defend it."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>The hybrid cuts the per-token cache roughly by its attention fraction: three linear layers per attention layer leaves a quarter of the KV, so about four times the concurrency at the same length, or 256K at roughly half today's per-sequence memory. The risk is the product's core task: contract analysis needs exact recall of clauses, which is what the copying result says recurrent layers do worst. I would choose the hybrid only after an exact-recall evaluation on our own contracts at 128K and 256K shows it matching the dense model; until then, retrieval on the dense model is the safer way to meet 256K, at the cost of a retrieval stage that can miss the clause.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Memory first. If the dense model caches 2 × 8 × 128 values on each of 64 layers (a typical 30B GQA shape; use the real config), that is 262,144 bytes per token, 32 GiB at 131,072 tokens. A 3:1 hybrid of the same depth keeps 16 attention layers: 8 GiB plus a fixed state in the tens of MiB. At 256K the hybrid needs about 16 GiB, half of what the dense model needs at 128K today.</p>
+<p>Quality second. The Repeat After Me result and its pretrained-model comparison predict the failure: verbatim copying and retrieval from context degrade as attention is removed. Shipped hybrids keep one attention layer in four to one in eight for this reason. The evaluation that decides is exact recall on our own documents: quote clause N, list all indemnity caps, find the conflicting definition. A needle test does not decide it.</p>
+<p>Retrieval keeps the dense model's attention quality on what it reads but adds a stage that can miss the clause, and cross-document questions ("does any clause contradict clause 3?") suffer most.</p>
+<p>The decision: run both evaluations in the next three weeks; ship the hybrid if exact recall at 256K is within a pre-agreed margin of the dense model at 128K; otherwise ship retrieval and tell sales that 256K means 256K of documents searched, not read in one pass. Failure mode of the hybrid path: our engine's prefix cache for a shared contract template must snapshot recurrent state, and if it does not, every request re-prefills the template.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The hybrid passes exact recall at 128K but loses four points at 256K. Sales has signed two customers on 256K. Who decides whether to ship, and what do you write down?</li>
+<li>What would you need to see in production to reverse the hybrid decision after launch, and how would you detect it without labelled data?</li>
+<li>Your inference lead says the state snapshots for prefix caching cost more memory than the KV you saved for short requests. At what prompt length is she right, using Qwen3.8-27B's numbers?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The copying result concerns copying and retrieval. Hybrids with a minority of attention layers may close most of that gap, and the ratio that suffices depends on training; the shipped ratios are the vendors' choices, not a measured threshold.
+
+The memory arithmetic assumes 16-bit caches and states. Engines may keep recurrent state in 32-bit for numerical stability, which doubles every state figure above; check the engine, not the config.
+
+Throughput claims (Mamba's 5 times, Kimi Linear's 6 times at 1M) are the authors' measurements in their setups. At 4K-token workloads the attention share of cost is small and a hybrid's advantage mostly disappears.
+
+<SelfRate id="lesson:multimodal/architectures/ssm-hybrids" />

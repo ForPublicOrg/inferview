@@ -1,0 +1,129 @@
+---
+title: Model merging
+track: training
+module: distill-merge
+order: 2
+kind: lesson
+level: senior
+minutes: 12
+summary: When averaging weights from a shared initialisation beats training another round, how uniform soups, greedy soups and TIES differ, and how Llama 3 and OLMo 2 use checkpoint averaging inside their pipelines.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Wortsman et al., Model soups, averaging weights of multiple fine-tuned models improves accuracy without increasing inference time (ICML 2022)
+    url: https://arxiv.org/abs/2203.05482
+    note: "Uniform soup averages all fine-tuned models; greedy soup adds models in decreasing order of held-out accuracy and keeps each only if held-out accuracy does not drop. CLIP ViT-B/32 on ImageNet (Table 3): best individual 80.38, uniform soup 79.97, greedy soup 81.03, ensemble 81.19; inference cost O(1) for soups against O(k) for ensembles; ViT-G/14 greedy soup 90.94. Error barriers appear mainly with high fine-tuning learning rates; uniform soups beat the best model only when all ingredients are accurate; soups do not improve calibration as ensembles do; gains are smaller for an ImageNet-22k pretrained model. Checked 2026-10-28."
+  - title: Yadav et al., TIES-Merging, Resolving Interference When Merging Models (NeurIPS 2023)
+    url: https://arxiv.org/abs/2306.01708
+    note: "Task vector = fine-tuned minus initial weights; trim to the top-k% by magnitude, elect the sign of the summed values, average only the agreeing nonzero values; recipe without validation k = 20%, lambda = 1. Table 1 against task arithmetic with validation: T5-Base 73.9 vs 73.2, T5-Large 76.9 vs 73.3, ViT-B/32 73.6 vs 70.1, ViT-L/14 86.0 vs 84.5. Sign conflicts occur even when merging two models; merging relies on common initialisation and architecture and lags multitask training. Checked 2026-10-28."
+  - title: Llama Team, AI at Meta, The Llama 3 Herd of Models (2024)
+    url: https://arxiv.org/html/2407.21783
+    note: "Learning rate linearly annealed to 0 over the final 40M pretraining tokens, and the final pretrained model is an average of checkpoints during annealing (Polyak averaging); in post-training, models from experiments with various data or hyperparameters are averaged at each RM, SFT or DPO stage; six rounds of post-training. Checked 2026-10-28."
+  - title: OLMo Team, 2 OLMo 2 Furious (2025)
+    url: https://arxiv.org/html/2501.00656
+    note: "7B: mid-training run three times for 50B tokens each with different data orders, and the three models averaged; 13B and 32B: three runs of 100B tokens and one of 300B, final model the average of all four; averaging checkpoints trained on the same mixture with different data-order seeds consistently improves over individual checkpoints; the 1B is not averaged. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+You have two or more checkpoints that share an ancestor: fine-tunes on different tasks, runs of one recipe with different seeds or data orders, or several points along one run. Merging produces one set of weights from them by arithmetic, with no gradient steps and no change in inference cost. The alternative is to train again, either one multitask run or one more round of the stage that produced them. Merging is the cheap option; this lesson is about when the cheap option is also the right one.
+
+It is tempting to treat merging as an ensemble with the bill removed. It is not. An ensemble runs every model and combines outputs, so it works for any set of models, including ones with different architectures. A merge runs one model whose weights are a combination of the others, and that model is only good if the combined point in weight space is itself a good model. The soups paper puts the difference in its cost column: an ensemble of k models costs O(k) at inference, a soup costs O(1). The price of that column is a precondition: the ingredients must sit in a region of weight space where the loss stays low along the straight lines between them.
+
+## Why a shared initialisation matters
+
+Fine-tuning from a large pretrained checkpoint moves the weights a small distance, and the soups paper's premise is that fine-tunes of one checkpoint often land in a single low-error basin. Interpolating between two points in that basin stays in it. Two independently pretrained models have no such relation; their hidden units are permuted relative to each other, and averaging them produces a model that is neither.
+
+Even from one initialisation the property can fail. The paper reports error barriers between fine-tuned models, mainly when fine-tuning used high learning rates, and observed that models fine-tuned at a learning rate of 1e-4 ended far from the initial model and were often rejected by the greedy procedure. A merge of checkpoints you did not train yourself starts with checking their lineage and learning rates, not with running the merge.
+
+## Uniform and greedy soups
+
+The uniform soup averages every fine-tune. The greedy soup sorts the fine-tunes by held-out accuracy, starts from the best, and adds each next model only if the held-out accuracy of the average does not drop. On CLIP ViT-B/32 fine-tuned on ImageNet the paper's Table 3 shows why the greedy step exists:
+
+| Method | ImageNet top-1 | Inference cost |
+|---|---|---|
+| Best single fine-tune | 80.38 | 1 model |
+| Uniform soup | 79.97 | 1 model |
+| Greedy soup | 81.03 | 1 model |
+| Ensemble | 81.19 | k models |
+
+The uniform soup lost to the best single model, because some ingredients sat outside the basin; the paper notes uniform soups beat the best model only when every ingredient is accurate. The greedy soup recovered 0.65 of the ensemble's 0.81-point gain over the best model (computed from the table) at one model's inference cost. Two limits from the same paper belong in any plan: soups did not improve calibration the way ensembles did, and the gains were smaller for a model pretrained on ImageNet-22k than for CLIP and ALIGN, which were pretrained on larger and more heterogeneous data.
+
+```python
+def greedy_soup(models, evaluate):
+    """models: list of weight dicts with identical keys and shapes; evaluate: weights -> held-out score."""
+    ranked = sorted(models, key=evaluate, reverse=True)
+    soup, members = dict(ranked[0]), 1
+    best = evaluate(soup)
+    for m in ranked[1:]:
+        candidate = {k: (soup[k] * members + m[k]) / (members + 1) for k in soup}
+        score = evaluate(candidate)
+        if score >= best:
+            soup, members, best = candidate, members + 1, score
+    return soup, members
+```
+
+The cost is in `evaluate`: one full held-out evaluation per candidate. The held-out set used for the greedy decision cannot be the one you report, or the soup is tuned on the test.
+
+## TIES: merging models trained for different tasks
+
+Soups average fine-tunes of one task. Merging fine-tunes of different tasks raises a second problem: the task vectors (fine-tuned minus base weights) interfere. TIES-Merging names two sources: redundant small changes that add noise, and parameters where tasks pull in opposite directions, so averaging cancels both. Its three steps answer them. Trim each task vector to its largest-magnitude entries (the paper's recipe without a validation set keeps 20%). Elect, per parameter, the sign of the sum of the trimmed values. Average only the nonzero values that agree with the elected sign, and add the result, scaled by λ, to the base.
+
+<Predict id="trn-dm-merging-ties" question="Four task vectors, already trimmed, hold +0.5, -0.2, -0.4 and +0.3 for one parameter. With TIES and λ = 1, how far does the merged parameter move from the base?" answer={0.4} tolerance={0.01}>
+The sum is +0.2, so the elected sign is plus. The values that agree are +0.5 and +0.3, and their mean is +0.4. A plain average of the four gives 0.2 / 4 = +0.05: the two tasks that wanted this parameter to move have their change shrunk by a factor of eight by two tasks that wanted it to move the other way. Note that the result depends on magnitudes, not on a vote: two models said plus and two said minus.
+</Predict>
+
+The paper's Table 1, with a validation set for hyperparameters, reports TIES ahead of task arithmetic (adding the summed task vectors) on every setting it tested, for example 76.9 against 73.3 on T5-Large and 73.6 against 70.1 on ViT-B/32. It also reports that sign conflicts appear even when only two models are merged and grow more likely with more, and it lists in its limitations that merged single-task models still lag a model trained on all the tasks together. Problem trn-062 has you implement the three steps with a property-tested trim.
+
+## Merging inside a pretraining run
+
+The most common production use is not combining tasks. It is reducing variance at the end of a stage.
+
+Llama 3 anneals the learning rate linearly to zero over the final 40M pretraining tokens and takes the average of checkpoints from the annealing phase as the released pretrained model. In post-training, the report says it averages models obtained from experiments with different data versions or hyperparameters at each reward-model, SFT and DPO stage, across six rounds.
+
+OLMo 2 makes the same move explicit in mid-training. The 7B model's mid-training stage was run three times for 50B tokens each, on the same mixture with different data orders, and the three results were averaged. The 13B and 32B ran three 100B-token runs and one 300B-token run and averaged all four. The report states that averaging checkpoints trained on the same mixture with different data-order seeds consistently improves over the individual checkpoints, and it keeps a 1B model unaveraged.
+
+The engineering reading: if a stage ends in an anneal on high-quality data, several anneals from the same starting checkpoint with different data orders, averaged, are an alternative to one anneal. The runs parallelise, so the wall-clock cost is one run, and the token cost is the sum: 3 × 50B = 150B tokens for OLMo 2's 7B and 3 × 100B + 300B = 600B for the 13B and 32B.
+
+## Merge or train again
+
+Merge when the checkpoints share an initialisation and were trained with moderate learning rates, when you have a held-out evaluation for every behaviour you need to keep, and when the alternative costs a training run you cannot schedule. Train again when one task must not regress at all, when the fine-tunes came from different bases, when you need calibrated probabilities from the result, or when the merge loses to the best ingredient on the task that matters most. A merge is also cheap to reverse; a merged model that regresses in production can be replaced by its ingredients the same day.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Three teams fine-tuned the same 8B base for code review, SQL generation and support replies. Product wants one served model in two weeks, the GPU budget has no room for a multitask run until next quarter, and the support team says any regression on their eval blocks launch. Merge, serve three adapters, or wait?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Try a TIES merge first because it costs evaluations, not training, and gate it on each team's eval against that team's own fine-tune. If support regresses beyond the agreed margin, serve support from its own fine-tune or adapter and merge the other two. Waiting for the multitask run is the fallback, not the plan.</p>
+</Fragment>
+<Fragment slot="long">
+<p>First I confirm the precondition: all three fine-tunes come from the same base checkpoint, and I check their learning rates, because a high-learning-rate fine-tune is the one most likely to sit outside the shared basin.</p>
+<p>Then the merge sweep: density and λ on a held-out split of each team's eval, picking the setting by the worst task, not the mean, since the goal is to keep every task. The cost conflict is evaluation time against coverage; a sweep of five densities and four scales is twenty runs of three evals each, which fits two weeks.</p>
+<p>If support regresses, the support team's constraint wins and I split: one merged model for code and SQL, and support on its own weights. If the fine-tunes are LoRA adapters, multi-adapter serving is the other option; it keeps every task at its own quality and costs serving complexity and per-request adapter routing.</p>
+<p>What I write down: the per-task deltas of the chosen merge against each fine-tune, the regression margin each team agreed to, and a rollback that restores the separate models. The merge's known failure is a quiet regression on behaviour no eval covers, so I also shadow it against the separate models on live traffic for a week.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The best merge is within the margin on all three evals but the support team's live shadow comparison shows a shift in tone their eval does not measure. Do you ship?</li>
+<li>The SQL team retrains next month. Do you re-merge, and what does that do to the code and support results you already signed off?</li>
+<li>What would you need to see to stop merging and pay for the multitask run next quarter?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The published evidence comes from settings where the shared initialisation is a large, broadly pretrained model and the fine-tunes are modest. The soups paper itself saw smaller gains with narrower pretraining, and TIES was evaluated on T5 and ViT task suites, not on modern instruction-tuned LLMs with RL stages. Checkpoints that went through long RL runs, or continued pretraining on a new domain, move further from the base than these papers' fine-tunes, and nothing here guarantees they still share a basin.
+
+The Llama 3 and OLMo 2 descriptions say that averaging is used and that it helps; they do not publish the size of the gain per stage, so the claim to repeat is "both pipelines average checkpoints at the end of a stage", not a number.
+
+Merging also hides attribution. When a merged model misbehaves, there is no single training run to inspect, and a regression can come from the interaction of task vectors rather than from any one of them. Keep the ingredients and the merge configuration as versioned artefacts so a regression can be bisected.
+
+<SelfRate id="lesson:training/distill-merge/merging" />

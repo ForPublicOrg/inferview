@@ -1,0 +1,122 @@
+---
+id: wfl-041
+title: A green dashboard and runs stuck since Monday
+track: workflows
+module: operating-workflows
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [observability, alerting, queues, sqs, poison-messages]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: AWS Builder Center, Avoiding insurmountable queue backlogs (2019-12-05)
+    url: https://builder.aws.com/content/3EuRcgkTP1MI0c7zM8W6HL3WIqA/avoiding-insurmountable-queue-backlogs
+    note: measure the age of messages, logged at dequeue from the enqueue timestamp; AWS IoT's AgeOfFirstAttempt metric counts only first attempts as an early warning; dead-letter queues and alarms on them
+  - title: Amazon SQS developer guide, available CloudWatch metrics
+    url: https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-available-cloudwatch-metrics.html
+    note: ApproximateAgeOfOldestMessage; in standard queues a message received three or more times and not deleted moves to the back and poison-pill messages are excluded from the metric; age resets when a message moves to a DLQ; ApproximateNumberOfMessagesNotVisible counts in-flight messages (checked 2026-10-28)
+choices:
+  - text: Duration is recorded only for runs that finish, and the alarm counts visible messages, so runs that never finish move neither number
+    correct: true
+    why: The stuck runs fail and reappear every 300 seconds without ever reaching the timing line, and they spend most of their time invisible, so neither the p95 nor the visible count can see them.
+  - text: The visibility timeout is below three 120-second model calls, so slow runs are processed twice and the duplicates hold the p95 down
+    correct: false
+    why: The timeout is a real defect, but a duplicate of a slow run is just as slow, and duplicated runs finish; it costs money and side effects, not stuck runs.
+  - text: The alarm threshold of 2,000 is ten times this queue's normal depth, so a backlog of stuck runs had to grow tenfold before anyone was paged
+    correct: false
+    why: Visible messages stayed in their normal band all day; a lower threshold on the same metric would not have fired either.
+  - text: The p95 is taken over one hour across every tenant, so three customers' slow runs sit above the 95th percentile and drop out of the panel
+    correct: false
+    why: Dilution needs the slow runs to be recorded; these runs never reach the timing call, so a per-tenant p99 would be just as green.
+---
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+A document-processing workflow takes uploads through an API, which writes a run row with status `processing` and sends a message to an SQS standard queue. Twenty workers poll the queue; each runs three model steps and saves the result. Customers are promised results within 15 minutes (scenario).
+
+```python
+# worker.py
+def handle(msg):
+    job = json.loads(msg["Body"])
+    t0 = time.monotonic()
+    try:
+        out = run_steps(job)   # extract, classify, summarise; each model call has timeout=120
+        store.complete(job["run_id"], out)
+        metrics.timing("run.duration_ms", (time.monotonic() - t0) * 1000)
+        sqs.delete_message(QueueUrl=QUEUE, ReceiptHandle=msg["ReceiptHandle"])
+    except Exception:
+        log.exception("run %s failed", job["run_id"])
+```
+
+```yaml
+queue: doc-jobs            # standard queue
+VisibilityTimeout: 300
+MessageRetentionPeriod: 1209600
+RedrivePolicy: null
+
+alarm doc-jobs-backlog: ApproximateNumberOfMessagesVisible > 2000 for 5 minutes
+dashboard: run.duration_ms p95 (1 h), messages visible, messages in flight, worker CPU
+```
+
+What the team has on Tuesday at 14:00:
+
+| Signal | Value |
+|---|---|
+| `run.duration_ms` p95, last hour | 52 s, flat all week |
+| Messages visible | 180 to 260 all day, the same band as last week |
+| Messages in flight | 230 to 250 since Monday evening; last week 15 to 25 |
+| `NumberOfMessagesSent` since 00:00 | 18,900 |
+| `NumberOfMessagesReceived` since 00:00 | 55,800 |
+| Runs with status `processing` older than one hour | 212, from three customers |
+| Worker CPU | 35 percent |
+
+The exception logs for Monday and Tuesday are in a log tier nobody on the team can query until an access request is approved tomorrow.
+
+Three customers report runs stuck in "processing" since Monday evening. Which defect explains why the dashboard and the alarm stayed green while these runs were stuck? Then rank the other defects you can see, and say what you would collect and what you would change today without the logs.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how many messages twenty single-threaded workers can hold in flight at once, and compare it with the table.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the duration histogram for the three customers since Monday, with its sample count.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the receive count of one of the stuck runs' messages, and the time it was first sent.</p></details>
+
+## Answer
+
+Twenty workers that handle one message each can hold about twenty messages in flight; the table shows about 240. The extra 220 or so match the 212 stuck runs: messages that were received, failed and are now invisible until their 300-second visibility timeout ends, after which they are received and fail again. The receive counts agree. 55,800 received against 18,900 sent is 36,900 extra receives since midnight; 212 messages failing every 300 seconds is 12 receives an hour each, and 212 × 12 × 14 hours = 35,616. Duplicates from the next defect cover the rest.
+
+Neither signal on the dashboard can see this. `run.duration_ms` is recorded after `store.complete`, so a run that fails never records a duration; the p95 describes only runs that finished. The alarm counts visible messages, and the stuck messages spend 300 seconds of every cycle invisible and a moment visible, so they barely touch it. Visible depth stayed in last week's band because the healthy traffic was flowing normally.
+
+Why the other picks are tempting. The visibility timeout is a real defect: three model calls with 120-second timeouts can take 360 seconds plus the save, longer than 300, so a slow run becomes visible again and a second worker starts it. That doubles model spend and any side effect in `run_steps`, but both copies finish. The 2,000 threshold looks high next to a normal depth of about 200, but depth did not move, so a lower threshold on the same metric would have stayed quiet; at the p95 of 52 seconds, twenty workers drain 200 messages in at most 200 × 52 / 20 = 520 seconds, under nine minutes, so the normal band is not a backlog. Tenant dilution of a percentile needs the slow runs to be in the data, and these are not.
+
+<Depth>
+<Fragment slot="short">
+<p>The metrics only see work that finishes. Duration is recorded on success, and the alarm watches visible depth, while the stuck runs fail on every attempt and sit invisible between attempts. The cause of the failures is unknown until the logs are readable. Without them: alarm on the age of the oldest unfinished run from the run table, add a redrive policy so repeated failures leave the main queue, raise the visibility timeout above the worst-case run, and contact the three customers today.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Ranking the secondary defects. First, no redrive policy: a message that fails for a permanent reason, a document the model step cannot handle, is retried every five minutes for the 14-day retention period, burning a worker attempt and possibly model calls each time, and never reaches anything with an alarm. Second, the visibility timeout below the worst-case run: duplicate processing of slow runs, doubled model spend for them, and any non-idempotent side effect done twice. Third, duration measured from dequeue, which excludes time spent waiting in the queue, so even successful runs report less than the customer waited.</p>
+<p>The decision is what to alarm on, and there are two defensible answers. The SQS metric <code>ApproximateAgeOfOldestMessage</code> costs nothing to add and catches workers falling behind. But the SQS docs say that in a standard queue a message received three or more times without being deleted moves to the back of the queue and poison-pill messages are excluded from this metric. These 212 messages are exactly that, so an alarm on it would have stayed quiet in this incident. The alternative is the age of the oldest run in status <code>processing</code>, from the run table: it catches every run that has not finished, whatever the queue does with its message, but it is a query against the database on a schedule, and it pages on runs that legitimately wait, so states that wait on purpose need their own status. I add both: the run-table age as the page, because it measures what the customer sees, and the SQS age as an early warning for capacity.</p>
+<p>The threshold is a choice tied to the promise. Normal queue wait is up to about nine minutes at the top of the visible band, and the promise is 15 minutes. Paging when the oldest unfinished run passes 15 minutes is reasonable, and anything from 12 to 20 is defensible; 2 minutes pages on normal queueing, and 6 hours tells you what the customers already told you.</p>
+<p>The failure mode of this fix. With a redrive policy and a DLQ, the poison messages leave the main queue after a few receives, and the run-table alarm keeps firing on them until someone marks those runs failed. The page then fires for hours on runs everyone knows about and gets muted, and the next real incident pages into a muted alarm. Runs whose message reached the DLQ must move to status <code>failed</code> with the error, which takes them out of the age query and gives the customer an answer; the DLQ gets its own alarm on visible messages, since the age of a message resets when it moves there.</p>
+</Fragment>
+</Depth>
+
+What to collect, in order: the receive count and first-sent time of the messages for a few stuck runs (a receive with `AttributeNames=["ApproximateReceiveCount", "SentTimestamp"]` from a debugging client, which itself hides the message for a visibility timeout); the input documents of the stuck runs, to see what the three customers have in common; and the exception logs once access is granted. What to change today without them: the run-table age alarm, a redrive policy with a `maxReceiveCount` of a few attempts, a visibility timeout above the worst-case run, and a message to the three customers with a time for an answer.
+
+## Follow-ups
+
+- *Your run-table alarm pages on every poison message until a human marks the run failed. The on-call engineer says it will be muted within a week. Which half of the fix do you cut, and what risk do you accept in writing?* Keep the alarm and automate the transition to `failed` when a message reaches the DLQ; accept that a run whose message is lost without reaching the DLQ stays in `processing` until the age alarm fires.
+- *What would you need to see in production to drop the run-table alarm and rely on SQS metrics alone?* A FIFO queue or a redrive policy that removes every poison message before the third receive, and a month of incidents where the SQS age alarm fired no later than the run-table alarm. Without both, the SQS metric has the blind spot this incident walked through.
+- *One of the three customers uploads 900-page PDFs. The extract step needs a bigger context window, which doubles cost per run for everyone if you change the default model. What do you ship this week?* Route documents over a size threshold to the larger model, measured from the failing inputs, and fail anything above the larger model's limit with a clear error rather than a retry.
+- *The AWS IoT team's metric counts age only on a message's first attempt. Why would you want that here as well?* It separates "workers are behind on new work" from "a few messages keep failing", which are two different pages with two different fixes.
+
+## Common mistakes
+
+- Lowering the depth threshold, which pages on normal bursts and still misses work that is failing rather than waiting.
+- Adding `ApproximateAgeOfOldestMessage` on a standard queue and declaring the gap closed, when the docs exclude messages received three or more times from it.
+- Recording duration only on success, so an outage looks like an improvement in latency.
+- Adding a DLQ without moving the matching runs to `failed`, which leaves customers looking at "processing" for a run nobody will retry.
+- Treating the receive-to-send ratio as a metrics glitch instead of evidence of redelivery.

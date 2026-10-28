@@ -1,0 +1,137 @@
+---
+id: rag-025
+title: Offline recall went up, short queries got worse
+subtitle: rank the causes from a diff, one trace and length buckets, then write the routing rule
+track: rag
+module: hybrid-search
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [hyde, query-transformation, hybrid-search, routing, latency, eval-coverage]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Gao, Ma, Lin and Callan, Precise Zero-Shot Dense Retrieval without Relevance Labels (HyDE, arXiv 2212.10496, 2022-12-20)
+    url: https://arxiv.org/abs/2212.10496
+    note: "an instruction-following model writes a hypothetical document that may contain false details; its embedding retrieves real documents. Eq. 8 averages the embeddings of N sampled documents with the query's own embedding; the method assumes the query is not ambiguous and leaves ambiguous queries to future work; sampling at temperature 0.7; Table 1, TREC DL19 nDCG@10: BM25 50.6, Contriever 44.5, HyDE 61.3. The conclusion suggests routing common queries to a supervised dense retriever and less common or emerging ones to HyDE. Read in the PDF. Checked 2026-10-28."
+  - title: Cormack, Clarke and Büttcher, Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods (SIGIR 2009)
+    url: http://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf
+    note: "fusion score is the sum of 1 / (k + rank) with k = 60, so a leg that loses a document loses all of that leg's contribution to it. Checked 2026-10-28."
+choices:
+  - text: The reranker scores candidates against the query plus the guess, so it favours chunks like the guess
+    correct: false
+    why: "A real defect, and it will cost precision, but the gold chunk in the trace never reached the reranker: it was missing from the fused 30 before reranking started."
+  - text: BM25 now searches the query plus the guess, so a rare exact term is outweighed by generic words
+    correct: true
+    why: "The gold chunk fell from BM25 rank 1 to outside its top 50 while its dense rank barely moved, and long queries, whose terms are less decisive, got better at the same time."
+  - text: A short query is ambiguous, so the guess commits to one reading and drags the dense leg to generic pages
+    correct: false
+    why: "Real for HyDE, whose paper assumes unambiguous queries, but the dense leg never carried these queries: the gold chunk sat at dense rank 38 before the change and 41 after."
+  - text: The cache key now carries a sampled guess, so hits vanish and slow requests fall back to weaker answers
+    correct: false
+    why: "A real defect behind part of the latency, but timeouts with fallback answers are 0.3 percent of requests, too few to move thumbs-down on short queries from 9 to 21 percent."
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Debug round, 30 minutes">
+"We added HyDE to the docs assistant. Offline recall went up, so we shipped it. Two weeks later p95 latency is over the SLO and users complain about short queries. Which defect explains the quality drop, how do you rank the others, and what is the routing rule for HyDE going forward?"
+</Callout>
+
+The system and every number are a scenario. An assistant over the company's developer docs, about 180,000 chunks. BM25 and a dense leg, 50 candidates each, fused with RRF at k = 60, top 30 reranked by a cross-encoder, then generation. Latency SLO: 1.5 s at p95.
+
+The change that shipped:
+
+```diff
+ def retrieve(query: str, user: User) -> list[Chunk]:
+     q = normalise(query)
++    guess = hyde.generate(HYDE_PROMPT.format(question=q), max_tokens=256, temperature=0.7)
++    q = f"{q}\n{guess}"
+     key = cache_key(q, user.tenant)
+     if (hit := cache.get(key)) is not None:
+         return hit
+     filters = acl_filter(user)
+     lexical = bm25.search(q, k=50, filters=filters)
+-    dense = vectors.search(embed(q), k=50, filters=filters)
++    dense = vectors.search(embed(q, max_len=512), k=50, filters=filters)
+     fused = rrf([lexical, dense], k=60)[:30]
+-    result = rerank(query, fused)
++    result = rerank(q, fused)
+     cache.set(key, result, ttl=3600)
+     return result
+```
+
+Offline, before shipping: 412 eval queries, median 14 tokens, 25 of them (6 percent) three tokens or fewer. Recall@10 of the final list rose from 0.71 to 0.79.
+
+Production, two weeks before and after:
+
+```text
+                                     before    after
+p95 end to end                       1.10 s    1.85 s
+hyde.generate p50 / p95                 -      380 / 610 ms
+cache hit rate                         22%       1%
+timeouts answered from fallback       0.2%     0.3%
+share of final top 5 from BM25 leg     31%      12%
+queries of 3 tokens or fewer           37%      37%
+thumbs-down, 3 tokens or fewer          9%      21%
+thumbs-down, longer queries            14%      11%
+```
+
+One trace, the query `saml acs_url`, for the chunk an engineer marked as the answer, `sso/saml.md#acs-url`:
+
+```text
+                    before         after
+BM25 rank           1              not in top 50
+dense rank          38             41
+fused top 30        rank 1         absent
+final answer        cites it       cites "Configuring single sign-on"
+```
+
+The hypothetical passages are not logged. There is no labelled set of short queries and no per-leg recall. Pick the defect that explains the quality drop on short queries, rank the others, say what you would collect and what you would ship today, then write the routing rule.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Request three more traces of short queries that got worse, with each leg's rank for the answer chunk before and after.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the input string each retriever and the reranker actually received in one of those traces.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask how much of the offline recall gain came from the 25 short queries and how much from the rest.</p></details>
+
+## Answer
+
+**BM25 is searching the guess.** The reassignment `q = f"{q}\n{guess}"` runs before every consumer of `q`, so BM25 receives two words of user query and up to 256 tokens of generated prose. `acs_url` is a rare term with a high weight; it is now one term among dozens of common ones like "configure", "identity" and "provider", and the chunks that match those win. In the trace the answer chunk drops from BM25 rank 1 to outside the top 50 while its dense rank moves from 38 to 41: the dense leg never found this chunk, BM25 did, and BM25 stopped. RRF cannot recover a document no leg returns. Long queries improve at the same time because their BM25 terms were never as decisive and the dense leg, which is what HyDE is meant to help, carries more of them. The share of the final top 5 coming from BM25 falling from 31 to 12 percent is the same failure seen in aggregate.
+
+Ranking the rest by how much of what users see they explain:
+
+1. **The reranker scoring against the guess.** `rerank(q, fused)` asks the cross-encoder which chunk matches the model's guess, not the user's question. It is a real precision loss on every query, and it would hurt even after BM25 is fixed. It cannot explain the trace, because the chunk never reached it.
+2. **The cache key.** Keying on a sampled guess makes every key unique: the hit rate fell from 22 to 1 percent, which is part of the latency regression on top of the 610 ms generation call. It does not touch quality beyond the 0.3 percent of timeouts.
+3. **Ambiguity of short queries.** Real, and the HyDE paper says so: its averaging assumes an unambiguous query and leaves ambiguous ones to future work. For `saml acs_url` the dense rank barely moved, so it is not this trace's cause. It becomes the main question once BM25 is fixed, for short queries that are vague rather than exact.
+
+The offline gain was real for the set it was measured on. With 6 percent short queries against 37 percent in traffic, the eval could not see a regression concentrated in short queries; reweighting its buckets to traffic would have shown it.
+
+**What to collect.** Twenty short-query traces with the string each stage received and each leg's rank for the answer chunk. A labelled set of 100 short queries from logs. Offline recall per length bucket, weighted to production's mix, for three configurations: no HyDE, HyDE on the dense leg only, and HyDE on the dense leg with the query embedding averaged in as the paper's Eq. 8 does.
+
+**What to ship today without it.** BM25, the reranker and the cache key get the user's normalised query; only the dense leg sees the guess. This is correct under every explanation above and costs one small change. It does not fix latency, so HyDE is switched off for queries of three tokens or fewer behind a flag until the routing rule is in place.
+
+**The routing rule, two defensible answers.** The latency arithmetic first. The fixed pipeline without HyDE runs at 1.10 s p95. A sequential 256-token guess at 610 ms p95 cannot ride on top of that for most traffic: 1.10 + 0.61 = 1.71 s by summed p95s, over the 1.5 s SLO.
+
+- **Route before retrieval, with a shorter guess.** Skip HyDE when the query is three tokens or fewer, contains an identifier pattern (dotted or snake-case names, error codes, CLI flags), or exactly matches a page title. Cut the guess to about 96 tokens; the paper only needs it to carry the relevance pattern, not to be right. Suppose a load test measures the 96-token call at 260 ms p95 (scenario): 1.10 + 0.26 = 1.36 s, inside the SLO. The cost: a model call on every routed query, at most the 63 percent of traffic longer than three tokens, and a shorter guess whose recall gain has to be measured again rather than assumed.
+- **Retrieve first, fall back to HyDE on low confidence.** Run the raw query; call HyDE with a full guess only when the reranker's top score is under a threshold, then retrieve again. Only the hard queries pay. Suppose replaying logged traffic shows fallback requests exceed 1.5 s 60 percent of the time and the rest exceed it 1 percent of the time (scenario). For a fallback share f the share over the SLO is 0.01 × (1 − f) + 0.6 × f, which stays at or under 5 percent while f ≤ 0.04 / 0.59 ≈ 6.8 percent. The cost: the threshold now controls the SLO, and a shift in the score distribution (a reranker upgrade, a new product area) moves f without any code change.
+
+This is the constraint conflict: recall from HyDE against the latency SLO, with the short-query traffic that HyDE hurts as the third party. I would ship the pre-retrieval rule with the shorter guess now, because its latency is set by a rule I can read, and keep the fallback design for when the per-bucket eval shows where the gain lives. If the gain sits in a small low-confidence slice, the fallback is the better design.
+
+**Where the rule fails.** A length-and-pattern router misroutes in both directions. "billing" is short and vague, gets no guess, and is exactly the query HyDE helps. "why does acs_url reject my https callback" contains an identifier and loses HyDE, which is acceptable only because BM25 now carries the identifier again. New product names that look like ordinary words pass the identifier check and get a guess that invents what the product does. The router needs its own eval slice and a log of which branch each query took.
+
+## Follow-ups
+
+- *Pushback: the search team says a hand-written router is technical debt and wants a learned query classifier instead. It needs 2,000 labelled queries you do not have. What do you ship this quarter, and what risk do you accept in writing?*
+- *Reversal: what would the per-bucket eval have to show for you to remove HyDE entirely rather than route it?*
+- *The product lead wants HyDE kept on for every query because offline recall went up 8 points. How do you settle it without deciding by rank?*
+
+## Common mistakes
+
+- Reassigning the query variable for one consumer and changing every downstream stage with it.
+- Shipping on an aggregate offline gain from a set whose length mix does not match traffic.
+- Putting sampled model output into a cache key.
+- Measuring a query transformation by recall alone and finding its latency in production.

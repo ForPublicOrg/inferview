@@ -1,0 +1,172 @@
+---
+title: Load testing model endpoints
+track: inference
+module: operating
+order: 2
+kind: lesson
+level: senior
+minutes: 14
+summary: Prompt length, output length, concurrency and prefix sharing each move a different bottleneck in a model server, so a load test that would catch a real regression replays measured length distributions in open loop, sweeps to the knee, and reads the engine's own metrics to name what saturated.
+prerequisites: [inference/operating/slos-autoscaling]
+updated: 2026-10-28
+sources:
+  - title: NVIDIA NIM benchmarking, Metrics
+    url: https://docs.nvidia.com/nim/benchmarking/llm/latest/metrics.html
+    note: "TTFT includes queuing, prefill and network latency; AIPerf ignores initial responses with no content; e2e = TTFT + generation time; AIPerf ITL = (e2e - TTFT) / (output tokens - 1), excluding the first token, and tools differ on this; system TPS = output tokens / (Ty - Tx); per-user TPS approaches 1/ITL; system TPS rises until it saturates compute and can then decline; compare tools only when definitions align. Checked 2026-10-28."
+  - title: vLLM source, vllm/v1/metrics/loggers.py (main)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/v1/metrics/loggers.py
+    note: "Logged prompt throughput counts computed tokens and excludes cached ones; metric names for waiting, running, waiting by reason, KV usage, preemptions, prefix cache queries and hits, prompt_tokens_cached, request_prompt_tokens and request_generation_tokens histograms, request_num_preemptions, request_prefill_kv_computed_tokens, iteration_tokens_total. Checked 2026-10-28."
+  - title: vLLM docs, Metrics design
+    url: https://docs.vllm.ai/en/latest/design/metrics.html
+    note: "Prefix cache hit rate computed from the queries and hits counters rather than a gauge; queue, prefill and decode intervals from engine-core timestamps; preemption during decode counts in the inter-token interval; the stated goal of exposing the metrics needed to detect the saturation point. Checked 2026-10-28."
+  - title: vLLM docs, vllm bench serve
+    url: https://docs.vllm.ai/en/latest/cli/bench/serve.html
+    note: "Defaults: request-rate inf (all requests sent at time 0), burstiness 1.0 (Poisson; below 1 is burstier), num-prompts 1000, dataset random with input 1024, output 128, range-ratio 0.0 and prefix-len 0; prefix_repetition dataset defaults 256-token prefix, 256-token suffix, 10 prefixes, 128 output; ignore-eos off; goodput keys ttft, tpot, e2el in ms; percentile metrics include client_queue_time and e2el_including_client_queue; ramp-up strategies linear and exponential. Checked 2026-10-28."
+  - title: vLLM docs, Optimization and tuning
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: "Preemption when KV cache space is insufficient, recompute by default in V1; raising gpu_memory_utilization reduces preemption; smaller max_num_batched_tokens favours ITL and larger favours TTFT. Page dated 2026-10-27; checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Four inputs, four bottlenecks
+
+A load test for a web service varies the request rate and reads latency. A model server has at least four independent load dimensions, and each one pushes on a different resource.
+
+**Prompt length** is prefill work, which is compute-bound and lands in time to first token; NVIDIA's NIM docs list longer prompts among the things that raise TTFT. With chunked prefill, a long prompt also shares engine steps with running decodes, so it raises everyone else's inter-token latency; vLLM's tuning guide describes the knob for that trade (`max_num_batched_tokens`: smaller favours ITL, larger favours TTFT).
+
+**Output length** is decode steps, and it sets how long each sequence holds its KV cache. Long outputs raise the number of sequences in flight at a given arrival rate, which is what fills memory.
+
+**Concurrency** is batch size. Decode reads the weights once per step for the whole batch, so throughput rises with the batch while ITL rises more slowly, until the KV cache is full and the scheduler starts preempting.
+
+**Prefix sharing** removes prefill work. A request whose prefix is cached skips computing it, so TTFT and prompt throughput both look better than they would on traffic that shares less.
+
+A test that fixes three of these and varies the fourth measures one bottleneck and reports it as the capacity of the system. vLLM's own benchmark client does exactly that by default.
+
+## The default benchmark measures the easy case
+
+`vllm bench serve` with no options sends 1,000 prompts of 1,024 random tokens, asks for 128 output tokens each, varies neither length (`--random-range-ratio` defaults to 0.0), shares no prefix (`--random-prefix-len` 0), and sends every request at time 0 (`--request-rate` defaults to `inf`). That is a fine smoke test for a build. As a capacity test it has three problems.
+
+The lengths never touch the KV ceiling. With a scenario model that stores 128 KiB of KV per token, 32 concurrent sequences of 1,024 + 128 tokens hold 32 × 1,152 × 128 KiB = 4.5 GiB (4.8 GB), about a tenth of the 48 GB KV pool in the scenario later in this lesson. Preemption never happens in this test.
+
+Sending everything at time 0 measures a drain, not a steady state. The first requests see an empty server and the last ones see a full queue, so the percentiles describe the burst shape rather than the service.
+
+A closed loop hides queueing. With `--max-concurrency`, the client holds requests until a slot frees, so the server's TTFT excludes time spent waiting in the client. vLLM's client can report `client_queue_time` and `e2el_including_client_queue` for this reason; if you cap concurrency, put those in the report, or the server's TTFT will look flat while users wait.
+
+## What each tool calls latency
+
+Numbers from two tools are comparable only when their definitions match, and NIM's docs say so directly. The disagreements that move results:
+
+| Quantity | Definition in NIM (AIPerf) | Definition in vLLM | Trap |
+|---|---|---|---|
+| TTFT | Query submission to the first token with content; empty initial chunks are ignored | Engine metric starts at frontend arrival, when tokenisation begins | A server that streams an empty role chunk first looks faster in tools that count it; the engine metric excludes gateway and network |
+| ITL | (e2e − TTFT) / (output tokens − 1), excluding the first token | `inter_token_latency_seconds` is the gap between streamed outputs; per-request TPOT uses the AIPerf formula | With speculative decoding one output carries several tokens, so the gap and TPOT diverge |
+| Throughput | Output tokens over first request to last response | Logged "Avg prompt throughput" counts computed prompt tokens, excluding cached ones | A high prefix-cache hit rate shows as low prompt throughput, not as a fault |
+
+NIM also separates system throughput from per-user throughput (output length over end-to-end time, which approaches 1/ITL for long outputs). Report both: the operator pays for the first, the user feels the second, and they move in opposite directions as concurrency rises.
+
+## Prefix sharing has to be measured, not assumed
+
+vLLM's `prefix_repetition` dataset makes sharing explicit: by default each prompt is a 256-token prefix drawn from 10 prefixes, plus a unique 256-token suffix.
+
+<Predict id="inf-operating-prefix-hits" question="1,000 prompts, 10 distinct 256-token prefixes used equally, each prompt a prefix plus a unique 256-token suffix. If every repeat of a prefix hits the cache and nothing is evicted, what percentage of all prompt tokens are served from the prefix cache?" answer={49.5} tolerance={1} unit="%">
+<p>Each prefix appears 100 times; the first use computes it and the other 99 hit. Cached tokens are 10 × 99 × 256 = 253,440 of 1,000 × 512 = 512,000 prompt tokens: <b>49.5%</b>. The ceiling is 50%, because the suffix is never shared. Two things lower the measured figure: eviction once the cache is full, and requests scheduled before the shared prefix has been computed, which a time-0 burst produces in bulk.</p>
+</Predict>
+
+The number that matters is production's, not the dataset's. vLLM exports `vllm:prefix_cache_queries` and `vllm:prefix_cache_hits` as token counters, and its design doc says to compute the hit rate as a ratio of their rates over a window rather than read a gauge. Take that ratio from production for the hours you are sizing for, then choose a prefix length and prefix count that reproduce it. A test with a 90% hit rate computes 10% of its prompt tokens; a service at 30% computes 70%, seven times the prefill work per request, so the test's TTFT and capacity say nothing about it.
+
+## Reading the saturation curve
+
+Sweep the arrival rate in open loop, hold each step long enough for the KV cache to reach steady state (several multiples of the longest request's duration), and record TTFT and TPOT percentiles, maximum inter-token gap, system throughput and goodput at each step. vLLM's client computes goodput from `--goodput ttft:<ms> tpot:<ms>`, the rate of requests that met every objective. NIM's docs describe the shape: system throughput rises until compute saturates and can decline past that point, while per-user throughput falls throughout.
+
+The knee tells you that something saturated; the engine metrics tell you what. Read them at the step where goodput stops rising:
+
+| What moves first | Engine evidence | Bottleneck |
+|---|---|---|
+| TTFT rises, TPOT flat | `vllm:num_requests_waiting_by_reason{reason="capacity"}` grows; KV usage below 1 | Admission limit or prefill compute; requests queue for a slot |
+| TPOT rises with load, no waiting | `num_requests_running` rising; `iteration_tokens_total` per step rising | Decode batch growth, the expected cost of throughput |
+| p99 gap jumps, throughput falls | `kv_cache_usage_perc` at 1; `num_preemptions` and `request_num_preemptions` rising | KV capacity; preempted requests are recomputed |
+| TTFT low, prompt throughput low | `prompt_tokens_cached` large against `prompt_tokens` | Prefix cache doing the work; check the test's sharing |
+
+The third row is the expensive one. vLLM recomputes a preempted request by default, so each preemption adds prefill work exactly when the server is short of capacity, and the design doc puts the stall inside the inter-token interval. Mean TPOT barely moves; the maximum gap and the preemption counters do.
+
+## A test designed to catch a stated regression
+
+Take a concrete change. In this lesson's scenario, a release lowers vLLM's `gpu_memory_utilization` from 0.92 to 0.85 on 80 GB GPUs to make room for a sidecar, with 16 GB of weights and 4 GB of activations. vLLM's tuning guide lists raising this setting as a cure for preemption, so lowering it should cause some. The KV pool falls from 0.92 × 80 − 20 = 53.6 GB to 0.85 × 80 − 20 = 48 GB, 10.4% smaller. At 128 KiB (131,072 bytes) per token that is about 408,900 tokens before and 366,200 after.
+
+The default benchmark holds 36,864 tokens in flight and passes both versions identically. A test that catches the regression has to put more in-flight KV tokens on the server than the new pool holds, and in proportions production produces:
+
+1. Lengths from production. Export the `vllm:request_prompt_tokens` and `vllm:request_generation_tokens` histograms for the peak hours and sample from them jointly, so long prompts arrive with the outputs they actually get. Force output lengths with `--ignore-eos` and per-request `max_tokens`, since random tokens end at unrealistic places otherwise.
+2. Arrivals in open loop, with burstiness from production. vLLM's `--burstiness` draws gamma-distributed gaps (1.0 is Poisson, lower is burstier); fit it to the inter-arrival times at the gateway.
+3. Prefix sharing at the measured hit rate, as above.
+4. A rate sweep that runs past the old knee, so both versions are pushed beyond 409,000 in-flight tokens.
+5. A gate on the comparison, not the absolute: goodput at the committed peak within an agreed margin of the baseline, zero preemptions below the committed peak, and the knee's arrival rate reported for both builds with the same seed.
+
+```python
+import random
+
+def schedule(rate, burstiness, n, length_hist, seed=7):
+    """Open-loop arrivals: gamma gaps with mean 1/rate; lengths drawn from a measured histogram."""
+    rng = random.Random(seed)
+    lengths, weights = zip(*length_hist)
+    t, out = 0.0, []
+    for _ in range(n):
+        t += rng.gammavariate(burstiness, 1 / (rate * burstiness))
+        prompt, output = rng.choices(lengths, weights)[0]
+        out.append((round(t, 3), prompt, output))
+    return out
+
+def goodput(results, duration_s, ttft_s, tpot_s, max_gap_s):
+    """Requests per second that met every objective; results are (ttft, tpot, max_gap)."""
+    ok = sum(1 for a, b, c in results if a <= ttft_s and b <= tpot_s and c <= max_gap_s)
+    return ok / duration_s
+
+# (prompt tokens, output tokens) buckets with production counts from the engine histograms
+hist = [((400, 150), 55), ((2000, 400), 30), ((12000, 900), 12), ((30000, 1500), 3)]
+reqs = schedule(rate=8, burstiness=0.5, n=2000, length_hist=hist)
+print(len(reqs), round(reqs[-1][0], 1))                    # 2000 250.8
+print(sum(p for _, p, _ in reqs) // len(reqs), sum(o for _, _, o in reqs) // len(reqs))  # 3127 352
+print(goodput([(0.4, 0.03, 0.2), (1.9, 0.03, 0.2), (0.5, 0.03, 2.5), (0.3, 0.02, 0.1)],
+              2.0, 1.0, 0.05, 1.0))                        # 1.0: two of four met all three
+```
+
+The goodput function adds a maximum-gap objective that vLLM's `--goodput` flag does not take (its keys are `ttft`, `tpot` and `e2el`), because the preemption regression shows up there first. The histogram buckets are scenario values; the means they produce, about 3,100 prompt and 350 output tokens, are nothing like the default 1,024 and 128.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"An engine upgrade ships Thursday. You have eight GPU-hours of test capacity. The release notes promise higher throughput, product wants that claim in the launch post, and last quarter an upgrade passed the load test and caused preemption storms at peak. What test do you run, and what does it gate?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>One comparison, old build against new with the same seed, using production's joint length distribution, measured burstiness and measured prefix hit rate, swept in open loop past the old knee. The gate is goodput at the committed peak and zero preemptions below it, not the throughput number. The throughput claim gets reported only for the conditions it was measured under. I give up breadth: no separate tests per model or region in eight hours.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Budget first. Each rate step needs time for the KV cache to reach steady state, so a sweep of six steps at ten minutes each per build, two builds, two repeats, is four GPU-hours on one single-GPU replica; that leaves room for one rerun after a fix, which is the slack I want before Thursday.</p>
+<p>Inputs: last week's peak-hour histograms of prompt and generation tokens, sampled jointly; burstiness fitted to gateway inter-arrival times; prefix length and count chosen to reproduce the production hit ratio from the queries and hits counters. Outputs forced with ignore-eos and sampled max_tokens.</p>
+<p>Readout per step: TTFT and TPOT percentiles, maximum gap, goodput, and the engine's waiting by reason, KV usage and preemption counters. The previous incident was a preemption storm, so preemptions below the committed peak fail the gate regardless of throughput.</p>
+<p>What can still go wrong: the test runs on random tokens, so anything content-dependent, such as speculative decoding acceptance, is not measured; I would say so in the release note and watch the acceptance metric for a day after rollout.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The new build has 12% more throughput and 3% lower goodput at peak. Product wants to ship. What do you write down?</em> Goodput is what the SLO pays for; I would ship only with a lower batch-size target that restores goodput, and state the throughput gain at that target.</li>
+<li><em>Your test passes and production preempts anyway. What do you check first?</em> Whether the test's in-flight token count ever reached production's, from the KV usage gauge in both; then whether production's length mix moved since the histograms were taken.</li>
+<li><em>Why not replay recorded production prompts instead of synthetic ones?</em> Content-faithful replay catches content-dependent effects, but it needs a privacy review and a store of user text; synthetic lengths with measured sharing cover the capacity question without either.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Random tokens are not text. Speculative decoding's acceptance rate depends on how predictable the output is, a mixture-of-experts model's expert load depends on content, and models stop at end-of-sequence tokens for content reasons. A synthetic test measures the server under none of these; a canary on real traffic measures all of them, which is why the load test gates the release and the canary still runs.
+
+Single-turn tests miss conversation structure. In a chat product the prefix that repeats is the conversation so far, growing turn by turn, with think time between turns that decides whether it is still cached. A test that samples independent prompts at the right hit rate gets the ratio right and the timing wrong.
+
+A test run from inside the cluster measures the engine, not the user. The gateway, TLS termination, the network and any queue in front of the engine add to TTFT, and the SLO is measured there; run at least the final step through the production path.
+
+Every number in a load test belongs to one engine version, one set of flags and one hardware type. The curve is evidence for the release it was measured on and expires with the next change to any of them.
+
+<SelfRate id="lesson:inference/operating/load-testing" />

@@ -1,0 +1,160 @@
+---
+id: wfl-030
+title: Garden hoses tagged as pet food
+subtitle: a nightly batch writer, find the cause
+track: workflows
+module: batch-pipelines
+type: debug
+difficulty: medium
+seniority: [senior, staff]
+minutes: 25
+tags: [batch-api, reconciliation, custom-id, data-quality]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Claude docs, Batch processing
+    url: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+    note: results can be returned in any order and should be matched on custom_id; custom_id must match ^[a-zA-Z0-9_-]{1,64}$; result types succeeded, errored, canceled and expired; invalid_request_error must be fixed before re-sending while other errors can be retried; results available for 29 days after creation; checked 2026-10-28
+  - title: OpenAI API docs, Batch API
+    url: https://developers.openai.com/api/docs/guides/batch
+    note: the output line order may not match the input line order; use custom_id; unfinished requests in an expired batch get the batch_expired error; checked 2026-10-28
+choices:
+  - text: Results are paired with products by position, but they arrive in any order and skipped rows shift later pairs
+    correct: true
+    why: A hose with pet-food attributes and a television with a hose's are what a shifted join writes; skipped descriptions and filtered failures both shift it.
+  - text: SKUs used as custom_id break the documented ID pattern, so those requests error and keep last week's attributes
+    correct: false
+    why: The SKU pattern is a real risk, but a rejected request leaves a product's old attributes in place; it never writes another product's attributes.
+  - text: Replies cut off at 400 max_tokens yield partial attribute sets, and the upsert merges them into the old row
+    correct: false
+    why: A cut-off reply is invalid JSON, so json.loads raises and the loop stops; that loses the rest of the run instead of mixing products.
+  - text: Prompt caching shares the system prefix across requests, so a cached reply for one product is served to another
+    correct: false
+    why: Caching reuses the processed prompt prefix, not replies; each request still generates its own output from its own document.
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+"Since the nightly enrichment moved to the batch API, merchandisers report products with another product's attributes. Here is the job and what we have. What happened, and what do you do tonight?"
+</Callout>
+
+```python
+def build_requests(products):
+    reqs = []
+    for p in products:
+        if not p.description:
+            continue  # nothing to enrich
+        reqs.append({
+            "custom_id": p.sku,
+            "params": {"model": MODEL, "max_tokens": 400, "system": SYSTEM,
+                       "messages": [{"role": "user", "content": p.description}]},
+        })
+    return reqs
+
+
+def run_nightly(products):
+    batch = client.messages.batches.create(requests=build_requests(products))
+    wait_until_ended(batch.id)
+    results = [r for r in client.messages.batches.results(batch.id)
+               if r.result.type == "succeeded"]
+    for product, r in zip(products, results):
+        attrs = json.loads(r.result.message.content[0].text)
+        db.upsert_attributes(product.sku, attrs, run_date=today())
+```
+
+What you have (scenario, last night's run):
+
+- `products` held 148,000 rows.
+- The batch's `request_counts`: succeeded 139,880, errored 214, canceled 0, expired 1,906.
+- Three tickets from merchandisers:
+
+| SKU | Product | Attributes in the database |
+|---|---|---|
+| HD-20931 | 20 m garden hose | `{"category": "pet food", "flavour": "salmon"}` |
+| TV-55-OLED | 55-inch OLED TV | `{"category": "garden", "length_m": 20}` |
+| KB-0042 | Mechanical keyboard | unchanged since 2026-10-21 |
+
+The job logs nothing per product. Which defect explains the wrong attributes?
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how many requests the batch contained and compare it with the 148,000 products.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request one complaint's row from the results file, found by its custom_id, and compare it with what was written to that SKU.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask whether the job finished last night or stopped part-way, and how many rows carry last night's run_date.</p></details>
+
+## Answer
+
+The join is positional. `zip(products, results)` pairs the nth product with the nth succeeded result, and three things break that alignment: the results stream returns in any order (the Claude and OpenAI docs both say so and both tell you to match on `custom_id`), products without a description are in `products` but not in the batch, and errored and expired results are filtered out before the zip. Any one of these misaligns every pair after the first gap. The counts already show two of them: 148,000 products against 142,000 requests (139,880 + 214 + 1,906), so 6,000 products were skipped, and 2,120 requests failed. `zip` also stops at the shorter list, so the last 8,120 products in `products` received nothing, which is one way KB-0042 went stale.
+
+Why the wrong picks are tempting. Raw SKUs as `custom_id` are a real risk: the documented pattern allows letters, digits, hyphens and underscores up to 64 characters, and a SKU with a slash or a dot breaks it. But a rejected request leaves old attributes in place; it cannot put a hose's attributes on a television. A 400-token cap does truncate long attribute lists, but truncated output fails `json.loads`, which raises, stops the loop and leaves everything after it stale. Prompt caching reuses the processed prefix of a prompt, not a previous reply, so it cannot serve one product's answer to another.
+
+Ranking the defects that are really there:
+
+1. Positional join. Explains the symptom, and corrupts data silently.
+2. Failures dropped without reconciliation. 2,120 products got nothing last night and nobody knows which ones. Errored requests split in two: an `invalid_request_error` needs the request fixed, anything else can be re-sent as is, and expired requests can be re-sent as is.
+3. No `stop_reason` check and an unguarded `json.loads`. One truncated reply aborts the rest of the run.
+4. Raw SKUs as `custom_id`. Latent until the first SKU with a slash or more than 64 characters.
+
+<Depth>
+<Fragment slot="short">
+<p>The writer pairs products with results by position. Results come back in any order, 6,000 products were never sent and 2,120 failed requests are filtered out, so every pair after the first gap is wrong. Fix: join on custom_id against a ledger of what was sent, write only succeeded results, and re-send or dead-letter the rest. Tonight, stop the writer and re-join last night's stored results instead of paying for a re-run.</p>
+</Fragment>
+<Fragment slot="long">
+<p>What I would collect. The results file for the batch (the docs keep results for 29 days), the list of SKUs skipped for empty descriptions, and a count of rows with last night's run_date. With the results file I can say exactly which rows are wrong: re-join on custom_id and diff against the database.</p>
+<p>What I would do without it. Treat every row with last night's run_date as suspect, roll those back to the previous night's values from the audit history if there is one, and pause the writer. If there is no history, the stored results are the repair path, and they expire 29 days after the batch was created.</p>
+<p>The fix. Keep a ledger per run: custom_id, SKU, attempt. Generate custom_id from the ledger (for example the row number with a run prefix), not from the SKU. Stream results into a dict keyed by custom_id; write only succeeded results whose stop_reason is end_turn and whose JSON validates; re-send expired and server-error items in the next batch; send invalid_request_error items to a dead-letter list with the error. At the end, assert that every ledger entry has an outcome.</p>
+<p>The constraint conflict. Pausing the writer leaves search on stale attributes; letting it run keeps writing wrong ones. Stale is the cheaper error, so pause, repair from stored results, then resume.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>How many times does an expired item get re-sent before a person looks at it?</em> A number you choose and defend: two re-submissions keeps it inside two nights; more than that hides a request that cannot finish.</li>
+<li><em>How would you have caught this before a merchandiser did?</em> A post-write check that the written SKU equals the ledger SKU for the custom_id, and a canary: ten products with known attributes in every run.</li>
+<li><em>What changes if results arrive as a JSONL file from another provider?</em> Nothing in the design: OpenAI also says output line order may not match input order and tells you to use custom_id.</li>
+</ul>
+</Fragment>
+</Depth>
+
+The repair has a failure mode of its own: re-joining stored results writes last night's model output, so for any product whose description changed since then, the repair is consistent but stale. Mark repaired rows with the original run_date, not today's, so the next run treats them as due.
+
+```python
+def run_nightly(products):
+    ledger = {f"r{i}": p for i, p in enumerate(p for p in products if p.description)}
+    reqs = [{"custom_id": cid, "params": params_for(p)} for cid, p in ledger.items()]
+    batch = client.messages.batches.create(requests=reqs)
+    wait_until_ended(batch.id)
+    seen, retry, dead = set(), [], []
+    for r in client.messages.batches.results(batch.id):
+        p, res = ledger[r.custom_id], r.result
+        seen.add(r.custom_id)
+        if res.type == "succeeded" and res.message.stop_reason == "end_turn":
+            attrs = parse_and_validate(res.message.content[0].text)
+            if attrs is not None:
+                db.upsert_attributes(p.sku, attrs, run_date=today())
+                continue
+            dead.append((p.sku, "invalid output"))
+        elif res.type == "errored" and res.error.error.type == "invalid_request_error":
+            dead.append((p.sku, "invalid request"))
+        else:
+            retry.append(p)  # expired, server error, or cut off at max_tokens
+    assert seen == set(ledger), "every request has exactly one result"
+    schedule_retry(retry)
+    report_dead_letters(dead)
+```
+
+Cut-off replies go to the retry list here; re-send them with a larger `max_tokens`, or they truncate again.
+
+## Follow-ups
+
+- *Your fix re-sends expired items the next night. The search team says two nights of staleness is too long for new products. What do you change?* Re-send failed new products through the synchronous API the same night, capped, and report how many hit the cap.
+- *The ledger lives in memory. The worker restarts while results are streaming. What happens?* Persist the ledger before creating the batch, and make the write idempotent per (run, custom_id), so re-processing the stream after a restart writes the same rows again.
+- *How do you prove the repaired data is right?* Re-run the diff after the repair: zero rows where the written SKU differs from the ledger SKU, and a spot audit of 50 products against their descriptions.
+
+## Common mistakes
+
+- Sorting the results by custom_id and zipping again; skipped and failed items still shift the pairs.
+- Re-running the whole night at full cost when the results are stored for 29 days.
+- Retrying invalid_request_error items unchanged; they fail the same way every night.
+- Fixing the join and leaving `zip`'s silent truncation as the way failures disappear.

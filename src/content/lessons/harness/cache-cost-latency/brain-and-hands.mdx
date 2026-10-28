@@ -1,0 +1,145 @@
+---
+title: "Latency: decoupling the loop from the sandbox"
+track: harness
+module: cache-cost-latency
+order: 4
+kind: lesson
+level: staff
+minutes: 12
+summary: When the agent loop lives in the same container as the sandbox, every session pays container setup before its first token; Claude Managed Agents moved the loop out, put the session in a log and provisioned sandboxes through a tool call, and Anthropic reports large drops in median and tail time to first token.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Lance Martin, Gabe Cemaj and Michael Cohen, Scaling Managed Agents, decoupling the brain from the hands (Anthropic, 2026-04-08)
+    url: https://www.anthropic.com/engineering/managed-agents
+    note: "first design put session, harness and sandbox in one container; harness now calls the sandbox as execute(name, input) returning a string; a dead container is caught as a tool-call error and a new one created with provision({resources}); harness recovery with wake(sessionId), getSession(id), emitEvent(id, event); getEvents() positional slices; every session used to clone the repo, boot the process and fetch pending events before inference; p50 TTFT dropped roughly 60% and p95 over 90%; git tokens wired into the remote at sandbox initialisation, MCP OAuth tokens in a vault behind a proxy"
+  - title: Claude Managed Agents overview (beta header managed-agents-2026-04-01, checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/managed-agents/overview
+    note: "agent, environment, session and events; cloud or self-hosted sandboxes; event history persisted server-side; stateful by design and therefore not eligible for Zero Data Retention or HIPAA BAA coverage"
+  - title: Claude API docs, Pricing, Claude Managed Agents (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: "session runtime $0.08 per session-hour, metered to the millisecond only while the session is running; idle time waiting for a message or tool confirmation is not billed; replaces container-hour billing for code execution"
+  - title: OpenAI, Unrolling the Codex agent loop (2026-01-23)
+    url: https://openai.com/index/unrolling-the-codex-agent-loop/
+    note: "Codex keeps every Responses API request stateless, without previous_response_id, partly to support Zero Data Retention"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What sat in front of the first token
+
+Anthropic's first design for Claude Managed Agents, its hosted agent runtime, put three things in one container: the session (everything that happened), the harness (the loop that calls Claude and routes tool calls) and the sandbox (where Claude runs code and edits files). The April 2026 engineering post lists what that coupling cost. File edits were direct syscalls and there were no service boundaries to design, but every session, including sessions that would never touch the sandbox, had to clone the repository, boot the process and fetch pending events before any inference could happen. No model call could start until the container existed.
+
+The fix was to decouple what the post calls the brain (Claude and the harness) from the hands (sandboxes and tools) and from the session (the event log). The harness calls a sandbox the way it calls any tool, `execute(name, input)` returning a string, and the sandbox is created by that call when it is first needed. Inference starts as soon as the orchestration layer has pulled pending events from the session log. Anthropic reports that with this architecture p50 time to first token dropped roughly 60% and p95 over 90%. Those are the vendor's own measurements, published without absolute values, a time window or the workload mix.
+
+## Why the tail falls further than the median
+
+The shape of the result follows from the arithmetic of what was removed. A scenario with five sessions, numbers chosen for illustration: provisioning (clone, boot, fetch) takes 3, 4, 5, 9 and 30 seconds, because repositories differ in size and one host is slow; the model's own time to first token is 1.0, 1.5, 2.0, 2.0 and 2.5 seconds. In the coupled design each session's TTFT is the sum of its two times. In the decoupled design, for a first turn that needs no sandbox, it is the model time alone.
+
+<Predict id="hrn-brain-hands-median" question="By what percentage does the median TTFT of these five sessions fall when provisioning leaves the critical path?" answer={71} tolerance={2} unit="%">
+<p>Coupled TTFTs are 4.0, 5.5, 7.0, 11.0 and 32.5 seconds, median 7.0. Decoupled, the median is 2.0. The median falls by 1 - 2.0 / 7.0 = <b>71%</b>.</p>
+<p>The worst session falls from 32.5 to 2.5 seconds, 92%. The tail was made of provisioning: slow clones, cold hosts, large images. Model time to first token varies far less. Removing the high-variance term from the critical path cuts the tail by more than the median, which is the same shape as the published 60% and over 90%, though nothing here reproduces Anthropic's numbers.</p>
+</Predict>
+
+The scenario also shows the limit. It assumed the first turn needs no sandbox. A session that runs a command in its first turn still pays provisioning, now at its first tool call instead of before its first token. Lazy provisioning removes the cost from sessions that never need a sandbox, and moves it later for sessions that do; it does not make provisioning faster.
+
+## Three interfaces
+
+The design rests on three interfaces, each of which can fail or be replaced without the others. The post's framing is an operating-system one: virtualise the components so the abstractions outlast the implementations.
+
+**The session is an append-only log outside the harness.** The harness writes each event with `emitEvent(id, event)`. Because nothing it needs lives only in its memory, a crashed harness is replaced rather than repaired: a new one starts with `wake(sessionId)`, reads the log with `getSession(id)` and resumes from the last event. This is event sourcing with a model as the consumer. The difference from a conventional projection is that the harness reads positional slices with `getEvents()` and may transform them before they enter Claude's context, including, in the post's words, organising context for a high prompt cache hit rate. The log keeps everything; the context window gets a projection the harness chooses, and a compaction choice that turns out wrong can be revisited because the events were never discarded.
+
+**The sandbox is behind `execute(name, input)`.** A container, a phone or an emulator looks the same to the harness. When a container dies, the harness catches the failure as a tool-call error and passes it back to Claude. If Claude retries, a new container is created from a standard recipe, `provision({resources})`. Containers stopped being pets to nurse back to health; in the coupled design, debugging a stuck session meant opening a shell in a container that often also held user data.
+
+**Credentials live outside the sandbox.** In the coupled design, code Claude generated ran next to the credentials, so a prompt injection only had to get Claude to read its own environment. The structural fix keeps tokens unreachable from the sandbox: a repository's access token is used to clone at sandbox initialisation and wired into the git remote, so push and pull work without the agent handling the token; MCP OAuth tokens sit in a vault, and Claude's MCP calls go through a proxy that fetches credentials per session. The harness never sees them.
+
+## A lazy sandbox in code
+
+The harness side of the pattern is small. The sandbox is created on the first `execute`, and a dead one becomes a string the model reads:
+
+```python
+class SandboxDied(Exception):
+    pass
+
+
+class Harness:
+    """Stateless loop: its state is the session log, and a sandbox exists only after the first tool call."""
+
+    def __init__(self, log, provision):
+        self.log, self.provision, self.sandbox = log, provision, None
+
+    def execute(self, name, tool_input):
+        if self.sandbox is None:
+            self.log.append({"type": "provision"})
+            self.sandbox = self.provision()          # paid at the first tool call, not before the first token
+        try:
+            result = self.sandbox(name, tool_input)
+        except SandboxDied as err:
+            self.sandbox = None                      # drop it; the model decides whether to retry
+            result = f"error: sandbox unavailable ({err}); a new one will be provisioned on the next call"
+        self.log.append({"type": "tool_result", "name": name, "content": result})
+        return result
+
+
+def flaky_sandbox():
+    calls = {"n": 0}
+    def run(name, tool_input):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise SandboxDied("container exited")
+        return f"ran {tool_input}"
+    return run
+
+
+log = []
+h = Harness(log, flaky_sandbox)
+for cmd in ["pytest -x", "pytest -x", "pytest -x"]:
+    print(h.execute("bash", cmd))
+print(sum(e["type"] == "provision" for e in log), "provisions")
+# ran pytest -x
+# error: sandbox unavailable (container exited); a new one will be provisioned on the next call
+# ran pytest -x
+# 2 provisions
+```
+
+What the code leaves out is where a platform design spends its effort, and none of it is in Anthropic's post. If the harness crashes after a command ran but before the result was logged, a woken harness cannot tell whether to re-run it; log the call before executing and make re-execution safe, or return "outcome unknown" to the model. Two harnesses woken for one session both append to the log; something must make one of them the writer. A replacement sandbox has lost uncommitted work in the old one's filesystem, and the model needs to be told that, not just that the call failed. And a provisioning recipe that clones the repository is only as fast as the clone, so the recipe is where caching of images and repositories pays.
+
+## Paying for the hands only when used
+
+The billing matches the architecture. Managed Agents charges tokens at model rates plus $0.08 per session-hour of runtime, metered only while the session is running; time spent idle, waiting for the next message or a tool confirmation, is not billed, and session runtime replaces container-hour billing for code execution. Anthropic's pricing page works an example: a one-hour Opus 5.5 session with 50,000 input and 15,000 output tokens costs $0.58, of which $0.08 is runtime.
+
+Statefulness has a compliance price that the latency gain does not show. The Managed Agents overview says that because sessions store conversation history, sandbox state and outputs server-side, the product is not currently eligible for Zero Data Retention or HIPAA BAA coverage. Codex made the opposite trade: OpenAI's January 2026 post says it keeps every Responses API request stateless, without `previous_response_id`, partly so Zero Data Retention customers are supported. A durable session log is what makes `wake(sessionId)` possible, and it is also a store of customer data.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your internal agent platform starts a container, clones the repository and installs dependencies before the first model call. Product wants the first response to feel immediate; security wants repository and API credentials out of the container; the team is four engineers with one quarter, and the existing container image cannot be rebuilt this quarter. What do you build?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Move the loop out of the container and provision the container on the first tool call, with the session's events in a durable log outside both. Most of the TTFT win comes from sessions whose first turn needs no sandbox, so measure that share first. Put credentials behind the boundary: clone with a token at initialisation and wire it into the remote, and route API calls through a proxy that injects secrets. The image stays as it is; only who starts it, and when, changes.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Measure before building. From existing traces, split TTFT into provisioning and model time, and find the share of sessions whose first turn calls no tool. If almost every session runs a command first, lazy provisioning moves the cost rather than removing it, and the quarter is better spent on a warm pool or repository caching.</p>
+<p>If the share is large, build the three interfaces in order. The session log first, because a stateless harness depends on it; then <code>execute</code> and <code>provision</code> around the unchanged image; then the credential path. A dead container returns as a tool error, and the model decides whether to retry.</p>
+<p>What you give up: a network hop on every tool call where there used to be a syscall, a new service to run, and a log that now holds customer data and needs a retention policy. Write the rollback trigger: if p95 time to first tool result rises beyond what the TTFT gain buys, route those workloads back to the coupled path.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Your traces show 85% of sessions run a shell command in their first turn. Do you still decouple, and what would make the quarter worth it?</li>
+<li>Security asks for the session log to be deleted at session end; the reliability lead says that breaks harness recovery. How do you decide without deciding by rank?</li>
+<li>After launch, median TTFT halves but users report the agent feels slower on real tasks. What do you measure, and what would make you reverse the change?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The published result is one vendor's measurement on its own workload mix, and the post gives percentages without baselines. A coding agent whose first action is nearly always a shell command gains little from lazy provisioning, because the critical path to a useful result still includes the container. TTFT is the latency users feel first, not the latency of finishing the task, and an architecture can improve one while worsening the other.
+
+The coupled design had real advantages the post names: file edits as direct syscalls and no service boundaries. For a single-tenant agent with one sandbox and short sessions, one container is simpler and the decoupling buys little. The case for the split grows with session length, sandbox failures, the number of execution environments a brain reaches into, and the cost of credentials sitting next to generated code.
+
+<SelfRate id="lesson:harness/cache-cost-latency/brain-and-hands" />

@@ -1,0 +1,159 @@
+---
+title: "Playbook: cascaded pipeline or speech-to-speech"
+track: multimodal
+module: speech-voice
+order: 3
+kind: playbook
+level: senior
+minutes: 15
+summary: How to choose between a cascaded recognizer, LLM and synthesizer pipeline and a speech-to-speech model from four inputs (latency target, tool calls per turn, compliance logging and cost per minute), and what to measure in the first week of a pilot.
+prerequisites: [multimodal/speech-voice/speech-models, multimodal/speech-voice/voice-turn]
+updated: 2026-10-28
+sources:
+  - title: OpenAI docs, voice agents (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/guides/voice-agents
+    note: "three options: speech-to-speech with the Realtime API ('speech, reasoning, and tool use in one session'; the session handles audio turns, tools, interruptions and handoffs), GPT-Live (full-duplex with a separate backend; users can keep talking while backend work runs), and a chained pipeline for control over each stage ('inspect or transform intermediate text and replace each component independently'), with the example of storing the transcript and running policy checks before speech is generated; track backend time separately and compare median and 95th percentile"
+  - title: OpenAI docs, Realtime costs (fetched 2026-10-28; the page returned 404 on direct fetch that day, and the figures were read from its indexed text)
+    url: https://developers.openai.com/api/docs/guides/realtime-costs
+    note: "audio tokens in user messages are 1 token per 100 ms, in assistant messages 1 token per 50 ms; prompt caching applies automatically in multi-turn sessions; input transcription is billed separately; truncation with retention_ratio 0.8 drops 20% of the context so the cache is not busted on every turn"
+  - title: OpenAI developer notes on the Realtime API (checked 2026-10-28)
+    url: https://developers.openai.com/blog/realtime-api
+    note: "the service drops messages when the session reaches 28,672 tokens, configurable; retention ratio 0.8 truncates 20% of the context window; prompt caching matches identical prefixes; the GA service drops some audio tokens when a transcript is available"
+  - title: OpenAI API pricing (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/pricing
+    note: "gpt-realtime-2.1 audio $32 input, $0.40 cached input, $64 output per 1M tokens; text $4, $0.40, $24; gpt-live-1 $0.05 per minute, billed per second; gpt-4o-transcribe $0.006 and gpt-4o-mini-transcribe $0.003 per minute; tts-1 $15 per 1M characters"
+  - title: "Moshi: a speech-text foundation model for real-time dialogue (Défossez et al., arXiv 2410.00037, v2 2024-10-02)"
+    url: https://arxiv.org/abs/2410.00037
+    note: "user and system speech as parallel streams, capturing overlap, interruptions and interjections without explicit turns; the paper reports 160 ms theoretical and 200 ms practical latency"
+  - title: Voice AI and Voice Agents, an illustrated primer (Pipecat maintainers; June 2026 update, checked 2026-10-28)
+    url: https://www.voiceaiandvoiceagents.com
+    note: "1,500 ms voice-to-voice target; typical cascaded stack measured at 1,293 ms; function calls add latency, including the second inference"
+  - title: ElevenLabs, voice agent latency optimization (published 2026-06-23, updated 2026-10-09; vendor)
+    url: https://elevenlabs.io/blog/voice-agent-latency-optimization
+    note: "illustrative stage budget the widget's defaults use (P50/P95 ms): capture and endpointing 120/280, STT 60/150, network 60/160, LLM 250/600, TTS 110/220, buffering 80/150; the vendor's own target of P50 under 800 ms from end of speech"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import SystemDesignVoiceBudget from '../../../../components/widgets/SystemDesignVoiceBudget.astro';
+
+## The decision
+
+A voice agent either chains three models with text between them (a recognizer, a text LLM with tools, a synthesizer) or hands audio to one speech-to-speech model that listens and speaks. OpenAI's voice-agent guide states the split in its own terms: the speech-to-speech session handles audio turns, tools, interruptions and handoffs in one model, while a chained pipeline lets you "inspect or transform intermediate text and replace each component independently", for example to store the transcript and run policy checks before any speech is generated. A third option sits between them: OpenAI's GPT-Live is full-duplex on the audio side and calls a backend you choose, so users can keep talking while backend work runs.
+
+The choice is hard to reverse. A cascaded design accumulates per-stage instrumentation, text-level guardrails and a vendor per stage; a speech-to-speech design accumulates prompts and evaluations tuned to one vendor's audio model. Decide it on four inputs.
+
+## The inputs that change the answer
+
+**Latency target and the interval it measures.** A cascaded stack measured by the Pipecat maintainers takes 1,293 ms from microphone to speaker, against their 1,500 ms target. Moshi, a research speech-to-speech model, reports 160 ms theoretical and 200 ms practical latency in its paper. If the requirement is a P95 under 1.5 seconds with occasional tool calls, a cascaded pipeline with streaming and a tight-tailed LLM can meet it for non-tool turns. If the requirement is conversational overlap (backchannels, interruptions mid-word), only a model that hears while it speaks can meet it.
+
+**Tool calls per turn.** Every tool call in a cascaded pipeline adds the tool's latency and a second time to first token. A speech-to-speech session pays the tool's latency too, but handles the conversation around it inside the model. If most turns call a tool, latency is dominated by the tools in either architecture, and the deciding factor becomes how the agent behaves while it waits.
+
+**Compliance logging.** Regulated conversations (finance, health, collections) usually need a record of what was said and a check before certain things are said. The cascaded pipeline produces the transcript of both sides as a by-product and has a text stage where a policy check can block a reply before synthesis. A speech-to-speech model gives you whatever transcripts the provider emits alongside the audio, and the check can only run on audio that is already being generated or on a transcript that may lag it.
+
+**Cost per minute.** Speech-to-speech token pricing scales with conversation length in a way per-minute pricing does not, which is the input most teams get wrong. The next section does the arithmetic.
+
+## Cost per minute, computed
+
+OpenAI's realtime cost guide counts user audio at 1 token per 100 ms and assistant audio at 1 token per 50 ms, and each response is generated over the session's accumulated conversation, which is why OpenAI's developer notes describe automatic truncation when a session reaches 28,672 tokens and a retention ratio that keeps the cached prefix stable. The function below bills the full history as input on every turn, at gpt-realtime-2.1's audio rates.
+
+```python
+# Speech-to-speech session cost when each response is generated over the whole conversation so far.
+# OpenAI counts user audio at 1 token per 100 ms and assistant audio at 1 per 50 ms.
+# gpt-realtime-2.1 audio, USD per 1M tokens, checked 2026-10-28: $32 in, $0.40 cached in, $64 out.
+P_IN, P_CACHED, P_OUT = 32.0, 0.40, 64.0
+
+def s2s_cost(turns, user_s, agent_s, cache_hit=0.0):
+    history, total = 0.0, 0.0
+    for _ in range(turns):
+        user_tok, agent_tok = user_s * 10, agent_s * 20
+        reused = history * (cache_hit * P_CACHED + (1 - cache_hit) * P_IN)
+        total += (reused + user_tok * P_IN + agent_tok * P_OUT) / 1e6
+        history += user_tok + agent_tok
+    return total
+
+for turns, hit in [(10, 0.0), (20, 0.0), (20, 0.9)]:
+    minutes = turns * (5 + 10) / 60
+    c = s2s_cost(turns, user_s=5, agent_s=10, cache_hit=hit)
+    print(f"{turns} turns, {minutes:.1f} min, cache hit {hit:.0%}: ${c:.3f} (${c / minutes:.3f}/min)")
+
+# Cascaded audio stages for the same call shape, per minute: 20 s of user audio and 40 s of agent audio.
+# gpt-4o-transcribe $0.006 per audio minute; tts-1 $15 per 1M characters; 15 characters per second of speech (scenario).
+asr = 20 / 60 * 0.006
+tts = 40 * 15 * 15.0 / 1e6
+print(f"cascaded audio stages: ${asr + tts:.3f}/min plus the text LLM")
+```
+
+```text
+10 turns, 2.5 min, cache hit 0%: $0.504 ($0.202/min)
+20 turns, 5.0 min, cache hit 0%: $1.808 ($0.362/min)
+20 turns, 5.0 min, cache hit 90%: $0.457 ($0.091/min)
+cascaded audio stages: $0.011/min plus the text LLM
+```
+
+The call shape (5 seconds of user audio and 10 of agent audio per turn) and the characters per second are scenario values. Doubling the turns multiplies the uncached cost by 3.6, because the history is billed again on every turn; caching the history is worth a factor of four at 20 turns. The cascaded column carries only its audio stages: its text LLM bill also grows with history, but at text token rates on a transcript that is much shorter in tokens than the audio it came from. GPT-Live sits at $0.05 per minute, billed per second, with the backend model and tools billed on top.
+
+<Predict id="mml-s2s-cost-30" question="Using the function above with no caching, what does a 30-turn call cost (5 s of user audio and 10 s of agent audio per turn)?" answer={3.912} tolerance={0.05} unit="USD">
+<p><b>$3.91</b>, or $0.52 a minute over 7.5 minutes. The per-minute price keeps rising with call length, because the history term grows with the square of the turn count. Long calls on uncached speech-to-speech sessions are where budgets break; cap the session, truncate in large steps so the cached prefix survives, and summarise old turns.</p>
+</Predict>
+
+## The options, and when each wins
+
+**Cascaded pipeline wins** when a policy check must run before speech, when the transcript is a legal record, when the team needs to swap one stage (a recognizer that handles a regional accent, a cheaper TTS) without retraining prompts, or when calls are long and per-token audio pricing would dominate. It loses on turn-taking feel: the endpointer decides when the user is done, and overlap is handled by cancelling, not by listening.
+
+**Speech-to-speech wins** when conversational feel is the product (coaching, companionship, language practice), when calls are short, and when the compliance requirement is satisfied by a provider transcript after the fact. It loses observability at the stage level and puts tone, latency and pricing in one vendor's hands.
+
+**Full-duplex front end with a separate backend** (GPT-Live in OpenAI's lineup) wins when you already have a text agent with tools and guardrails you trust and want better turn-taking in front of it. The cost is two bills and a seam: what the voice layer says while the backend works is generated outside your text guardrails.
+
+Use the widget to see how much of a cascaded budget each stage takes. Its defaults are ElevenLabs' illustrative stage budget; the budget is set to the Pipecat primer's 1,500 ms target.
+
+<SystemDesignVoiceBudget budget={1500} note="stage times from ElevenLabs' illustrative budget, checked 28 Oct 2026; 1,500 ms is the Pipecat primer's target" />
+
+## A worked decision
+
+The case, as a scenario: a regional insurer's claims line. Callers report a claim, the agent looks up the policy (one tool call on most turns, two on some), and regulation requires a retained record of both sides and a block on any statement that admits liability. Calls average 8 minutes. The latency requirement from the business is "no dead air", written as P95 time to first audio under 1.5 seconds.
+
+Liability language must be blocked before it is spoken, so a text stage between the LLM and the synthesizer is required, which rules out a pure speech-to-speech session for the replies. Tool calls on most turns mean latency is set by the tools and the second inference in any architecture, so the speech-to-speech latency advantage is mostly spent. An 8-minute call is about 32 turns of the shape in the code above, where uncached speech-to-speech audio pricing is above $0.50 a minute. The decision is a cascaded pipeline with streaming TTS, a watchdog filler on every tool call, a semantic turn detector, and the policy check on each clause before it reaches the synthesizer.
+
+**What you give up:** the natural overlap of a speech-to-speech model, and some latency on every turn to the clause-level policy check. The risk to write down: a clause-level check sees a sentence in pieces, so "we will cover" and "the damage in full" pass separately; the check needs the reply so far as context, not just the clause.
+
+## What to measure in the first week of the pilot
+
+1. Per-stage timestamps per turn: end of user speech, endpoint decision, first LLM token, first TTS byte, first audio played. Report P50 and P95 of first audio and of answer audio, split by tool and non-tool turns.
+2. Cut-off rate: turns where the user was still speaking when the agent started, from recordings, labelled by a person on a sample.
+3. Barge-in correctness: on a sample of interrupted turns, whether the stored assistant message matches what was played.
+4. Policy-check blocks and false blocks per hundred calls, and the latency the check adds per clause.
+5. Cost per minute by call length bucket, from the invoice, not from the price sheet.
+6. Recognizer errors on the tokens that matter: policy numbers, names, dates.
+
+Revisit the decision if the pilot shows tool turns are rare, calls are short, and the compliance team accepts a provider transcript: those are the conditions under which speech-to-speech wins.
+
+## In the room
+
+**"We are building a voice agent for appointment booking at a chain of clinics. Leadership saw a speech-to-speech demo and wants it. We have twelve weeks, a HIPAA review, and a booking API that takes 1 to 3 seconds. Make the call."**
+
+<Depth>
+<Fragment slot="short">
+<p>Cascaded, with a full-duplex front end as a later experiment. The HIPAA review needs a record and a place to redact and check text; the booking API's 1 to 3 seconds dominates latency on the turns that matter in either design; and twelve weeks favours stages the team can test one at a time. The speech-to-speech demo's advantage is on turns without tools, which booking calls have few of.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Three inputs decide it. Tools: most booking turns call the API, so latency is the API plus a second inference in any architecture, and the work is in what the agent says while it waits and in prefetching availability at call start. Compliance: a cascaded pipeline yields a transcript you control and a text stage where PHI can be redacted before logging and replies can be checked before speech; a speech-to-speech session can still be used if the provider's transcripts and data terms pass the review, but that is a dependency on someone else's paperwork inside a twelve-week plan. Cost: booking calls are short, so speech-to-speech token pricing is not the deciding input here.</p>
+<p>Write down the plan and its exit: cascaded pipeline in production by week ten, with per-stage telemetry; a two-week experiment routing a slice of calls through a full-duplex front end with the same backend, compared on completion rate and cut-offs. The failure mode of the recommendation: leadership's complaint is about feel, and a cascaded agent with a tuned endpointer still sounds like turn-taking, so the pilot can meet every latency number and still lose the argument. Put a call-completion metric in the plan so the comparison is on outcomes.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The speech-to-speech provider passes the HIPAA review in week four. What changes in your plan, and what does not?</li>
+<li>Your experiment shows the full-duplex front end completes 4 percent more bookings at three times the per-minute cost. Who decides, and what do you put in the memo?</li>
+<li>What would you need to see in the pilot to abandon the cascaded design entirely?</li>
+</ul>
+</Fragment>
+</Depth>
+
+<Callout kind="aside">The 800 ms figure that appears in voice-agent requirements comes from ElevenLabs' post, where it is the vendor's P50 target for time to first audio from the end of user speech. Treat it as one vendor's target; this module uses the Pipecat primer's 1,500 ms voice-to-voice figure as the reference.</Callout>
+
+## When this is wrong
+
+The cost function bills the whole audio history on every turn; OpenAI's developer notes say the service drops some audio tokens when a transcript is available, so real bills can be lower, and the only reliable per-minute number is the one on your invoice. Prices and model names here were checked on 2026-10-28 and change several times a year. The playbook treats speech-to-speech as unable to run a text check before speaking; a provider that exposes a pre-speech text hook would move the compliance input. And the four inputs are not the only ones: language coverage, voice cloning terms, and whether your telephony provider can carry the provider's transport can each decide the question before any of these do.
+
+<SelfRate id="lesson:multimodal/speech-voice/pipeline-vs-s2s" />

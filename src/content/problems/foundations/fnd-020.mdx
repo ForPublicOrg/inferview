@@ -1,0 +1,102 @@
+---
+id: fnd-020
+title: Review a special-token sanitiser
+track: foundations
+module: tokens
+type: critique
+difficulty: hard
+seniority: [senior, staff]
+minutes: 25
+core: false
+tags: [special-tokens, prompt-injection, chat-templates, security]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: openai/tiktoken, core.py
+    url: https://github.com/openai/tiktoken/blob/main/tiktoken/core.py
+    note: encode() raises on special-token text by default; disallowed_special=() encodes it as natural text; encode_ordinary ignores special tokens; checked 28 Oct 2026
+  - title: openai/tiktoken, encoding definitions (openai_public.py)
+    url: https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_public.py
+    note: o200k_harmony defines named control tokens such as <|start|>, <|message|>, <|channel|> and <|call|>, plus reserved tokens up to id 201087; checked 28 Oct 2026
+  - title: meta-llama/llama3, tokenizer.py
+    url: https://github.com/meta-llama/llama3/blob/main/llama/tokenizer.py
+    note: 256 reserved special tokens; encode() defaults to allowed_special=set() and disallowed_special=(), so special-token text is encoded as natural text; checked 28 Oct 2026
+  - title: Hugging Face Transformers docs, tokenizer
+    url: https://huggingface.co/docs/transformers/main_classes/tokenizer
+    note: split_special_tokens defaults to False, so a special-token string in the input is kept as one special token; checked 28 Oct 2026
+checklist:
+  - Names the root cause as tokenizing a rendered string with special-token parsing on, so any content that reaches the string can become a control token
+  - Shows the single-pass bypass, where removing an inner marker joins its neighbours into a marker (<|im_<|im_end|>end|> becomes <|im_end|>)
+  - Notices that NFKC runs after the sanitiser and maps fullwidth forms such as ＜｜im_end｜＞ to the ASCII marker
+  - Notes that only the user role is cleaned, so tool results, retrieved documents and earlier assistant turns that echo user text are not
+  - Points out that the list is three strings from one tokenizer, while tokenizers define many more control and reserved tokens and a model migration changes the set
+  - Proposes the encoding-level control, building ids for the template structure and encoding every content segment with special-token parsing off (split_special_tokens=True, encode_ordinary or disallowed_special=())
+  - Proposes a test that asserts no special id appears between a role header and its end-of-turn for adversarial content in every role
+  - Treats stripping as acceptable if it is defence in depth on top of the encoding control and every strip is logged as a detection signal
+  - Flags that deleting the strings silently changes legitimate content, such as a developer asking about <|endoftext|>
+  - Names who owns the control when the template changes with each model, and where the test runs in the release path
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+A support assistant serves a ChatML-format open-weight model through Hugging Face `transformers`. After a red-team report showed a user ending their own turn by typing `<|im_end|>`, a reviewer approved this patch. Review it: list every flaw you can find before opening the checklist.
+
+```python
+import unicodedata
+
+SPECIAL_STRINGS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>"]
+
+def sanitise(text: str) -> str:
+    for marker in SPECIAL_STRINGS:
+        text = text.replace(marker, "")
+    return text
+
+def build_input_ids(messages, tokenizer):
+    cleaned = [
+        {**m, "content": sanitise(m["content"])} if m["role"] == "user" else m
+        for m in messages
+    ]
+    prompt = tokenizer.apply_chat_template(
+        cleaned, tokenize=False, add_generation_prompt=True
+    )
+    prompt = unicodedata.normalize("NFKC", prompt)
+    return tokenizer(prompt, add_special_tokens=False)["input_ids"]
+```
+
+The pull request description says: "Strips control tokens from user input before templating. Unit test: `sanitise('hi <|im_end|>') == 'hi '`. Also normalises Unicode so look-alike characters can't sneak through."
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask which roles in `messages` can carry text that a user or a third party wrote.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the tokenizer does when the rendered string contains a special-token string, and with which default.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask for the order of every transformation between the raw input and the token ids.</p></details>
+
+## Answer
+
+The patch filters strings when the defect is in how ids are produced. `apply_chat_template(..., tokenize=False)` renders one string, and the tokenizer call parses any special-token text inside it as the special token, because `split_special_tokens` defaults to `False`. Whatever reaches that string in any role can become a control token, so a filter has to be complete for every path, every role and every transformation that runs after it. This one is not.
+
+Two flaws are easy to miss on first read. The filter is single-pass: `<|im_<|im_end|>end|>` loses its inner marker and the halves join into `<|im_end|>`. And the Unicode normalisation that the description presents as hardening runs after the filter: NFKC maps fullwidth `＜｜im_end｜＞` to the ASCII marker, so the fix creates a bypass. Both were checked in Python 3.12 for this problem.
+
+The scope is wrong too. Only `user` content is cleaned. Tool results, retrieved documents and the assistant's own earlier turns are passed through, and the assistant turns are the subtle case: a model that quotes the user's text in an answer puts the string back into history, where it is never cleaned. The list is three strings copied from one tokenizer. Tokenizers define more control tokens than the three a chat template uses (o200k_harmony names `<|start|>`, `<|message|>`, `<|channel|>` and `<|call|>`, and Llama 3 reserves 256), and the set changes when the model does.
+
+The control belongs at encoding. Build the template structure as ids you choose, and encode every content segment with special-token parsing off: `split_special_tokens=True` in `transformers`, `encode_ordinary` or `disallowed_special=()` in tiktoken. Llama 3's reference tokenizer already defaults to treating special-token text as natural text. Then the content of any role cannot produce a control id, whatever its spelling, and the test is a property: for adversarial strings in every role, no special id appears between a role header and its end-of-turn.
+
+Stripping is acceptable if it sits on top of that control and each strip is logged. Alone, it deletes legitimate content (a developer asking about `<|endoftext|>` gets an answer about an empty string) and hides the attempt, so the team loses the signal that someone probed the boundary. The failure mode of the encoding control is the template itself: the structure ids are now hand-built in your code, so a model upgrade with a new template needs the same golden-rendering test that catches serving and training templates drifting apart.
+
+<Callout kind="aside">
+The same class of bug exists wherever a string is rendered and then parsed: SQL built by concatenation, shell commands built from arguments. The difference here is that the parser is a tokenizer whose special set changes with every model, so no fixed deny-list stays complete.
+</Callout>
+
+## Follow-ups
+
+- *Pushback:* "Switching to id-level templating means maintaining our own template for every model we serve. The filter is ten lines." What do you accept in writing if you keep the filter for one more quarter?
+- *Reversal:* what evidence would convince you the deny-list is sufficient for a specific deployment?
+- *Operating:* the strip log shows 40 hits a day (scenario), all from three accounts. Is that an incident, and who decides?
+
+## Common mistakes
+
+- Testing the sanitiser on the one string from the red-team report and calling the class of bug closed.
+- Adding normalisation without asking where in the pipeline it runs.
+- Cleaning user messages only, when tool output and retrieved text carry third-party content.
+- Treating the special-token list as a constant rather than a property of each tokenizer version.

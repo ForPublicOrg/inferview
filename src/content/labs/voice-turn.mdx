@@ -1,0 +1,499 @@
+---
+title: A voice turn simulator
+track: multimodal
+module: speech-voice
+kind: lab
+minutes: 120
+summary: Build a seeded simulator of one cascaded voice turn over six steps, from a serial baseline through streaming TTS, speculative LLM start, a watchdog filler for slow tools and barge-in truncation, to a p50 and p95 report against targets you set.
+updated: 2026-10-28
+sources:
+  - title: Voice AI and Voice Agents, an illustrated primer (Kwindla Hultman Kramer and Pipecat contributors; June 2026 update, checked 2026-10-28)
+    url: https://www.voiceaiandvoiceagents.com
+    note: "round-trip table summing to 1,293 ms (mic 40, opus encoding 21, network 10, packet handling 2, jitter buffer 40, opus decoding 1, transcription and endpointing 300, LLM TTFB 650, sentence aggregation 20, TTS TTFB 120, then 21, 2, 10, 40, 1 and speaker 15 on the way back); 1,500 ms as the target and no spikes above it; LLM TTFT median and P95 (GPT-4.1 536/1771, Gemini 2.5 Flash 597/1137, Claude 4.5 Haiku 637/1615, GPT-5.1 739/1492, Nemotron 3 Ultra self-hosted 541/712 ms); TTS time to first audio median and P95 (Cartesia Sonic 3.5 195/240, Deepgram Aura-2 310/600, ElevenLabs Turbo v2.5 330/670, Gradium 235/320, Inworld TTS 1.5 Max 337/560 ms); a message before a function call or a watchdog timer for slow tools; every part of the pipeline cancellable; assistant context assembled from word-level timestamps to match the audio the user heard"
+  - title: "Moshi: a speech-text foundation model for real-time dialogue (Défossez et al., arXiv 2410.00037, v2 2024-10-02)"
+    url: https://arxiv.org/abs/2410.00037
+    note: "the speech-to-speech alternative the simulator does not model: user and system audio as parallel streams with no explicit turns; the paper reports 160 ms theoretical and 200 ms practical latency"
+steps:
+  - title: The serial baseline
+    brief: |
+      A cascaded voice turn is a chain: audio travels up to your server, the transcriber and endpointer decide the user has finished, the LLM produces its first token and then the rest, TTS produces its first audio, and the audio travels back and plays. The starter gives you Dist (a lognormal stage time set by its median and 95th percentile; equal values mean fixed), a Pipeline whose fixed defaults are the stage medians from the Pipecat maintainers' round-trip table, with the transport rows summed to 114 ms up and 89 ms down, and draw(), which samples every stage of one turn in a fixed order so that two pipelines given the same seed see the same turn. Token speed (10 ms per token) and the 60-token reply are scenario values. Write run_turn(sample, cfg) to return a Turn whose events map each event name to its time in ms after the user stopped speaking, and simulate(cfg, n, seed). In this step nothing overlaps: TTS starts when the last token arrives. The fields the later steps use are already in Pipeline and stay off by default.
+    starter: |
+      import bisect
+      import math
+      import random
+      from dataclasses import dataclass, field, replace
+
+
+      class Dist:
+          """A stage time in ms: lognormal with this median and 95th percentile. p95 equal to p50 means fixed."""
+
+          def __init__(self, p50, p95=None):
+              self.p50 = float(p50)
+              p95 = self.p50 if p95 is None else float(p95)
+              self.sigma = math.log(p95 / self.p50) / 1.6449 if 0 < self.p50 < p95 else 0.0
+
+          def sample(self, rng):
+              z = rng.gauss(0.0, 1.0)  # drawn even when fixed, so every pipeline consumes the stream identically
+              return self.p50 * math.exp(self.sigma * z)
+
+
+      @dataclass
+      class Pipeline:
+          uplink: Dist = field(default_factory=lambda: Dist(114))    # mic, encode, network, jitter buffer, decode
+          endpoint: Dist = field(default_factory=lambda: Dist(300))  # transcription and endpointing
+          llm_ttfb: Dist = field(default_factory=lambda: Dist(650))
+          ms_per_token: Dist = field(default_factory=lambda: Dist(10))
+          tts_ttfb: Dist = field(default_factory=lambda: Dist(120))
+          downlink: Dist = field(default_factory=lambda: Dist(89))   # encode, network, jitter buffer, decode, speaker
+          reply_tokens: int = 60
+          clause_tokens: int = 8
+          interim_lead: Dist = field(default_factory=lambda: Dist(200))
+          p_interim_match: float = 0.0
+          p_tool: float = 0.0
+          tool_ms: Dist = field(default_factory=lambda: Dist(800))
+          filler_ms: float = 1200.0
+          streaming_tts: bool = False
+          speculative: bool = False
+          watchdog_ms: object = None
+
+
+      def draw(cfg, rng):
+          return {
+              'uplink': cfg.uplink.sample(rng), 'endpoint': cfg.endpoint.sample(rng),
+              'llm_ttfb': cfg.llm_ttfb.sample(rng), 'llm_ttfb2': cfg.llm_ttfb.sample(rng),
+              'ms_per_token': cfg.ms_per_token.sample(rng), 'tts_ttfb': cfg.tts_ttfb.sample(rng),
+              'downlink': cfg.downlink.sample(rng), 'lead': cfg.interim_lead.sample(rng),
+              'interim_ok': rng.random() < cfg.p_interim_match, 'tool': rng.random() < cfg.p_tool,
+              'tool_ms': cfg.tool_ms.sample(rng),
+          }
+
+
+      @dataclass
+      class Turn:
+          events: dict
+          llm_calls: int = 1
+
+          @property
+          def latency(self):
+              return self.events['heard']
+
+          @property
+          def answer_latency(self):
+              return self.events.get('answer_heard', self.events['heard'])
+
+
+      def run_turn(s, cfg):
+          # events: speech_end, at_server, endpoint, llm_first, llm_done, tts_start, tts_first, heard
+          raise NotImplementedError
+
+
+      def simulate(cfg, n, seed=0):
+          raise NotImplementedError
+    tests: |
+      cfg = Pipeline()
+      t = run_turn(draw(cfg, random.Random(1)), cfg)
+      assert abs(t.latency - (114 + 300 + 650 + 60 * 10 + 120 + 89)) < 1e-6
+      chain = ['speech_end', 'at_server', 'endpoint', 'llm_first', 'llm_done', 'tts_start', 'tts_first', 'heard']
+      assert all(t.events[a] <= t.events[b] for a, b in zip(chain, chain[1:]))
+      assert t.llm_calls == 1
+      wide = Pipeline(endpoint=Dist(300, 600), llm_ttfb=Dist(650, 1500))
+      assert [x.latency for x in simulate(wide, 50, seed=7)] == [x.latency for x in simulate(wide, 50, seed=7)]
+      assert [x.latency for x in simulate(wide, 50, seed=7)] != [x.latency for x in simulate(wide, 50, seed=8)]
+    hidden: |
+      wide = Pipeline(uplink=Dist(114, 200), endpoint=Dist(300, 600), llm_ttfb=Dist(650, 1500), ms_per_token=Dist(10, 20), tts_ttfb=Dist(120, 300), downlink=Dist(89, 150))
+      rng = random.Random(3)
+      draws = [draw(wide, rng) for _ in range(300)]
+      assert all(abs(run_turn(s, wide).latency - (s['uplink'] + s['endpoint'] + s['llm_ttfb'] + 60 * s['ms_per_token'] + s['tts_ttfb'] + s['downlink'])) < 1e-6 for s in draws)
+      assert len(simulate(wide, 123, seed=1)) == 123
+    solution: |
+      import bisect
+      import math
+      import random
+      from dataclasses import dataclass, field, replace
+
+
+      class Dist:
+          """A stage time in ms: lognormal with this median and 95th percentile. p95 equal to p50 means fixed."""
+
+          def __init__(self, p50, p95=None):
+              self.p50 = float(p50)
+              p95 = self.p50 if p95 is None else float(p95)
+              self.sigma = math.log(p95 / self.p50) / 1.6449 if 0 < self.p50 < p95 else 0.0
+
+          def sample(self, rng):
+              z = rng.gauss(0.0, 1.0)
+              return self.p50 * math.exp(self.sigma * z)
+
+
+      @dataclass
+      class Pipeline:
+          uplink: Dist = field(default_factory=lambda: Dist(114))
+          endpoint: Dist = field(default_factory=lambda: Dist(300))
+          llm_ttfb: Dist = field(default_factory=lambda: Dist(650))
+          ms_per_token: Dist = field(default_factory=lambda: Dist(10))
+          tts_ttfb: Dist = field(default_factory=lambda: Dist(120))
+          downlink: Dist = field(default_factory=lambda: Dist(89))
+          reply_tokens: int = 60
+          clause_tokens: int = 8
+          interim_lead: Dist = field(default_factory=lambda: Dist(200))
+          p_interim_match: float = 0.0
+          p_tool: float = 0.0
+          tool_ms: Dist = field(default_factory=lambda: Dist(800))
+          filler_ms: float = 1200.0
+          streaming_tts: bool = False
+          speculative: bool = False
+          watchdog_ms: object = None
+
+
+      def draw(cfg, rng):
+          return {
+              'uplink': cfg.uplink.sample(rng), 'endpoint': cfg.endpoint.sample(rng),
+              'llm_ttfb': cfg.llm_ttfb.sample(rng), 'llm_ttfb2': cfg.llm_ttfb.sample(rng),
+              'ms_per_token': cfg.ms_per_token.sample(rng), 'tts_ttfb': cfg.tts_ttfb.sample(rng),
+              'downlink': cfg.downlink.sample(rng), 'lead': cfg.interim_lead.sample(rng),
+              'interim_ok': rng.random() < cfg.p_interim_match, 'tool': rng.random() < cfg.p_tool,
+              'tool_ms': cfg.tool_ms.sample(rng),
+          }
+
+
+      @dataclass
+      class Turn:
+          events: dict
+          llm_calls: int = 1
+
+          @property
+          def latency(self):
+              return self.events['heard']
+
+          @property
+          def answer_latency(self):
+              return self.events.get('answer_heard', self.events['heard'])
+
+
+      def run_turn(s, cfg):
+          t = {'speech_end': 0.0}
+          t['at_server'] = s['uplink']
+          t['endpoint'] = t['at_server'] + s['endpoint']
+          t['llm_first'] = t['endpoint'] + s['llm_ttfb']
+          t['llm_done'] = t['llm_first'] + cfg.reply_tokens * s['ms_per_token']
+          t['tts_start'] = t['llm_done']
+          t['tts_first'] = t['tts_start'] + s['tts_ttfb']
+          t['heard'] = t['tts_first'] + s['downlink']
+          return Turn(t)
+
+
+      def simulate(cfg, n, seed=0):
+          rng = random.Random(seed)
+          return [run_turn(draw(cfg, rng), cfg) for _ in range(n)]
+  - title: Streaming TTS
+    brief: |
+      With the defaults the serial turn takes 1,873 ms, and 600 of them are the reply's 60 tokens waiting for the last one. When cfg.streaming_tts is on, start TTS when the first clause (cfg.clause_tokens) has arrived, or when the reply ends if it is shorter than a clause. The latency then stops depending on reply length, which is the property the tests check, and the default turn drops to 1,353 ms. The Pipecat table's 20 ms "sentence aggregation" row is this wait with a faster model or a shorter first clause; here it is 8 tokens at 10 ms, a scenario value. Edit run_turn in place.
+    starter: |
+
+
+      # Step 2: edit run_turn above. When cfg.streaming_tts is on, tts_start is the time the first
+      # cfg.clause_tokens tokens have arrived, or llm_done if the reply is shorter than one clause.
+    tests: |
+      cfg = Pipeline(streaming_tts=True)
+      t = run_turn(draw(cfg, random.Random(1)), cfg)
+      assert abs(t.latency - (114 + 300 + 650 + 8 * 10 + 120 + 89)) < 1e-6
+      long_reply = Pipeline(streaming_tts=True, reply_tokens=400)
+      assert abs(run_turn(draw(long_reply, random.Random(1)), long_reply).latency - t.latency) < 1e-6
+      assert t.events['tts_start'] < t.events['llm_done']
+    hidden: |
+      wide = Pipeline(endpoint=Dist(300, 600), llm_ttfb=Dist(650, 1500), ms_per_token=Dist(10, 20))
+      streamed = replace(wide, streaming_tts=True)
+      rng = random.Random(5)
+      draws = [draw(wide, rng) for _ in range(300)]
+      assert all(run_turn(s, streamed).latency <= run_turn(s, wide).latency + 1e-9 for s in draws)
+      short = Pipeline(streaming_tts=True, reply_tokens=3)
+      ts = run_turn(draw(short, random.Random(1)), short)
+      assert abs(ts.events['tts_start'] - ts.events['llm_done']) < 1e-6
+      serial = Pipeline()
+      assert abs(run_turn(draw(serial, random.Random(1)), serial).latency - 1873) < 1e-6
+    solution: |
+      def run_turn(s, cfg):
+          t = {'speech_end': 0.0}
+          t['at_server'] = s['uplink']
+          t['endpoint'] = t['at_server'] + s['endpoint']
+          t['llm_first'] = t['endpoint'] + s['llm_ttfb']
+          ms = s['ms_per_token']
+          t['llm_done'] = t['llm_first'] + cfg.reply_tokens * ms
+          if cfg.streaming_tts:
+              t['tts_start'] = min(t['llm_first'] + cfg.clause_tokens * ms, t['llm_done'])
+          else:
+              t['tts_start'] = t['llm_done']
+          t['tts_first'] = t['tts_start'] + s['tts_ttfb']
+          t['heard'] = t['tts_first'] + s['downlink']
+          return Turn(t)
+  - title: Speculative LLM start
+    brief: |
+      The endpointer waits for silence before it commits the transcript, but the interim transcript is often already final. When cfg.speculative is on, start an LLM request at spec_start, which is s['lead'] ms before the endpoint and never before the audio reached the server. If s['interim_ok'], the final transcript matched and that request's tokens are used. If not, the speculative request is thrown away and a second one starts at the endpoint, so the turn is no faster and llm_calls is 2: that is the cost of speculation, paid in tokens on every miss. Either way nothing is spoken before the endpoint confirms the user has finished, so tts_start is never earlier than the endpoint. The interim match rate is a property of your transcriber and your users; measure it before you enable this.
+    starter: |
+
+
+      # Step 3: edit run_turn. Record events['spec_start'] when cfg.speculative is on, use it as the LLM start
+      # when s['interim_ok'], count the wasted request in llm_calls otherwise, and never start TTS before the endpoint.
+    tests: |
+      hit = Pipeline(streaming_tts=True, speculative=True, p_interim_match=1.0)
+      t = run_turn(draw(hit, random.Random(1)), hit)
+      assert abs(t.latency - (114 + 300 - 200 + 650 + 80 + 120 + 89)) < 1e-6
+      assert t.llm_calls == 1
+      miss = Pipeline(streaming_tts=True, speculative=True, p_interim_match=0.0)
+      m = run_turn(draw(miss, random.Random(1)), miss)
+      assert abs(m.latency - (114 + 300 + 650 + 80 + 120 + 89)) < 1e-6
+      assert m.llm_calls == 2
+    hidden: |
+      wide = Pipeline(endpoint=Dist(300, 600), llm_ttfb=Dist(650, 1500), interim_lead=Dist(150, 400), p_interim_match=0.6, streaming_tts=True)
+      spec = replace(wide, speculative=True)
+      rng = random.Random(11)
+      draws = [draw(wide, rng) for _ in range(4000)]
+      runs = [(s, run_turn(s, spec)) for s in draws]
+      assert all(r.latency <= run_turn(s, wide).latency + 1e-9 for s, r in runs)
+      assert all(r.events['tts_start'] >= r.events['endpoint'] - 1e-9 for s, r in runs)
+      assert all(r.events['spec_start'] >= r.events['at_server'] - 1e-9 for s, r in runs)
+      assert abs(sum(r.llm_calls for s, r in runs) / len(runs) - 1.4) < 0.05
+      eager = Pipeline(streaming_tts=True, speculative=True, p_interim_match=1.0, interim_lead=Dist(5000), llm_ttfb=Dist(20))
+      e = run_turn(draw(eager, random.Random(2)), eager)
+      assert e.events['tts_start'] >= e.events['endpoint'] - 1e-9 and e.events['spec_start'] >= e.events['at_server'] - 1e-9
+    solution: |
+      def run_turn(s, cfg):
+          t = {'speech_end': 0.0}
+          t['at_server'] = s['uplink']
+          t['endpoint'] = t['at_server'] + s['endpoint']
+          calls, start = 1, t['endpoint']
+          if cfg.speculative:
+              t['spec_start'] = max(t['at_server'], t['endpoint'] - s['lead'])
+              if s['interim_ok']:
+                  start = t['spec_start']
+              else:
+                  calls = 2
+          t['llm_first'] = start + s['llm_ttfb']
+          ms = s['ms_per_token']
+          t['llm_done'] = t['llm_first'] + cfg.reply_tokens * ms
+          if cfg.streaming_tts:
+              t['tts_start'] = min(t['llm_first'] + cfg.clause_tokens * ms, t['llm_done'])
+          else:
+              t['tts_start'] = t['llm_done']
+          t['tts_start'] = max(t['tts_start'], t['endpoint'])
+          t['tts_first'] = t['tts_start'] + s['tts_ttfb']
+          t['heard'] = t['tts_first'] + s['downlink']
+          return Turn(t, calls)
+  - title: A watchdog filler for slow tools
+    brief: |
+      When s['tool'] is true the first inference returns a tool call at llm_first instead of an answer. The tool runs for s['tool_ms'], then a second inference takes s['llm_ttfb2'] to its first token, and the answer streams or waits from there as before; count that inference in llm_calls. Silence through all of it reads as a dropped call. The Pipecat primer offers two fixes, a spoken message before the function call or a watchdog timer, and this step builds the watchdog: when cfg.watchdog_ms is set and the tool is still running that long after it started, play a cached filler clip (no TTS, so it is heard one downlink later) of cfg.filler_ms. Record filler_heard, keep the answer from talking over the clip, record answer_heard for the answer's first audio, and set heard to whichever audio came first. Choosing watchdog_ms is the policy decision: too low and quick tools get a filler they did not need, too high and the silence is back.
+    starter: |
+
+
+      # Step 4: edit run_turn. Tool turns: tool_done, llm_first2, answer_heard, and filler_heard when the
+      # watchdog fires. heard is the first audio of any kind; Turn.answer_latency reads answer_heard.
+    tests: |
+      slow = Pipeline(streaming_tts=True, p_tool=1.0, tool_ms=Dist(900), watchdog_ms=300)
+      t = run_turn(draw(slow, random.Random(1)), slow)
+      assert abs(t.events['filler_heard'] - (114 + 300 + 650 + 300 + 89)) < 1e-6
+      assert abs(t.latency - t.events['filler_heard']) < 1e-6
+      assert abs(t.answer_latency - (114 + 300 + 650 + 900 + 650 + 80 + 120 + 89)) < 1e-6
+      assert t.llm_calls == 2
+      quick = Pipeline(streaming_tts=True, p_tool=1.0, tool_ms=Dist(200), watchdog_ms=300)
+      q = run_turn(draw(quick, random.Random(1)), quick)
+      assert 'filler_heard' not in q.events and abs(q.latency - q.answer_latency) < 1e-6
+    hidden: |
+      clip = Pipeline(streaming_tts=True, p_tool=1.0, tool_ms=Dist(900), watchdog_ms=300, filler_ms=3000)
+      c = run_turn(draw(clip, random.Random(1)), clip)
+      assert abs(c.answer_latency - (c.events['filler_heard'] + 3000)) < 1e-6
+      wide = Pipeline(llm_ttfb=Dist(650, 1500), tool_ms=Dist(800, 3000), p_tool=0.5, p_interim_match=0.7, streaming_tts=True, speculative=True, watchdog_ms=400)
+      rng = random.Random(13)
+      for _ in range(2000):
+          s = draw(wide, rng)
+          r = run_turn(s, wide)
+          assert r.latency <= r.answer_latency + 1e-9
+          assert r.llm_calls == 1 + (not s['interim_ok']) + s['tool']
+          if 'filler_heard' in r.events:
+              assert s['tool'] and s['tool_ms'] > 400 and r.answer_latency >= r.events['filler_heard'] + wide.filler_ms - 1e-9
+          else:
+              assert not (s['tool'] and s['tool_ms'] > 400)
+      nowatch = replace(wide, watchdog_ms=None)
+      rng = random.Random(13)
+      assert all('filler_heard' not in run_turn(draw(nowatch, rng), nowatch).events for _ in range(500))
+    solution: |
+      def run_turn(s, cfg):
+          t = {'speech_end': 0.0}
+          t['at_server'] = s['uplink']
+          t['endpoint'] = t['at_server'] + s['endpoint']
+          calls, start = 1, t['endpoint']
+          if cfg.speculative:
+              t['spec_start'] = max(t['at_server'], t['endpoint'] - s['lead'])
+              if s['interim_ok']:
+                  start = t['spec_start']
+              else:
+                  calls = 2
+          t['llm_first'] = start + s['llm_ttfb']
+          answer_first = t['llm_first']
+          if s['tool']:
+              t['tool_done'] = t['llm_first'] + s['tool_ms']
+              answer_first = t['llm_first2'] = t['tool_done'] + s['llm_ttfb2']
+              calls += 1
+          ms = s['ms_per_token']
+          t['llm_done'] = answer_first + cfg.reply_tokens * ms
+          if cfg.streaming_tts:
+              t['tts_start'] = min(answer_first + cfg.clause_tokens * ms, t['llm_done'])
+          else:
+              t['tts_start'] = t['llm_done']
+          t['tts_start'] = max(t['tts_start'], t['endpoint'])
+          t['tts_first'] = t['tts_start'] + s['tts_ttfb']
+          t['answer_heard'] = t['tts_first'] + s['downlink']
+          if s['tool'] and cfg.watchdog_ms is not None and s['tool_ms'] > cfg.watchdog_ms:
+              t['filler_heard'] = t['llm_first'] + cfg.watchdog_ms + s['downlink']
+              t['answer_heard'] = max(t['answer_heard'], t['filler_heard'] + cfg.filler_ms)
+          t['heard'] = min(t['answer_heard'], t.get('filler_heard', math.inf))
+          return Turn(t, calls)
+  - title: Barge-in truncation
+    brief: |
+      When the user talks over the agent, the pipeline cancels generation and playback, and the conversation history must hold what the user heard rather than what the LLM wrote, or the next turn answers as if the user heard a sentence they interrupted. The primer assembles the assistant message from word-level timestamps for this reason. Given each word's playout start in ms after the agent's audio began (non-decreasing, ties allowed), the moment the interruption was detected, and stop_ms (the time from detection until playback has actually stopped, which includes whatever the client's jitter buffer still holds), heard_count returns how many words began playing before playback stopped. apply_barge_in returns a new history whose last assistant message keeps only those words; whether you add an interruption marker, and what you do when nothing was heard, is your decision, and the tests accept either as long as no unheard word survives. heard_count runs once per interruption across long sessions, so it must answer in logarithmic time: the tests call it thousands of times on a 200,000-word timeline.
+    starter: |
+
+
+      def heard_count(starts, interrupt_at, stop_ms):
+          raise NotImplementedError
+
+
+      def apply_barge_in(history, words, starts, interrupt_at, stop_ms):
+          raise NotImplementedError
+    tests: |
+      import re
+      words = ['w%d' % i for i in range(10)]
+      starts = [i * 300.0 for i in range(10)]
+      assert heard_count(starts, 1000, 0) == 4
+      assert heard_count(starts, 1000, 250) == 5
+      assert heard_count(starts, 99999, 0) == 10
+      history = [{'role': 'user', 'content': 'q'}, {'role': 'assistant', 'content': ' '.join(words)}]
+      new = apply_barge_in(history, words, starts, 1000, 250)
+      assert history[1]['content'] == ' '.join(words)
+      assert re.findall(r'w\d+', new[-1]['content']) == words[:5]
+    hidden: |
+      import re
+      import time
+      assert heard_count([0.0, 100.0, 100.0, 100.0, 400.0], 100, 0) == 1
+      assert heard_count([0.0, 100.0, 100.0, 100.0, 400.0], 100, 1) == 4
+      words = ['w%d' % i for i in range(6)]
+      starts = [50.0 * (i + 1) for i in range(6)]
+      history = [{'role': 'system', 'content': 's'}, {'role': 'user', 'content': 'q'}, {'role': 'assistant', 'content': ' '.join(words)}]
+      none = apply_barge_in(history, words, starts, 0, 10)
+      assert [m for m in none if m['role'] != 'assistant'] == history[:2]
+      assert all(not re.findall(r'w\d+', m['content']) for m in none if m['role'] == 'assistant')
+      full = apply_barge_in(history, words, starts, 10000, 0)
+      assert re.findall(r'w\d+', full[-1]['content']) == words
+      big = [i * 3.0 for i in range(200000)]
+      t0 = time.perf_counter()
+      total = sum(heard_count(big, (k * 997) % 600000, 120) for k in range(5000))
+      assert time.perf_counter() - t0 < 2.0
+      assert total == sum(min(200000, -(-((k * 997) % 600000 + 120) // 3)) for k in range(5000))
+    solution: |
+      def heard_count(starts, interrupt_at, stop_ms):
+          return bisect.bisect_left(starts, interrupt_at + stop_ms)
+
+
+      def apply_barge_in(history, words, starts, interrupt_at, stop_ms):
+          k = heard_count(starts, interrupt_at, stop_ms)
+          out = [dict(m) for m in history]
+          if k == 0:
+              return out[:-1]
+          text = ' '.join(words[:k])
+          out[-1]['content'] = text if k == len(words) else text + ' [interrupted by the user]'
+          return out
+  - title: The p50 and p95 report
+    brief: |
+      Write percentile (nearest rank) and report(cfg, n, seed), which returns p50 and p95 of first audio, p50 and p95 of answer audio, and LLM calls per turn. The tests build a scenario pipeline: medians from the Pipecat table, tails and the tool and interim rates chosen as scenario values, and GPT-4.1 and ElevenLabs Turbo v2.5 at the latencies the primer measured. Set TARGETS, a p50 at or under the primer's 1,500 ms and a p95 at or under 2,000 ms, and MAX_LLM_CALLS_PER_TURN, at most 1.6, as your token budget. Then write tune(cfg), which may switch the feature flags, set watchdog_ms, and swap llm_ttfb and tts_ttfb for entries from LLM_OPTIONS and TTS_OPTIONS (the primer's measured median and P95 per model), and nothing else. The report must meet your targets on seeds you have not seen. Look at answer_p95 after you meet the target: the watchdog moves first audio, not the answer, and no option in the table brings answer audio under 1,500 ms at p95, because one slow tool call is longer than the whole budget.
+    starter: |
+
+
+      # Median and P95 in ms, as measured in the Pipecat primer (checked 2026-10-28).
+      LLM_OPTIONS = {'gpt-4.1': (536, 1771), 'gemini-2.5-flash': (597, 1137), 'claude-4.5-haiku': (637, 1615),
+                     'gpt-5.1': (739, 1492), 'nemotron-3-ultra-self-hosted': (541, 712)}
+      TTS_OPTIONS = {'cartesia-sonic-3.5': (195, 240), 'deepgram-aura-2': (310, 600), 'elevenlabs-turbo-v2.5': (330, 670),
+                     'gradium': (235, 320), 'inworld-tts-1.5-max': (337, 560)}
+
+      TARGETS = (None, None)          # (p50 ms, p95 ms)
+      MAX_LLM_CALLS_PER_TURN = None
+
+
+      def percentile(xs, q):
+          raise NotImplementedError
+
+
+      def report(cfg, n=2000, seed=0):
+          raise NotImplementedError
+
+
+      def tune(cfg):
+          raise NotImplementedError
+    tests: |
+      def scenario():
+          return Pipeline(uplink=Dist(114, 160), endpoint=Dist(300, 450), llm_ttfb=Dist(536, 1771),
+                          ms_per_token=Dist(10, 15), tts_ttfb=Dist(330, 670), downlink=Dist(89, 130),
+                          interim_lead=Dist(150, 250), p_interim_match=0.7, p_tool=0.25, tool_ms=Dist(800, 3000))
+      assert percentile([5, 1, 4, 2, 3], 50) == 3
+      assert percentile(list(range(1, 101)), 95) == 95
+      r0 = report(Pipeline(streaming_tts=True), n=10)
+      assert {'p50', 'p95', 'answer_p50', 'answer_p95', 'llm_calls_per_turn'} <= set(r0)
+      p50_target, p95_target = TARGETS
+      assert p50_target <= 1500 and p50_target <= p95_target <= 2000
+      assert MAX_LLM_CALLS_PER_TURN <= 1.6
+      assert report(scenario())['p50'] > 1500
+      base, cfg = scenario(), tune(scenario())
+      same = lambda a, b: (a.p50, a.sigma) == (b.p50, b.sigma)
+      assert all(same(getattr(cfg, f), getattr(base, f)) for f in ['uplink', 'endpoint', 'ms_per_token', 'downlink', 'interim_lead', 'tool_ms'])
+      assert (cfg.reply_tokens, cfg.clause_tokens, cfg.p_interim_match, cfg.p_tool, cfg.filler_ms) == (base.reply_tokens, base.clause_tokens, base.p_interim_match, base.p_tool, base.filler_ms)
+      assert any(same(cfg.llm_ttfb, Dist(*v)) for v in LLM_OPTIONS.values()) and any(same(cfg.tts_ttfb, Dist(*v)) for v in TTS_OPTIONS.values())
+      r = report(cfg)
+      assert r['p50'] <= p50_target and r['p95'] <= p95_target
+      assert r['llm_calls_per_turn'] <= MAX_LLM_CALLS_PER_TURN
+    hidden: |
+      def scenario():
+          return Pipeline(uplink=Dist(114, 160), endpoint=Dist(300, 450), llm_ttfb=Dist(536, 1771),
+                          ms_per_token=Dist(10, 15), tts_ttfb=Dist(330, 670), downlink=Dist(89, 130),
+                          interim_lead=Dist(150, 250), p_interim_match=0.7, p_tool=0.25, tool_ms=Dist(800, 3000))
+      assert percentile([7, 3, 9], 100) == 9 and percentile([7, 3, 9], 1) == 3
+      cfg = tune(scenario())
+      assert report(cfg, seed=4) == report(cfg, seed=4)
+      for seed in (1, 2, 3):
+          r = report(cfg, n=2000, seed=seed)
+          assert r['p50'] <= TARGETS[0] and r['p95'] <= TARGETS[1] and r['llm_calls_per_turn'] <= MAX_LLM_CALLS_PER_TURN
+          assert r['answer_p95'] >= r['p95']
+    solution: |
+      LLM_OPTIONS = {'gpt-4.1': (536, 1771), 'gemini-2.5-flash': (597, 1137), 'claude-4.5-haiku': (637, 1615),
+                     'gpt-5.1': (739, 1492), 'nemotron-3-ultra-self-hosted': (541, 712)}
+      TTS_OPTIONS = {'cartesia-sonic-3.5': (195, 240), 'deepgram-aura-2': (310, 600), 'elevenlabs-turbo-v2.5': (330, 670),
+                     'gradium': (235, 320), 'inworld-tts-1.5-max': (337, 560)}
+
+      TARGETS = (1300, 1650)
+      MAX_LLM_CALLS_PER_TURN = 1.6
+
+
+      def percentile(xs, q):
+          ys = sorted(xs)
+          k = max(1, math.ceil(q / 100 * len(ys)))
+          return ys[k - 1]
+
+
+      def report(cfg, n=2000, seed=0):
+          turns = simulate(cfg, n, seed)
+          first = [t.latency for t in turns]
+          answer = [t.answer_latency for t in turns]
+          return {'p50': percentile(first, 50), 'p95': percentile(first, 95),
+                  'answer_p50': percentile(answer, 50), 'answer_p95': percentile(answer, 95),
+                  'llm_calls_per_turn': sum(t.llm_calls for t in turns) / n}
+
+
+      def tune(cfg):
+          return replace(cfg, llm_ttfb=Dist(*LLM_OPTIONS['nemotron-3-ultra-self-hosted']),
+                         tts_ttfb=Dist(*TTS_OPTIONS['cartesia-sonic-3.5']),
+                         streaming_tts=True, speculative=True, watchdog_ms=250)
+---
+This lab builds a simulator of one cascaded voice turn, the kind the Pipecat maintainers measure in their primer: microphone, encoding, network and jitter buffer on the way up, transcription and endpointing, LLM time to first token, sentence aggregation, TTS time to first audio, and the same transport on the way back. Their table sums to 1,293 ms for a typical stack, and their June 2026 update sets 1,500 ms as the target and warns against spikes above it. Every step adds to one program and runs its tests against everything written so far.
+
+Nothing calls a model. Each stage is a seeded distribution, and `draw()` samples every stage of a turn in a fixed order, so a pipeline with streaming on and one with streaming off see the same turn and the tests can compare them turn by turn. The stage medians come from the primer's table and the per-model LLM and TTS latencies from its measurements; the tails, the tool-call rate and the interim-transcript match rate are scenario values, labelled as such where they appear. The tests check behaviour: event order, which stage a feature removes from the critical path, how many LLM calls a turn costs, and whether p50 and p95 meet the targets you set on seeds you did not tune against.
+
+The simulator models a cascaded pipeline only. A speech-to-speech model such as Moshi, which the paper reports at 160 ms theoretical and 200 ms practical latency, has no endpoint, LLM and TTS stages to overlap, and its tuning levers are different. The last step leaves you with two numbers that disagree: first audio can meet a p95 target with a filler, while answer audio cannot get under 1,500 ms at p95 with any option in the primer's table.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

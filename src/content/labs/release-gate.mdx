@@ -1,0 +1,470 @@
+---
+title: Release gate and experiment calculator
+track: llmops
+module: releases-experiments
+kind: lab
+minutes: 120
+summary: Grow one program over five steps that gates a candidate on paired flips, sizes and schedules an A/B test, checks the arms for sample ratio mismatch, computes clustered standard errors for multi-turn sessions, and writes a ship or no-ship decision against guardrails.
+updated: 2026-10-28
+sources:
+  - title: Anthropic, A statistical approach to model evaluations (2024-11-19)
+    url: https://www.anthropic.com/research/statistical-approach-to-model-evals
+    note: cluster standard errors on the unit of randomisation, which on popular evals can be over three times as large as naive ones; analyse paired differences when two models answer the same questions; use power analysis to size an eval; steps 1, 2 and 4; checked 2026-10-28
+  - title: Evan Miller, Adding Error Bars to Evals (arXiv 2411.00640, 2024-11-01)
+    url: https://arxiv.org/abs/2411.00640
+    note: the clustered standard error as the naive variance plus within-cluster cross terms (Eq. 4) and the sample-size formula n = (z_alpha/2 + z_beta)^2 x variance / delta^2 (Eq. 9), used in steps 2 and 4; checked 2026-10-28
+steps:
+  - title: Paired flip gate
+    brief: |
+      Both models answered the same eval items, so compare them item by item: the items that flipped from pass to fail or from fail to pass carry the information about the difference, and the items both passed or both failed carry none. Anthropic's eval guidance recommends paired differences for this reason. Write flip_gate: list the regressed and improved ids, return a two-sided exact sign-test p-value on the flips (with no true difference each flip is a fair coin), and block when the candidate is significantly worse at alpha or when any must-pass item regressed. Raise ValueError when the two runs did not score the same items. How you compute the binomial tail is your choice, but a suite of 200,000 items with about 40,000 flips has to gate in under three seconds, which rules out summing big-integer binomial coefficients.
+    starter: |
+      import math
+
+
+      def flip_gate(baseline, candidate, alpha=0.05, must_pass=()):
+          """baseline, candidate: {item_id: passed (bool)} for the same items.
+          Return {"regressed": sorted ids, "improved": sorted ids, "p_value": float,
+                  "decision": "ship" or "block", "must_pass_regressed": sorted ids}."""
+          raise NotImplementedError
+    tests: |
+      base = {f"q{i}": True for i in range(12)}
+      cand = dict(base)
+      for i in range(2):
+          cand[f"q{i}"] = False
+      for i in range(2, 12):
+          base[f"q{i}"] = False
+      r = flip_gate(base, cand)
+      assert r["regressed"] == ["q0", "q1"] and len(r["improved"]) == 10
+      assert abs(r["p_value"] - 2 * (1 + 12 + 66) / 4096) < 1e-9, r["p_value"]
+      assert r["decision"] == "ship", "more improvements than regressions never blocks on the test alone"
+      r2 = flip_gate(cand, base)
+      assert abs(r2["p_value"] - r["p_value"]) < 1e-12 and r2["decision"] == "block"
+      assert flip_gate(base, base)["p_value"] == 1.0 and flip_gate(base, base)["decision"] == "ship"
+      assert flip_gate(cand, base, must_pass={"q5"})["decision"] == "block"
+      try:
+          flip_gate({"a": True}, {"b": True})
+          raise AssertionError("mismatched item sets must raise ValueError")
+      except ValueError:
+          pass
+    hidden: |
+      import math as _hx_m, random as _hx_r, time as _hx_t
+      _hx_g = _hx_r.Random(7)
+      for _hx_n in (1, 5, 17, 40, 99):
+          for _hx_b in range(0, _hx_n + 1, max(1, _hx_n // 6)):
+              _hx_c = _hx_n - _hx_b
+              _hx_base = {i: i < _hx_b for i in range(_hx_n)}
+              _hx_cand = {i: i >= _hx_b for i in range(_hx_n)}
+              _hx_exact = min(1.0, 2 * sum(_hx_m.comb(_hx_n, j) for j in range(min(_hx_b, _hx_c) + 1)) / 2 ** _hx_n)
+              assert abs(flip_gate(_hx_base, _hx_cand)["p_value"] - _hx_exact) < 1e-9
+      _hx_base = {i: _hx_g.random() < 0.7 for i in range(200000)}
+      _hx_cand = {i: (v if _hx_g.random() < 0.8 else not v) for i, v in _hx_base.items()}
+      _hx_t0 = _hx_t.perf_counter()
+      _hx_res = flip_gate(_hx_base, _hx_cand)
+      assert _hx_t.perf_counter() - _hx_t0 < 3.0, "200,000 items with about 40,000 flips must gate in under 3 seconds"
+      assert 0.0 <= _hx_res["p_value"] <= 1.0
+      assert len(_hx_res["regressed"]) + len(_hx_res["improved"]) == sum(_hx_base[i] != _hx_cand[i] for i in _hx_base)
+      _hx_c3 = {i: (False if (v and i % 20 == 0) else v) for i, v in _hx_base.items()}
+      _hx_r3 = flip_gate(_hx_base, _hx_c3)
+      assert _hx_r3["decision"] == "block" and _hx_r3["p_value"] < 1e-12 and not _hx_r3["improved"]
+    solution: |
+      import math
+
+
+      def flip_gate(baseline, candidate, alpha=0.05, must_pass=()):
+          if set(baseline) != set(candidate):
+              raise ValueError("baseline and candidate must score the same items")
+          regressed = sorted(k for k in baseline if baseline[k] and not candidate[k])
+          improved = sorted(k for k in baseline if candidate[k] and not baseline[k])
+          b, c = len(regressed), len(improved)
+          p_value = _sign_test(b, c)
+          blocked_items = sorted(set(regressed) & set(must_pass))
+          if blocked_items or (b > c and p_value < alpha):
+              decision = "block"
+          else:
+              decision = "ship"
+          return {"regressed": regressed, "improved": improved, "p_value": p_value,
+                  "decision": decision, "must_pass_regressed": blocked_items}
+
+
+      def _sign_test(b, c):
+          n, k = b + c, min(b, c)
+          if n == 0:
+              return 1.0
+          # log of C(n, k) / 2^n, then walk down to 0 with the term ratio, which never builds a big integer
+          log_term = math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1) - n * math.log(2)
+          term = math.exp(log_term)
+          total = term
+          for j in range(k, 0, -1):
+              term *= j / (n - j + 1)
+              total += term
+              if term < total * 1e-17:
+                  break
+          return min(1.0, 2 * total)
+  - title: Sample size and duration from baseline, minimum effect and traffic
+    brief: |
+      Fix the sample and the calendar before launch. sample_size uses the normal approximation for two proportions with unpooled variances and a treatment share f: total = (z at 1 - alpha/2 + z at power)^2 x (p0(1 - p0)/(1 - f) + p1(1 - p1)/f) / mde^2, multiplied by the design effect when the unit of assignment holds several measured conversations (step 4 is how you measure it). Return per-arm counts rounded up. duration_days walks a weekly volume pattern from the first day until the total is reached, then rounds up to whole weeks unless told not to, so both arms see each weekday equally often. The tests check worked values (70% to 72% at alpha 0.05 and power 0.8 comes to about 8,080 conversations per arm) and properties of the formula, and a horizon of 10^12 conversations has to be arithmetic rather than a loop over days.
+    starter: |
+      import math
+      from statistics import NormalDist
+
+
+      def sample_size(p0, mde, alpha=0.05, power=0.8, share=0.5, deff=1.0):
+          """Conversations needed to detect p0 -> p0 + mde, two-sided, with a treatment share and a design effect.
+          Return {"control": int, "treatment": int, "total": int}."""
+          raise NotImplementedError
+
+
+      def duration_days(total, daily, whole_weeks=True):
+          """daily is one volume per day, or seven volumes starting on the test's first day."""
+          raise NotImplementedError
+    tests: |
+      s = sample_size(0.70, 0.02)
+      assert s["control"] == s["treatment"] and 8070 <= s["control"] <= 8085, s
+      assert s["total"] == s["control"] + s["treatment"]
+      u = sample_size(0.70, 0.02, share=0.2, deff=1.2)
+      assert abs(u["total"] - 29916) <= 0.005 * 29916, u
+      assert abs(u["treatment"] / u["total"] - 0.2) < 0.001
+      assert duration_days(19385, 2400, whole_weeks=False) == 9
+      assert duration_days(19385, 2400) == 14
+      assert duration_days(5000, [1000, 1000, 1000, 1000, 1000, 0, 0], whole_weeks=False) == 5
+      try:
+          sample_size(0.99, 0.02)
+          raise AssertionError("p0 + mde above 1 must raise ValueError")
+      except ValueError:
+          pass
+    hidden: |
+      _hx_a = sample_size(0.18, -0.015)["control"]
+      _hx_b = sample_size(0.18, -0.0075)["control"]
+      assert 3.6 < _hx_b / _hx_a < 4.4, "halving the effect roughly quadruples the sample"
+      assert abs(sample_size(0.18, -0.015, deff=1.55)["total"] / sample_size(0.18, -0.015)["total"] - 1.55) < 0.01
+      _hx_t = {f: sample_size(0.5, 0.03, share=f)["total"] for f in (0.1, 0.3, 0.5, 0.7, 0.9)}
+      assert min(_hx_t, key=_hx_t.get) == 0.5 and _hx_t[0.1] > _hx_t[0.3] > _hx_t[0.5]
+      assert sample_size(0.70, 0.02, alpha=0.01)["total"] > sample_size(0.70, 0.02)["total"]
+      assert sample_size(0.70, 0.02, power=0.9)["total"] > sample_size(0.70, 0.02)["total"]
+      _hx_w = [2500, 2500, 2500, 2500, 2500, 300, 300]
+      for _hx_n in (1, 2500, 2501, 12800, 12801, 30860, 70245):
+          _hx_d = duration_days(_hx_n, _hx_w, whole_weeks=False)
+          _hx_cum = sum(_hx_w[i % 7] for i in range(_hx_d))
+          assert _hx_cum >= _hx_n and _hx_cum - _hx_w[(_hx_d - 1) % 7] < _hx_n
+          assert duration_days(_hx_n, _hx_w) % 7 == 0 and 0 <= duration_days(_hx_n, _hx_w) - _hx_d < 7
+      assert duration_days(10 ** 12, 10, whole_weeks=False) == 10 ** 11, "a long horizon is arithmetic, not a loop over days"
+    solution: |
+      import math
+      from statistics import NormalDist
+
+
+      def sample_size(p0, mde, alpha=0.05, power=0.8, share=0.5, deff=1.0):
+          p1 = p0 + mde
+          if not (0 < p0 < 1 and 0 < p1 < 1) or mde == 0:
+              raise ValueError("p0 and p0 + mde must lie strictly between 0 and 1, and mde must be non-zero")
+          if not 0 < share < 1 or deff < 1:
+              raise ValueError("share must lie in (0, 1) and deff must be at least 1")
+          z = NormalDist().inv_cdf(1 - alpha / 2) + NormalDist().inv_cdf(power)
+          total = z * z * (p0 * (1 - p0) / (1 - share) + p1 * (1 - p1) / share) / mde ** 2 * deff
+          control = math.ceil(total * (1 - share))
+          treatment = math.ceil(total * share)
+          return {"control": control, "treatment": treatment, "total": control + treatment}
+
+
+      def duration_days(total, daily, whole_weeks=True):
+          week = [daily] * 7 if isinstance(daily, (int, float)) else list(daily)
+          if len(week) != 7 or sum(week) <= 0 or any(v < 0 for v in week):
+              raise ValueError("daily is one positive volume or seven non-negative weekday volumes")
+          full_weeks, rest = divmod(total, sum(week))
+          if rest == 0 and full_weeks > 0:
+              full_weeks, rest = full_weeks - 1, sum(week)
+          days = int(full_weeks) * 7
+          seen = 0
+          for v in week:
+              if seen >= rest:
+                  break
+              seen += v
+              days += 1
+          if whole_weeks:
+              days = -(-days // 7) * 7
+          return days
+  - title: Sample ratio mismatch check
+    brief: |
+      A test planned at 50/50 that logs 50,000 and 49,000 users has lost or gained users in one arm somewhere between assignment and analysis, and every outcome comparison inherits whatever selected them. Before anyone reads an outcome, test the observed counts against the planned shares with a chi-square goodness-of-fit test on k - 1 degrees of freedom. The standard library has no chi-square survival function: build it from math.lgamma and a series or continued fraction for the regularised upper incomplete gamma, Q(df/2, chi2/2). The threshold is a required argument because it is a policy for your team, not a constant of the test. Raise ValueError on shares that do not sum to 1, a zero total, or fewer than two arms.
+    starter: |
+      import math
+
+
+      def srm_check(counts, shares, threshold):
+          """counts: units observed per arm; shares: planned share per arm.
+          Return {"chi2": float, "p_value": float, "mismatch": bool}."""
+          raise NotImplementedError
+    tests: |
+      r = srm_check([50000, 49000], [0.5, 0.5], threshold=0.001)
+      assert abs(r["chi2"] - 2 * 500 ** 2 / 49500) < 1e-9
+      assert abs(r["p_value"] - math.erfc(math.sqrt(r["chi2"] / 2))) < 1e-9
+      assert r["mismatch"] is False and srm_check([50000, 49000], [0.5, 0.5], threshold=0.01)["mismatch"] is True
+      assert srm_check([10000, 10000], [0.5, 0.5], threshold=0.001)["p_value"] == 1.0
+      r3 = srm_check([20000, 20400, 19700], [1 / 3, 1 / 3, 1 / 3], threshold=0.001)
+      assert abs(r3["p_value"] - math.exp(-r3["chi2"] / 2)) < 1e-9
+      assert srm_check([8000, 2000], [0.8, 0.2], threshold=0.001)["chi2"] == 0
+    hidden: |
+      import math as _hx_m, random as _hx_r
+      _hx_g = _hx_r.Random(11)
+      for _ in range(200):
+          _hx_c = [_hx_g.randint(1000, 100000) for _ in range(4)]
+          _hx_x = srm_check(_hx_c, [0.25] * 4, threshold=0.001)
+          _hx_q = _hx_m.erfc(_hx_m.sqrt(_hx_x["chi2"] / 2)) + _hx_m.sqrt(2 * _hx_x["chi2"] / _hx_m.pi) * _hx_m.exp(-_hx_x["chi2"] / 2)
+          assert abs(_hx_x["p_value"] - _hx_q) < 1e-8, (_hx_c, _hx_x, _hx_q)
+          assert _hx_x["mismatch"] == (_hx_x["p_value"] < 0.001)
+      for _hx_k in (2, 3, 5):
+          for _hx_n in (100, 10 ** 6):
+              _hx_c = [_hx_n // _hx_k] * _hx_k
+              _hx_c[0] += 3
+              assert 0.0 <= srm_check(_hx_c, [1 / _hx_k] * _hx_k, threshold=0.001)["p_value"] <= 1.0
+      for _hx_bad in (([1, 2], [0.5, 0.6]), ([0, 0], [0.5, 0.5]), ([5], [1.0]), ([1, 2, 3], [0.5, 0.5])):
+          try:
+              srm_check(*_hx_bad, threshold=0.001)
+              raise AssertionError(f"invalid input accepted: {_hx_bad}")
+          except ValueError:
+              pass
+      _hx_y = srm_check([505000, 495000], [0.5, 0.5], threshold=0.001)
+      assert _hx_y["mismatch"] and 0 < _hx_y["p_value"] < 1e-20
+    solution: |
+      import math
+
+
+      def srm_check(counts, shares, threshold):
+          if len(counts) != len(shares) or len(counts) < 2:
+              raise ValueError("one count and one planned share per arm, at least two arms")
+          if abs(sum(shares) - 1) > 1e-9 or any(s <= 0 for s in shares):
+              raise ValueError("planned shares must be positive and sum to 1")
+          n = sum(counts)
+          if n <= 0 or any(c < 0 for c in counts):
+              raise ValueError("counts must be non-negative with a positive total")
+          chi2 = sum((c - n * s) ** 2 / (n * s) for c, s in zip(counts, shares))
+          p_value = _upper_gamma_q((len(counts) - 1) / 2, chi2 / 2)
+          return {"chi2": chi2, "p_value": p_value, "mismatch": p_value < threshold}
+
+
+      def _upper_gamma_q(a, x):
+          """Regularised upper incomplete gamma Q(a, x): series below a + 1, continued fraction above."""
+          if x <= 0:
+              return 1.0
+          log_front = -x + a * math.log(x) - math.lgamma(a)
+          if x < a + 1:
+              term = total = 1 / a
+              ap = a
+              for _ in range(10000):
+                  ap += 1
+                  term *= x / ap
+                  total += term
+                  if abs(term) < abs(total) * 1e-15:
+                      break
+              return max(0.0, 1 - total * math.exp(log_front))
+          tiny = 1e-300
+          b = x + 1 - a
+          c = 1 / tiny
+          d = 1 / b
+          h = d
+          for i in range(1, 10000):
+              an = -i * (i - a)
+              b += 2
+              d = an * d + b
+              d = tiny if abs(d) < tiny else d
+              c = b + an / c
+              c = tiny if abs(c) < tiny else c
+              d = 1 / d
+              delta = d * c
+              h *= delta
+              if abs(delta - 1) < 1e-15:
+                  break
+          return math.exp(log_front) * h
+  - title: Clustered standard errors for multi-turn sessions
+    brief: |
+      When users are assigned and conversations are measured, conversations from one user are correlated and the naive standard error is too small. Miller's Eq. 4 adds the within-cluster cross terms of the residuals to the naive variance; the two together equal the squared residual total of each cluster, summed over clusters and divided by n squared, which is one pass over the rows. Anthropic reports that clustered standard errors on popular evals can be more than three times the naive ones. Write clustered_se returning both, and diff_clustered for treatment minus control with an interval at the given level, treating the two arms as independent samples. Production logs contain bots and load-test accounts with tens of thousands of rows in one cluster: 300,000 rows with one 40,000-row cluster must finish in under three seconds, so nothing pairwise.
+    starter: |
+      import math
+      from collections import defaultdict
+      from statistics import NormalDist
+
+
+      def clustered_se(rows):
+          """rows: (cluster_id, value) pairs. Return {"n", "clusters", "mean", "se_naive", "se_clustered"}."""
+          raise NotImplementedError
+
+
+      def diff_clustered(control_rows, treatment_rows, level=0.95):
+          """Return {"diff", "se", "low", "high"} for treatment minus control."""
+          raise NotImplementedError
+    tests: |
+      import random
+      g = random.Random(3)
+      single = [(i, float(g.random() < 0.55)) for i in range(5000)]
+      s = clustered_se(single)
+      assert abs(s["se_clustered"] / s["se_naive"] - 1) < 1e-3, "one row per cluster: clustered equals naive"
+      assert abs(s["mean"] - sum(v for _, v in single) / 5000) < 1e-12
+      copies = [(u, float(g.random() < 0.55)) for u in range(2000)]
+      copies = [(u, v) for u, v in copies for _ in range(4)]
+      d = clustered_se(copies)
+      assert abs(d["se_clustered"] / d["se_naive"] - 2.0) < 0.02, "four identical rows per cluster: sqrt(4) times naive"
+      r = diff_clustered(single, [(i, v + 0.0) for i, v in single])
+      assert abs(r["diff"]) < 1e-12 and r["low"] < 0 < r["high"]
+      assert abs((r["high"] - r["low"]) / 2 - 1.959964 * r["se"]) < 1e-5
+    hidden: |
+      import random as _hx_r, time as _hx_t
+      _hx_g = _hx_r.Random(5)
+      _hx_rows = [(u, float(_hx_g.random() < 0.3 + 0.4 * (u % 2))) for u in range(20000) for _ in range(_hx_g.randint(1, 6))]
+      _hx_a = clustered_se(_hx_rows)
+      _hx_g.shuffle(_hx_rows)
+      _hx_b = clustered_se(_hx_rows)
+      assert abs(_hx_a["se_clustered"] - _hx_b["se_clustered"]) < 1e-12 and _hx_a["clusters"] == 20000
+      _hx_big = [("bot", float(i % 3 == 0)) for i in range(40000)] + [(u, float(_hx_g.random() < 0.5)) for u in range(260000)]
+      _hx_t0 = _hx_t.perf_counter()
+      _hx_c = clustered_se(_hx_big)
+      assert _hx_t.perf_counter() - _hx_t0 < 3.0, "300,000 rows with one 40,000-row cluster in under 3 seconds"
+      assert _hx_c["se_clustered"] > _hx_c["se_naive"]
+      _hx_neg = [(u, (1.0 if k == 0 else 0.0)) for u in range(3000) for k in range(2)]
+      _hx_n = clustered_se(_hx_neg)
+      assert _hx_n["se_clustered"] < _hx_n["se_naive"], "negatively correlated rows within a cluster shrink the error"
+      _hx_x = diff_clustered(_hx_rows, [(c, v + 0.05) for c, v in _hx_rows])
+      assert abs(_hx_x["diff"] - 0.05) < 1e-9 and _hx_x["low"] < 0.05 < _hx_x["high"]
+      _hx_w = diff_clustered(_hx_rows, _hx_rows, level=0.99)
+      assert _hx_w["high"] - _hx_w["low"] > diff_clustered(_hx_rows, _hx_rows)["high"] - diff_clustered(_hx_rows, _hx_rows)["low"]
+    solution: |
+      import math
+      from collections import defaultdict
+      from statistics import NormalDist
+
+
+      def clustered_se(rows):
+          """rows: iterable of (cluster_id, value). Miller (2024) Eq. 4: the naive variance plus the within-cluster cross terms,
+          which together equal the sum over clusters of the squared summed residuals, divided by n squared."""
+          rows = list(rows)
+          n = len(rows)
+          if n < 2:
+              raise ValueError("need at least two rows")
+          mean = sum(v for _, v in rows) / n
+          sums = defaultdict(float)
+          squares = 0.0
+          for cluster, v in rows:
+              e = v - mean
+              sums[cluster] += e
+              squares += e * e
+          se_naive = math.sqrt(squares / n / n)
+          se_clustered = math.sqrt(sum(s * s for s in sums.values()) / n / n)
+          return {"n": n, "clusters": len(sums), "mean": mean, "se_naive": se_naive, "se_clustered": se_clustered}
+
+
+      def diff_clustered(control_rows, treatment_rows, level=0.95):
+          c = clustered_se(control_rows)
+          t = clustered_se(treatment_rows)
+          diff = t["mean"] - c["mean"]
+          se = math.sqrt(c["se_clustered"] ** 2 + t["se_clustered"] ** 2)
+          z = NormalDist().inv_cdf(0.5 + level / 2)
+          return {"diff": diff, "se": se, "low": diff - z * se, "high": diff + z * se}
+  - title: A written ship or no-ship decision with guardrail metrics
+    brief: |
+      decide turns the numbers into a decision someone signs. It takes the primary metric's difference and interval (higher is better), the guardrails (each with a difference, an interval, the harm it may not exceed and its direction), the SRM result, and the minimum effect that pays for the change. A sample ratio mismatch makes the result invalid before any outcome is read. A guardrail whose whole interval lies beyond its allowed harm blocks the release. Shipping needs a primary interval above zero and every guardrail's harm ruled out by its interval bound. What you return for a real lift smaller than the minimum effect, or for a guardrail the data has not yet cleared, is your policy; the tests check that the decision never gets worse when the primary metric improves and that every blocking guardrail is named in the reasons. memo writes the decision down with every number it rests on.
+    starter: |
+      def decide(primary, guardrails, srm, mde):
+          """Return {"decision": "ship" | "no-ship" | "inconclusive" | "invalid", "reasons": [str], ...}."""
+          raise NotImplementedError
+
+
+      def memo(result):
+          """The decision written down: decision, minimum effect, primary and every guardrail with its interval, reasons."""
+          raise NotImplementedError
+    tests: |
+      ok_srm = {"chi2": 0.4, "p_value": 0.53, "mismatch": False}
+      bad_srm = {"chi2": 31.0, "p_value": 2.6e-8, "mismatch": True}
+      lat = {"name": "p95_latency_ms", "diff": 40.0, "low": 10.0, "high": 70.0, "max_harm": 150.0, "higher_is_better": False}
+      win = {"diff": 0.025, "low": 0.011, "high": 0.039}
+      assert decide(win, [lat], ok_srm, mde=0.02)["decision"] == "ship"
+      assert decide(win, [lat], bad_srm, mde=0.02)["decision"] == "invalid"
+      slow = dict(lat, diff=260.0, low=220.0, high=300.0)
+      res = decide(win, [slow], ok_srm, mde=0.02)
+      assert res["decision"] == "no-ship" and any("p95_latency_ms" in r for r in res["reasons"])
+      flat = {"diff": 0.004, "low": -0.006, "high": 0.014}
+      assert decide(flat, [lat], ok_srm, mde=0.02)["decision"] != "ship"
+      m = memo(decide(win, [lat], ok_srm, mde=0.02))
+      assert isinstance(m, str) and "ship" in m and "p95_latency_ms" in m
+    hidden: |
+      import random as _hx_r
+      _hx_g = _hx_r.Random(9)
+      _hx_ok = {"chi2": 0.1, "p_value": 0.75, "mismatch": False}
+      _hx_bad = {"chi2": 40.0, "p_value": 2e-10, "mismatch": True}
+      _hx_order = {"no-ship": 0, "inconclusive": 1, "ship": 2}
+      for _ in range(300):
+          _hx_gs = []
+          for _hx_i in range(_hx_g.randint(0, 3)):
+              _hx_d = _hx_g.uniform(-2, 2)
+              _hx_w = _hx_g.uniform(0.1, 1.5)
+              _hx_gs.append({"name": f"g{_hx_i}", "diff": _hx_d, "low": _hx_d - _hx_w, "high": _hx_d + _hx_w,
+                             "max_harm": _hx_g.uniform(0.2, 1.5), "higher_is_better": _hx_g.random() < 0.5})
+          _hx_d = _hx_g.uniform(-0.05, 0.05)
+          _hx_w = _hx_g.uniform(0.001, 0.03)
+          _hx_p = {"diff": _hx_d, "low": _hx_d - _hx_w, "high": _hx_d + _hx_w}
+          _hx_res = decide(_hx_p, _hx_gs, _hx_ok, mde=0.01)
+          assert _hx_res["decision"] in _hx_order and _hx_res["reasons"]
+          assert decide(_hx_p, _hx_gs, _hx_bad, mde=0.01)["decision"] == "invalid"
+          if _hx_res["decision"] == "ship":
+              assert _hx_p["low"] > 0
+              for _hx_x in _hx_gs:
+                  assert (_hx_x["low"] if _hx_x["higher_is_better"] else -_hx_x["high"]) >= -_hx_x["max_harm"], "shipped with a guardrail harm not ruled out"
+          for _hx_x in _hx_gs:
+              _hx_bound = _hx_x["high"] if _hx_x["higher_is_better"] else -_hx_x["low"]
+              if _hx_bound < -_hx_x["max_harm"]:
+                  assert _hx_res["decision"] == "no-ship" and any(_hx_x["name"] in r for r in _hx_res["reasons"])
+          _hx_up = {k: v + 0.02 for k, v in _hx_p.items()}
+          assert _hx_order[decide(_hx_up, _hx_gs, _hx_ok, mde=0.01)["decision"]] >= _hx_order[_hx_res["decision"]], "a better primary never lowers the decision"
+          _hx_m = memo(_hx_res)
+          assert _hx_res["decision"] in _hx_m and all(_hx_x["name"] in _hx_m for _hx_x in _hx_gs)
+      _hx_tie = {"diff": 0.0, "low": -0.01, "high": 0.01}
+      assert decide(_hx_tie, [], _hx_ok, mde=0.005)["decision"] != "ship", "an interval straddling zero never ships"
+      assert decide({"diff": 0.03, "low": 0.02, "high": 0.04}, [], _hx_ok, mde=0.01)["decision"] == "ship"
+    solution: |
+      def decide(primary, guardrails, srm, mde):
+          """primary: {"diff", "low", "high"}, higher is better. guardrails: [{"name", "diff", "low", "high", "max_harm",
+          "higher_is_better"}]. srm: the srm_check result. mde: the smallest lift that pays for the change."""
+          if srm["mismatch"]:
+              return {"decision": "invalid", "reasons": [f"sample ratio mismatch (p = {srm['p_value']:.2g}); outcomes not read"],
+                      "primary": primary, "guardrails": guardrails, "mde": mde}
+          reasons, harmed, unproven = [], [], []
+          for g in guardrails:
+              sign = 1 if g["higher_is_better"] else -1
+              worst = g["low"] if g["higher_is_better"] else g["high"]
+              if sign * g["diff"] < -g["max_harm"]:
+                  harmed.append(g["name"])
+                  reasons.append(f"guardrail {g['name']} breached: estimate {g['diff']:+.4g} beyond allowed harm {g['max_harm']:.4g}")
+              elif sign * worst < -g["max_harm"]:
+                  unproven.append(g["name"])
+                  reasons.append(f"guardrail {g['name']} not cleared: interval bound {worst:+.4g} beyond allowed harm {g['max_harm']:.4g}")
+          if harmed:
+              decision = "no-ship"
+          elif primary["high"] < 0:
+              decision = "no-ship"
+              reasons.append(f"primary metric worse: interval {primary['low']:+.4g} to {primary['high']:+.4g}")
+          elif primary["high"] < mde:
+              decision = "no-ship"
+              reasons.append(f"primary interval {primary['low']:+.4g} to {primary['high']:+.4g} excludes the minimum effect {mde:+.4g}")
+          elif primary["low"] <= 0 or unproven:
+              decision = "inconclusive"
+              if primary["low"] <= 0:
+                  reasons.append(f"primary interval {primary['low']:+.4g} to {primary['high']:+.4g} includes zero")
+          else:
+              decision = "ship"
+              reasons.append(f"primary lift {primary['diff']:+.4g} (interval {primary['low']:+.4g} to {primary['high']:+.4g}); every guardrail cleared")
+          return {"decision": decision, "reasons": reasons, "primary": primary, "guardrails": guardrails, "mde": mde}
+
+
+      def memo(result):
+          lines = [f"Decision: {result['decision']}", f"Minimum effect that pays for the change: {result['mde']:+.4g}"]
+          p = result["primary"]
+          lines.append(f"Primary: {p['diff']:+.4g} (interval {p['low']:+.4g} to {p['high']:+.4g})")
+          for g in result["guardrails"]:
+              lines.append(f"Guardrail {g['name']}: {g['diff']:+.4g} (interval {g['low']:+.4g} to {g['high']:+.4g}), allowed harm {g['max_harm']:.4g}")
+          lines += [f"Reason: {r}" for r in result["reasons"]]
+          return "\n".join(lines)
+---
+
+This lab builds the arithmetic behind the module's release ladder as one program. Each step adds functions to the same file, and later steps use earlier ones: the sample size in step 2 takes the design effect that step 4 measures, and the decision in step 5 reads the sample ratio check from step 3 and the intervals from step 4.
+
+Step 1 is the offline rung, a paired comparison of two models on the same eval items. Steps 2 to 4 are the online rung: sizing and scheduling an A/B test, checking that the arms hold the users they should, and computing errors that respect the unit of assignment. Step 5 writes down the decision and the numbers it rests on. The tests check worked values where the arithmetic has one answer, and properties (symmetry, monotonicity, invariance to row order, behaviour at the boundary) where the policy is yours.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

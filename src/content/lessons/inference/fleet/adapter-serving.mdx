@@ -1,0 +1,149 @@
+---
+title: "Serving adapters: merge or hot-load many on one base"
+track: inference
+module: fleet
+order: 4
+kind: lesson
+level: senior
+minutes: 13
+summary: A LoRA adapter merged into the base costs nothing per token and a whole model copy per tenant; kept separate, hundreds share one base at a per-request overhead, and the operational cost moves into slot limits, rank caps, lost prefix sharing and routing that sticks to the replicas holding each adapter.
+prerequisites: [inference/inference-anatomy/kv-capacity, inference/fleet/fleet-routing]
+updated: 2026-10-28
+sources:
+  - title: "vLLM docs: LoRA Adapters"
+    url: https://docs.vllm.ai/en/latest/features/lora.html
+    note: "Latest docs, checked 2026-10-28. Adapters are requested by name in the model field and listed in /v1/models with the base as parent; --max-lora-rank should be set to the highest rank among the adapters, and setting it much higher wastes memory; requests for different adapters run in the same batch only if max_loras is high enough. Runtime loading needs VLLM_ALLOW_RUNTIME_LORA_UPDATING and POST /v1/load_lora_adapter; the docs warn it carries security risks and should not be used in production outside an isolated, fully trusted environment. Resolver plugins load adapters on demand; enabling remote downloads is insecure and not intended for production."
+  - title: "vLLM docs: Engine arguments, LoRAConfig"
+    url: https://docs.vllm.ai/en/latest/configuration/engine_args.html
+    note: "Checked 2026-10-28. --max-loras default 1 (max LoRAs in a single batch); --max-lora-rank default 16, choices 1, 8, 16, 32, 64, 128, 256, 320, 512; --max-cpu-loras must be at least max_loras; --lora-dtype auto uses the base dtype; --fully-sharded-loras default False, when only half of the LoRA computation is sharded with tensor parallelism."
+  - title: "vLLM source: vllm/lora/peft_helper.py (main branch)"
+    url: https://github.com/vllm-project/vllm/blob/main/vllm/lora/peft_helper.py
+    note: "Checked 2026-10-28. validate_legal rejects an adapter whose largest rank, over r and every rank_pattern entry, exceeds max_lora_rank ('LoRA rank ... is greater than max_lora_rank ...'); DoRA, lora_bias and bias other than none are rejected."
+  - title: "S-LoRA: Serving Thousands of Concurrent LoRA Adapters (Sheng et al., 2023, v3 June 2024)"
+    url: https://arxiv.org/abs/2311.03285
+    note: "The paper reports up to 4x throughput over vLLM-packed (one merged copy per adapter, each in its own vLLM process under NVIDIA MPS) and 30x over HuggingFace PEFT. Body (arxiv.org/html/2311.03285): all adapters in host memory, those used by the running batch fetched to GPU; Unified Paging pool for adapter weights and KV; 2,000 adapters on one A100 80GB with Llama-7B rank-8 adapters at 7.61 req/s, against 8.05 req/s with 5 adapters; vLLM-packed 2.04 req/s with 5 adapters and out of memory at 100; merging wins with one adapter and loses beyond two; prefetching from the waiting queue; adapter clustering has a small effect."
+  - title: "LoRA Land: 310 Fine-tuned LLMs that Rival GPT-4 (Zhao et al., Predibase, April 2024)"
+    url: https://arxiv.org/abs/2405.00732
+    note: "310 models from 10 base models and 31 tasks; the paper reports 4-bit LoRA models beating their base by 34 points and GPT-4 by 10 points on average on its tasks; LoRAX served 25 LoRA fine-tuned Mistral-7B models on one A100 80GB."
+  - title: "Mistral-7B-v0.1 config.json"
+    url: https://huggingface.co/mistralai/Mistral-7B-v0.1/raw/main/config.json
+    note: "32 layers, hidden_size 4096, intermediate_size 14336, 32 attention heads, 8 KV heads, vocab 32,000, untied embeddings, bfloat16. Checked 2026-10-28."
+  - title: "Fireworks docs: Fine-tuning models"
+    url: https://docs.fireworks.ai/fine-tuning/fine-tuning-models
+    note: "Vendor docs, checked 2026-10-28. Trained models are served on on-demand deployments; maximum LoRA rank depends on the base model, up to 128, and firectl defaults to 8."
+  - title: "Fireworks docs: Deploying LoRAs"
+    url: https://docs.fireworks.ai/fine-tuning/deploying-loras
+    note: "Vendor docs, checked 2026-10-28. Live merge: one adapter per deployment, no inference overhead. Multi-LoRA: many adapters share a deployment with some overhead, the vendor's estimate of TTFT often 10 to 30% above the base, adapter count having little effect on per-request performance; requires a BF16 deployment shape, FP8 and FP4 shapes do not support addons."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Two ways to serve a fine-tune
+
+A LoRA adapter replaces a weight matrix W with W + (α/r)·B·A, where A and B have rank r. A serving platform can apply that sum once, before serving, or on every forward pass. The choice decides the unit of deployment.
+
+Merged, the adapter disappears: the server holds W' and runs the base model's kernels at the base model's speed. Fireworks, whose docs describe both modes, says a live-merged deployment performs identically to a natively trained model with no inference overhead, and allows one adapter per deployment. The cost is that every tenant is a full model copy.
+
+Unmerged, one copy of W serves every adapter, and each request carries an adapter id; the server computes x·W + (α/r)·(x·A)·B for that request's adapter, batching requests for different adapters together. Fireworks calls this multi-LoRA, puts its overhead at a TTFT often 10 to 30% above the base (the vendor's estimate), and says the number of adapters on a deployment has little effect on per-request performance. The cost moves from memory into operations: slot limits, rank caps, cache sharing and routing.
+
+## The arithmetic of one adapter
+
+An adapter on a matrix of shape d_in × d_out stores r·(d_in + d_out) parameters. Mistral-7B's config gives the shapes: hidden size 4096, MLP width 14336, 32 layers, and 8 KV heads of 128, so the key and value projections are 4096 × 1024.
+
+<Predict id="inf-fleet-lora-size" question="A rank-16 adapter on the q, k, v and o projections of Mistral-7B, stored in BF16: how many MB?" answer={27.3} tolerance={0.5} unit="MB">
+<p>Per layer: q and o are 16 × (4096 + 4096) = 131,072 parameters each; k and v are 16 × (4096 + 1024) = 81,920 each; total 425,984. Times 32 layers is 13,631,488 parameters, times 2 bytes is <b>27.3 MB</b>. Adding the three MLP projections at rank 16 brings it to 83.9 MB; at rank 64 on all seven, 335.5 MB.</p>
+</Predict>
+
+Against that, the base is 7.24 billion parameters by the same config (32 layers of 218 million plus 262 million for the untied embeddings and output head), 14.48 GB in BF16. A merged tenant costs 14.48 GB; an unmerged rank-16 tenant on all linear layers costs 83.9 MB, 173 times less. LoRA Land served 25 fine-tuned Mistral-7B models from one 80 GB A100 with LoRAX; at the all-linear rank-16 size, 25 adapters are 2.1 GB, while 25 merged copies would be 362 GB. The memory argument for unmerged serving is settled at this scale; the remaining questions are about compute and operations.
+
+```python
+MISTRAL_7B = {"hidden_size": 4096, "intermediate_size": 14336, "num_hidden_layers": 32,
+              "num_attention_heads": 32, "num_key_value_heads": 8, "vocab_size": 32000}
+
+def shapes(cfg):
+    h, f = cfg["hidden_size"], cfg["intermediate_size"]
+    kv = cfg["num_key_value_heads"] * h // cfg["num_attention_heads"]
+    return {"q_proj": (h, h), "k_proj": (h, kv), "v_proj": (h, kv), "o_proj": (h, h),
+            "gate_proj": (h, f), "up_proj": (h, f), "down_proj": (f, h)}
+
+def lora_bytes(cfg, rank, targets, elem=2):
+    s = shapes(cfg)
+    return sum(rank * (s[t][0] + s[t][1]) for t in targets) * cfg["num_hidden_layers"] * elem
+
+def base_params(cfg):
+    layer = sum(i * o for i, o in shapes(cfg).values())
+    return layer * cfg["num_hidden_layers"] + 2 * cfg["vocab_size"] * cfg["hidden_size"]
+
+ATTN = ["q_proj", "k_proj", "v_proj", "o_proj"]
+ALL = ATTN + ["gate_proj", "up_proj", "down_proj"]
+print(lora_bytes(MISTRAL_7B, 16, ATTN))     # 27262976
+print(lora_bytes(MISTRAL_7B, 64, ALL))      # 335544320
+print(base_params(MISTRAL_7B))              # 7241465856, norms excluded
+```
+
+## What the S-LoRA paper changed
+
+The S-LoRA paper's main baseline, which it calls vLLM-packed, merges each adapter into its own copy of the base and runs the copies as separate vLLM processes on one GPU. It measured that baseline at 2.04 requests per second with 5 adapters on one A100 80GB, out of memory at 100. S-LoRA keeps every adapter in host memory, copies to the GPU only those the running batch uses, and allocates adapter weights and KV blocks from one paged pool so that adapters of different ranks and sequences of different lengths fragment the same memory. With Llama-7B rank-8 adapters it served 5 adapters at 8.05 requests per second and 2,000 at 7.61. The paper reports up to 4 times the throughput of vLLM-packed and 30 times that of HuggingFace PEFT. Its ablation is the decision rule for merging: merging wins with one adapter and loses beyond two, because each adapter switch leaves the GPU underused.
+
+Host memory is the reason it scales. At Mistral-7B shapes, 2,000 rank-8 attention-only adapters are 2,000 × 13.6 MB = 27.3 GB, more than a third of an 80 GB GPU; in host memory they cost little, and only the working set competes with the KV cache. The paper names the I/O of loading adapters as a remaining concern and mitigates it by prefetching adapters for requests already in the waiting queue.
+
+Multi-LoRA batching has since moved into the mainstream engines. The rest of this lesson uses vLLM's current interface, because its limits are where the operating decisions sit.
+
+## The knobs that become incidents
+
+vLLM's LoRA configuration has four limits that matter, with defaults from the current docs:
+
+- `--max-loras`, default 1: the most adapters in one batch. With the default, requests for a second adapter wait for the first adapter's requests to clear, which looks like a latency problem on a lightly loaded replica.
+- `--max-cpu-loras`, at least `max_loras`: adapters cached in host memory, the S-LoRA tier.
+- `--max-lora-rank`, default 16, from a fixed set of choices (1, 8, 16, 32, 64, 128, 256, 320, 512): the docs say to set it to the highest rank among the adapters and warn that a value much higher than needed wastes memory.
+- `--fully-sharded-loras`, default off: with tensor parallelism, only half of the LoRA computation is sharded unless this is enabled.
+
+The rank cap is checked against the adapter, and it is checked strictly. vLLM's `peft_helper.py` takes the largest rank across the adapter's base `r` and every per-module `rank_pattern` entry, and rejects the adapter if that exceeds `max_lora_rank`. An adapter declared at rank 16 with one module at rank 64 fails on a server capped at 32. The same validation rejects DoRA, LoRA bias terms and adapter bias, so a training configuration can produce adapters that load in PEFT and fail at serving time.
+
+The memory cost of a high cap is a budget question. A slot sized for rank 64 on all linear layers of Mistral-7B is 335.5 MB, so eight such slots hold 2.68 GB. Mistral-7B caches 2 × 32 × 8 × 128 × 2 = 131,072 bytes per token in BF16, so those slots equal the KV cache of 20,480 tokens. Raising the cap to fit one tenant's large adapter takes capacity from every tenant on the replica; lowering it to recover capacity breaks the tenants whose adapters exceed the new cap, at load time, with an error naming the rank.
+
+## Prefix sharing stops at the adapter
+
+In vLLM the prefix-cache block hash includes the LoRA ID. Two tenants with different adapters and the same 2,000-token system prompt each cache their own copy, because the adapter changes every layer's keys and values. On one replica serving 25 such tenants, that prompt holds 25 × 2,000 × 131,072 bytes = 6.55 GB instead of 262 MB. Shared prompts across tenants are a reason to keep common traffic on the base model and send only the tenant-specific part of a workflow to the adapter.
+
+## Routing sticks to the adapter
+
+An unmerged adapter is cheap to hold and expensive to fetch for the first time, so routing has to prefer replicas that already hold it, the same bounded affinity the fleet-routing lesson applied to prefixes, with the adapter id as the key. A popular adapter needs a larger replica set than a rare one, so the router maps each adapter to a set of replicas sized by its traffic and spreads load inside the set; a rare adapter maps to one or two replicas and accepts a cold load when they are busy. The cost is that adapter popularity becomes a placement input the platform has to measure and update, and a tenant whose traffic jumps lands on too few replicas until the mapping catches up.
+
+Loading is a control-plane path, not a request path. vLLM supports loading adapters at runtime through `/v1/load_lora_adapter` when `VLLM_ALLOW_RUNTIME_LORA_UPDATING` is set, and its docs warn that this carries security risks and should not be used in production outside an isolated, fully trusted environment; resolver plugins that download adapters on demand from remote sources are described as insecure and not intended for production. A tenant-facing platform therefore validates each adapter once at upload (rank against the fleet's cap, supported features, target modules, an evaluation gate), stores it in a store the platform controls, and pushes it to replicas, which load it from local disk. An adapter is a release: it changes answers for one tenant, and it goes through the same probe-and-rollback discipline as a model version.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You run a per-tenant fine-tuning product on one 8B base: 400 tenants, adapter ranks from 8 to 64, and the top 10 tenants send most of the traffic. Two of them have contracts that require base-model latency. The GPU budget is fixed for the quarter, and a new enterprise tenant arrives next month with a rank-128 adapter. Design the serving layout."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Merge the two latency-contract tenants into dedicated deployments, since merged serving runs at base speed; serve everyone else unmerged on a shared pool with the rank cap at 64 and adapter-affinity routing. The rank-128 tenant gets either a merged deployment, if its traffic pays for a model copy, or a separate small pool with a higher cap, so its rank does not tax the shared pool's KV budget.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Merging is a per-tenant decision on traffic and contract: a merged tenant costs a full model copy and replicas sized for its peak, so only tenants with a latency contract or enough steady traffic to fill a replica get one. The shared pool caps rank at 64, the highest rank among the remaining adapters, with `max_loras` set from how many distinct adapters appear in a typical batch, measured rather than guessed, and adapters routed to replica sets sized by their traffic.</p>
+<p>The rank-128 tenant should not raise the shared cap: every slot on every shared replica would grow, taking KV from 398 other tenants. A two-replica pool capped at 128, or a merged deployment, isolates the cost. The alternative is to ask the tenant to retrain at rank 64, which is cheaper for us and a product conversation with them.</p>
+<p>What I give up: the merged tenants' capacity cannot absorb shared-pool bursts, and the separate pool idles when the new tenant is quiet. What I write down: the fleet's rank cap as a registry value that upload validation reads, a rule that the cap may not be lowered while any registered adapter exceeds it, and the latency comparison that would move a tenant from merged to shared.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The shared pool's p95 TTFT is 25% above the base model's and a third large tenant asks for the latency contract. Do you merge a third tenant, and what fixed budget do you take it from?</em></li>
+<li><em>An adapter passes its eval gate and then drifts a tenant's answers in production. Who owns the rollback, the tenant or the platform, and what does the contract need to say?</em></li>
+<li><em>What would you need to measure to reverse the decision and move everyone, including the contract tenants, onto unmerged serving?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The memory arithmetic assumes adapters are small next to the base. Adapters on embeddings and the output head, or at high rank on a model with a wide MLP, can reach a sizeable share of the base, and at that point a merged copy and an unmerged slot are closer in cost than the 173 times above.
+
+The overhead figures are conditional. Fireworks' 10 to 30% is the vendor's estimate for its own stack, S-LoRA's numbers are for 2023-era kernels and baselines, and the ratio between merged and unmerged speed depends on batch composition: a batch of many distinct adapters does more small matrix products than a batch where most requests share one. Benchmark the engine version you deploy with the adapter mix you expect.
+
+Quantization changes the merge decision. Merging an adapter into a quantized base means requantizing the merged weights, and unmerged serving may require a higher-precision base: Fireworks' multi-LoRA requires BF16 deployment shapes and does not support addons on FP8 or FP4 shapes, as of the check date. A fleet that runs its base in FP8 for capacity may find that adapters cost it that capacity back.
+
+<SelfRate id="lesson:inference/fleet/adapter-serving" />

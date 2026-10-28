@@ -1,0 +1,130 @@
+---
+title: Disaggregated prefill and decode
+track: inference
+module: faster-cheaper
+order: 4
+kind: lesson
+level: staff
+minutes: 14
+summary: Splitting prefill and decode onto separate GPU pools removes their interference and lets each pool be sized and parallelised for its own bottleneck, at the price of a KV transfer per request and a pool ratio that drifts with traffic, so the split is chosen only when no chunk size in one pool meets both latency targets at the load you must carry.
+prerequisites: [inference/batching/continuous-batching, inference/inference-anatomy/roofline-serving]
+updated: 2026-10-28
+sources:
+  - title: "Zhong et al., DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving (arXiv 2401.09670, OSDI 2024)"
+    url: https://arxiv.org/abs/2401.09670
+    note: "Prefill and decode on separate GPUs, with resource allocation, parallelism per phase and placement by bandwidth co-optimised; 7.4x more requests or 12.6x tighter SLO than the systems compared, with over 90% of requests within latency targets. Checked 2026-10-28."
+  - title: DistServe, full text (arXiv HTML)
+    url: https://arxiv.org/html/2401.09670
+    note: "Section 2: chunked prefill trades TTFT for TPOT and cannot eliminate the interference; chunking reloads earlier KV, O(N^2) KV loads against O(N). Section 3.3: a 512-token OPT-66B request has about 1.13 GB of KV; at 10 rps that is 11.3 GB/s, about 90 Gbps. Section 6: KV transfer under 0.1% of total latency for OPT-175B on ShareGPT; over 95% of requests see under 30 ms of transfer delay. Table 1 SLOs, e.g. chatbot OPT-66B TTFT 2.5 s and TPOT 0.15 s, code completion TTFT 0.125 s. Checked 2026-10-28."
+  - title: "Patel et al., Splitwise: Efficient generative LLM inference using phase splitting (arXiv 2311.18677, 2023)"
+    url: https://arxiv.org/abs/2311.18677
+    note: "Prompt phase compute-intensive, token phase memory-intensive and able to run on lower-power hardware; 1.4x throughput at 20% lower cost, or 2.35x throughput at the same cost and power. Checked 2026-10-28."
+  - title: "Agrawal et al., Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve (arXiv 2403.02310, 2024)"
+    url: https://arxiv.org/abs/2403.02310
+    note: "Chunked prefills and stall-free scheduling; against vLLM under tail-latency constraints, 2.6x serving capacity for Mistral-7B on one A100, up to 3.7x for Yi-34B on two A100s, up to 5.6x for Falcon-180B with pipeline parallelism. Checked 2026-10-28."
+  - title: vLLM docs, Disaggregated Prefilling (experimental; latest, page dated 2026-10-03)
+    url: https://docs.vllm.ai/en/latest/features/disagg_prefill.html
+    note: "Reasons: tune TTFT and ITL separately, control tail ITL; states that disaggregated prefill does not improve throughput; experimental; connectors include NixlConnector, LMCacheConnectorV1, MooncakeConnector, OffloadingConnector and others. Checked 2026-10-28."
+  - title: vLLM docs, Optimization and Tuning (latest, page dated 2026-10-27)
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: "Chunked prefill on by default in V1; smaller max_num_batched_tokens (e.g. 2048) gives better ITL, larger gives better TTFT; above 8192 recommended for throughput. Checked 2026-10-28."
+  - title: NVIDIA, Introducing NVIDIA Dynamo (2025-03-18)
+    url: https://developer.nvidia.com/blog/introducing-nvidia-dynamo-a-low-latency-distributed-inference-framework-for-scaling-reasoning-ai-models/
+    note: "Planner decides whether to serve requests with or without disaggregation and whether to add GPUs to prefill or decode; NIXL transfer library; vendor figures: up to 30x requests for DeepSeek-R1 on GB200 NVL72 (TensorRT-LLM, FP4, 32K in, 8K out, projection), more than 2x throughput for Llama 70B on Hopper (vLLM, FP8, 3K in, 50 out). Checked 2026-10-28."
+  - title: NVIDIA H100 product page
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: "H100 SXM: 80 GB, 3.35 TB/s, FP8 tensor 3,958 TFLOPS with sparsity, NVLink 900 GB/s. Checked 2026-10-28."
+  - title: How to Scale Your Model, All About Rooflines (Google DeepMind, JAX team)
+    url: https://jax-ml.github.io/scaling-book/roofline/
+    note: "Tensor-core figures on the spec sheet are twice the true value because they need structured sparsity. Checked 2026-10-28."
+  - title: DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: "In DeepSeek's H800 cluster, NVLink offers 160 GB/s and InfiniBand 50 GB/s per GPU. Checked 2026-10-28."
+  - title: The Llama 3 Herd of Models (Meta, 2024), Table 3
+    url: https://arxiv.org/html/2407.21783
+    note: "70B: 80 layers, model dimension 8,192, 64 heads, 8 key/value heads. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The interference being removed
+
+In one pool, every engine step mixes work from both phases. Continuous batching with chunked prefill adds a slice of some waiting prompt to the decode batch, so the step that produces the next token for every streaming user also carries a block of prefill compute. Decode is bound by memory reads and prefill by FLOPs, so the prefill slice lengthens a step that would otherwise cost one weight read.
+
+A toy model with the roofline numbers shows the size. Llama 3 70B in FP8 on four H100 SXM with tensor parallelism: the weight read is 70e9 bytes over 4 × 3.35 TB/s = 5.2 ms per step, and each token costs 2 × 70e9 FLOPs over 4 × 1.979e15 dense FP8 FLOP/s = 0.0177 ms. A decode batch of 64 adds 1.1 ms of compute, well under the weight read, so the step costs about 5.2 ms plus its KV reads.
+
+<Predict id="inf-disagg-chunk-step" question="Same toy model. The scheduler adds a 2,048-token prefill chunk to that decode step. About how many milliseconds does the step take now, ignoring KV reads?" answer={37} tolerance={3} unit="ms">
+<p>The step now carries 2,048 + 64 = 2,112 tokens of compute: 2,112 × 0.0177 ms = <b>37.4 ms</b>, which exceeds the 5.2 ms weight read, so the step is compute bound. Every user decoding on that replica waits about seven times longer for this token. A 32,000-token document admitted in 2,048-token chunks takes 16 such steps.</p>
+</Predict>
+
+That is the interference. Chunked prefill bounds it, because `max_num_batched_tokens` caps the tokens per step; vLLM's tuning guide says smaller values such as 2,048 give better inter-token latency and larger ones better time to first token. It cannot remove it. DistServe's analysis puts it as chunking trading TTFT for TPOT: smaller chunks lengthen every prefill, and each chunk re-reads the KV of the chunks before it, so a chunked prefill does O(N²) KV loads where an unchunked one does O(N). Both latency targets are being paid from the same step budget.
+
+## What splitting buys
+
+Disaggregated serving runs prefill on one pool of GPUs and decode on another, and moves each request's KV from the first to the second when its prefill ends. Decode steps then carry no prefill, so time per output token depends only on decode batch size and context; prefill instances run large compute-bound batches without anyone waiting on their steps. Each pool can also have its own parallelism and its own hardware: Splitwise argues the token phase does not need the newest GPU's compute and can run on lower-power, cheaper parts.
+
+DistServe frames the objective as goodput: the request rate a GPU sustains while meeting both a TTFT and a TPOT target, with targets per application (in its Table 1, for example, a chatbot on OPT-66B at 2.5 s TTFT and 0.15 s TPOT, code completion at 0.125 s TTFT). Against the systems it compared, it reports serving 7.4 times more requests or meeting a 12.6 times tighter SLO, with over 90% of requests inside the targets. Splitwise reports 1.4 times the throughput at 20% lower cost, or 2.35 times the throughput at the same cost and power. NVIDIA reports, for Dynamo, more than double the throughput for Llama 70B on Hopper with vLLM in FP8 at 3K input and 50 output tokens, and up to 30 times the requests for DeepSeek-R1 on GB200 NVL72, the latter labelled a projection.
+
+vLLM's documentation states the other side flatly: disaggregated prefill does not improve throughput, and the reasons to use it are tuning TTFT and inter-token latency separately and controlling tail inter-token latency. Both are true. The papers measure requests served within latency targets; raw tokens per second with no latency target is at best unchanged, because the same FLOPs and bytes are spent and a transfer is added. A split pays when the targets, not the hardware, are the binding constraint.
+
+## What splitting costs
+
+Every request moves its KV between pools. For Llama 3 70B one token of BF16 KV is 2 × 80 layers × 8 KV heads × 128 × 2 bytes = 327,680 bytes, so a 32,000-token document carries 10.5 GB. DistServe's own example is a 512-token OPT-66B request at about 1.13 GB, and at 10 requests per second that is 11.3 GB/s, about 90 Gbps, to keep transfer off the critical path. Placement decides whether that is cheap. DistServe places paired prefill and decode instances on the same node so the transfer uses NVLink (900 GB/s per H100 SXM on NVIDIA's page) and measures transfer at under 0.1% of total latency, with over 95% of requests seeing less than 30 ms. Across nodes, at the 50 GB/s per GPU of InfiniBand that DeepSeek reports for its cluster, four GPUs each sending their tensor-parallel shard move 10.5 GB in 10.5 / 200 = 52 ms, added to that request's time to first token unless the transfer overlaps prefill layer by layer.
+
+The transfer is also a new failure surface. A prefill instance can die after computing KV and before handing it over, a decode instance can be full when the KV arrives, and the connector between them (NIXL, LMCache, Mooncake and others in vLLM's list, where the feature is still marked experimental) is a component to version, monitor and upgrade. And there are now two pools to size. The right ratio of prefill to decode GPUs is a function of the traffic mix, input lengths against output lengths, so a ratio that is right on Monday is wrong when a customer starts sending long documents. Dynamo's planner exists for this reason: it watches capacity against SLOs, decides whether to serve requests with or without disaggregation, and moves GPUs between the phases.
+
+Granularity bites on small fleets. Sixteen GPUs at tensor parallel 4 are four instances, so the only splits are 1:3, 2:2 and 3:1, a 33% step in capacity between options.
+
+## Chunked prefill is the one-pool alternative
+
+Sarathi-Serve is the case for keeping one pool. It splits prefills into roughly equal chunks and schedules them without stalling ongoing decodes, and against vLLM of that time, under tail-latency constraints, reports 2.6 times serving capacity for Mistral-7B on one A100, up to 3.7 times for Yi-34B on two A100s, and up to 5.6 times for Falcon-180B with pipeline parallelism, where uniform batches also shrink pipeline bubbles. Chunked prefill is now on by default in vLLM V1. It keeps every GPU able to do either phase, needs no transfer and no ratio, and degrades smoothly under a shifting mix. Its limit is the one above: every chunk is paid by every decoding user on that replica.
+
+## Deciding for a mixed workload
+
+Scenario: sixteen H100 SXM, Llama 3 70B in FP8 at tensor parallel 4, so four instances. Traffic is 20 chat requests per second with 2,000 input and 300 output tokens, plus 1 document request per second with 32,000 input and 500 output tokens. Targets are p99 time per output token of 40 ms for everyone and a document time to first token of 8 s. The toy model from the first section, extended with KV reads, gives:
+
+Prefill demand is 20 × 2,000 + 32,000 = 72,000 tokens per second, which at 0.0177 ms per token is 1.27 instance-seconds of compute every second. Decode concurrency at the 40 ms bound, by Little's law, is 20 × 300 × 0.04 = 240 chat sequences and 20 document sequences, holding about 1.16 million tokens of KV, 380 GB. One instance has 4 × 80 GB − 70 GB − 20 GB reserved = 230 GB, about 702,000 tokens.
+
+One pool of four instances: each holds about 290,000 tokens of KV, so the base decode step is 5.2 ms of weights plus 290,250 × 327,680 bytes over 13.4 TB/s = 7.1 ms of KV, 12.3 ms. Each instance must also absorb 18,000 prefill tokens per second. If the scheduler spreads them evenly, each step carries a chunk c with c / (12.3 + 0.0177c) = 18 tokens per ms, which gives c of about 325 tokens and a step of about 18 ms. The largest chunk that keeps a step under 40 ms is about 1,565 tokens, so a document admitted at that size reaches its first token in about 20 steps, 0.8 s.
+
+Split two and two: the decode instances hold about 580,000 tokens each, so their step is 5.2 + 14.2 = 19.4 ms with no prefill in it. The prefill instances supply up to 2 × 56,500 = 113,000 tokens per second at peak against 72,000 demand. A document's prefill is 566 ms of compute plus the KV transfer.
+
+Under this model the one pool wins: a lower time per output token (about 18 ms against 19.4), twice the KV headroom (2.8 million tokens against 1.4 million for decode, with 1.16 million needed), no transfer, and no ratio to manage. The split's decode pool runs at 83% of its KV capacity, so a rise of about 38% in document traffic fills it: (1.40 − 1.16) million spare tokens over the 645,000 that documents hold now. The decision is to tune one pool, sweep `max_num_batched_tokens` at the target load, and write down the trigger for splitting: p99 time per output token over target at a chunk size that still meets the document TTFT. That happens when prefill demand grows until every step is near its chunk limit, or when the TPOT target tightens towards the base step, at which point neither layout meets it on sixteen GPUs and the split becomes the way to add decode capacity without adding prefill.
+
+A third option sits between them: route documents to a dedicated pool that runs both phases with chunking, and keep chat on its own pool. It isolates chat from long prefills without a KV transfer, at the cost of fragmenting capacity and a routing rule.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your platform split into 6 prefill and 10 decode GPUs a year ago for a long-document workload. Traffic is now mostly agents with 80% prefix-cache hits and short outputs, the prefill pool runs at 20% utilisation, and decode is the bottleneck. The quarterly capacity review is in three weeks and the team that built the split wants to keep it. What do you recommend?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Merge back to one pool with chunked prefill, or shrink the prefill pool to the minimum that still serves the long-document tenants. Prefix-cache hits remove most prefill work, so the interference that justified the split is mostly gone, and the idle prefill GPUs are the cheapest decode capacity available. I would show it with per-class step times and TPOT measured on a merged canary, not argue it from the original design.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The split paid when prefill was heavy and long. With 80% of prompt tokens served from cache, the prefill a request still needs is short, so a chunk in a merged pool costs little per step, and the KV transfer for each request is now overhead on work that is mostly cached. Worse, the prefix cache sits on the prefill pool while the decode pool reads the KV, so cache-aware routing has to reason about two pools.</p>
+<p>The measurement: run a merged canary at production mix and compare time per output token, time to first token and tokens per GPU-second against the split pool, per traffic class. If the merged pool meets the targets, the six prefill GPUs become decode capacity, a 60% increase on the decode side, without a purchase. If the long-document tenants still need isolation, keep a small prefill pool sized to their traffic and move the rest.</p>
+<p>What we give up: isolation of decode from any burst of uncached long prompts, which returns as a tail-latency risk, and a year of operational tuning on the split. I would write the trigger for splitting again, the p99 TPOT on the merged pool above target during document bursts, and get the team that built the split to agree on that trigger before the review rather than at it.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The original team says the merged canary looked fine because it ran on a quiet week. How do you settle it without deciding by seniority?</em> Agree the load and mix the canary must see, replay a recorded peak against both layouts, and accept the result in advance.</li>
+<li><em>Finance wants the six GPUs returned instead of reused. What do you lose, and what do you put in writing?</em></li>
+<li><em>What would you need to see in production to split again?</em> For example, the uncached prompt-token share rising past the point where chunk steps push p99 TPOT over target at the chunk size that keeps document TTFT.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The toy model takes FLOPs and bytes at the spec-sheet rate and ignores attention compute, communication and scheduler overhead. Real kernels reach a fraction of peak, chunked prefill pays the quadratic KV reloads that make later chunks of a long prompt slower than earlier ones, and Little's law at the bound overstates concurrency when actual TPOT is lower. The model ranks the options and finds the trigger; the numbers to plan capacity with come from a load test at the target mix.
+
+The published gains are against the baselines of their time. DistServe and Sarathi-Serve both compared against vLLM versions that predate chunked prefill by default and V1's scheduler, so the gap to a tuned single pool today is smaller than the headline multiples, and vendor figures such as Dynamo's are measured on the vendor's stack and configurations.
+
+Disaggregation also interacts with every other lever in this module. Prefix caching shrinks prefill and the case for a split; speculative decoding runs on the decode pool and changes its batch; quantising the KV cache halves the transfer. Re-run the decision when any of them changes.
+
+<SelfRate id="lesson:inference/faster-cheaper/disaggregation" />

@@ -1,0 +1,167 @@
+---
+title: Claude Managed Agents
+track: harness
+module: cache-cost-latency
+order: 5
+kind: teardown
+level: staff
+minutes: 14
+summary: Anthropic's hosted agent runtime keeps the session in an append-only log outside a stateless harness, reaches sandboxes through one execute interface provisioned on first use, and keeps credentials out of the sandbox with a vault, a proxy for MCP and secret substitution at egress.
+prerequisites: [harness/cache-cost-latency/brain-and-hands]
+updated: 2026-10-28
+sources:
+  - title: Lance Martin, Gabe Cemaj and Michael Cohen, Scaling Managed Agents, decoupling the brain from the hands (Anthropic, 2026-04-08)
+    url: https://www.anthropic.com/engineering/managed-agents
+    note: "session as the append-only log, harness as the loop, sandbox as the execution environment; execute(name, input) returning a string; provision({resources}); wake(sessionId), getSession(id), emitEvent(id, event), getEvents(); container failure caught as a tool-call error; git token used to clone at sandbox initialisation and wired into the remote; MCP OAuth tokens in a vault behind a proxy; p50 TTFT down roughly 60%, p95 over 90%"
+  - title: Claude Managed Agents overview (beta header managed-agents-2026-04-01, checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/managed-agents/overview
+    note: "agent, environment, session and events; Anthropic-managed cloud sandbox or self-hosted sandbox; events over server-sent events with history persisted server-side; built-in prompt caching and compaction; built-in tools Bash, file operations, web search and fetch with optional allow and block lists, MCP; not eligible for Zero Data Retention or HIPAA BAA coverage; MCP tunnels and dreaming in a more limited research preview"
+  - title: Claude Managed Agents docs, Authenticate with vaults (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/managed-agents/vaults
+    note: "vaults are workspace-scoped and referenced per session by vault_ids; credential types mcp_oauth, static_bearer and environment_variable; environment variables stored in the sandbox as opaque placeholders and substituted at egress for allowed_hosts and the enabled injection_location; signing clients such as AWS SigV4 break; substitution is outbound only; maximum 20 credentials per vault; credentials re-resolved periodically; refresh_failed webhook and mcp_oauth_validate statuses; environment variable credentials not yet supported with self-hosted sandboxes"
+  - title: Claude API docs, Pricing, Claude Managed Agents (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: "tokens at model rates with caching multipliers; $0.08 per session-hour, metered to the millisecond only while running; idle, rescheduling and terminated time not billed; no Batch API discount; web search $10 per 1,000; worked example of a one-hour Opus 5.5 session at $0.58, or $0.428 with 40,000 of 50,000 input tokens read from cache"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Diagram from '../../../../components/Diagram.astro';
+import Trace from '../../../../components/Trace.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What it is and who runs it
+
+Claude Managed Agents is Anthropic's hosted runtime for long-running agents, offered on the Claude Platform in beta behind the `managed-agents-2026-04-01` header (checked 2026-10-28). The customer defines an **agent** (model, system prompt, tools, MCP servers, skills) and an **environment** (an Anthropic-managed cloud sandbox or a self-hosted one), then starts **sessions** against them and exchanges **events**: user turns, tool results, status updates, streamed back over server-sent events. Anthropic runs the loop, the session store and, for cloud environments, the sandboxes.
+
+The interesting part for a harness engineer is the shape Anthropic chose after its first design failed. The April 2026 engineering post describes Managed Agents as a meta-harness: opinionated about three interfaces (session, harness, sandbox) and deliberately unopinionated about what runs behind them, because harnesses encode assumptions about what the model cannot do, and those assumptions go stale. Its example is context resets, needed for Sonnet 4.5 and dead weight on Opus 4.5.
+
+## The system
+
+<Diagram
+  title="Claude Managed Agents, from the April 2026 post and the docs"
+  nodes={[
+    { id: 'app', label: 'Customer application', note: 'creates sessions, sends events' },
+    { id: 'log', label: 'Session log', note: 'append-only events, durable' },
+    { id: 'harness', label: 'Harness', note: 'stateless; woken per session' },
+    { id: 'model', label: 'Claude', note: 'model API' },
+    { id: 'prov', label: 'Provisioning', note: 'provision on first execute' },
+    { id: 'proxy', label: 'MCP proxy', note: 'session token in, credential out' },
+    { id: 'sandbox', label: 'Sandbox', note: 'cloud or self-hosted; behind execute' },
+    { id: 'vault', label: 'Vault', note: 'OAuth, bearer and secret values' },
+    { id: 'egress', label: 'Egress substitution', note: 'placeholder to secret, allowed hosts only' },
+    { id: 'ext', label: 'External services', note: 'APIs, MCP servers, git remote' },
+  ]}
+  edges={[
+    { from: 'app', to: 'log', label: 'events' },
+    { from: 'log', to: 'harness', label: 'wake, getEvents' },
+    { from: 'harness', to: 'log', label: 'emitEvent' },
+    { from: 'harness', to: 'model', label: 'context' },
+    { from: 'harness', to: 'prov', label: 'execute' },
+    { from: 'harness', to: 'proxy', label: 'MCP call' },
+    { from: 'prov', to: 'sandbox' },
+    { from: 'proxy', to: 'vault' },
+    { from: 'sandbox', to: 'egress', label: 'outbound request' },
+    { from: 'egress', to: 'ext' },
+    { from: 'proxy', to: 'ext' },
+  ]}
+  rows={[['app'], ['log'], ['harness', 'model'], ['prov', 'proxy'], ['sandbox', 'vault'], ['egress', 'ext']]}
+/>
+
+**Session log.** The session is the append-only record of everything that happened, stored durably outside the harness. The harness writes to it with `emitEvent(id, event)` and reads it with `getSession(id)` or with `getEvents()`, which returns positional slices: resume where the harness last stopped reading, rewind a few events before a moment, or reread context before an action. The docs add that event history is persisted server-side and can be fetched in full by the customer.
+
+**Harness.** The loop that calls Claude and routes its tool calls. It holds no state that needs to survive a crash: a failed harness is replaced by a new one started with `wake(sessionId)`, which reads the log and resumes from the last event. Scaling to many sessions means starting many stateless harnesses. The managed harness includes prompt caching and compaction, and the post is explicit that how the harness transforms log events into context, including arranging them for cache hits, is the harness's business and can change; only the log's durability is guaranteed.
+
+**Claude.** The model, called with whatever context the harness built. Nothing in the architecture requires the model to see the whole log.
+
+**Provisioning and the sandbox.** A sandbox is reached only through `execute(name, input)`, which returns a string. In the post's words, the harness does not know whether the sandbox is a container, a phone or a Pokémon emulator. A container is created when a tool first needs one, from a standard recipe, `provision({resources})`. If it dies, the harness reports a tool-call error to Claude, and a retry gets a fresh container. In the coupled design, a customer who wanted Claude to reach resources in their virtual private cloud had to peer their network with Anthropic's or run the harness in their own environment; with the harness out of the container, the post says that constraint went away. Separately, the docs offer self-hosted sandboxes on the customer's infrastructure as an environment type.
+
+**MCP proxy and vault.** Claude's MCP calls go through a dedicated proxy that receives a token tied to the session, fetches the matching credential from a vault and calls the external server. The harness never sees the credential. Vaults are per end user, referenced per session with `vault_ids`, and hold up to 20 credentials each.
+
+**Egress substitution.** For services authenticated through an environment variable, the sandbox holds an opaque placeholder instead of the secret. When a request leaves the sandbox for a host in the credential's `allowed_hosts`, the placeholder is replaced with the real value in the enabled locations (headers, body or both). Code in the sandbox, and the model reading its output, never see the secret. For git, the post describes a separate path: the repository's token is used to clone at sandbox initialisation and wired into the local remote, so push and pull work without the agent handling it.
+
+## A session, step by step
+
+<Trace
+  title="One Managed Agents session that needs a sandbox and two credentials"
+  note="from the April 2026 post and the docs; ordering inside Anthropic's service is not published"
+  steps={[
+    { actor: 'user', text: 'The application creates a session that names the agent, the environment and the end user’s vault, then sends a user event.' },
+    { actor: 'log', text: 'The event is appended to the session log.', note: 'Runtime billing accrues only while the session is running.' },
+    { actor: 'harness', text: 'The orchestration layer pulls pending events and a stateless harness is woken for the session; it reads the events it needs.', note: 'No container exists yet.' },
+    { actor: 'assistant', text: 'Claude receives the context the harness built and starts streaming a response.', note: 'Time to first token no longer includes clone, boot or dependency setup.' },
+    { actor: 'assistant', text: 'Claude calls Bash to run the test suite.' },
+    { actor: 'harness', text: 'execute finds no sandbox for the session, so provision creates one; the repository is cloned with its token, which is wired into the git remote.', note: 'The provisioning cost lands here, at the first tool call.' },
+    { actor: 'tool', text: 'The command runs and its output returns to the harness as a string, which is emitted to the log and passed to Claude.' },
+    { actor: 'tool', text: 'A script in the sandbox calls api.notion.com with the NOTION_API_KEY placeholder in a header; at egress the placeholder is replaced because the host is allowed for that credential.', note: 'A host outside allowed_hosts receives the literal placeholder.' },
+    { actor: 'tool', text: 'Claude calls an MCP tool; the proxy fetches the end user’s OAuth token from the vault and calls the server.' },
+    { actor: 'system', text: 'The container exits mid-task. The harness returns a tool error; Claude retries and a fresh container is provisioned.', note: 'Uncommitted files in the dead container are gone.' },
+    { actor: 'assistant', text: 'Claude finishes the turn. The session goes idle until the next event, and idle time is not billed.' },
+  ]}
+/>
+
+## Context strategy
+
+The post separates two concerns that most harnesses fuse: recoverable storage of everything (the session log) and the choice of what enters the context window (the harness). Compaction, memory files and trimming of old tool results or thinking blocks are all irreversible when the harness owns the only copy. With the log outside, a compacted summary can be wrong without being fatal, because the harness can go back to the events with `getEvents()`. The post compares this to keeping context as an object outside the window that the model queries, but stored durably in the log rather than in a sandbox or REPL. The managed harness's own policies (when it compacts, how it orders events for cache hits) are not specified beyond the overview's statement that prompt caching and compaction are built in.
+
+## Tools and permission model
+
+The built-in tools are Bash, file operations (read, write, edit, glob, grep), web search and fetch with optional domain allow or block lists, and MCP servers. All execution happens in the sandbox, behind `execute`.
+
+The credential model is the most detailed public part, and its edge cases are the ones to know:
+
+- **Two levels of host allow-listing.** A credential's `allowed_hosts` controls which requests get the secret, not which requests are allowed. The environment's networking settings must also permit the domain, or the request does not leave.
+- **Placement.** `injection_location` limits substitution to headers, body or both. The docs recommend header-only where possible because request bodies are assembled from content the agent is working with. Credentials created in the Console are header-only by default, and a client that sends the secret in a form body then fails with the service's own authentication error.
+- **What breaks.** Substitution happens at egress, so anything that processes the secret inside the sandbox sees the placeholder: clients that validate key format at startup reject it, and clients that sign requests with the secret, AWS SigV4 for example, produce invalid signatures.
+- **Outbound only.** If a client uses a stored secret to obtain a session token, the returned token arrives in the sandbox unredacted. The docs' advice is to perform such exchanges outside and store the resulting token in the vault.
+- **Scope.** Vaults and credentials are workspace-scoped: any API key with workspace access can reference them when creating a session. Revocation is deleting or archiving the vault or credential; archiving purges secrets, keeps records for audit, fails future sessions that reference the vault, and lets running sessions continue. Credentials are re-resolved periodically, so rotation reaches running sessions without a restart.
+- **Self-hosted gap.** Environment-variable credentials are not yet supported with self-hosted sandboxes; the docs suggest running your own egress proxy that performs the same replacement.
+
+## Cost and latency
+
+Billing has two dimensions: tokens at the model's rates, with prompt-caching multipliers applied as on the Messages API, and session runtime at $0.08 per session-hour, metered to the millisecond while the session's status is running. Idle time waiting for the next message or a tool confirmation, rescheduling and terminated time are not billed, and runtime replaces container-hour billing. The Batch API discount does not apply, and web searches cost the standard $10 per 1,000.
+
+Anthropic's pricing page works one example: a one-hour Opus 5.5 session with 50,000 input and 15,000 output tokens costs $0.20 + $0.30 + $0.08 = $0.58, and with 40,000 of the input tokens read from cache, $0.428. Runtime is 14% of the first bill (0.08 / 0.58) and 19% of the second (0.08 / 0.428). The cheaper the tokens become through caching, the larger the runtime share; in both versions of this example the token terms are still most of the bill.
+
+On latency, the post reports that moving provisioning off the critical path cut p50 time to first token by roughly 60% and p95 by over 90%. A session that needs a sandbox still pays provisioning, at its first tool call.
+
+## Failure modes
+
+**Sandbox death** is a tool error the model sees, and the model decides whether to retry. A fresh container has lost whatever the old one held that was not committed or pushed.
+
+**Harness crash** is recovered by waking a new harness on the same session. Whether a tool call in flight at the crash is re-run, skipped or reported is not documented.
+
+**Credential faults** do not stop sessions. Credentials are not validated until runtime; an invalid one surfaces as an authentication or downstream error inside the session, which continues. A failed OAuth refresh emits a `vault_credential.refresh_failed` webhook, and a validate endpoint classifies the credential as `valid`, `invalid` (re-authorise the user) or `unknown` (transient: wait and retry).
+
+**Silent placeholder leakage** happens when the destination host is not in `allowed_hosts` or the location is disabled: the third party receives the literal placeholder. That leaks nothing secret, but the symptom is an authentication failure that looks like a bad key.
+
+**Data retention** is a design consequence rather than a fault: because sessions store history, sandbox state and outputs server-side, Managed Agents is not eligible for Zero Data Retention or HIPAA BAA coverage. Customers can delete sessions and uploaded files through the API.
+
+## What is not public
+
+Anthropic has not published how sessions are scheduled onto harness instances, what triggers a wake, or what guarantees that only one harness writes to a session at a time. The sandbox isolation technology for cloud environments, the provisioning recipe beyond cloning the repository, and the use of warm pools or image caches are not described. There are no capacity numbers: containers per host, harness concurrency, provisioning times, or the absolute TTFT values behind the 60% and over-90% figures, nor the period or workload they were measured on. The session log's storage engine and retention period, how often credentials are re-resolved beyond "periodically", and the implementation of the MCP proxy and egress substitution are also not public. Nothing on this page should be read as a statement about any of them.
+
+## Interview questions
+
+<Callout kind="interview" label="Interview question">
+**"You are building an agent platform for a regulated customer. They want sessions that survive crashes and can run for hours, agents that call their internal APIs with per-user credentials, and Zero Data Retention. Using Managed Agents' design as the reference, what do you keep, what do you change, and what do you tell the customer they cannot have together?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Keep the stateless harness, the execute interface with sandboxes provisioned on use, and credentials kept out of the sandbox through a proxy and egress substitution. The conflict is the durable session log: crash recovery by waking a new harness requires storing the events, and storing them is incompatible with zero retention. Offer a log in the customer's own infrastructure with their retention policy, and say plainly that zero retention means a crash loses the session.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Durability and zero retention conflict at the log, not elsewhere. Managed Agents resolves it by storing state and being ineligible for ZDR; Codex resolves it the other way, with stateless requests. A third option is to keep the log under the customer's control (self-hosted store, their keys, their deletion policy), which preserves recovery and moves the retention decision to them.</p>
+<p>Credentials: per-user vaults referenced per session, MCP through a proxy, and an egress proxy for API keys with header-only substitution and host allow-lists at two levels. Their internal APIs may sign requests or exchange keys for session tokens, and both break or leak under egress substitution, so those calls go through a tool that runs outside the sandbox instead.</p>
+<p>What you give up: a network hop per tool call, a proxy on every outbound request, and an operational surface (log store, proxy, provisioning) the customer now co-owns. Put the retention trade in the decision memo with the customer's sign-off.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The customer's security team wants the egress proxy to log full request bodies for audit. What does that do to the credential model, and what would you log instead?</li>
+<li>Two harnesses wake for the same session after a network partition and both append events. How do you detect it, and what does the model see afterwards?</li>
+<li>A year in, most sessions run a shell command in their first turn. Would you keep lazy provisioning, and what evidence would make you switch to warm pools?</li>
+</ul>
+</Fragment>
+</Depth>
+
+<SelfRate id="lesson:harness/cache-cost-latency/managed-agents" />

@@ -1,0 +1,277 @@
+---
+title: Build a sampler
+track: foundations
+module: sampling
+kind: lab
+minutes: 90
+summary: Grow one sampler over five steps, from a stable softmax to top-k, top-p, min-p, a repetition penalty and a seeded draw whose determinism is a test.
+updated: 2026-10-28
+sources:
+  - title: The Curious Case of Neural Text Degeneration (Holtzman et al., ICLR 2020)
+    url: https://arxiv.org/abs/1904.09751
+    note: nucleus sampling keeps the smallest top set reaching p and truncates the unreliable tail (step 3); checked 2026-10-28
+  - title: "Turning Up the Heat: Min-p Sampling for Creative and Coherent LLM Outputs (Nguyen et al., ICLR 2025)"
+    url: https://arxiv.org/abs/2407.01082
+    note: threshold p_base x p_max applied after temperature (step 4); checked 2026-10-28
+  - title: vLLM docs, SamplingParams
+    url: https://docs.vllm.ai/en/latest/api/vllm/sampling_params.html
+    note: temperature 0 is greedy and disables the filters; top_k 0 or -1 disables; top_p 1 keeps all; min_p 0 disables; repetition_penalty above 1 favours new tokens and covers prompt and output; seed for seeded random sampling (steps 2 to 5); checked 2026-10-28
+steps:
+  - title: Stable softmax with temperature
+    brief: |
+      Logits arrive as a list indexed by token id. Divide by the temperature, subtract the maximum before exponentiating so large logits cannot overflow, and normalise. Accept minus infinity as a logit and give it probability exactly 0, because that is how a grammar mask or a banned token reaches the sampler. Temperature 0 is not a softmax; raise ValueError for any temperature at or below 0 and let the caller handle greedy decoding in step 5.
+    starter: |
+      import math
+
+      def softmax(logits, temperature=1.0):
+          """Return probabilities for a list of logits. -inf maps to 0. Raise ValueError if temperature <= 0."""
+          raise NotImplementedError
+    tests: |
+      p = softmax([2.0, 1.0, 0.0])
+      assert abs(sum(p) - 1) < 1e-12
+      assert abs(p[0] - 0.6652409557748219) < 1e-9
+      assert softmax([1000.0, 999.0])[0] > 0.7, "large logits must not overflow"
+      assert softmax([0.0, float("-inf"), 1.0])[1] == 0.0, "a masked token has probability exactly 0"
+      assert softmax([2.0, 1.0], 0.5)[0] > softmax([2.0, 1.0], 1.0)[0], "lower temperature sharpens"
+      try:
+          softmax([1.0, 2.0], 0)
+          raised = False
+      except ValueError:
+          raised = True
+      assert raised, "temperature 0 raises ValueError"
+    hidden: |
+      import random
+      _r = random.Random(5)
+      _cases = [[_r.gauss(0, 4) for _ in range(_r.randint(1, 60))] for _ in range(200)]
+      assert all(abs(sum(softmax(c, t)) - 1) < 1e-9 for c in _cases for t in (0.3, 1.0, 2.0))
+      assert all(max(range(len(c)), key=lambda i: c[i]) == max(range(len(c)), key=lambda i: softmax(c, 0.7)[i]) for c in _cases), "temperature preserves the argmax"
+      assert all(max(abs(a - b) for a, b in zip(softmax(c), softmax([x + 123.0 for x in c]))) < 1e-9 for c in _cases), "adding a constant changes nothing"
+      assert all(max(softmax(c, 0.5)) >= max(softmax(c, 1.5)) - 1e-12 for c in _cases), "the top probability falls as temperature rises"
+      _m = [_r.gauss(0, 1) if i % 3 else float("-inf") for i in range(30)]
+      assert all(q == 0.0 for i, q in enumerate(softmax(_m)) if i % 3 == 0)
+    solution: |
+      import math
+
+      def softmax(logits, temperature=1.0):
+          if temperature <= 0:
+              raise ValueError("temperature must be positive; temperature 0 is greedy decoding")
+          z = [x / temperature for x in logits]
+          m = max(z)
+          e = [math.exp(x - m) if x != float("-inf") else 0.0 for x in z]
+          s = sum(e)
+          return [x / s for x in e]
+  - title: Top-k
+    brief: |
+      Keep the k most likely tokens, set the rest to 0 and renormalise, returning a list the same length as the input so token ids stay aligned. Follow vLLM's convention that k of 0 or -1 disables the filter. When the k-th and (k+1)-th tokens tie, you decide which survives; the tests only require that exactly k tokens survive (or every token with non-zero probability, if there are fewer) and that no dropped token is more likely than a kept one.
+    starter: |
+      def renormalise(probs):
+          """Given: scale a list of non-negative numbers to sum to 1."""
+          s = sum(probs)
+          return [p / s for p in probs]
+
+      def top_k(probs, k):
+          """Keep the k most likely tokens, zero the rest, renormalise. k <= 0 disables."""
+          raise NotImplementedError
+    tests: |
+      p = softmax([3.0, 1.0, 2.0, 0.0])
+      q = top_k(p, 2)
+      assert len(q) == 4 and q[1] == 0.0 and q[3] == 0.0, "the two least likely are cut"
+      assert abs(sum(q) - 1) < 1e-12
+      assert top_k(p, 0) == p and top_k(p, -1) == p, "0 and -1 disable top-k"
+      assert top_k(p, 10) == renormalise(p), "k larger than the vocabulary keeps everything"
+    hidden: |
+      import random
+      _r = random.Random(6)
+      def _ok(p, k):
+          q = top_k(p, k)
+          kept = [i for i, x in enumerate(q) if x > 0]
+          dropped = [i for i, x in enumerate(q) if x == 0 and p[i] > 0]
+          want = min(k, sum(1 for x in p if x > 0))
+          low = min(p[i] for i in kept)
+          ratio_ok = all(abs(q[i] / q[kept[0]] - p[i] / p[kept[0]]) < 1e-9 for i in kept)
+          return len(kept) == want and all(p[d] <= low + 1e-15 for d in dropped) and abs(sum(q) - 1) < 1e-9 and ratio_ok
+      _cases = [softmax([_r.gauss(0, 3) for _ in range(_r.randint(1, 80))]) for _ in range(200)]
+      assert all(_ok(c, k) for c in _cases for k in (1, 3, 20))
+      _tied = renormalise([1.0, 2.0, 2.0, 2.0, 0.5])
+      assert sum(1 for x in top_k(_tied, 2) if x > 0) == 2, "ties at the cut still leave exactly k tokens"
+    solution: |
+      def renormalise(probs):
+          s = sum(probs)
+          return [p / s for p in probs]
+
+      def top_k(probs, k):
+          if k <= 0 or k >= len(probs):
+              return renormalise(probs) if k > 0 else probs
+          order = sorted(range(len(probs)), key=lambda i: (-probs[i], i))
+          keep = set(order[:k])
+          return renormalise([p if i in keep else 0.0 for i, p in enumerate(probs)])
+  - title: Top-p
+    brief: |
+      Keep the smallest set of most likely tokens whose total probability reaches p, zero the rest and renormalise. Check the running total after adding a token, so the top token survives even when it alone holds more than p. p of 1 keeps everything. The tests check the properties that define the nucleus rather than one output: the kept set is a top set, it reaches p, and dropping its least likely member would fall below p.
+    starter: |
+      def top_p(probs, p):
+          """Keep the smallest top set with total probability >= p, zero the rest, renormalise. p >= 1 disables."""
+          raise NotImplementedError
+    tests: |
+      q = top_p(softmax([9.0, 6.5, 5.8, 4.0, 3.5, 3.0, 2.0, 1.0], 2.0), 0.9)
+      assert [i for i, x in enumerate(q) if x > 0] == [0, 1, 2, 3], "top-p 0.9 at T=2 keeps four tokens"
+      assert [i for i, x in enumerate(top_p(softmax([9.0, 6.5, 5.8]), 0.5)) if x > 0] == [0], "the top token alone can satisfy p"
+      assert abs(sum(q) - 1) < 1e-12
+    hidden: |
+      import random
+      _r = random.Random(7)
+      def _ok(pr, p):
+          q = top_p(pr, p)
+          kept = [i for i, x in enumerate(q) if x > 0]
+          mass = sum(pr[i] for i in kept)
+          low = min(pr[i] for i in kept)
+          dropped = [pr[i] for i, x in enumerate(q) if x == 0]
+          return mass >= p - 1e-9 and mass - low < p + 1e-9 and all(d <= low + 1e-15 for d in dropped) and abs(sum(q) - 1) < 1e-9
+      _cases = [softmax([_r.gauss(0, _r.choice([0.5, 2.0, 5.0])) for _ in range(_r.randint(1, 120))]) for _ in range(200)]
+      assert all(_ok(c, p) for c in _cases for p in (0.2, 0.8, 0.95))
+      _logits = [_r.gauss(0, 3) for _ in range(150)]
+      _n = [sum(1 for x in top_p(softmax(_logits, t), 0.9) if x > 0) for t in (0.5, 1.0, 2.0, 3.0)]
+      assert _n == sorted(_n), "the nucleus grows as temperature rises"
+    solution: |
+      def top_p(probs, p):
+          if p >= 1:
+              return probs
+          order = sorted(range(len(probs)), key=lambda i: (-probs[i], i))
+          keep, mass = set(), 0.0
+          for i in order:
+              keep.add(i)
+              mass += probs[i]
+              if mass >= p:
+                  break
+          return renormalise([x if i in keep else 0.0 for i, x in enumerate(probs)])
+  - title: Min-p
+    brief: |
+      Keep every token whose probability is at least p_base times the largest probability, zero the rest and renormalise; p_base of 0 disables. The cutoff scales with the model's confidence, so on a flat distribution min-p keeps many tokens and on a peaked one few. The min-p paper applies it after temperature, which is why the function takes probabilities rather than logits, and the hidden tests check the case that motivates it: at high temperature on a peaked distribution, min-p admits no more tokens than top-p.
+    starter: |
+      def min_p(probs, p_base):
+          """Keep tokens with probability >= p_base * max(probs), zero the rest, renormalise. p_base <= 0 disables."""
+          raise NotImplementedError
+    tests: |
+      peaked = softmax([9.0, 6.5, 5.8, 4.0, 3.5, 3.0, 2.0, 1.0], 2.0)
+      assert [i for i, x in enumerate(min_p(peaked, 0.1)) if x > 0] == [0, 1, 2], "cutoff 0.1 x 0.577"
+      flat = softmax([3.0, 2.9, 2.8, 2.6, 2.5, 2.3, 1.5, -1.0])
+      assert sum(1 for x in min_p(flat, 0.1) if x > 0) == 7
+      assert min_p(flat, 0) == flat
+    hidden: |
+      import random
+      _r = random.Random(8)
+      def _ok(pr, b):
+          q = min_p(pr, b)
+          cut = b * max(pr)
+          return all((q[i] > 0) == (x >= cut) for i, x in enumerate(pr) if abs(x - cut) > 1e-12) and abs(sum(q) - 1) < 1e-9
+      _cases = [softmax([_r.gauss(0, 3) for _ in range(_r.randint(1, 100))]) for _ in range(200)]
+      assert all(_ok(c, b) for c in _cases for b in (0.05, 0.2, 0.9))
+      assert all(min_p(c, 0.5)[max(range(len(c)), key=lambda i: c[i])] > 0 for c in _cases), "the top token always survives"
+      assert sum(1 for x in min_p([1 / 40] * 40, 0.99) if x > 0) == 40, "a uniform distribution keeps everything"
+      _peaks = [[_r.uniform(6, 10)] + [_r.gauss(0, 1) for _ in range(60)] for _ in range(50)]
+      _cmp = [(sum(1 for x in min_p(softmax(l, 2.0), 0.1) if x > 0), sum(1 for x in top_p(softmax(l, 2.0), 0.9) if x > 0)) for l in _peaks]
+      assert all(a <= b for a, b in _cmp), "on peaked logits at T=2, min-p 0.1 admits no more than top-p 0.9"
+    solution: |
+      def min_p(probs, p_base):
+          if p_base <= 0:
+              return probs
+          cut = p_base * max(probs)
+          return renormalise([x if x >= cut else 0.0 for x in probs])
+  - title: Repetition penalty and a seeded sampler
+    brief: |
+      Assemble the pipeline. The repetition penalty edits logits for every token id already seen in the prompt or output, as vLLM's does; this lab divides positive logits and multiplies negative ones by the penalty, so a penalty above 1 always lowers a seen token's logit and 1 is a no-op. The Sampler applies the penalty, then temperature, then top-k, top-p and min-p, then draws with its own random.Random(seed). Temperature 0 is greedy: return the argmax of the penalised logits (lowest id on a tie) and ignore the filters, as vLLM does. Two samplers with the same seed must produce the same sequence of tokens from the same logits; that determinism is the test, and the next lesson explains why it does not survive a real server.
+    starter: |
+      import random
+
+      def apply_repetition_penalty(logits, seen_ids, penalty):
+          """Return new logits: for ids in seen_ids, positive logits / penalty, negative logits * penalty."""
+          raise NotImplementedError
+
+      class Sampler:
+          def __init__(self, temperature=1.0, top_k=0, top_p=1.0, min_p=0.0, repetition_penalty=1.0, seed=None):
+              raise NotImplementedError
+
+          def sample(self, logits, seen_ids=()):
+              """Return one token id."""
+              raise NotImplementedError
+    tests: |
+      assert apply_repetition_penalty([2.0, -1.0, 0.5], {0, 1}, 2.0) == [1.0, -2.0, 0.5]
+      assert apply_repetition_penalty([2.0, -1.0], {0, 1}, 1.0) == [2.0, -1.0]
+      g = Sampler(temperature=0, top_k=1, top_p=0.1)
+      assert g.sample([0.1, 3.0, 2.9]) == 1, "temperature 0 is the argmax"
+      assert Sampler(temperature=0, repetition_penalty=1.2).sample([0.1, 3.0, 2.9], seen_ids={1}) == 2, "the penalty moves the argmax off a seen token"
+      logits = [3.0, 2.9, 2.8, 2.6, 2.5, 2.3, 1.5, -1.0]
+      a = Sampler(temperature=1.0, top_p=0.9, seed=42)
+      b = Sampler(temperature=1.0, top_p=0.9, seed=42)
+      assert [a.sample(logits) for _ in range(50)] == [b.sample(logits) for _ in range(50)], "same seed, same sequence"
+    hidden: |
+      import random
+      _r = random.Random(9)
+      _flat = [_r.gauss(0, 0.3) for _ in range(30)]
+      def _seq(seed):
+          smp = Sampler(temperature=1.0, seed=seed)
+          return tuple(smp.sample(_flat) for _ in range(40))
+      _seqs = {_seq(s) for s in range(5)}
+      assert len(_seqs) == 5, "different seeds give different sequences on a flat distribution"
+      _s = Sampler(temperature=1.3, top_k=6, top_p=0.95, min_p=0.05, seed=3)
+      for _ in range(100):
+          l = [_r.gauss(0, 2) for _ in range(40)]
+          p = min_p(top_p(top_k(softmax(l, 1.3), 6), 0.95), 0.05)
+          t = _s.sample(l)
+          assert p[t] > 0, "every draw comes from the kept set"
+      _l = [1.0, 0.0, -1.0, 0.5]
+      _p = softmax(_l)
+      _c = [0] * 4
+      _u = Sampler(seed=10)
+      for _ in range(20000):
+          _c[_u.sample(_l)] += 1
+      assert all(abs(_c[i] / 20000 - _p[i]) < 0.02 for i in range(4)), "draw frequencies follow the distribution"
+      _pen = Sampler(temperature=0, repetition_penalty=1.5)
+      assert _pen.sample([2.0, 1.9], seen_ids={0}) == 1, "the penalty can move the argmax"
+      _many = apply_repetition_penalty([_r.gauss(0, 3) for _ in range(50)], set(range(0, 50, 2)), 1.3)
+      assert all(isinstance(x, float) for x in _many) and len(_many) == 50
+    solution: |
+      import random
+
+      def apply_repetition_penalty(logits, seen_ids, penalty):
+          if penalty == 1.0:
+              return list(logits)
+          out = list(logits)
+          for i in seen_ids:
+              out[i] = out[i] / penalty if out[i] > 0 else out[i] * penalty
+          return out
+
+      class Sampler:
+          def __init__(self, temperature=1.0, top_k=0, top_p=1.0, min_p=0.0, repetition_penalty=1.0, seed=None):
+              self.temperature = temperature
+              self.k = top_k
+              self.p = top_p
+              self.min_p = min_p
+              self.penalty = repetition_penalty
+              self.rng = random.Random(seed)
+
+          def sample(self, logits, seen_ids=()):
+              logits = apply_repetition_penalty(logits, seen_ids, self.penalty)
+              if self.temperature == 0:
+                  return max(range(len(logits)), key=lambda i: (logits[i], -i))
+              probs = softmax(logits, self.temperature)
+              probs = min_p(top_p(top_k(probs, self.k), self.p), self.min_p)
+              r = self.rng.random()
+              acc = 0.0
+              last = 0
+              for i, q in enumerate(probs):
+                  if q > 0:
+                      acc += q
+                      last = i
+                      if r < acc:
+                          return i
+              return last
+---
+
+This lab builds the sampler from the samplers lesson as one program. Each step adds functions to the same file, and its tests run against everything written so far: the Sampler in step 5 calls the softmax from step 1 and the three filters from steps 2 to 4.
+
+Every filter takes and returns a list indexed by token id, the same length as the vocabulary, with cut tokens at probability 0. That is the shape an engine works in, a tensor over the vocabulary for each sequence, and it keeps the filters composable: step 5 chains them without converting between representations.
+
+The visible tests are examples taken from the lesson's two distributions. The hidden tests check properties on seeded random logits: probabilities sum to 1, the argmax survives temperature, kept sets are top sets of the right size or mass, ratios between kept tokens are preserved, the nucleus grows with temperature, min-p admits no more than top-p on peaked logits at high temperature, draws come only from the kept set and follow the distribution, and two samplers with one seed agree. Tie-breaks at a cut are yours, as long as they are deterministic.
+
+What separates this program from an engine's sampler is the batch. A real engine applies per-sequence parameters to a batch of logits tensors at once, avoids a full sort for top-k and top-p, and handles penalties with per-sequence token counts kept on the device. The seeded determinism tested in step 5 holds here because the logits are fixed inputs; on a server, the logits themselves vary with batch composition, which is the subject of the nondeterminism lesson.

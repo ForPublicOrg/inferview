@@ -1,0 +1,157 @@
+---
+title: Prefix caching in the engine
+track: inference
+module: faster-cheaper
+order: 3
+kind: lesson
+level: senior
+minutes: 13
+summary: The engine keys each full KV block by a hash chained through every token before it, so shared prefixes are prefilled once per replica, routing decides whether the hit happens on a fleet, and a per-tenant salt closes the side channel at the price of one copy of the shared prefix per tenant.
+prerequisites: [inference/inference-anatomy/kv-capacity]
+updated: 2026-10-28
+sources:
+  - title: vLLM docs, Automatic Prefix Caching design (latest)
+    url: https://docs.vllm.ai/en/latest/design/prefix_caching.html
+    note: "Block hash = hash of parent hash, block tokens and extra hashes (LoRA id, multimodal input hash, cache salt); only full blocks are cached; sha256 default since v0.11 with pickle serialisation, sha256_cbor for cross-language determinism, xxhash options faster but non-cryptographic with a collision risk that can leak private information in multi-tenant deployments; free queue as a doubly linked list, blocks of a finished request added in reverse order so the tail is evicted first, LRU eviction; cache_salt injected into the first block's hash to prevent timing attacks. Checked 2026-10-28."
+  - title: "Kwon et al., Efficient Memory Management for Large Language Model Serving with PagedAttention (arXiv 2309.06180, SOSP 2023)"
+    url: https://arxiv.org/abs/2309.06180
+    note: "Paged KV blocks with near-zero waste and KV sharing within and across requests; 2 to 4x throughput against FasterTransformer and Orca at the same latency. Checked 2026-10-28."
+  - title: vLLM blog, vLLM V1 alpha release (2025-01-27)
+    url: https://vllm.ai/blog/2025-01-27-v1-alpha-release
+    note: "Prefix caching on by default in V1; less than 1% throughput decrease at a 0% hit rate; hash-based caching with LRU eviction and constant-time eviction. Checked 2026-10-28."
+  - title: "Zheng et al., SGLang: Efficient Execution of Structured Language Model Programs (arXiv 2312.07104, 2024)"
+    url: https://arxiv.org/abs/2312.07104
+    note: "RadixAttention named as the runtime's KV cache reuse mechanism; up to 6.4x throughput against other systems on the authors' workloads. Checked 2026-10-28."
+  - title: llm-d blog, KV-Cache Wins You Can See (2025-09-24)
+    url: https://llm-d.ai/blog/kvcache-wins-you-can-see
+    note: "8 vLLM pods on 2 H100 each, Qwen3-32B, 150 customers with 6,000-token shared contexts, 5 users each sending 1,200-token queries, Poisson 3 to 60 QPS; all active prefixes need about 73% of cluster KV capacity; output tok/s 4,428.7 random, 6,944.4 approximate, 8,730.0 precise; p90 TTFT 92.551 s, 31.083 s, 0.542 s; precise scheduling indexes KV events from each pod. Project's own benchmark. Checked 2026-10-28."
+  - title: NVIDIA, Introducing NVIDIA Dynamo (2025-03-18)
+    url: https://developer.nvidia.com/blog/introducing-nvidia-dynamo-a-low-latency-distributed-inference-framework-for-scaling-reasoning-ai-models/
+    note: "Smart Router routes by KV cache overlap, tracking cache locations with a radix tree and balancing load; KV cache manager offloads blocks to host memory, SSD or networked storage. Checked 2026-10-28."
+  - title: "GitHub advisory GHSA-935w-9g4m-p28p (CVE-2026-105752), vLLM Harmony tool continuations drop cache_salt (published 2026-09-28)"
+    url: https://github.com/advisories/GHSA-935w-9g4m-p28p
+    note: "Low severity, CVSS 3.1; affected below 0.30.0, patched in 0.30.0; on /v1/responses with GPT-OSS Harmony and a built-in or MCP tool, the tool-continuation turn was resubmitted without the caller's cache_salt, so its prefix was cached unsalted; an attacker who could reconstruct the history could read per-turn cached-token counts from the usage field. Fix: pass the salt to the continuation call. Checked 2026-10-28."
+  - title: The Llama 3 Herd of Models (Meta, 2024), Table 3
+    url: https://arxiv.org/html/2407.21783
+    note: "8B: 32 layers, model dimension 4,096, 32 heads, 8 key/value heads. Checked 2026-10-28."
+  - title: How to Scale Your Model, All About Rooflines (Google DeepMind, JAX team)
+    url: https://jax-ml.github.io/scaling-book/roofline/
+    note: "H100 about 9.89e14 dense BF16 FLOPs/s. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## A cache key that encodes position and history
+
+Engine prefix caching keeps the KV blocks of finished requests and hands them to new requests whose prompts start with the same tokens. The cache key is what makes it different from a response cache. The keys and values for a token depend on every token before it, through attention in every layer, so the same 16 tokens after two different preambles have different KV. A block can be reused only if the whole prefix before it matches.
+
+vLLM encodes that directly. Each full block's hash is computed from three inputs: the hash of the block before it, the token ids in the block, and extra hashes that make it unique beyond its tokens, such as a LoRA adapter id, the hash of an image whose placeholder tokens sit in the block, and a cache salt. Chaining through the parent hash means a lookup walks the request's blocks in order and stops at the first miss: the hit is always a prefix, and one hash per block decides it. The structure is a Merkle chain over KV pages, with the paged allocator from PagedAttention underneath so a cached block can be referenced by many running requests at once.
+
+Only full blocks are cached. A prompt whose shared part ends mid-block reuses everything up to the last full block and recomputes the rest. The hash function is a configuration choice with consequences: since v0.11 the default is SHA-256 over a pickle serialisation, which is not reproducible across Python or vLLM versions; `sha256_cbor` is the deterministic option for caches shared across processes or languages; and the xxHash options are faster but non-cryptographic, which the docs warn raises the collision risk, with collisions able to cause undefined behaviour or leak private information between tenants.
+
+```python
+import hashlib
+
+BLOCK = 16
+
+def block_hashes(tokens, salt=""):
+    """vLLM-style chain: each full block hashes its parent's hash, its tokens and extra keys."""
+    hashes, parent = [], salt
+    for i in range(0, len(tokens) - BLOCK + 1, BLOCK):
+        h = hashlib.sha256(repr((parent, tuple(tokens[i:i + BLOCK]))).encode()).hexdigest()
+        hashes.append(h)
+        parent = h
+    return hashes
+
+def cached_tokens(tokens, cache, salt=""):
+    hit = 0
+    for h in block_hashes(tokens, salt):
+        if h not in cache:
+            break
+        hit += BLOCK
+    return hit
+
+system = list(range(1000, 4000))              # 3,000-token shared system prompt
+cache = set(block_hashes(system + [7] * 500))  # first request fills the cache
+
+req = system + [9] * 500                       # same system prompt, different user turn
+print("hit tokens, same prefix:      ", cached_tokens(req, cache))
+stamped = [42] + system[1:] + [9] * 500        # one token changed at position 0
+print("hit tokens, first token edited:", cached_tokens(stamped, cache))
+print("hit tokens, other tenant salt: ", cached_tokens(req, cache, salt="tenant-b"))
+# hit tokens, same prefix:       2992
+# hit tokens, first token edited: 0
+# hit tokens, other tenant salt:  0
+```
+
+The second line is the production failure: a timestamp, request id or user name at the top of the system prompt changes the first block, every later hash changes with it, and the hit rate is zero while the cache metrics show the cache working. Stable content goes first and variable content last; that ordering is a contract between the prompt owners and the serving team, and it belongs in the prompt review checklist.
+
+## Eviction
+
+Blocks no request references go on a free queue, a doubly linked list threaded through the block table so every move is constant time. A cached block stays findable by hash while it sits there and is evicted only when the allocator needs it, least recently used first. Two details shape what survives. When a request finishes, its blocks join the queue in reverse order, so the tail of the request, which hashes the most tokens and is least likely to be shared, is evicted before the system prompt at its head. And blocks that a new request hits are pulled off the queue before its new blocks are allocated, so an allocation cannot evict the prefix it is about to use.
+
+The V1 release post reports less than 1% throughput loss at a 0% hit rate, which is why prefix caching is on by default in vLLM V1. SGLang reaches the same reuse with RadixAttention, which keeps cached prefixes in a radix tree; NVIDIA's Dynamo router also tracks cache locations in a radix tree. The data structure differs; the contract (longest cached prefix, LRU eviction of unreferenced pages) is the same.
+
+## What a hit saves
+
+A hit skips the prefill of the cached tokens: their FLOPs, and the time to first token they would have cost. It does not shorten decode. Every decode step still reads the full KV of the sequence, cached prefix included; the saving on the decode side is memory, because many running requests can reference one copy of the shared blocks.
+
+Take Llama 3 8B serving 20 requests per second, each a 3,000-token system prompt followed by a 500-token user turn, with 16-token blocks. The system prompt fills 187 full blocks, 2,992 tokens, and the last 8 tokens share a block with the user turn.
+
+<Predict id="inf-prefix-hit-share" question="What share of each request's 3,500 prompt tokens is served from the cache once the prefix is resident, in percent?" answer={85.5} tolerance={1} unit="%">
+<p>2,992 / 3,500 = <b>85.5%</b>. At about 2 FLOPs per parameter per token, the saved prefill is 2 × 8e9 × 2,992 × 20 = 9.6e14 FLOP/s, close to one H100's dense BF16 peak of 9.89e14. One shared system prompt at modest traffic is worth roughly a GPU of prefill compute, before the attention term, which grows with prompt length and makes the saving larger.</p>
+</Predict>
+
+That figure assumes the prefix stays resident. On one replica at 20 requests per second it will: the head blocks are touched constantly and sit at the young end of the LRU queue. The estimate breaks in two places. Under memory pressure, a burst of long requests can push even hot blocks out. And across replicas, each one has its own cache, so the question becomes which replica a request lands on.
+
+## Routing decides whether the hit happens
+
+With one shared system prompt, cache-blind routing costs little: every replica sees the prefix often and keeps its own copy. With many distinct prefixes (one per tenant, per document, per long conversation), a cache-blind balancer spreads requests for the same prefix across replicas, each replica computes and stores its own copy, and the copies compete for memory until they evict each other.
+
+llm-d's benchmark (the project's own, September 2025) shows the size of the effect: 8 vLLM pods on 2 H100 each serving Qwen3-32B, 150 customers each with a 6,000-token shared context and 5 users sending 1,200-token queries, at 3 to 60 queries per second, with all active prefixes needing about 73% of the cluster's KV capacity. Random scheduling produced 4,428.7 output tokens per second and a p90 time to first token of 92.551 seconds; approximate prefix-aware scheduling, which predicts cache location from past routing, 6,944.4 and 31.083; precise scheduling, which indexes the KV events each pod publishes and scores pods by how much of the request's prefix they hold, 8,730.0 and 0.542.
+
+Approximate routing, whether it predicts location from its own routing history or hashes a prefix key consistently to a replica, fails where the router's belief and the pod's cache disagree: after an eviction under pressure, a restart, or a scale event. The precise method needs the engine to publish block-level events and a component to index them. Both have to be combined with a load signal, because perfect affinity sends every request for a hot prefix to one replica; llm-d and Dynamo both score cache overlap and load together. The policy question is how much queueing you accept on a warm replica before a cold one becomes cheaper, and it is answered by comparing the queue wait against the prefill time of the prefix.
+
+## Shared caches leak
+
+A cache shared across tenants is a side channel. If tenant B's request returns faster, or reports more cached tokens, when it starts with text tenant A sent, B can test guesses about A's prompts. vLLM's `cache_salt` closes it: the salt is injected into the first block's hash, so blocks are reusable only by requests carrying the same salt, and the docs give timing attacks as the reason.
+
+The advisory GHSA-935w-9g4m-p28p (published 2026-09-28, CVE-2026-105752, low severity) shows where such controls break. On vLLM's `/v1/responses` path for GPT-OSS models, a request that used a built-in or MCP tool ran as a loop, and the continuation turn after the tool call was resubmitted without the caller's salt. That prefix was cached in the unsalted namespace, and an attacker able to reconstruct the post-tool history could read exact cached-token counts from the usage field of the response. Versions below 0.30.0 were affected; the fix passes the salt into the continuation call. Two lessons generalise: the salt has to follow every internal resubmission path, not only the request handler, and usage fields that report cached tokens are an oracle as direct as timing.
+
+Salting has a cost the security review does not see. A salt per tenant makes the chain per tenant from the first block, so a system prompt that every tenant shares is stored once per tenant per replica. With Llama 3 8B, one token of BF16 cache is 2 × 32 layers × 8 KV heads × 128 × 2 bytes = 131,072 bytes; the 2,992 cached tokens are 0.39 GB for one copy and 59 GB for 150 tenants on the same replica, if all stay resident. In practice they do not, so salting shows up as a lower hit rate rather than as an out-of-memory error. The middle option is a salt per isolation group, tenants who accept sharing with each other, which the salt mechanism supports because reuse follows whoever holds the same salt.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your multi-tenant serving platform shares one prefix cache across 150 tenants. Security wants a per-tenant salt within two weeks after the vLLM advisory. Your measurements say the shared system prompt accounts for most cache hits, and salting it per tenant would raise time to first token and cost more GPUs at the next quarterly capacity review. What do you ship?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Ship per-tenant salts on the deadline, after patching to a version with the continuation fix, because a salt that some code paths drop is worse than none: it reads as isolation. Isolation groups that share the platform system prompt come after, and only with security's sign-off. Then measure the hit rate and time to first token per tenant after salting, and take that number to the capacity review rather than the estimate.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The threat is real and cheap to exploit wherever usage fields report cached tokens, so the default is per-tenant salts. The question is whether anything can be shared safely. The platform system prompt is the same for everyone and contains nothing tenant-specific; a hit on it tells an attacker only what they already know. If the salt mechanism allowed a public prefix to be shared and the tenant part to be salted, that would be the answer, but the salt goes into the first block's hash, so everything after it is per tenant too.</p>
+<p>So the options are a per-tenant salt everywhere, accepting a lower hit rate on the shared prompt, or salts per isolation group, tenants who agree to share with each other, which security has to sign off as acceptable. I would ship per-tenant salts in the two weeks, after upgrading past 0.30.0 and adding a test that drives a tool continuation and asserts the salt reaches the cache.</p>
+<p>For capacity, the cost is per-replica copies of the shared prompt for tenants active on that replica. Cache-aware routing reduces it: if each tenant tends to land on a small set of replicas, each replica holds copies for few tenants. What we give up is written down: higher time to first token for tenants' first requests on each replica, and more GPUs if routing cannot concentrate tenants.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Security says isolation groups are a policy nobody will maintain and finance says the extra GPUs are not in the budget. Which do you cut, the groups or the tenants' time to first token target, and what risk do you accept in writing?</em></li>
+<li><em>After salting, one tenant's hit rate drops to zero while others recover. What do you check first?</em> Whether that tenant's requests come through a path that drops or varies the salt, then whether its prompts start with a per-request field.</li>
+<li><em>What would you need to see to drop salting for a class of tenants?</em> For example, tenants whose prompts are all public templates, with usage fields stripped of cached-token counts and timing noise measured above the hit-versus-miss difference.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The savings estimate counts linear-layer FLOPs for the cached tokens and ignores attention, which makes it an underestimate for long prefixes, and it assumes the prefix is resident, which makes it an overestimate under memory pressure. The measured hit rate per replica, in tokens rather than requests, is the number to plan with; a request that hits 10 tokens of a 3,000-token prompt counts as a hit in some dashboards.
+
+Prefix caching assumes the prefix is byte-identical in tokens. Two prompts that differ in whitespace, in the order of tool definitions, or in a tokenizer version produce different tokens and share nothing. Multimodal inputs add another failure: the image hash is part of the block key, so the same image re-encoded or resized misses.
+
+Engine-level caching is also not the same thing as the prompt caching a model API sells. Provider caches have their own lifetimes, minimum lengths and prices, and they cache on the provider's fleet; the mechanism here is what runs inside the engine you operate.
+
+<SelfRate id="lesson:inference/faster-cheaper/prefix-caching" />

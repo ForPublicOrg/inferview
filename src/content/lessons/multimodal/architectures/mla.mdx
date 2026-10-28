@@ -1,0 +1,130 @@
+---
+title: Multi-head latent attention and the KV bytes table
+track: multimodal
+module: architectures
+order: 1
+kind: paper
+level: staff
+minutes: 14
+summary: DeepSeek-V2 caches one compressed latent and one small rotary key per token per layer instead of per-head keys and values, and its headline 93.3% KV saving only reproduces once you know the baseline was a GQA model and the cache was quantised.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: DeepSeek-V2, A Strong, Economical, and Efficient Mixture-of-Experts Language Model (arXiv 2405.04434)
+    url: https://arxiv.org/abs/2405.04434
+    note: "236B total, 21B activated, 128K context; compared with DeepSeek 67B it reduces the KV cache by 93.3%, saves 42.5% of training costs and raises maximum generation throughput to 5.76 times. Checked 2026-10-28."
+  - title: DeepSeek-V2 full text (HTML)
+    url: https://arxiv.org/html/2405.04434
+    note: "60 layers, hidden 5120, 128 heads of dimension 128, d_c 512, d_c' 1536, decoupled RoPE dimension 64; KV per token table (MHA 2 n_h d_h l, GQA 2 n_g d_h l, MQA 2 d_h l, MLA (d_c + d_h^R) l), equal to GQA with 2.25 groups; RoPE is incompatible with low-rank KV compression because W^UK could no longer be absorbed into W^Q; deployment converts parameters to FP8 and compresses each KV element to 6 bits on average; Appendix D.1 7B dense ablation with MHA ahead of GQA-8 and MQA; Appendix D.2 KV per token MHA 110.6K vs MLA 15.6K (small MoE), 860.2K vs 34.6K (large MoE). Checked 2026-10-28."
+  - title: DeepSeek LLM 67B base, config.json
+    url: https://huggingface.co/deepseek-ai/deepseek-llm-67b-base/blob/main/config.json
+    note: "95 layers, hidden 8192, 64 attention heads, 8 key-value heads, bfloat16. Checked 2026-10-28."
+  - title: DeepSeek-V3, config.json
+    url: https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json
+    note: "61 layers, hidden 7168, 128 heads, kv_lora_rank 512, q_lora_rank 1536, qk_nope_head_dim 128, qk_rope_head_dim 64, v_head_dim 128, max_position_embeddings 163840, YaRN factor 40 from 4096, FP8 e4m3 weights in 128x128 blocks. Checked 2026-10-28."
+  - title: DeepSeek-V3.2 (arXiv 2512.02556)
+    url: https://arxiv.org/html/2512.02556
+    note: "DeepSeek Sparse Attention is implemented on the MQA mode of MLA, where each latent vector is shared across all query heads. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+<Callout kind="aside" label="Attempt first">
+Before reading, answer [problem mml-011](/problems/mml-011): which baseline the 93.3% figure is measured against.
+</Callout>
+
+## The problem the paper solves
+
+At long context, decode time goes mostly to reading the KV cache. Grouped-query attention shrinks the cache by sharing each key and value head across a group of query heads, and the paper's own 7B dense ablation shows what that costs: MHA beats GQA with 8 groups, which beats MQA, on BBH, MMLU, C-Eval and CMMLU (Appendix D.1). DeepSeek-V2 wanted a cache smaller than GQA's without that quality cost. Multi-head latent attention (MLA) is its answer: cache a low-rank latent per token and reconstruct per-head keys and values from it.
+
+## The mechanism
+
+For each token, MLA projects the hidden state down to a latent `c_kv` of width `d_c` = 512. Per-head keys and values are up-projections of that latent, `k_i = W_UK_i c_kv` and `v_i = W_UV_i c_kv`, for 128 heads of dimension 128. Only `c_kv` is cached.
+
+Reconstructing 128 keys per cached token on every decode step would cost more than it saves. The paper avoids it by absorption. A head's score is `q_i^T k_i = q_i^T W_UK_i c_kv`, so `W_UK_i` can be folded into the query side once per step: compute the 512-wide `q_i' = W_UK_i^T q_i` and dot it directly against the cached latents. `W_UV_i` folds into the output projection the same way. At decode time every head attends over the same 512-wide cached vectors, which is why the DeepSeek-V3.2 paper calls this the MQA mode of MLA.
+
+RoPE breaks absorption. With rotary positions the score becomes `q_i^T R_m^T R_n W_UK_i c_kv`, and the rotation depends on the pair of positions `m` and `n`. It sits between the query and `W_UK_i`, so no single matrix can be folded in ahead of time, and the paper states the consequence: keys for every prefix token would have to be recomputed during inference. The fix is decoupled RoPE. Each head gets an extra 64-wide query part that carries rotation, all heads share one 64-wide rotated key `k_R`, and that key is cached next to the latent. Per token per layer the cache holds 512 + 64 = 576 values, which the paper writes as `(d_c + d_h^R) l` and describes as equal to GQA with 2.25 groups (576 is 4.5 head dimensions, and GQA stores two per group).
+
+The systems analogy is a compressed materialised view with the decompression pushed into the query. The difference is that the compression is learned in pretraining, so it cannot be bolted onto a trained GQA checkpoint without further training.
+
+## The bytes table, from published configs
+
+Values cached per token, per layer:
+
+| layout | values per layer | what is cached |
+|---|---|---|
+| MHA, DeepSeek-V3 shape | 128 × (192 + 128) = 40,960 | per head, a 128-wide content key plus 64-wide rotary key, and a 128-wide value |
+| GQA-8, head dim 128 | 2 × 8 × 128 = 2,048 | one key and one value per group |
+| MLA, DeepSeek-V3 | 512 + 64 = 576 | latent plus shared rotary key |
+
+DeepSeek-V3's config has 61 layers. In BF16, at 2 bytes per value:
+
+- MHA: 40,960 × 61 × 2 = 4,997,120 bytes per token, about 4.77 MiB.
+- GQA-8: 2,048 × 61 × 2 = 249,856 bytes per token.
+- MLA: 576 × 61 × 2 = 70,272 bytes per token, about 68.6 KiB.
+
+<Predict id="mml-mla-v3-128k" question="How many GiB of KV cache does one 131,072-token sequence need on DeepSeek-V3 with MLA in BF16? (1 GiB = 2^30 bytes)" answer={8.58} tolerance={0.05} unit="GiB">
+70,272 bytes × 131,072 tokens = 9,210,691,584 bytes = 8.58 GiB. The same sequence with GQA-8 at this depth is 30.5 GiB, and with the MHA shape it is 610 GiB, more than an 8-GPU node of 80 GB parts holds.
+</Predict>
+
+MLA is 3.6 times smaller than GQA-8 at the same depth (249,856 / 70,272) and 71 times smaller than the MHA shape. The paper's own MoE ablation (Appendix D.2) reports per-token caches of 15.6K against 110.6K values for a small model and 34.6K against 860.2K for a large one, with MLA scoring slightly higher than MHA on BBH, MMLU and CMMLU at both sizes. Those are the authors' ablations at their scale, not an independent replication.
+
+## Where 93.3% comes from
+
+The abstract compares DeepSeek-V2 with DeepSeek 67B. That model is dense, in the sense of having no experts, but its attention is not MHA: its config has 64 query heads and 8 key-value heads, so it is GQA-8, with 95 layers and a head dimension of 8192 / 64 = 128.
+
+- DeepSeek 67B: 2 × 8 × 128 × 95 = 194,560 values per token, 389,120 bytes in BF16.
+- DeepSeek-V2: 576 × 60 = 34,560 values per token, 69,120 bytes in BF16.
+
+<Predict id="mml-mla-v2-bf16" question="At equal BF16 precision, by what percentage is DeepSeek-V2's per-token KV cache smaller than DeepSeek 67B's?" answer={82.2} tolerance={0.3} unit="%">
+1 − 69,120 / 389,120 = 0.822, so 82.2%, which is not the paper's figure. The deployment section compresses each KV element to 6 bits on average: 34,560 × 6 / 8 = 25,920 bytes, and 1 − 25,920 / 389,120 = 0.9334. The 93.3% reproduces only when V2's cache is quantised and the baseline's is not.
+</Predict>
+
+So the 93.3% bundles three changes: a different attention layout, 35 fewer layers (V2 is a 60-layer MoE, 67B a 95-layer dense model), and 6-bit cache quantisation. When a design document says "MLA cuts KV by 93%", the defensible restatement is: against a 95-layer GQA-8 model in BF16, a 60-layer MLA model with a 6-bit cache stores 6.7% of the bytes per token. For a like-for-like layout comparison use the config arithmetic: 3.6 times smaller than GQA-8 at equal depth and precision.
+
+The 5.76 times throughput figure carries the same baggage. V2 is served with FP8 weights and the quantised cache, and 21B of its 236B parameters are active per token, against all 67B for the dense model.
+
+## What the decode kernel now looks like
+
+Compression moves the bottleneck. Per cached token per layer, GQA-8 with 128 query heads reads 2 × 8 × 128 × 2 = 4,096 bytes and does 128 × (128 + 128) multiply-adds, 65,536 FLOPs: 16 FLOPs per byte, which is the group size. MLA in absorbed form reads 576 × 2 = 1,152 bytes and does 128 × (576 + 512) multiply-adds, 278,528 FLOPs: about 242 FLOPs per byte. Decode attention goes from clearly bandwidth-bound to a regime where tensor-core throughput matters, so MLA needs kernels written for it, and a generic paged-attention path serves it poorly. When evaluating an engine, ask which MLA kernel it uses and for measured decode tokens per second at your context length.
+
+## What changed in practice
+
+DeepSeek-V3 kept MLA with the same 512 + 64 layout and a 1,536-wide query compression. DeepSeek-V3.2 built its sparse attention on MLA's shared-latent mode. Kimi Linear uses MLA for its full-attention layers (see [state space models and hybrids](/learn/multimodal/architectures/ssm-hybrids)). For a serving team, a cache entry is one 576-wide vector per layer instead of K and V tensors per head, which changes block sizes in a paged allocator, and prefix-cache entries are about 3.6 times smaller than a same-depth GQA-8 model's, so the same HBM or host tier holds more cached prefixes.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Our 70B dense model is GQA-8 and we serve 128K contexts. A research lead proposes continued pretraining to convert it to MLA, citing DeepSeek's 93.3% KV reduction, and wants a decision this quarter. The conversion would take two weeks of the training cluster. What do you tell them?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>The 93.3% is the wrong number to plan with. It compares DeepSeek-V2 with a 6-bit cache against DeepSeek 67B, itself GQA-8, in BF16, at a different depth. The like-for-like layout gain from published configs is about 3.6 times at equal depth and precision. FP8 KV on the current model halves the cache with no retraining. If 2x buys the concurrency we need, quantise and measure quality; if we need more than 2x and the model will live long enough to repay two cluster-weeks, conversion is on the table, with a quality gate written before training starts.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Start from the target: how many concurrent 128K sequences per node do we need, and what does one cost today. A 70B GQA-8 model with 80 layers caches 2 × 8 × 128 × 80 × 2 = 327,680 bytes per token in BF16, 40 GiB per 131,072-token sequence. MLA at 576 values per layer and the same depth would be 92,160 bytes per token, about 11.3 GiB, a 3.6x cut. FP8 KV gives 2x on the current model.</p>
+<p>Two defensible answers. Quantise only: the cost is a long-context quality evaluation and an engine with FP8 KV; the risk is accuracy loss on retrieval-heavy prompts. Convert to MLA: the cost is two cluster-weeks, a new kernel path in serving, and an evaluation covering everything the current model does, because conversion changes every attention layer. The conflict is the quarter deadline against an architecture change whose quality DeepSeek's ablations cannot predict, since those compared models trained from scratch.</p>
+<p>The written artefact is a decision memo: the concurrency target, the 2x path as the default, and the two conditions that fund conversion (quantisation fails the long-context gate, or the target needs more than 2x).</p>
+<p>Failure mode of the recommendation: FP8 KV error can be invisible on short evals and appear only on long-context retrieval, so the gate has to use 128K prompts sampled from production, not a needle test.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The research lead replies that the DeepSeek-V2 ablation shows MLA scoring above MHA, so the quality risk is negative. What in that ablation's setup stops it transferring to a converted checkpoint?</li>
+<li>FP8 KV passes your gate, but the engine you run has no MLA kernel and the one that does is six months behind on other features. What would you need to see in production to reverse the decision and convert anyway?</li>
+<li>Finance offers either the two cluster-weeks or a larger serving fleet for a year at the same cost. Which do you take, and which measured number decides it?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The bytes table counts cache only. Weights, activations and the engine's block granularity decide how many sequences fit, and a 576-wide entry may round up inside an allocator built for per-head blocks.
+
+The FLOPs-per-byte comparison assumes the absorbed form at decode. Prefill is already compute-bound, and implementations may materialise per-head keys and values there instead; the decode analysis says nothing about prefill cost.
+
+The quality comparisons are the authors' own ablations. No independent replication is cited here of MLA against GQA at a fixed training budget outside DeepSeek's recipes, so treat "better than MHA" as what the paper reports, not as a property of the layout.
+
+<SelfRate id="lesson:multimodal/architectures/mla" />

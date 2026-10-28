@@ -1,0 +1,126 @@
+---
+id: trn-046
+title: The chosen responses are getting less likely
+subtitle: a DPO run, its training log, a config and a held-out regression
+track: training
+module: post-training
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [dpo, likelihood-displacement, preference-data, safety, debugging]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Rafailov et al., Direct Preference Optimization (v3, 2024-07-29)
+    url: https://arxiv.org/abs/2305.18290
+    note: "the DPO loss constrains only the difference of the chosen and rejected log-ratios against the reference. Checked 2026-10-28."
+  - title: Razin et al., Unintentional Unalignment, Likelihood Displacement in Direct Preference Optimization (ICLR 2025)
+    url: https://arxiv.org/abs/2410.08847
+    note: "preferred-response likelihood falls during DPO and mass can shift to responses with the opposite meaning; driven by pairs with similar hidden embeddings (CHES); in their refusal experiment Llama-3-8B-Instruct's refusal rate fell from 74.4% to 33.4%; filtering high-CHES pairs mitigated it. Checked 2026-10-28."
+  - title: Llama Team, The Llama 3 Herd of Models
+    url: https://arxiv.org/html/2407.21783
+    note: "section 4.1.4: header and termination tokens masked out of the DPO loss because shared tokens create a conflicting objective and can lead to tail repetition; NLL term with coefficient 0.2 on chosen sequences to prevent the chosen log-probability from decreasing. Checked 2026-10-28."
+choices:
+  - text: End-of-turn tokens sit inside the loss mask on both sides, and their conflicting gradient drags down every chosen sequence's log-prob
+    correct: false
+    why: A real defect that explains the tail repetition, but it is shared by both subsets and cannot by itself turn refusals into compliance.
+  - text: A beta of 0.1 is too small for safety data, so the policy drifts far from the reference and forgets the refusals that SFT taught it
+    correct: false
+    why: Beta sets how far the policy moves for a given margin; it does not choose the direction, and the direction here is towards compliance.
+  - text: The cached reference log-probs are stale against the policy's template, so every margin is measured against the wrong baseline
+    correct: false
+    why: A stale reference would show a step-0 loss away from log 2 and nonzero step-0 margins; the log shows 0.693 and 0.00.
+  - text: The safety pairs differ by a word or two, so each update lowers refusal and compliance together and frees mass for compliant replies
+    correct: true
+    why: Near-identical pairs are the case Razin et al. tie to the chosen response losing probability, and the mass went to the compliant replies the eval now sees.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The round">
+"Here is a DPO run from last week. The chosen log-probs go down. Is that a bug? What do you change?" You have the training log, the config, the function that built the safety pairs, and one evaluation.
+</Callout>
+
+The run trains a 7B assistant from its SFT checkpoint on two subsets: 60,000 helpfulness pairs labelled by annotators, and 12,000 safety pairs built by the data team from the SFT model's own refusals. This is a scenario; the numbers come from the team's dashboards, not from a published run. The release review is in four days, and the safety lead has blocked release on the evaluation below.
+
+Training log (means over the batch, policy log-probs summed over response tokens):
+
+| step | loss | margin | held-out pair accuracy | chosen log-prob | rejected log-prob |
+|---|---|---|---|---|---|
+| 0 | 0.693 | 0.00 | 0.50 | −212 | −219 |
+| 200 | 0.48 | 0.70 | 0.71 | −218 | −232 |
+| 600 | 0.31 | 1.80 | 0.83 | −236 | −261 |
+| 1,200 | 0.22 | 2.80 | 0.89 | −259 | −294 |
+
+Evaluation at step 1,200 against the SFT checkpoint: refusal rate on 500 held-out harmful prompts fell from 81% to 56%; helpfulness win rate against SFT on 400 prompts is 58%; 2.6% of sampled responses end in a repeated phrase, against 0.4% for SFT.
+
+```yaml
+policy_init: sft-2026-09-30
+reference: sft-2026-09-30
+reference_logps: cache/ref-2026-10-01.parquet
+beta: 0.1
+learning_rate: 5.0e-6
+loss_tokens: assistant        # every assistant-turn token
+nll_coef: 0.0
+```
+
+```python
+def safety_pairs(rows):
+    for r in rows:
+        chosen = r["sft_refusal"]
+        rejected = to_compliance(chosen)
+        yield {"prompt": r["prompt"], "chosen": chosen, "rejected": rejected}
+
+def to_compliance(text):
+    return (text.replace("I can't help with", "I can help with")
+                .replace("I won't", "I will")
+                .replace("isn't something I can", "is something I can"))
+```
+
+Pick the defect that explains the refusal regression. Then rank the remaining defects, say what you would collect before the review, and say what you would ship, or not ship, without it.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the chosen and rejected log-probs split by subset rather than averaged over the batch.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for ten safety pairs printed side by side, and for the token edit distance between chosen and rejected across the subset.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the step-1,200 model actually says to the held-out harmful prompts it no longer refuses.</p></details>
+
+## Answer
+
+**The cause is the pair construction.** `to_compliance` produces a rejected response that differs from the chosen refusal by a few tokens. DPO only asks the chosen log-ratio to beat the rejected log-ratio. When the two responses are nearly the same sequence, the gradients on their shared tokens largely cancel, and the update that separates them acts on a handful of tokens while the rest of the probability mass moves wherever the model's representation sends it. Razin et al. describe this as likelihood displacement: pairs with similar hidden representations drive the chosen response's probability down, and mass can move to responses with the opposite meaning. In their refusal experiment, Llama-3-8B-Instruct's refusal rate fell from 74.4% to 33.4%. The log here matches that shape: margin and held-out accuracy rise, the chosen log-prob falls by 47 nats over 1,200 steps, and the eval says the mass went to compliance.
+
+A falling chosen log-prob alone is not the bug. The DPO loss does not forbid it, and Llama 3 added an NLL term at 0.2 specifically to stop it. It becomes a bug when held-out behaviour moves the wrong way, which it does here.
+
+**Why the others are tempting, and how they rank.**
+
+1. *Formatting tokens in the loss* is real and second. `loss_tokens: assistant` includes the end-of-turn token in both responses, which Llama 3 reports as a conflicting objective that can lead to tail repetition. The 0.4% to 2.6% repetition rate is its signature. It does not explain why refusals in particular turned into compliance. Mask header and end-of-turn tokens on both sides.
+2. *Beta* is tempting because a smaller beta lets the policy travel further. It sets distance, not direction. Changing it to 0.5 would shrink the damage and keep the cause.
+3. *A stale reference cache* is a common bug and worth checking whenever a template changes, but the step-0 loss is 0.693 with a zero margin, which is what a reference equal to the policy gives. Rule it out from the log.
+
+**What to collect before the review.** Chosen and rejected log-probs split by subset (the prediction is that the safety subset's chosen log-prob falls much faster than the helpfulness subset's); the edit distance or embedding similarity between chosen and rejected for every safety pair; samples of step-1,200 responses to the prompts it now complies with; and the refusal rate at steps 200 and 600, to see when the regression started.
+
+**What to ship without it.** Not this checkpoint: the safety regression is measured, and the helpfulness win does not offset a blocked release. Two defensible plans for the four days:
+
+- *Retrain without the safety subset* (helpfulness pairs only, formatting masked, NLL term at 0.2). Cost: one training run. Risk: the release carries no safety preference training at all, so refusals sit at the SFT level, which the safety lead accepted before.
+- *Rebuild the safety pairs and retrain.* Sample real compliant responses from a less-aligned checkpoint or a jailbroken prompt as the rejected side, so chosen and rejected differ in content, filter the remaining near-identical pairs by embedding similarity, and add the NLL term. Cost: generation and review of 12,000 pairs, which may not fit four days. Risk: the new rejected responses are harmful text that has to be handled under the data team's content policy.
+
+Recommend the first for the review and the second for the next release, with the written condition that the safety subset does not return until the per-subset chosen log-prob stays flat on a pilot run.
+
+**Failure mode of the recommendation.** The NLL term raises the probability of every chosen response, including verbose helpfulness answers, and can trade preference accuracy for likelihood. Watch the helpfulness win rate and length on the retrain; if the win rate falls to the SFT level, lower the coefficient rather than removing it.
+
+## Follow-ups
+
+- The safety lead wants the rebuilt pairs before any release, which moves the date by two weeks. The product lead wants the helpfulness-only model now. Two senior people disagree; how do you decide without deciding by rank, and what do you write down?
+- The retrain with the NLL term at 0.2 restores refusals to 80% but increases refusals on benign prompts from 3% to 9%. Which do you ship, and what risk do you accept in writing?
+- What would you need to see on the pilot run to put a template-generated safety subset back into training?
+- Your filter by embedding similarity removes 70% of the safety pairs. Is the remaining 30% a biased sample of the harms you care about, and how would you check?
+
+## Common mistakes
+
+- Calling the falling chosen log-prob a bug by itself, and fixing it with the NLL term without explaining the safety regression.
+- Lowering the learning rate or raising beta and calling it fixed: both slow the movement without changing its direction.
+- Blaming the reference cache without reading the step-0 row.
+- Averaging over subsets: a batch mean hides that one subset drives the whole drop.

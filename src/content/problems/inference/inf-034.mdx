@@ -1,0 +1,124 @@
+---
+id: inf-034
+title: Route one model across two accelerator types and three regions
+subtitle: agent sessions want their cache, research wants the night, and EU tenants cannot leave the EU
+track: inference
+module: fleet
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 50
+core: false
+tags: [routing, prefix-caching, cache-affinity, multi-region, accelerators, capacity-isolation, system-design]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: vLLM documentation, automatic prefix caching design
+    url: https://docs.vllm.ai/en/latest/design/prefix_caching.html
+    note: "Only full blocks are cached; a block's hash covers the parent block's hash, its tokens and extra keys (LoRA id, multimodal hashes, cache salt); freed blocks go to an LRU free queue and are evicted from its head; a cache_salt limits reuse to requests with the same salt. Checked 2026-10-28."
+  - title: SGLang model gateway (sgl-router) README, main branch
+    url: https://raw.githubusercontent.com/sgl-project/sglang/main/sgl-router/README.md
+    note: "The cache_aware policy prefers the engine holding the longest cached prefix, with --cache-affinity-min-matched-tokens defaulting to 1024; engines publish KV events; with --affinity-mode balanced the router leaves the preferred engine only when its load exceeds both alternative x --affinity-load-factor (default 2) and alternative + --affinity-load-gap; otherwise it falls back to power-of-two choices. Checked 2026-10-28."
+  - title: Anthropic, A postmortem of three recent issues (2025-09-17)
+    url: https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues
+    note: "Claude is served on AWS Trainium, NVIDIA GPUs and Google TPUs; from 2025-08-05 some Sonnet 4 requests were misrouted to servers configured for the 1M-token context window; a load-balancing change on 2025-08-29 raised the share, peaking at 16% of Sonnet 4 requests in the worst hour on 2025-08-31; routing is sticky, so follow-up requests often went to the same wrong servers. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Design round, 50 minutes">
+"We serve one model on GPUs and TPUs in three regions. Design the router: it should keep prefix-cache hits, keep research jobs from hurting production, and work with the global load balancer we already have."
+</Callout>
+
+What you learn by asking (scenario):
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Region</th><th>GPU replicas</th><th>TPU replicas</th><th>Constraint</th></tr></thead>
+<tbody>
+<tr><td>us-east</td><td>48</td><td>32</td><td></td></tr>
+<tr><td>us-west</td><td>24</td><td>24</td><td></td></tr>
+<tr><td>eu-west</td><td>16</td><td>0</td><td>EU tenants' requests are processed in the EU by contract</td></tr>
+</tbody>
+</table>
+</div>
+
+- Two products share the fleet. The chat API sends short, independent requests. The coding agent sends sessions: the average turn carries 60,000 prompt tokens of history and 2,000 new ones, and 70% of turns arrive within 5 minutes of the same session's previous turn.
+- The coding agent peaks at 100 turns per second in us-east. Measured prefill rate per replica: 40,000 prompt tokens per second on a GPU replica, 30,000 on a TPU replica.
+- The two builds are numerically different. The quality team runs probes per pool and has seen them disagree once this year, on long contexts.
+- Research runs eval sweeps and RL rollouts against the same model. Today they enter through the production router. Last month one sweep raised production TTFT p99 in us-east from 1.1 s to 4.8 s.
+- The global load balancer picks a region by client latency. The network team owns it and will not change it this quarter. You own everything after it.
+- Four engineers, eight weeks.
+
+Design the router: what it keys on, how it chooses an accelerator type and a replica, when it gives up affinity, where research traffic goes, and what happens to EU traffic when eu-west runs out. Say what you give up, and write the rollout plan for the router with its rollback triggers.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what fraction of a session's prompt is unchanged from its previous turn, and how long a replica keeps those blocks under today's load.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the prefill time of an average coding-agent turn on each accelerator, with and without a cache hit.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask research which of their jobs have a deadline and which only need to finish by morning.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>The router is a per-region layer behind the existing global balancer. It pins each coding-agent session to one accelerator type and one replica for the session's life, with consistent hashing on the session id and a bounded-load rule, and it breaks affinity only when the preferred replica's queue would cost more than a re-prefill does. Chat requests go to the least-loaded replica. Research traffic gets its own entry point and its own replicas, never a share of a production replica, because its long unique prompts flush the production prefix cache. EU traffic never leaves eu-west; when eu-west is full, EU requests queue and then fail with a retry-after. I give up the night's spare production capacity for research, even load across replicas, and EU availability during a regional shortfall. The weak point is the stickiness itself: a replica that goes bad keeps its sessions, so every replica runs quality probes and the router ejects on a failed probe, not only on errors.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Why affinity decides the capacity plan.</strong> A cache hit is per replica: vLLM caches full blocks keyed by the chain of parent hashes, so a turn only reuses its history on the replica that served the previous turn. In us-east, with 80 replicas and random placement, the next turn lands on the same replica about 1 time in 80. Prefill for the coding agent at peak:</p>
+<ul>
+<li>No affinity: 100 turns per second x 62,000 tokens = 6.2 million prompt tokens per second, which is 155 GPU replicas of prefill alone. us-east has 80 replicas in total.</li>
+<li>Affinity, 70% of turns hitting: 0.3 x 100 x 62,000 + 0.7 x 100 x 2,000 = 1.86 million + 0.14 million = 2.0 million tokens per second, 50 GPU replicas of prefill.</li>
+</ul>
+<p>So affinity is not a latency nicety here; without it the region does not fit. A miss also costs the user: 62,000 / 40,000 = 1.55 s of prefill on a GPU replica, 2.07 s on a TPU replica, against 0.05 s and 0.07 s for the 2,000 new tokens on a hit.</p>
+
+<p><strong>Decision 1: what the affinity keys on.</strong> Two defensible answers.</p>
+<ul>
+<li><em>Session id, consistent hashing with bounded load.</em> The client already sends a session id, the router needs no tokenizer and no state beyond the ring, and four engineers can ship it in the eight weeks. The cost: it only finds reuse inside a session. Shared system prompts are cached on every replica separately, and when a session moves, its cache is lost.</li>
+<li><em>Prefix-aware routing.</em> The router keeps an approximate prefix tree per replica from the engines' KV events and sends a request to the replica holding its longest cached prefix, as SGLang's gateway does with a 1,024-token minimum match by default. It catches cross-session reuse and survives a session moving. The cost: a tokenizer per model in the router, an event stream from every engine, router state that must be rebuilt after a restart, and most of the quarter.</li>
+</ul>
+<p>I build the session hash now and run a prefix-aware router in shadow, logging where it would have sent each request, so the second decision is made from measured extra hit rate rather than argued.</p>
+
+<p><strong>The quantity you choose: when to break affinity.</strong> Leaving the preferred replica costs one re-prefill, 1.55 s on GPU. So the rule is to move only when the preferred replica's expected wait exceeds the alternative's by more than that, which the measured per-replica drain rate turns into a queue-length gap. A threshold written as a load ratio, like SGLang's balanced mode with a factor of 2 plus a gap, is the same idea; I would start from the 1.55 s penalty, convert it, and tune it on the coding agent's TTFT p99. Breaking affinity at any imbalance (pure least-loaded) is unreasonable, since it pays the 1.55 s on almost every turn; never breaking it is also unreasonable, since a hot replica then queues behind itself while neighbours idle.</p>
+
+<p><strong>Decision 2: accelerator type.</strong> A session is placed on GPU or TPU at its first turn, by weighted free capacity in the region, and stays there. Moving loses the cache and also changes numerics mid-session, which the quality team has already seen matter on long contexts. The cost is imbalance between pools when sessions are long, which the weights correct only for new sessions.</p>
+
+<p><strong>Decision 3: research.</strong> Two defensible answers.</p>
+<ul>
+<li><em>Dedicated research replicas.</em> Research enters through its own route and lands on replicas that production never uses, sized by an agreed share of each region that the scheduler grows at night by draining production replicas and moving them over. The cost: production's spare capacity cannot absorb a research burst in the day, and research waits for the nightly move.</li>
+<li><em>Shared replicas with priority.</em> Research runs as low priority on production replicas. Utilisation is higher. The cost is the one that hit last month: research prompts are long and unique, the prefix cache evicts from the head of an LRU free queue, and a sweep pushes production session blocks out, so production's hit rate falls even when its scheduling priority holds.</li>
+</ul>
+<p>The constraint conflict is utilisation against the coding agent's latency, and the hit-rate arithmetic says the coding agent loses: every 10 points of hit rate is 0.1 x 100 x 60,000 = 600,000 more prefill tokens per second in us-east, 15 GPU replicas. I choose dedicated replicas. Research deadlines that cannot wait until night get a fixed daytime reservation in us-west, where the coding agent's load is lowest.</p>
+
+<p><strong>EU.</strong> eu-west has only GPUs and 16 of them. EU requests never spill to the US; when eu-west's admission control refuses, they queue with a deadline and then fail with a retry-after. I write down that EU tenants get lower availability than US tenants during an EU shortfall, and that the fix is capacity in a second EU location, not routing.</p>
+
+<p><strong>How the recommended design fails.</strong> Stickiness concentrates damage. In Anthropic's August 2025 incident, requests routed to servers configured for a different context window were sticky, so follow-ups from the same users kept landing on the wrong servers, and a routine load-balancing change took the share to 16% of Sonnet 4 requests in the worst hour. The same can happen here with one bad replica or a mis-configured pool. Three controls: the router checks a replica's advertised serving configuration against the request class before sending, and counts and alerts on any mismatch; every replica answers a fixed set of quality probes on a schedule and is ejected when it fails them, with its sessions re-placed at the cost of one miss each; and any change to routing weights goes through the same canary as a code change.</p>
+
+<p><strong>Written down: the router's rollout plan.</strong></p>
+<ol>
+<li>Shadow in us-west for a week: the new router computes a decision for every request and logs it while the old path serves. Compare predicted hit rate, per-replica load spread and config mismatches.</li>
+<li>Canary: the new router serves 5% of us-west sessions, assigned by stable hash of session id, so control and canary run at the same time.</li>
+<li>Widen to all of us-west, then us-east, then eu-west, one region per step with a day between.</li>
+<li>Rollback triggers, any of which returns traffic to the old path: coding-agent TTFT p99 in the canary above control by an agreed margin for 30 minutes; any config-mismatch routing error; a quality-probe failure rate on canary replicas above control; any EU request served outside eu-west.</li>
+<li>Owner: the inference platform on-call holds the rollback; the quality team owns the probe set and can halt the rollout.</li>
+</ol>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Pushback: the prefix-aware router would take the whole eight weeks, and your shadow data says it adds 6 points of hit rate over the session hash. Do you build it this quarter, and what do you accept in writing?* Six points is 0.06 x 100 x 60,000 = 360,000 prefill tokens per second in us-east at peak, 9 GPU replicas. Compare that with what the four engineers would otherwise ship, and write down the replica cost of waiting a quarter.
+- *Reversal: what would you need to see in production to put research back on shared replicas?* A production hit rate that does not drop during research sweeps, for example because research moved to a cache salt and short prompts, and a measured production TTFT p99 that holds with research present for a full sweep.
+- *Operating: the TPU build's long-context probe starts failing at 1% the day before the coding agent's launch. Which traffic do you move, and who signs off?* Moving every coding session to GPU does not fit: at a 70% hit rate the coding agent needs 50 GPU replicas of prefill and us-east has 48, before decode. So the router moves only sessions whose context is above the length where the probe fails, keeps shorter sessions on TPU, and sheds chat before coding sessions if the GPU pool saturates. The quality team signs off the probe result and the product owner signs off the launch-day capacity limit.
+- *Two senior engineers disagree: one wants per-request least-loaded routing because it is simpler to operate. How do you decide without deciding by rank?* Run it as the control arm of the shadow week and compare the coding agent's prefill tokens per turn and TTFT p99 at peak; the arithmetic predicts the answer and the shadow data settles it.
+
+## Common mistakes
+
+- Routing by load alone and expecting the prefix cache to help, when each replica caches only what it served.
+- Letting a session move between accelerator types, which loses the cache and changes numerics mid-conversation.
+- Giving research low priority on production replicas and missing that its prompts evict production's cached blocks.
+- Spilling EU traffic to the US during a shortfall because the global balancer would allow it.
+- Ejecting replicas only on errors and latency, when the failures that stick to sessions return 200 with worse answers.
+- Shipping a routing-weight change outside the canary because it is "only config".

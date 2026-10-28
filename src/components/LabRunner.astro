@@ -1,0 +1,235 @@
+---
+// Progressive build: one editor for the whole program, a step list, and Run tests for the current step.
+// Props: slug (the lab's file name, or "problem:<id>" for a multistage problem), steps [{ title, brief, starter,
+// tests, hidden, solution }], kind ('lab' or 'multistage'; multistage calls the steps stages), problem (problem id).
+// The step reached and the editor contents persist in the progress store under labs[slug]; hidden tests run after the
+// visible ones. In a lab each passed step records a gradable completion lab:<slug>/<n> and the next step's starter is
+// appended. For a multistage problem only stage 1 has a starter, later stages continue from the reader's code, and
+// passing the last stage records the gradable completion problem:<id> and unlocks the answer.
+import { MAX_LAB_CODE } from '../lib/progress.ts';
+
+type Step = { title: string; brief: string; starter?: string; tests: string; hidden?: string; solution?: string };
+interface Props {
+  slug: string;
+  steps: Step[];
+  kind?: 'lab' | 'multistage';
+  problem?: string;
+}
+const { slug, steps, kind = 'lab', problem } = Astro.props;
+const unit = kind === 'multistage' || problem ? 'stage' : 'step';
+const Unit = unit === 'stage' ? 'Stage' : 'Step';
+const editorId = `lab-${slug.replace(/[^a-z0-9-]/g, '-')}-code`;
+---
+<div class="widget lab" data-lab={slug} data-total={steps.length} data-unit={unit} data-problem={problem}>
+  <header><h4>{Unit}s</h4><span class="tiny" data-lab-progress aria-live="polite">{Unit} 1 of {steps.length}</span></header>
+  <ol class="labsteps" aria-label={`${Unit}s`}>
+    {steps.map((s, i) => (
+      <li>
+        <button type="button" data-step={i + 1} disabled={i > 0} aria-current={i === 0 ? 'step' : undefined}>
+          <span class="n">{i + 1}</span><span>{s.title}</span><span class="tiny" data-step-state></span>
+        </button>
+      </li>
+    ))}
+  </ol>
+
+  {steps.map((s, i) => (
+    <section class="labbrief" data-brief={i + 1} hidden={i > 0}>
+      <h3>{Unit} {i + 1}: {s.title}</h3>
+      <p>{s.brief}</p>
+      <details class="solution">
+        <summary>Show the tests for this {unit}</summary>
+        <pre><code>{s.tests}</code></pre>
+      </details>
+      {s.hidden && <p class="tiny">This {unit} also runs hidden tests that report only whether they pass.</p>}
+      {s.solution && (
+        <details class="solution">
+          <summary>Show the reference solution for this {unit}</summary>
+          <pre><code>{s.solution}</code></pre>
+        </details>
+      )}
+      <template data-starter>{s.starter ?? ''}</template>
+      <template data-tests>{s.tests}</template>
+      <template data-hidden data-pagefind-ignore>{s.hidden ?? ''}</template>
+      <template data-solution>{s.solution ?? ''}</template>
+    </section>
+  ))}
+
+  <div class="label" style="margin: 16px 0 6px"><label for={editorId}>Your program</label></div>
+  <p class="tiny" style="margin: 0 0 8px">Python 3 in your browser, standard library only. Saved as you type. Tab indents; press Esc first to tab out.</p>
+  <textarea class="editor" id={editorId} rows="18" maxlength={MAX_LAB_CODE} spellcheck="false" autocapitalize="off" autocomplete="off" data-editor>{steps[0]?.starter}</textarea>
+  <div class="row" style="margin-top: 10px">
+    <button class="btn sm primary" type="button" data-run>Run the tests for {unit} 1</button>
+    <button class="btn sm" type="button" data-next disabled>Next {unit}</button>
+    <button class="btn sm" type="button" data-reset>{problem ? 'Reset to the starter' : `Reset to this ${unit}'s starting point`}</button>
+  </div>
+  <p class="tiny" data-status aria-live="polite" style="margin: 8px 0 0"></p>
+  <div class="runout" data-out hidden>
+    <div class="label" data-summary></div>
+    <ul class="results" data-results></ul>
+    <div data-stdout-wrap hidden><div class="label" style="margin-top: 10px">Output</div><pre data-stdout></pre></div>
+  </div>
+</div>
+
+<script>
+  import { complete, getItem, markSeen, getLab, saveLab, onProgress, MAX_LAB_CODE } from '../lib/progress.ts';
+  import { runTests, bindEditor, renderRun } from '../lib/pyodide.ts';
+
+  const SAVE_DELAY_MS = 600;
+  const text = (el: Element | null | undefined, sel: string) => el?.querySelector<HTMLTemplateElement>(sel)?.content.textContent ?? '';
+
+  document.querySelectorAll<HTMLElement>('[data-lab]').forEach((root) => {
+    const slug = root.dataset.lab ?? '';
+    const total = Number(root.dataset.total ?? 0);
+    const unit = root.dataset.unit ?? 'step';
+    const problem = root.dataset.problem;
+    const problemKey = problem ? `problem:${problem}` : '';
+    const briefs = [...root.querySelectorAll<HTMLElement>('[data-brief]')];
+    const stepBtns = [...root.querySelectorAll<HTMLButtonElement>('button[data-step]')];
+    const editor = root.querySelector<HTMLTextAreaElement>('[data-editor]');
+    const runBtn = root.querySelector<HTMLButtonElement>('[data-run]');
+    const nextBtn = root.querySelector<HTMLButtonElement>('[data-next]');
+    const resetBtn = root.querySelector<HTMLButtonElement>('[data-reset]');
+    const status = root.querySelector<HTMLElement>('[data-status]');
+    const progressLabel = root.querySelector<HTMLElement>('[data-lab-progress]');
+    const out = root.querySelector<HTMLElement>('[data-out]');
+    if (!editor || !runBtn || !nextBtn || !resetBtn || !total) return;
+
+    const starter = (n: number) => text(briefs[n - 1], '[data-starter]');
+    const tests = (n: number) => text(briefs[n - 1], '[data-tests]');
+    const hidden = (n: number) => text(briefs[n - 1], '[data-hidden]');
+    const solution = (n: number) => text(briefs[n - 1], '[data-solution]');
+    // A multistage problem records no per-stage items: a stage below the one reached has passed, and the last
+    // stage has passed once the problem is done. Passes of the reached stage in this visit are kept in memory.
+    const passedNow = new Set<number>();
+    const passed = (n: number) =>
+      problem ? n < reached || passedNow.has(n) || (n === total && getItem(problemKey)?.s === 'done') : getItem(`lab:${slug}/${n}`)?.s === 'done';
+    const setStatus = (s: string) => {
+      if (status) status.textContent = s;
+    };
+
+    const saved = getLab(slug);
+    let reached = Math.min(Math.max(saved?.step ?? 1, 1), total);
+    let current = reached;
+    if (saved?.code) editor.value = saved.code;
+
+    let saveTimer: ReturnType<typeof setTimeout> | null = null;
+    const save = () => {
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = null;
+      if (!saveLab(slug, reached, editor.value)) setStatus(`Not saved: the program is over ${MAX_LAB_CODE.toLocaleString('en-GB')} characters.`);
+    };
+    editor.addEventListener('input', () => {
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(save, SAVE_DELAY_MS);
+    });
+    addEventListener('pagehide', () => {
+      if (saveTimer) save();
+    });
+
+    function show() {
+      briefs.forEach((b, i) => (b.hidden = i + 1 !== current));
+      stepBtns.forEach((b, i) => {
+        const n = i + 1;
+        b.disabled = n > reached;
+        if (n === current) b.setAttribute('aria-current', 'step');
+        else b.removeAttribute('aria-current');
+        const state = b.querySelector<HTMLElement>('[data-step-state]');
+        if (state) state.textContent = passed(n) ? 'passed' : n > reached ? 'locked' : n === current ? 'current' : '';
+      });
+      runBtn!.textContent = `Run the tests for ${unit} ${current}`;
+      nextBtn!.textContent = `Next ${unit}`;
+      nextBtn!.disabled = !(current === reached && reached < total && passed(reached));
+      nextBtn!.hidden = reached >= total && current === total;
+      const done = stepBtns.filter((_, i) => passed(i + 1)).length;
+      if (progressLabel) {
+        const Unit = unit === 'stage' ? 'Stage' : 'Step';
+        progressLabel.textContent = done === total ? `All ${total} ${unit}s passed` : `${Unit} ${current} of ${total}, ${done} passed`;
+      }
+    }
+
+    stepBtns.forEach((b) =>
+      b.addEventListener('click', () => {
+        current = Number(b.dataset.step);
+        if (out) out.hidden = true;
+        setStatus('');
+        show();
+      }),
+    );
+
+    bindEditor(editor);
+
+    runBtn.addEventListener('click', async () => {
+      const n = current;
+      runBtn.disabled = true;
+      setStatus('Starting');
+      if (problemKey && !getItem(problemKey)) markSeen(problemKey);
+      try {
+        const run = await runTests(editor.value, tests(n), setStatus, { hidden: hidden(n) });
+        const allPass = renderRun(root, run);
+        if (allPass) {
+          if (problem) {
+            passedNow.add(n);
+            if (n === total) {
+              complete(problemKey, true);
+              document.dispatchEvent(new CustomEvent('inferview:reveal', { detail: { id: problem, solved: true } }));
+            }
+          } else complete(`lab:${slug}/${n}`, true);
+          const last = `All tests pass. That was the last ${unit}.`;
+          setStatus(n === total ? last : n === reached ? `All tests pass. The next ${unit} is unlocked.` : 'All tests pass.');
+        } else setStatus('');
+      } catch (e) {
+        setStatus((e as Error).message);
+      } finally {
+        runBtn.disabled = false;
+        show();
+      }
+    });
+
+    nextBtn.addEventListener('click', () => {
+      if (reached >= total || !passed(reached)) return;
+      reached += 1;
+      current = reached;
+      const add = starter(reached);
+      const names = [...add.matchAll(/^def (\w+)\(/gm)].map((m) => m[1]);
+      // Append the new step's stubs unless the reader already defined those functions.
+      if (add.trim() && !names.every((name) => new RegExp(`^def ${name}\\(`, 'm').test(editor.value))) {
+        editor.value = `${editor.value.replace(/\s+$/, '')}\n\n\n${add}`;
+      }
+      save();
+      if (out) out.hidden = true;
+      setStatus(add.trim() ? `${unit === 'stage' ? 'Stage' : 'Step'} ${reached} added its starter at the end of your program.` : `Stage ${reached} continues from your code.`);
+      show();
+      editor.focus();
+    });
+
+    // Two clicks, because a reset replaces the reader's code.
+    let armed: ReturnType<typeof setTimeout> | null = null;
+    const resetLabel = resetBtn.textContent ?? '';
+    resetBtn.addEventListener('click', () => {
+      if (!armed) {
+        resetBtn.textContent = 'Click again to replace your program';
+        armed = setTimeout(() => {
+          armed = null;
+          resetBtn.textContent = resetLabel;
+        }, 4000);
+        return;
+      }
+      clearTimeout(armed);
+      armed = null;
+      resetBtn.textContent = resetLabel;
+      if (problem) {
+        editor.value = starter(1);
+        save();
+        setStatus('Reset to the starter for stage 1. Stages you reached stay unlocked.');
+        return;
+      }
+      const earlier = Array.from({ length: current - 1 }, (_, i) => solution(i + 1));
+      editor.value = [...earlier, starter(current)].join('\n\n\n');
+      save();
+      const earlierText = current === 2 ? `the reference solution for ${unit} 1` : `the reference solutions for ${unit}s 1 to ${current - 1}`;
+      setStatus(current === 1 ? `Reset to the starter for ${unit} 1.` : `Reset to ${earlierText} plus the starter for ${unit} ${current}.`);
+    });
+
+    onProgress(show);
+  });
+</script>

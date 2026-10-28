@@ -1,0 +1,139 @@
+---
+id: api-018
+title: Review a retry and failover layer before it ships
+subtitle: three layers, one config review
+track: apis
+module: api-anatomy
+type: critique
+difficulty: hard
+seniority: [senior, staff]
+minutes: 35
+core: true
+tags: [retries, failover, circuit-breaker, timeouts, idempotency, gateway]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Timeouts, retries and backoff with jitter (Marc Brooker, Amazon Builders' Library)
+    url: https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter
+    note: retries at every layer multiply (243 times for five layers of three); retry at a single point; local token-bucket retry limits; side effects need idempotency; timeouts from an acceptable false-timeout rate
+  - title: Claude docs, API errors (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/errors
+    note: the SDK retries twice by default; 504 timeout_error and the advice to stream or batch long requests; 529 overloaded_error
+  - title: Claude docs, rate limits (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: spend-cap 429 without retry-after and with error_code enforced_spend_limit_reached; retries fail until access resumes
+  - title: LiteLLM docs, proxy reliability (checked 2026-10-28)
+    url: https://docs.litellm.ai/docs/proxy/reliability
+    note: num_retries per model name, fallbacks in list order, allowed_fails within cooldown_time, request_timeout
+  - title: Exponential Backoff And Jitter (Marc Brooker, AWS Architecture Blog)
+    url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+    note: exponential backoff without jitter keeps contending clients in step
+checklist:
+  - Multiplies the layers out (3 SDK attempts × 3 client attempts × 4 gateway attempts × 3 job attempts = 108 provider requests per failing item) and names retrying at one point as the fix
+  - Flags that the client retries every 429, including the spend-cap 429 that has no retry-after and cannot clear by waiting
+  - Flags that the client's backoff ignores retry-after and has no jitter, and that the job runner's fixed 5-second delay re-synchronises whole batches
+  - Flags 504 in the retry list; a request that timed out for length times out again, and the fix is streaming or batching
+  - Connects the 10-second request_timeout to long answers that legitimately take longer, so every long answer fails over and times out on the fallback too
+  - Flags allowed_fails 1 with a 300-second cooldown; one slow answer removes the primary for five minutes and moves all of its traffic at once
+  - Rejects "model calls are read-only" for the enrichment job, whose tool writes to the CRM; a job retry repeats the write without an idempotency key
+  - Notes the 600-second SDK timeout under a 10-second gateway timeout; the deadline is not propagated, so layers disagree about when to give up
+  - Flags the fallback as unevaluated ("same prompts"), with a cold cache and limits sized for its own traffic
+  - Adds a retry budget so a provider incident cannot multiply load without bound
+  - "Judgement call: retries in the gateway instead of the client are acceptable if every SDK sets max_retries=0 and clients send a deadline and an idempotency key with each call"
+  - "Judgement call: failover on the spend cap is acceptable if the second provider's spend is pre-approved and a named owner is paged when it happens"
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Critique, 35 minutes">
+A platform team asks you to approve the reliability section of their design before it ships to the chat API and the nightly enrichment job. List every problem you would block on or ask about, in priority order, then open the checklist.
+</Callout>
+
+> **Reliability.** Every layer retries so that each one is resilient on its own. A timeout at the gateway means the primary provider is slow, so we fail over on the first timeout to keep latency down. The fallback uses the same prompts. Retries are safe because model calls are read-only. The enrichment job calls the model with one tool, `update_account(account_id, fields)`, which writes the extracted fields to the CRM.
+
+```yaml
+# shared model client, used by the chat API and the enrichment job
+sdk:
+  max_retries: 2
+  timeout_s: 600
+
+client_retry:
+  attempts: 3
+  on_status: [429, 500, 502, 503, 504, 529]
+  backoff: exponential
+  base_s: 1
+  factor: 2
+
+gateway:                       # LiteLLM proxy
+  litellm_settings:
+    num_retries: 3
+    request_timeout: 10
+    fallbacks: [{"primary-large": ["secondary-large"]}]
+  router_settings:
+    allowed_fails: 1
+    cooldown_time: 300
+
+job_runner:                    # enrichment, 40,000 accounts a night
+  max_attempts: 3
+  retry_delay_s: 5
+```
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how many requests reach the provider when one enrichment item fails every time.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the p99 total latency of the chat API's longest answers and compare it with every timeout in the file.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the CRM shows if the same item runs twice.</p></details>
+
+## Answer
+
+Ranked by blast radius.
+
+**The layers multiply.** The SDK makes up to 3 requests per client attempt, the client makes 3 attempts, the gateway turns each into up to 4 (1 plus `num_retries: 3`, before any fallback), and the job runner runs the item 3 times: 3 × 3 × 4 × 3 = 108 provider requests for one failing item. During a provider incident that is the load the design adds. Brooker's five-layer example reaches 243 the same way.
+
+**The classifier is wrong in both directions.** It retries every 429, so a spend-cap 429, which has no `retry-after` and stays until access resumes, is hammered by every layer. It retries 504, which Claude documents as a request that timed out while processing; the documented fix is streaming or the batch API, and a retry repeats the timeout. Its exponential backoff ignores `retry-after` and has no jitter, and the job runner's fixed 5-second delay sends every failed item of a batch back in the same second.
+
+**Failover fires on normal traffic.** A 10-second `request_timeout` is a total timeout. Chat answers long enough to take more than 10 seconds time out on the primary every time, fail over, and time out on the fallback for the same reason. With `allowed_fails: 1` and `cooldown_time: 300`, one such answer takes the primary out for five minutes and moves all of its traffic to a fallback whose rate limits were sized for its own load.
+
+**"Read-only" is false for the job.** `update_account` writes. A model call that timed out may have produced a tool call the job already executed; the job runner's retry repeats the write. The fix is an idempotency key per item and tool-use id, checked by the tool.
+
+**The fallback is a behaviour change nobody evaluated.** Same prompts on a different model means a different tool-call format behind the adapter, different refusal behaviour, a cold prompt cache and different token counts. It needs a per-route eval gate before it is eligible for anything.
+
+**Deadlines disagree.** The SDK waits up to 600 seconds, the gateway gives up at 10, and nothing tells the gateway how long the caller will wait.
+
+The decision underneath is where the single retry layer lives, and two answers are defensible. **Gateway retries**, with every SDK at `max_retries=0` and the client loop removed: one place sees all traffic and can hold a retry budget and a breaker; the cost is that the gateway needs a deadline and an idempotency key from each caller, which is new plumbing. **Client-library retries**, with gateway `num_retries: 0`: the layer that knows the deadline and the side effects decides; the cost is a budget per process, not global, and every consuming team must upgrade. Either way the job runner stops retrying calls and re-queues failed items minutes later with jitter.
+
+The constraint conflict is latency against correctness. Failing over fast protects chat p99; failing over on the wrong signal ships unevaluated behaviour to users during every slow answer. The resolution is to fail over on a first-byte timeout and on breaker-open from 529s and 5xx, never on a total-time timeout, and to count only those signals toward `allowed_fails`.
+
+<Depth>
+<Fragment slot="short">
+<p>One retry layer per path with a retry budget; never retry the spend cap, 504 or 400s; honour <code>retry-after</code> with jitter; fail over on first-byte timeouts and breaker-open, not total timeouts; idempotency keys on the CRM write; an eval gate before the fallback is eligible.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Today one failing item can send 108 requests. The rewrite: gateway owns retries with a budget (retries capped at a share of recent first attempts, plus a floor), SDKs at <code>max_retries=0</code>, the client loop deleted, the job runner re-queues items minutes later with jitter. The classifier stops on spend-cap 429s and pages the budget owner, sends 504-prone routes to streaming, and never retries 4xx other than rate limits.</p>
+<p>Failover moves to first-byte timeouts set from the time-to-first-token distribution, plus breaker-open after several 529s or 5xx in a window. The fallback is per route, after a paired eval against the primary, and with a cap on the share of traffic that may move, because its limits cannot absorb the whole primary load.</p>
+<p>Failure mode of this answer: a gateway-wide retry budget is shared, so one team's misclassified retries can exhaust it for everyone during an incident. Account the budget per calling team, or classify before charging the budget.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The platform team says deadline propagation is a quarter of work. What do you approve without it, and what risk do you write down?</li>
+<li>What would the breaker's open and close events need to look like over a month for you to raise <code>allowed_fails</code> again?</li>
+<li>The chat lead wants the 10-second timeout kept because users abandon after 10 seconds. How do you settle it with data rather than rank?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Pushback:* your retry budget makes the job miss its 06:00 deadline on a night with a short provider incident. Do you raise the budget, extend the window, or accept late enrichment, and who signs?
+- *Reversal:* what would you need to see in production to move retries from the gateway back into the client library?
+- *Operating:* the fallback's evals show 3 of 20 extraction fields regress. Is the enrichment route eligible for failover, partially eligible, or not at all, and what do you write down?
+
+## Common mistakes
+
+- Counting the client loop and forgetting the SDK's own two retries.
+- Fixing jitter and leaving the 504 and spend-cap retries in place.
+- Treating "fail over on first timeout" as a latency improvement without asking what the timeout measures.
+- Accepting "read-only" without reading the tool list.
+- Approving the fallback because it "uses the same prompts".

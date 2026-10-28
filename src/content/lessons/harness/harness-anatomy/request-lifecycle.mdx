@@ -1,0 +1,176 @@
+---
+title: "The request lifecycle: how a harness builds each model call"
+track: harness
+module: harness-anatomy
+order: 2
+kind: lesson
+level: senior
+minutes: 14
+summary: Codex and Claude Code rebuild the whole request on every call in a fixed layer order, and that order decides which instructions win, what the cache can reuse and how a mid-session change is delivered.
+prerequisites: [harness/harness-anatomy/model-plus-harness]
+updated: 2026-10-28
+sources:
+  - title: OpenAI, Unrolling the Codex agent loop (Michael Bolin, 2026-01-23)
+    url: https://openai.com/index/unrolling-the-codex-agent-loop/
+    note: instructions, tools and input; the four items Codex inserts before the user message; no previous_response_id (stateless, ZDR); cache-miss causes; config changes appended as messages; /responses/compact and auto_compact_limit
+  - title: OpenAI Codex docs, Custom instructions with AGENTS.md
+    url: https://learn.chatgpt.com/docs/agent-configuration/agents-md
+    note: global file, then one file per directory from the project root down to the working directory; project_doc_max_bytes 32 KiB by default; chain rebuilt on every run. Checked 2026-10-28.
+  - title: Claude Code docs, How Claude Code uses prompt caching
+    url: https://code.claude.com/docs/en/prompt-caching
+    note: layer table (system prompt and tools, project context, conversation); plan mode and skills appended as messages; deferred MCP tools keep the first request's tool list; cache scope per machine and directory; TTL defaults. Checked 2026-10-28.
+  - title: Claude Agent SDK docs, How the agent loop works
+    url: https://code.claude.com/docs/en/agent-sdk/agent-loop
+    note: the five-step loop, the four-turn "Fix the failing tests in auth.ts" example, parallel read-only tools, maxTurns counting, compaction boundary message. Checked 2026-10-28.
+  - title: Claude Code docs, Explore the context window
+    url: https://code.claude.com/docs/en/context-window
+    note: what reloads after compaction (CLAUDE.md, auto memory, up to five recent files, skill bodies capped at 5,000 tokens each and 25,000 total). Checked 2026-10-28.
+  - title: Claude Code docs, How Claude Code works
+    url: https://code.claude.com/docs/en/how-claude-code-works
+    note: auto memory loads the first 200 lines or 25KB of MEMORY.md; Claude Code appends system reminders such as a note when a file read earlier changes on disk. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import Trace from '../../../../components/Trace.astro';
+
+## The request is rebuilt every call
+
+The model keeps no state between calls. Every model call in a coding agent is a fresh request that the harness assembles from layers: fixed instructions, tool definitions, project instructions, environment facts, then the conversation so far. Two properties of that assembly drive most of the engineering. The order is a precedence rule: OpenAI's Responses API ranks roles as system, developer, user, assistant in decreasing priority, and within the instruction files both Codex and Claude Code place more specific files later so they override broader ones. And provider-side prompt caches match on an exact prefix, so anything that changes early in the request forces everything after it to be processed again. A build system with content-addressed caching behaves the same way, with one difference that matters here: the cache key is the byte prefix of the whole request, not each layer separately.
+
+## Codex: three fields and a list
+
+The Codex CLI talks to the Responses API, at `chatgpt.com/backend-api/codex/responses` with a ChatGPT login, at `api.openai.com/v1/responses` with an API key, or at a local endpoint when run with `--oss`. OpenAI's January 2026 post walks through the payload. It has three fields that matter. `instructions` comes from `model_instructions_file` in `~/.codex/config.toml` if set, otherwise from the base instructions bundled into the CLI for the selected model. `tools` lists Codex's own tools (the `shell` tool and the `update_plan` tool in the post's example), tools the Responses API provides such as web search, and tools from the user's MCP servers. `input` is a list of items, and before the user's message Codex inserts four of them:
+
+1. A developer-role message describing the sandbox, which applies only to Codex's `shell` tool. The post states that MCP tools are not sandboxed by Codex and must enforce their own guardrails.
+2. Optionally, a developer-role message with `developer_instructions` from `config.toml`.
+3. Optionally, a user-role message holding the user instructions: AGENTS.md (or AGENTS.override.md) from the Codex home directory, then one file per directory from the Git root down to the working directory, capped at 32 KiB by default, then a skills preamble and each configured skill's metadata.
+4. A user-role message with an `environment_context` block giving the working directory and the shell.
+
+The server then derives the prompt: a system message it controls, the tools, the instructions, then the input list. Codex controls the content of the tools and instructions but not the system message or the order of those first three items. A custom Responses API implementation may order them differently.
+
+The AGENTS.md discovery rules are a precedence system. Codex includes at most one file per directory (override, then AGENTS.md, then any configured fallback names), concatenates from the root down, and stops adding files once the combined size reaches `project_doc_max_bytes`. Files nearer the working directory appear later and therefore win. The chain is built once per run, so an AGENTS.md edit applies on the next run, and a large root file can silently push the directory-specific file past the cap.
+
+## Why Codex re-sends everything
+
+The Responses API accepts `previous_response_id`, which would let the server hold the conversation. Codex does not use it, to keep every request stateless and to support customers on Zero Data Retention, since storing the conversation server-side conflicts with ZDR. Reasoning from earlier turns travels back to the server as `encrypted_content` items that only the server can decrypt; OpenAI keeps the ZDR customer's decryption key but not the data.
+
+The cost is that the JSON sent over a session grows quadratically with its length. The post's answer is that sampling cost dominates network cost, and that with cache hits, sampling cost is linear.
+
+<Predict id="hrn-quadratic-input" question="Scenario: the first request of a session is 20,000 tokens, each tool round trip appends 2,000 tokens, and the session makes 30 model calls. How many input tokens are sent in total across all 30 requests?" answer={1470000} tolerance={30000} unit="tokens">
+<p>Request k carries 20,000 + 2,000 × (k − 1) tokens. Summed over 30 requests: 30 × 20,000 + 2,000 × (0 + 1 + ... + 29) = 600,000 + 2,000 × 435 = <b>1,470,000 tokens</b>. With an exact-prefix cache hit on every call, the model only processes the new tokens fresh: 20,000 + 29 × 2,000 = 78,000 tokens. The other 1,392,000 are cache reads, billed at the provider's lower cached rate. The gap between those two numbers is why harness teams treat a cache miss as a performance bug.</p>
+</Predict>
+
+## Keeping the prefix stable
+
+OpenAI lists what causes a cache miss in Codex: changing the available tools mid-conversation, changing the model (which changes the model-specific instructions), and changing the sandbox configuration, approval mode or working directory. Its initial MCP support had a bug that enumerated tools in an inconsistent order, which caused misses. MCP servers can also announce a new tool list mid-session with `notifications/tools/list_changed`, and honouring that late in a long conversation costs a full miss.
+
+The fix is structural. When the sandbox or approval mode changes, Codex appends a new developer message in the same format as the original permissions item. When the working directory changes, it appends a new `environment_context` message. Earlier items are never edited.
+
+```python
+def common_prefix(a, b):
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+turn1 = ["SYSTEM", "TOOLS shell,update_plan", "PERMS workspace-write/on-request",
+         "AGENTS.md", "ENV cwd=/repo shell=zsh", "USER add a diagram"]
+turn2 = turn1 + ["CALL cat README.md", "OUTPUT ..."]
+
+# The approval mode changes before the next request.
+rewrite = [("PERMS workspace-write/never" if x.startswith("PERMS") else x) for x in turn2]
+rewrite += ["USER continue"]
+append = turn2 + ["PERMS workspace-write/never", "USER continue"]
+
+for name, req in (("rewrite", rewrite), ("append", append)):
+    print(f"{name}: {common_prefix(turn2, req)} of {len(req)} items reusable")
+# rewrite: 2 of 9 items reusable
+# append: 8 of 10 items reusable
+```
+
+The appended version also leaves the old permissions text in context. The model sees both and has to treat the later one as current. Codex keeps the appended message in the same format as the original, which makes the supersession easy to read; it does not make it binding, which is why the sandbox itself changes in the harness at the same moment.
+
+When the conversation passes `auto_compact_limit`, Codex calls the `/responses/compact` endpoint, which returns a shorter item list to use in place of the old input. The list includes a `compaction` item whose `encrypted_content` carries the model's understanding of the earlier conversation in a form the client cannot read. An earlier implementation was a manual `/compact` command that asked the model for a summary and used it as the new input.
+
+## Claude Code: three layers
+
+Claude Code's prompt-caching page documents the same discipline as a table. The system prompt layer holds core instructions and tool definitions and changes when the set of loaded tool definitions changes. The project context layer holds CLAUDE.md, auto memory (the first 200 lines or 25KB of MEMORY.md) and unscoped rules, and changes at session start or after `/clear` or `/compact`. The conversation layer changes every turn. Plan mode instructions, skill bodies and an output-style switch are delivered as messages appended to the conversation, so the cached prefix survives them; a file edited on disk after Claude read it produces an appended system reminder, not a rewrite of the earlier read.
+
+MCP tools are deferred by default behind a `ToolSearch` tool: only names load up front, and Claude Code keeps the first request's tool list for the whole conversation, so a server that connects later supplies deferred definitions instead of changing the prefix. Without tool search, a server connecting mid-session invalidates the cache. Switching models always does, because each model has its own cache.
+
+The cache is effectively scoped to one machine and directory: the system prompt embeds auto-memory paths, and the conversation opens with the working directory, platform, shell, OS version and a git status snapshot. Two sessions in different directories never share a prefix. Parallel sessions in the same directory can.
+
+<Trace
+  title="One Codex turn: add an architecture diagram to the README"
+  note="from OpenAI's January 2026 walkthrough"
+  steps={[
+    { actor: "user", text: "Types: Add an architecture diagram to the README.md." },
+    { actor: "harness", text: "Sets instructions from model_instructions_file, or the base instructions bundled for the selected model." },
+    { actor: "harness", text: "Lists tools in a stable order: shell, update_plan, web search, then MCP tools from config.toml.", note: "An unstable order here was a real cache-miss bug." },
+    { actor: "harness", text: "Inserts a developer message describing the sandbox for the shell tool, then any developer_instructions." },
+    { actor: "harness", text: "Inserts a user message with the AGENTS.md chain from the Git root to the working directory and the skills metadata.", note: "Capped at 32 KiB by default; closer files appear later and win." },
+    { actor: "harness", text: "Inserts environment_context (cwd, shell), appends the user message, and POSTs without previous_response_id." },
+    { actor: "system", text: "The server prepends its own system message, then tools and instructions, then the input list, and streams events back." },
+    { actor: "assistant", text: "Returns a reasoning item with encrypted_content and a function_call: shell, cat README.md." },
+    { actor: "tool", text: "Codex runs the command inside the sandbox and appends the reasoning item, the call and its output to input.", note: "The previous request is now an exact prefix of the next one." },
+    { actor: "assistant", text: "After more calls, returns a message with no tool call. The turn ends and control returns to the user." }
+  ]}
+/>
+
+<Trace
+  title="One Claude Code turn: fix the failing tests in auth.ts"
+  note="from the Agent SDK and prompt-caching docs"
+  steps={[
+    { actor: "system", text: "System prompt layer: core instructions and the built-in tool definitions; MCP tools appear as names behind ToolSearch.", note: "Changes only when the set of loaded tool definitions changes." },
+    { actor: "system", text: "Project context layer: CLAUDE.md, the first 200 lines or 25KB of auto memory, unscoped rules.", note: "Read at session start; edits wait for /clear, /compact or a restart." },
+    { actor: "user", text: "Conversation opens with working directory, platform, shell, OS version and a git status snapshot, then the prompt." },
+    { actor: "assistant", text: "Turn 1: calls Bash to run npm test." },
+    { actor: "tool", text: "Three tests fail; the output is appended as a tool result." },
+    { actor: "assistant", text: "Turn 2: calls Read on auth.ts and auth.test.ts.", note: "Read-only tools may run concurrently; Edit, Write and Bash run one at a time." },
+    { actor: "assistant", text: "Turn 3: calls Edit on auth.ts, then Bash to re-run npm test. All three pass." },
+    { actor: "assistant", text: "Turn 4: a text-only reply ends the loop; the SDK emits a result with cost, usage and the session id.", note: "Four turns, so maxTurns must be at least 4 for this run to finish with a reply." }
+  ]}
+/>
+
+When the conversation nears the context limit, Claude Code compacts it into a summary. The system prompt layer stays cached; the project context is reloaded from disk and hits the cache only if CLAUDE.md and memory are unchanged since the session started; the conversation layer is rebuilt by design. After compaction Claude Code re-reads up to five recently modified files it had read or edited (a file over 5,000 tokens comes back as a path reference) and re-injects invoked skill bodies, capped at 5,000 tokens per skill and 25,000 tokens in total.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You run a shared coding-agent platform for many internal teams. Each team wants its own instructions injected, security wants to tighten the sandbox mid-session when a task escalates, legal requires zero data retention, and the cost model assumes most input tokens are cache reads. Lay out the request."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Fixed platform instructions and a fixed, ordered tool list first; team instructions next, loaded once per session from the repository; environment facts after that; then the conversation. Every mid-session change, including a sandbox tightening, is an appended message in the same format as the original, never an edit. No server-side conversation state, so ZDR holds, and the client re-sends the full input with encrypted reasoning items. Measure cache-read share per session and alert when it drops.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Team instructions conflict with cache sharing only if they sit above shared content. Put them after the platform prefix so every team shares the platform-level cache entry and each session warms its own suffix. Load them from the repository at session start, as both Codex and Claude Code do, and accept that an edit applies next session.</p>
+<p>Policy changes create a correctness question as well as a cost one. Appending a stricter permissions message keeps the cache, but the model still sees the looser text above it. The enforcement must not depend on the model reading the newest message: the sandbox and rule engine change immediately in the harness, and the appended message only tells the model what will now be refused.</p>
+<p>ZDR rules out <code>previous_response_id</code>, so payloads grow quadratically. Budget for it with compaction at a token threshold, and make compaction a point where the platform re-reads team instructions from disk.</p>
+<p>Tool list stability is the common failure: sort MCP tools deterministically, freeze the list at session start, and defer late tools behind a search tool instead of adding definitions.</p>
+<p>What you give up: a team cannot change its instructions mid-session, and a security tightening is enforced at once but described to the model one message late.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Security says an appended permissions message leaves the old, looser text visible and wants the original rewritten even at the cost of a full cache miss. Which do you ship, and what do you write in the risk note?</li>
+<li>Cache-read share falls from most of the input to under half after a release. Which three counters do you check first, and in what order?</li>
+<li>One team's AGENTS.md chain hits the 32 KiB cap and the directory-specific file is dropped. Do you raise the cap, split the file, or fail loudly at session start, and what would change your answer?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Both vendors document their orderings as current behaviour, not a contract. Claude Code's layer table gives "common triggers rather than an exhaustive list", several behaviours carry version numbers (an output-style switch kept the cache but did not apply before v2.1.251), and Codex's server decides the order of the first three prompt items. Re-check the docs before quoting an ordering as fixed.
+
+The precedence rule is a tendency of the model, not an enforcement mechanism. The more specific or more recent instruction usually wins; a long conversation can still let an early, emphatic instruction outweigh a short appended correction. Anything that must hold goes into the harness's enforcement path, which is the subject of the next lesson.
+
+Cache economics depend on billing. Claude Code requests a one-hour cache TTL for the main conversation only on a subscription within plan usage, and five minutes with an API key unless configured otherwise, so the same request layout can have very different hit rates for a user who pauses between turns.
+
+<SelfRate id="lesson:harness/harness-anatomy/request-lifecycle" />

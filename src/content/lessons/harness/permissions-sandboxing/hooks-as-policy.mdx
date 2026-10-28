@@ -1,0 +1,201 @@
+---
+title: Hooks as policy, and how they fail
+track: harness
+module: permissions-sandboxing
+order: 2
+kind: lesson
+level: senior
+minutes: 15
+summary: A Claude Code hook enforces policy only when it exits 2 on a violation, blocks on its own failure and runs as code rather than as another model, and the Stop hook that runs the typecheck is a verification gate with a documented way to fail open.
+prerequisites: [harness/permissions-sandboxing/rule-engines]
+updated: 2026-10-28
+sources:
+  - title: Claude Code docs, Hooks reference
+    url: https://code.claude.com/docs/en/hooks
+    note: 33 hook events; handler types command, http, mcp_tool (600 s default timeout), prompt (30 s) and agent (60 s, experimental, up to 50 turns); exit 0, exit 2 and any other code including 1 as a non-blocking error; crash or timeout does not block PreToolUse; onFailure continue or block (command and http hooks, v2.1.295 or later) with no effect on Stop, SubagentStop, TaskCompleted, TeammateIdle or background hooks; exit 2 blocks even with JSON allow; PreToolUse precedence deny, defer, ask, allow across hooks; Stop hooks' stop_hook_active and the 8-consecutive-continuation cap, reset by any tool call, raised with CLAUDE_CODE_STOP_HOOK_BLOCK_CAP; prompt hook response ok, reason, impossible; ConfigChange can block settings changes except policy_settings; command hooks run with full user permissions; -p and SDK sessions treat the folder as trusted; disableAllHooks precedence. Checked 2026-10-28.
+  - title: Claude Code docs, Best practices
+    url: https://code.claude.com/docs/en/best-practices
+    note: deterministic versus non-deterministic instructions; a prompt or agent hook asks another model to decide; use command or http hooks with onFailure block for enforcement; the Stop hook typecheck example (pnpm tsc --noEmit 1>&2 || exit 2); a hook is for a rule with zero exceptions; keep the enforced set small. Checked 2026-10-28.
+  - title: Claude Code docs, Configure permissions
+    url: https://code.claude.com/docs/en/permissions
+    note: PreToolUse hook decisions do not bypass deny or ask rules; a hook exiting 2 blocks before permission rules are evaluated; output redirect targets are checked against Edit allow and deny rules. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import HarnessPermissionsSandboxingHookOutcome from '../../../../components/widgets/HarnessPermissionsSandboxingHookOutcome.astro';
+
+## The harness calls your code, and reads its exit status
+
+Rules match tool calls against patterns. When the decision needs logic (normalise a path, look up a branch, call a scanner), Claude Code hands the call to a hook: a handler registered on one of 33 lifecycle events, from `SessionStart` through `PreToolUse`, `PostToolUse` and `Stop` to `ConfigChange` and `SessionEnd`. There are five handler types. `command`, `http` and `mcp_tool` run your code or service, with a 600-second default timeout. `prompt` (30 seconds) and `agent` (60 seconds, experimental) ask a model.
+
+A command hook's protocol is its exit status. Exit 0 is success, and stdout is parsed as JSON if it is a single JSON object. Exit 2 is a blocking error on events that can block, with stderr as the reason: on `PreToolUse` the tool call does not run, on `Stop` Claude does not stop and keeps working. Every other exit code, including 1, is a non-blocking error and the action proceeds. The reference spells out the trap: exit 1 without valid JSON output is non-blocking, and a hook meant to enforce a policy must use exit 2.
+
+The same rule covers the hook's own failures. A hook that crashes, fails to start or exits with any code other than 0 or 2 is a non-blocking error. A hook that times out is canceled, its output discarded, and on `PreToolUse` the call is not blocked. Claude Code fails open by default. The switch is the one Kubernetes puts on admission webhooks as `failurePolicy`: since v2.1.295, command and http hooks accept `"onFailure": "block"`, which makes a failure to start, an unexpected exit code, an HTTP error, a timeout or invalid output behave like exit 2 on that event. It does nothing on `Stop`, `SubagentStop`, `TaskCompleted`, `TeammateIdle` or background hooks, and prompt and agent hooks do not have it.
+
+<HarnessPermissionsSandboxingHookOutcome />
+
+Three more details from the reference decide how a hook composes with everything else:
+
+- A `PreToolUse` hook that exits 2 blocks before permission rules are evaluated, so an allow rule cannot rescue the call, and exit 2 wins over JSON on stdout that says allow.
+- A hook that returns `"allow"` does not get past a matching deny or ask rule. Hooks can add refusals to the rule engine; they cannot remove them.
+- Matching hooks run in parallel, and when several `PreToolUse` hooks disagree the precedence is deny, then defer, then ask, then allow. Hook entries merge across user, project, local and managed settings rather than replacing each other.
+
+Exit 0 with no decision is silence, and silence is not approval: the call continues to the rules and the mode, as if the hook were absent.
+
+## Choosing fail-open or fail-closed
+
+The default is not careless. A hook that fails closed and breaks blocks every matching call until someone fixes it, so a crashing formatter hook with `onFailure: "block"` would stop all editing. The decision is per hook and follows what the hook protects.
+
+A hook that enforces an invariant (no writes under `migrations/`, no commit without a secret scan, no edits to `.claude/`) fails closed, because a miss is the expensive outcome and an outage is visible. A hook that helps (a formatter, telemetry, a lint that adds context) fails open, because an outage there should cost quality, not availability. The best-practices page draws the same line with a secret scanner: you would rather block the commit than let it through unscanned while the scanner is down.
+
+Fail-closed has two layers, and a policy hook needs both. Inside the script, catch every exception and exit 2, so malformed input or a bug in your own code blocks. Outside the script, set `onFailure: "block"`, so a missing interpreter, an import error before your `try` runs, or a hang past the timeout also blocks. The first layer you can unit-test. The second only exists in Claude Code's runtime, so it needs one integration check: point the hook at an interpreter that does not exist in a scratch repository and confirm the edit is refused.
+
+## A policy hook that fails closed, and its test
+
+The hook below protects `migrations/`, `.claude/` and any file named `.env`. It normalises Windows separators (the reference says `tool_input.file_path` is absolute and arrives with backslashes on Windows) and resolves `..` before comparing, and it puts the safe alternative in the refusal so the agent's next step is the right one.
+
+```python
+# .claude/hooks/protect_paths.py
+import json
+import posixpath
+import sys
+
+PROTECTED = ("migrations/", ".claude/", ".env")
+
+
+def main():
+    event = json.load(sys.stdin)
+    root = event["cwd"].replace("\\", "/").rstrip("/") + "/"
+    path = posixpath.normpath(event["tool_input"]["file_path"].replace("\\", "/"))
+    rel = path[len(root):] if path.startswith(root) else path
+    for p in PROTECTED:
+        if rel.startswith(p) or posixpath.basename(rel) == p:
+            print(f"Blocked: {rel} is protected. Add a new migration with scripts/new_migration.py.", file=sys.stderr)
+            return 2
+    return 0
+
+
+try:
+    sys.exit(main())
+except Exception as exc:  # malformed input or a bug in this file blocks the call
+    print(f"protect_paths failed, blocking: {exc!r}", file=sys.stderr)
+    sys.exit(2)
+```
+
+Registered with the outer layer:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/protect_paths.py"],
+            "timeout": 10,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The test drives the hook as Claude Code does, as a subprocess with JSON on stdin, and asserts exit codes. The last two cases are the ones a fail-open hook gets wrong.
+
+```python
+# test_protect_paths.py
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+HOOK = Path(__file__).with_name("protect_paths.py")
+
+
+def run(payload):
+    data = payload if isinstance(payload, str) else json.dumps(payload)
+    done = subprocess.run([sys.executable, "-I", str(HOOK)], input=data, capture_output=True, text=True, timeout=10)
+    return done.returncode
+
+
+def edit(path, cwd="/repo"):
+    return {"hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": cwd, "tool_input": {"file_path": path}}
+
+
+assert run(edit("/repo/src/app.py")) == 0
+assert run(edit("/repo/migrations/0042_add_index.sql")) == 2
+assert run(edit("/repo/src/../migrations/0042.sql")) == 2               # traversal
+assert run(edit("/repo/config/.env")) == 2                              # bare name at any depth
+assert run(edit(r"C:\repo\migrations\0042.sql", cwd=r"C:\repo")) == 2   # Windows separators
+assert run("not json") == 2                                             # malformed input
+assert run({"cwd": "/repo", "tool_input": {}}) == 2                     # missing field
+print("all cases pass")
+```
+
+The matcher is the hook's real scope. `Edit|Write` sees the Edit and Write tools, not `echo x > migrations/0042.sql` or `sed -i` from Bash. Claude Code checks output redirect targets against `Edit` allow and deny rules, so add `Edit(migrations/**)` to deny alongside the hook; that catches the redirect. Nothing at this layer catches a Python one-liner that opens the file. That is a sandbox write rule, not a hook.
+
+## Prompt and agent hooks are another model deciding
+
+A `prompt` hook sends the hook input and your prompt to a Claude model (by default the one Claude Code uses for background work) and acts on `{"ok": false, "reason": ...}`. An `agent` hook spawns a subagent that can read files and run searches for up to 50 turns before answering. Both are useful, and neither is enforcement. The best-practices page puts it directly: a prompt or agent hook asks another model to decide, so it is not deterministic either.
+
+Three properties follow from the reference. They have no `onFailure`, so on `PreToolUse` a prompt hook that times out does not block. Their input is the tool call, whose arguments the main model wrote, possibly after reading injected text, so a prompt hook that judges `curl` arguments is reading attacker-influenced strings with a model. And on `PermissionRequest` a prompt hook's `ok: false` has no effect; denying an approval from a hook takes a command hook. A rule written as a prompt ("Block any Bash command that reads .env files") is a classifier with an unmeasured error rate. Use it where a judgment call is the point, such as "all tasks in the request are done", and keep the invariants in code.
+
+## The Stop hook as a verification gate
+
+The canonical use of a hook as a gate is on `Stop`, which fires when Claude tries to end its turn. The best-practices example is one line in `.claude/settings.json`:
+
+```json
+{ "type": "command", "command": "pnpm tsc --noEmit 1>&2 || exit 2" }
+```
+
+Compiler errors go to stderr, exit 2 keeps Claude working, and stderr becomes its next instruction. Two limits bound it. Claude Code applies an 8-consecutive-continuation cap: after Stop hooks have continued the turn eight times in a row, it overrides the next block and ends the turn. The count resets every time Claude calls a tool, so the cap bounds a loop of argument, not a loop of edits. And `onFailure` has no effect on `Stop`, so a typecheck hook that times out lets the turn end unverified.
+
+The `|| exit 2` idiom has a quieter property: it turns every failure into a block, including failures Claude cannot fix. If `pnpm` is not on the path, the shell's "command not found" status becomes exit 2, and Claude is told to keep working on an environment problem.
+
+<Predict id="hrn-stop-cap-time" question="Scenario: the typecheck in that Stop hook takes 40 seconds, and the environment is broken so it always fails. Each time it blocks, Claude answers without calling a tool and tries to stop again. How many seconds are spent inside the hook before Claude Code ends the turn?" answer={360} tolerance={40} unit="seconds">
+<p>The hook blocks eight times in a row, which uses up the cap, and then runs once more on the ninth stop, when its block is overridden: 9 × 40 = <b>360 seconds</b>, plus the model's time for eight replies. If Claude calls a tool between stops, the counter resets and there is no bound from this mechanism at all. A gate that can tell "the check failed" (exit 2) from "the check could not run" (exit 0 with a message, or a separate alert) spends neither.</p>
+</Predict>
+
+The hook input carries `stop_hook_active: true` when Claude is already continuing because of a Stop hook, which lets the script stop insisting on a condition that will not resolve. A prompt-based Stop hook can return `impossible: true` for the same purpose.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Compliance requires that no agent commit leaves a developer machine without a secret scan, starting at the end of the quarter. The scanner is an internal HTTP service that had two outages last quarter, and the developer-experience lead says engineers will turn hooks off if a scanner outage blocks their work. Design the hook, its failure behaviour and what you write down."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>A `PreToolUse` command or http hook on the commit and push commands, `onFailure: "block"`, exit 2 on a finding, delivered through managed settings so it cannot be switched off from a repository or user file. For outages, a local fallback scanner the hook runs when the service does not answer, so the gate stays closed without stopping work. Formatting and telemetry hooks stay fail-open. Write down the residual risk of the fallback's lower coverage and an alert on every fallback use.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The requirement is an invariant with no exceptions, so it belongs in code with a deterministic verdict, not in a prompt hook or CLAUDE.md. Register two handlers on `Bash`, one with `if` set to `Bash(git commit *)` and one with `Bash(git push *)`, because the `if` field holds exactly one permission rule; each runs the scan and exits 2 with the finding on stderr. The `if` uses Bash rule matching, so `git -C . commit` slips past it, which is one more reason the server side needs its own check. `onFailure: "block"` covers the hook crashing or timing out. Set an explicit timeout well under the 600-second default so a hung service fails fast rather than stalling the session for ten minutes.</p>
+<p>The availability objection is real and has a design answer: degrade the scanner, not the gate. When the service is down, run a local pattern scanner, block on its findings, and emit an alert that coverage was reduced. Engineers keep committing; compliance keeps a closed gate with a known gap.</p>
+<p>Delivery matters as much as logic. Managed hooks cannot be disabled outside managed settings, while a repository's `disableAllHooks: false` overrides a user's `true`, so put the scan in managed settings and keep repository hooks for project conventions.</p>
+<p>What you give up: the matcher sees the commands the model writes, so a commit made through a script or an alias is not scanned here. Write that down, and make the server-side push protection the backstop the hook is not.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The local fallback misses a class of secret the service catches. Do you block commits during outages instead, and who signs off on either choice?</li>
+<li>Engineers measure the hook adding seconds to every commit and ask to scan on push only. What do you lose, and what evidence would make you agree?</li>
+<li>Two months in, the fallback has run on a large share of commits because the service is slow, not down. What do you change, and what would make you reverse the decision to fail closed?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+A hook sees what its matcher selects, in the form the model wrote it. The path hook above guards the Edit and Write tools; Bash can write the same file a dozen ways, and the hook never runs. Hooks shape the agent's normal path. The sandbox's filesystem rules are what hold when the path is unusual.
+
+Hooks are also code you run with your full user permissions, and the reference says so in its security section. A repository can ship them. In an interactive session Claude Code holds every settings-file hook until the folder is trusted, but a `claude -p` or SDK session never shows the trust dialog and runs hooks committed in the repository's `.claude/settings.json`. A policy engine that a cloned repository can extend is also an execution path for that repository, which the last lesson in this module treats as attack surface.
+
+Finally, the exit-code protocol is per event and versioned. `onFailure` exists only from v2.1.295; on older versions a crashing policy hook passes everything. `PreModelSwitch` blocks on timeout while `PreToolUse` does not, and an Agent SDK callback hook that times out blocks the tool call. A fleet with mixed Claude Code versions has mixed failure semantics for the same configuration, and the version floor is part of the policy.
+
+<SelfRate id="lesson:harness/permissions-sandboxing/hooks-as-policy" />

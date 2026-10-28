@@ -1,0 +1,170 @@
+---
+title: "Teardown: OpenHands"
+track: harness
+module: context-management
+order: 8
+kind: teardown
+level: senior
+minutes: 13
+summary: How the MIT-licensed OpenHands platform and its Software Agent SDK structure an agent as an event-sourced log of actions and observations, condense that log when it grows, and pause for confirmation on actions the model itself rates as risky.
+prerequisites:
+  - harness/context-management/compaction
+updated: 2026-10-28
+sources:
+  - title: "Wang et al., OpenHands: An Open Platform for AI Software Developers as Generalist Agents (arXiv 2407.16741, v3 2025-04-18)"
+    url: https://arxiv.org/abs/2407.16741
+    note: "MIT-licensed; more than 2.1K contributions from over 188 contributors; state centred on a chronological event stream of actions and observations; IPython, bash and browser actions (CodeAct-inspired); Docker sandbox per task with an action execution API server running bash, a Jupyter IPython server and Chromium through Playwright; AgentSkills library; AgentDelegateAction; CodeActAgent v1.8 with claude-3-5-sonnet-20240620: 26.0% on SWE-bench Lite (300 instances) at $1.10 average cost"
+  - title: "Wang et al., The OpenHands Software Agent SDK (arXiv 2511.03690, v1 2025-11-05, v2 2026-04-22, MLSys 2026)"
+    url: https://arxiv.org/abs/2511.03690
+    note: "ConversationState the only mutable component; agents, tools and LLMs immutable Pydantic models; base_state.json plus one JSON file per event, resumed by replay; on 433 SWE-bench Verified conversations (39,870 events) persist median 0.20 ms (p95 0.31 ms) and replay median 4.1 ms (p95 9.7 ms); LocalWorkspace on the host, RemoteWorkspace (DockerWorkspace, APIRemoteWorkspace) through an agent server; 100+ providers through LiteLLM; WAITING_FOR_CONFIRMATION until the user approves or rejects; SWE-bench Verified with Claude Sonnet 4.5: 64.6% on V0, 72.8% on V1; 15-day rollout: system-attributable errors 78.0 to 30.0 per 1,000 conversations, V1 SDK errors 29.7 per 1,000 mostly from a condensation bug since fixed"
+  - title: OpenHands SDK docs, Condenser (checked 2026-10-28)
+    url: https://docs.openhands.dev/sdk/arch/condenser
+    note: "LLMSummarizingCondenser max_size 120 events, keep_first 4, view of max_size // 2 = 60 after condensation; Condensation event with forgotten_event_ids, summary and summary_offset; condense() returns a View or a Condensation, which the agent appends to the log before ending the step; manual CondensationRequest, for example after a context-window error; the summariser is often a cheaper model"
+  - title: OpenHands SDK docs, Security (checked 2026-10-28)
+    url: https://docs.openhands.dev/sdk/arch/security
+    note: "SecurityRisk LOW, MEDIUM, HIGH, UNKNOWN; LLMSecurityAnalyzer adds a required security_risk parameter to every tool schema, so the model rates its own call with no separate analysis step; ConfirmRisky is the default policy with threshold HIGH and confirm_unknown true; NoOpSecurityAnalyzer always returns UNKNOWN; the analyzer can be disabled"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Diagram from '../../../../components/Diagram.astro';
+import Trace from '../../../../components/Trace.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What it is and who runs it
+
+OpenHands, formerly OpenDevin, is an open platform for software-development agents released under the MIT licence. The 2024 paper that introduced it lists 24 authors and more than 2,100 contributions from over 188 contributors. In November 2025 the team published a second paper on the OpenHands Software Agent SDK, which it describes as a complete redesign of the agent components, accepted at MLSys 2026. Because the code is public, this teardown can describe internals that the closed harnesses in this module leave unstated; it still relies on the papers and the SDK docs rather than on reading a particular commit.
+
+The design idea to take from OpenHands is that the agent is an event-sourced system. Every action the agent takes and every observation it receives is an event in an append-only log; state is what you get by replaying the log; and context management, persistence and approval are all expressed as events.
+
+## The system
+
+<Diagram
+  title="OpenHands agent and SDK components, from the 2024 and 2025 papers and the SDK docs"
+  nodes={[
+    { id: 'user', label: 'User or application' },
+    { id: 'state', label: 'Conversation state', note: 'event stream; the only mutable part' },
+    { id: 'agent', label: 'Agent', note: 'CodeAct in the 2024 paper' },
+    { id: 'llm', label: 'LLM', note: '100+ providers via LiteLLM' },
+    { id: 'cond', label: 'Condenser', note: '120 events, keep first 4' },
+    { id: 'sec', label: 'Security analyzer', note: 'model-rated risk; ConfirmRisky' },
+    { id: 'store', label: 'Event store', note: 'base_state.json, one JSON file per event' },
+    { id: 'ws', label: 'Workspace', note: 'Docker: bash, IPython, browser' },
+  ]}
+  edges={[
+    { from: 'user', to: 'state', label: 'messages, approvals' },
+    { from: 'state', to: 'agent', label: 'view' },
+    { from: 'agent', to: 'llm', label: 'completion' },
+    { from: 'agent', to: 'cond', label: 'condense()' },
+    { from: 'agent', to: 'sec', label: 'risk' },
+    { from: 'sec', to: 'state', label: 'pause' },
+    { from: 'agent', to: 'ws', label: 'actions' },
+    { from: 'state', to: 'store', label: 'persist' },
+  ]}
+  rows={[['user'], ['state', 'agent', 'llm'], ['cond', 'sec'], ['store', 'ws']]}
+/>
+
+**Event stream and conversation state.** The 2024 paper centres the agent's state on a chronological stream of actions and observations, including the user's messages and feedback; at each step the agent maps that state to its next action. The SDK makes the separation strict: the conversation state is the only mutable component, while agents, tools and LLM configurations are immutable, validated models.
+
+**Agent.** The 2024 paper's main agent, CodeActAgent, acts through three action types: running a cell in IPython, running a bash command, and sending browser commands. A Python library of helpers (AgentSkills, with functions such as `edit_file`) is pre-imported into the IPython environment, and the paper's rule is to add a helper only when the model cannot readily write the code itself. One agent can hand a subtask to another with a delegate action, as when CodeActAgent delegates web browsing to a browsing agent.
+
+**LLM.** The SDK reaches more than 100 providers through LiteLLM, using either Chat Completions or the Responses API.
+
+**Workspace.** In the 2024 design each task runs in a Docker container whose action execution server hosts a bash shell, a Jupyter IPython server and a Chromium browser driven by Playwright. The SDK abstracts this as a workspace: `LocalWorkspace` runs in-process against the host's filesystem and shell, and `RemoteWorkspace` (with Docker and hosted-API variants) sends actions over HTTP to an agent server. Switching from local to Docker is a matter of which workspace object the code constructs.
+
+**Condenser.** The default `LLMSummarizingCondenser` runs when the view exceeds 120 events, keeps the first 4 verbatim, keeps the most recent 55, and replaces the middle with one summary, leaving 60. The summariser is a separate LLM instance, often a cheaper model. The compaction lesson in this module traces what this does to an early instruction over a long run.
+
+**Security analyzer and confirmation policy.** Every tool schema gets a required `security_risk` parameter, so the model rates its own call as LOW, MEDIUM or HIGH as part of making it; there is no separate analysis call. The default confirmation policy, `ConfirmRisky`, pauses for the user at HIGH and also for UNKNOWN, which is what the no-op analyzer always returns.
+
+**Event store.** With persistence on, the SDK writes conversation metadata to `base_state.json` and each event to its own JSON file, and resumes a conversation by loading the metadata and replaying the events.
+
+## One step
+
+<Trace
+  title="One agent step that crosses the condensation limit and a risk threshold"
+  note="the command and counts are a scenario; the mechanics follow the SDK docs and paper"
+  steps={[
+    { actor: 'system', text: 'The agent builds its view from the event log: 121 events, over the 120-event limit.' },
+    { actor: 'system', text: 'condense() returns a Condensation event listing the forgotten event ids and a summary written by the summarising model.', note: 'The agent appends it to the log and returns early from this step.' },
+    { actor: 'system', text: 'Next step: the view is 60 events, the first 4, the summary and the last 55.', note: 'The forgotten events stay in the log on disk.' },
+    { actor: 'assistant', text: 'The model returns a bash action that deletes and rebuilds a directory, with security_risk set to HIGH.' },
+    { actor: 'system', text: 'ConfirmRisky sees HIGH at or above its threshold, and the conversation enters WAITING_FOR_CONFIRMATION.' },
+    { actor: 'user', text: 'Approves the action.' },
+    { actor: 'tool', text: 'The workspace runs the command in the Docker container and returns an observation event with the exit code and output.' },
+    { actor: 'system', text: 'Both events are written as JSON files and base_state.json is updated.', note: 'The SDK paper measured a median 0.20 ms per persisted event.' },
+  ]}
+/>
+
+## Context strategy
+
+Context is the condensed view of the event log, rebuilt each step. Three properties follow from making it an event.
+
+Condensation is auditable. A `Condensation` event records exactly which events were dropped from the view and the summary that replaced them, so a bad run can be diagnosed by reading what the summariser kept, which is not possible with an opaque compaction item.
+
+Condensation is a step of its own. When the condenser fires, the agent appends the event and returns early from the step, so the history is never rewritten in the middle of an action, and a manual `CondensationRequest` event (for example after a context-window error from the provider) is handled the same way on the next step.
+
+Nothing is lost from storage. The view shrinks; the log does not. Resuming, replaying or re-condensing with different settings all start from the full history.
+
+## Tools and permission model
+
+The action space is code (IPython), shell and browser, executed in a workspace. Isolation comes from the workspace: a Docker workspace confines actions to the container, and a local workspace runs them on the host with no isolation from OpenHands.
+
+Approval is a policy over a risk label. The design choice that matters is where the label comes from. The LLM analyzer asks the same model that chose the action to rate it, in the same call. That is cheap and fast, and it means the rating fails in the same situations the action does: a model that has been steered by injected content into a harmful command can also label it LOW. The defaults lean safe where they can: UNKNOWN requires confirmation unless switched off, and the threshold cannot be set to UNKNOWN.
+
+## Cost and latency
+
+The 2024 paper gives the clearest cost figure: CodeActAgent v1.8 with Claude 3.5 Sonnet (June 2024) resolved 26.0% of SWE-bench Lite's 300 instances at an average cost of $1.10 per instance.
+
+<Predict id="openhands-cost-per-resolved" question="What did each resolved SWE-bench Lite instance cost on average, in dollars?" answer={4.23} tolerance={0.1} unit="USD">
+<Fragment slot="prompt">
+<p>From the paper: $1.10 average cost per attempted instance, 26.0% of 300 instances resolved. Assume cost does not depend on whether the instance was resolved.</p>
+</Fragment>
+<p>Resolved instances: 0.26 × 300 = 78. Total cost: 300 × $1.10 = $330. Per resolved instance: $330 / 78 = <b>$4.23</b>, or equivalently $1.10 / 0.26. Cost per attempt is the number vendors report; cost per resolved task is the one a team budgets with, and it moves with the resolve rate as much as with token prices.</p>
+</Predict>
+
+The SDK paper adds three measurements. The condenser it ships as default is cited as cutting API cost by up to 2x without degrading performance. Event sourcing costs little: across 433 SWE-bench Verified conversations with 39,870 events, persisting an event took a median 0.20 ms (p95 0.31 ms) and replaying a full conversation a median 4.1 ms (p95 9.7 ms). And on matched models, the redesigned SDK scored 72.8% on SWE-bench Verified with Claude Sonnet 4.5 against 64.6% for the previous version. All of these are the authors' own measurements.
+
+## Failure modes
+
+- **Self-rated risk.** The risk label is produced by the model being supervised. Confirmation fires only when that model says HIGH, so it catches honest mistakes and misses steered ones.
+- **Local workspace on a developer machine.** `LocalWorkspace` runs actions against the host filesystem and shell. Moving to Docker is one object change, which makes it easy to forget for a quick experiment that later becomes a service.
+- **Condensation bugs.** In the SDK paper's 15-day production comparison, system-attributable errors fell from 78.0 to 30.0 per 1,000 conversations, and most of the new version's remaining 29.7 SDK errors per 1,000 came from a condensation bug found during the extended-thinking rollout, since fixed. The condenser is where a model-format change (thinking blocks) met history rewriting.
+- **Summaries of summaries.** With the defaults, the summary is re-summarised every 61 events, so an instruction from early in a long run survives only as a repeatedly compressed paraphrase unless it sits in the first four events.
+
+## What is not public
+
+- **Production usage.** There are no published figures for how many teams run OpenHands, on what repositories, or with what success on their own work. The SDK paper reports error rates for a 15-day rollout, not usage or task outcomes.
+- **How accurate the risk labels are.** The docs and papers describe the mechanism and give no measured rate of correct, under-rated or over-rated labels. The rating is a hint, not a control, because the model being supervised sets it.
+- **The summary quality of the condenser.** The cost reduction is cited; how often a condensation drops something the run later needed is not reported.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your team will build an internal agent on the OpenHands SDK that can run commands against staging infrastructure. Security asks whether ConfirmRisky with the LLM analyzer is a sufficient approval control. You have one engineer for a month. What do you answer and build?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>No: the risk label comes from the model being supervised, so it misses exactly the steered actions security worries about. Keep it as a hint, and build the control around it: a Docker workspace with no production credentials and restricted network, a deterministic check on the action itself (command and target patterns that always require confirmation), and confirmation for UNKNOWN left on. The event log gives security an audit trail of every action, approval and condensation.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The constraint conflict is coverage against effort. A complete policy engine is out of reach in a month; a model-rated label is free but not independent.</p>
+<p>The month goes on three things. The workspace is the boundary: Docker, credentials scoped to staging, egress limited to the hosts the agent needs. Then a small deterministic layer that rates risk from the action, not from the model's opinion: any command matching deletion, credential, network or deployment patterns, and any action outside the workspace path, is HIGH regardless of the label. Where the model's label and the rule disagree, the higher wins, and disagreements are logged as their own signal. Finally, the audit: the event log already records actions, observations, confirmations and condensations, so the work is retention and a review query.</p>
+<p>What I give up: pattern rules produce false confirmations and need an owner. The failure mode is approval fatigue, so I track confirmations per session and prune patterns that are always approved.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>After two weeks, engineers approve 95% of confirmations without reading. Which patterns do you remove, and what risk do you accept in writing?</em></li>
+<li><em>Security asks for proof that the model's label adds anything over the rules. What do you measure from the log, and what result would make you drop it?</em></li>
+<li><em>A run fails because the condenser dropped the staging environment name and the agent targeted a default. Where in the log do you look, and what do you change?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The 2024 and 2025 papers describe different generations: CodeActAgent and the Docker action server come from the 2024 platform, the immutable models, workspaces and analyzer from the SDK. Which agent a given deployment runs, and with which defaults, depends on its version and configuration.
+
+The benchmark and overhead numbers are the authors' own, on public benchmarks. They describe the harness's capability and cost on those tasks, not on a particular team's repositories.
+
+<SelfRate id="lesson:harness/context-management/openhands" />

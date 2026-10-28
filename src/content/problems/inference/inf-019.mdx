@@ -1,0 +1,137 @@
+---
+id: inf-019
+title: Long meetings turn to noise after a memory cap
+subtitle: rank the causes, then keep the saving
+track: inference
+module: inference-anatomy
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [kv-cache, sliding-window, rope, long-context, streaming, memory]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: "Efficient Streaming Language Models with Attention Sinks (Xiao et al., ICLR 2024)"
+    url: https://arxiv.org/abs/2309.17453
+    note: "window attention fails once text exceeds the cache; keeping the KV of four initial tokens largely recovers it; Llama-2-13B perplexity 5,158 with a 1,024-token window against 5.40 with 4 initial tokens plus 1,020; four newline tokens in place of the initial ones give 5.60, so position matters more than content; positions are assigned within the cache, with keys cached before the rotary transform; it does not extend the context window or long-term memory. Checked 2026-10-28."
+  - title: gpt-oss-120b and gpt-oss-20b model card (OpenAI, 2025-08-08), section 2.2
+    url: https://arxiv.org/abs/2508.10925
+    note: "attention alternates between a banded window of 128 tokens and dense layers; each head has a learned bias in the softmax denominator, similar to attention sinks, which lets it attend to no token. Checked 2026-10-28."
+  - title: gpt-oss-120b config.json
+    url: https://huggingface.co/openai/gpt-oss-120b/raw/main/config.json
+    note: "36 layers alternating sliding_attention and full_attention, sliding_window 128. Checked 2026-10-28."
+  - title: vLLM docs, Quantized KV cache
+    url: https://docs.vllm.ai/en/latest/features/quantization/quantized_kvcache.html
+    note: "without calibration all FP8 scales are set to 1.0; sliding-window layers are more sensitive to KV quantisation and can be skipped with --kv-cache-dtype-skip-layers. Checked 2026-10-28."
+  - title: amitshekhariitbhu, AI engineering interview questions
+    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
+    note: "synthesised question list, no company named, so no company tag: lists \"How does Sliding Window Attention work?\" and \"How do Attention Sinks work?\". The incident below is original. Checked 2026-10-28."
+choices:
+  - text: Evicting the oldest block drops the first tokens, which later queries use as a place to park attention they do not need
+    correct: true
+    why: Usability falls within a few hundred tokens of 4,096, exactly where the first eviction lands, and the first block is the only thing that changes at that point.
+  - text: Retired blocks never return to the allocator, so memory pressure forces preemptions that leave sessions with damaged caches
+    correct: false
+    why: The leak is real and explains the rising preemptions, but a preempted session is recomputed from its tokens, which is slow and correct, and the failure starts at a fixed length rather than late in the day.
+  - text: FP8 keys with default scales of 1.0 lose precision, and the rounding error accumulates as every session grows longer
+    correct: false
+    why: Uncalibrated scales are a real defect, but sessions under 4,096 tokens kept their usability under FP8, and error that grows with length would not cliff at the window size.
+  - text: Rotary positions stay absolute, so past 4,096 tokens each query sits further from the cached keys than training covered
+    correct: false
+    why: Absolute positions keep every query within 4,096 tokens of every cached key, inside the 8,192 the model was trained on; this becomes a problem only once the first tokens are kept again.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Debug round">
+"After last week's release, long meetings produce garbage. Here is what we have. What happened, and how do we keep the memory saving?"
+</Callout>
+
+A meeting assistant streams a live transcript into one long-running session per meeting and answers questions about it. The model, for this problem: a dense 8B model with rotary position embeddings, full attention in every layer, trained on 8,192-token sequences. Everything below is synthetic.
+
+The release shipped three changes. To cap memory per session, the engine's session cache now keeps a window of 4,096 tokens:
+
+```diff
+ class SessionCache:
+-    def __init__(self, allocator, block_size=16):
++    def __init__(self, allocator, block_size=16, window_tokens=4096):
+         self.allocator = allocator
+         self.block_size = block_size
++        self.window_blocks = window_tokens // block_size
+         self.blocks = []
++        self.retired = []
+
+     def append(self, block_id):
+         self.blocks.append(block_id)
++        while len(self.blocks) > self.window_blocks:
++            self.retired.append(self.blocks.pop(0))
+
+     def close(self):
+-        self.allocator.free(self.blocks)
++        self.allocator.free(self.blocks + self.retired)
+```
+
+The same release set `kv_cache_dtype: fp8` in the serving config, with no scales file, and raised the session limit per replica from 40 to 120. Keys are cached after the rotary transform at their absolute positions, as before.
+
+```text
+answers rated usable by reviewers, by session length when the question was asked
+  length                 answers   before release   after release
+  under 4,096 tokens       1,840        95%              96%
+  4,096 to 4,300             212        94%              11%
+  over 4,300                 590        95%               3%
+
+offline replay of one 6,000-token transcript through the new cache, perplexity per span
+  tokens 1 to 4,096       6.1
+  tokens 4,097 to 4,200   around 900, then stays above 500
+
+engine, per replica, during the day after release
+  KV blocks in use        rises from 31% at 09:00 to 97% at 16:00
+  preempted sequences     0.1% of steps at 09:00, 2.4% at 16:00
+```
+
+There are no attention maps, no replay with FP8 turned off, and no replay with the window disabled. Pick the defect that explains the noise, rank the other three, say what you would collect, and fix it without giving back the memory saving.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the replay of the same transcript with the window on and FP8 off, so one change is isolated.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the per-span perplexity replay with block 0 pinned and everything else unchanged.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask how long meetings run in tokens, and whether any session exceeds the length the model was trained on.</p></details>
+
+## Answer
+
+**The cause.** `self.blocks.pop(0)` evicts the first block, and with it the first 16 tokens of the session. Models trained with full attention put a large share of each query's attention on the first few positions whatever they contain, because the softmax has to sum to one and those positions are visible to every query during training. Xiao et al. call them attention sinks. Remove them and that mass spreads over the remaining tokens, and the outputs degenerate. The evidence matches the mechanism's signature: usability drops at 4,096 to 4,300 tokens, right where the first eviction lands, and the replay goes from perplexity 6 to about 900 at the same point. The paper's measurement has the same shape: Llama-2-13B at 5,158 with a pure window against 5.40 when 4 initial tokens are kept, and 5.60 when those 4 are newlines, so it is the position, not the words.
+
+**The ranking of the rest.**
+
+1. *The retired-block leak* ranks first. `retired` is freed only in `close()`, so a meeting holds every block it ever used, and the cap saves no memory at all. That is the climb from 31% to 97% and the preemptions. It does not explain the noise: a preempted sequence is recomputed from its tokens, which costs time but gives the same cache. Fix it before anything else ships, because the memory saving the release was for does not exist yet.
+2. *FP8 with scales of 1.0* ranks second. It is a real accuracy risk that vLLM's docs describe (no calibration means every scale is 1.0), but the under-4,096 row is unchanged, and an error that grows with length would not fall off a cliff at the window size. Calibrate the scales or turn FP8 off until a long-context comparison passes.
+3. *Absolute positions* are not a defect today: every cached key is within 4,096 tokens of the query, inside the 8,192 trained length. They become one the moment the fix keeps the first tokens, which is why the fix needs a second decision.
+
+**What I would collect.** The replay with FP8 off and the window on, which isolates the window; the same with block 0 pinned; per-layer attention mass on positions 0 to 3. Without them I would still ship the pinned block behind a flag to 5% of sessions and watch the over-4,300 row, because the change is small and its signature is specific.
+
+**The fix, and the decision inside it.** Never evict block 0: keep 16 sink tokens (the paper keeps 4; the block size rounds up) and 4,080 recent tokens, so the window costs 0.4% of its saving. Then the positions. A session past 8,192 tokens puts its query more than 8,192 positions from the sink keys, beyond anything the model saw in training. Two defensible answers:
+
+- *Positions within the cache*, as StreamingLLM does: cache keys before the rotary transform and rotate them by their position in the cache at each step, so the sink sits at 0 and the window at 16 to 4,095 forever. Sessions can run indefinitely. The cost is an engine change to the attention kernel and the cache layout, owned by this team from then on.
+- *Absolute positions, with a cap at the trained length*: keep the sink block and the window, and at 8,192 tokens start a new session whose prompt is a running summary of the meeting so far. No kernel change. The cost is a summarisation call per 8,192 tokens and whatever detail the summary drops.
+
+I would ship the cap and summary this sprint, because an hour-long meeting is past 8,192 tokens and the kernel route is weeks of engine work, and keep the in-cache positions as the option if summaries measurably lose answers.
+
+**How the fix fails.** Both options keep the model fluent past the window; neither makes it remember. The paper is explicit that StreamingLLM does not extend the context window or long-term memory. At minute 50 a question about minute 3 gets an answer built from the last 4,080 tokens and the summary, and it reads as well as a correct one. The noise was at least visible. Questions about earlier parts of the meeting need a retrieval path over the stored transcript, and the eval set needs questions whose answer lies outside the window.
+
+## Follow-ups
+
+- *Pushback: the summary call adds cost to every long meeting, and finance asks why you do not just run the window without sinks on a model that tolerates it. What do you say, and what would that model need?* gpt-oss is one published example: each head has a learned bias in the softmax denominator, so it can attend to nothing, and half its layers use a 128-token window by design.
+- *Reversal: what would you need to see to move from the summary cap to positions within the cache?* Reviewed answers about content older than the window measurably worse with the summary than with a pinned-sink stream on a replayed set, at a cost the engine work is worth.
+- *Two senior engineers disagree: one wants the sink fix behind a flag today, the other wants the FP8 replay first. How do you decide without deciding by rank?* The pinned-block change is reversible in minutes and its success signal is the over-4,300 row; run both, flag first.
+- *What does the window do to prefix caching across sessions that share a meeting template?* Once block 0 is pinned and later blocks roll, only the pinned prefix can still be shared.
+
+## Common mistakes
+
+- Blaming the model's context length when every query is within the trained range.
+- Taking the preemptions for the cause because they rose on the same day.
+- Pinning the first tokens and leaving absolute positions in place for sessions longer than the trained length.
+- Shipping the window with the leak still in it, so the memory saving never happens.
+- Calling the fix done when the outputs read well again, without testing questions about content outside the window.

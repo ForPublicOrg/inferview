@@ -1,0 +1,166 @@
+---
+title: "vLLM's request path"
+track: inference
+module: batching
+order: 4
+kind: teardown
+level: senior
+minutes: 15
+summary: A teardown of one request through vLLM v0.32.0, from the API server process to the engine core's scheduler, KV block manager, prefix cache and model runner, with every excerpt pinned to a commit because the code changes every few weeks.
+prerequisites: [inference/batching/continuous-batching, inference/batching/paged-attention, inference/batching/chunked-prefill]
+updated: 2026-10-28
+sources:
+  - title: vllm-project/vllm on GitHub, release v0.32.0 (2026-10-18, commit 5df63a7)
+    url: https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be
+    note: "Apache-2.0. v0.32.0 was the latest release on 2026-10-28; every code reference in this teardown is to this commit. Files read: vllm/v1/engine/core.py (step: schedule, execute_model, update_from_output), vllm/v1/core/sched/scheduler.py, vllm/v1/core/kv_cache_manager.py, vllm/v1/core/block_pool.py, vllm/v1/core/kv_cache_utils.py (FreeKVCacheBlockQueue), vllm/config/scheduler.py, vllm/config/cache.py, vllm/config/vllm.py (async scheduling default), vllm/engine/arg_utils.py (budget defaults by GPU), vllm/v1/metrics/loggers.py."
+  - title: vLLM releases on GitHub
+    url: https://github.com/vllm-project/vllm/releases
+    note: "v0.30.0 published 2026-09-22, v0.31.0 2026-10-05, v0.32.0 2026-10-18 (GitHub releases API, checked 2026-10-28)."
+  - title: vLLM V1 alpha release blog (2025-01-27)
+    url: https://vllm.ai/blog/2025-01-27-v1-alpha-release
+    note: "EngineCore busy loop in its own process; API server and AsyncLLM handle tokenization, multimodal preprocessing, detokenization and streaming; ZeroMQ IPC; {request_id: num_tokens} scheduling with no prefill or decode phases; persistent batch updated by diffs; piecewise CUDA graphs; torch.compile; tensor-parallel workers cache request state and receive diffs; prefix caching on by default with under 1% throughput loss at a 0% hit rate; up to 1.7x over V0 from lower CPU overhead. Checked 2026-10-28."
+  - title: "Efficient Memory Management for Large Language Model Serving with PagedAttention (Kwon et al., SOSP 2023)"
+    url: https://arxiv.org/abs/2309.06180
+    note: "Block tables, block size 16 default, reference counts and copy-on-write, all-or-nothing eviction, recomputation versus swapping. Checked 2026-10-28."
+  - title: vLLM docs, Automatic prefix caching design
+    url: https://docs.vllm.ai/en/latest/design/prefix_caching.html
+    note: "Block hash of parent hash, tokens and extra keys; full blocks only; KVCacheBlock fields block_id, block_hash, ref_cnt and free-list pointers; preallocated block pool; free queue with LRU eviction, freed blocks appended in reverse order; touch on cache hit; cache_salt. Checked 2026-10-28."
+  - title: vLLM docs, Metrics design
+    url: https://docs.vllm.ai/en/latest/design/metrics.html
+    note: "Metrics are computed in the frontend API server from EngineCoreOutputs; the engine core records QUEUED, SCHEDULED, PREEMPTED and NEW_TOKENS timestamps; interval definitions; monotonic timestamps must come from one process; swap metrics no longer apply in V1. Checked 2026-10-28."
+  - title: vLLM docs, Optimization and tuning
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: "gpu_memory_utilization sets the share of memory pre-allocated for the cache; preemption by RECOMPUTE in V1; chunked prefill on whenever possible with decodes batched first; max_num_batched_tokens guidance. Checked 2026-10-28."
+  - title: vLLM docs, Security
+    url: https://docs.vllm.ai/en/latest/usage/security.html
+    note: "--api-key covers only /v1, /v2, /inference and /cohere prefixes; /invocations, /pause, /abort_requests, /update_weights, /metrics, /tokenize and others stay open; inter-node traffic insecure by default; no tenant isolation within one process; cache_salt against TTFT timing side channels; dynamic LoRA loading not a secure operation. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import Diagram from '../../../../components/Diagram.astro';
+import Trace from '../../../../components/Trace.astro';
+
+## What it is and who runs it
+
+vLLM is an Apache-2.0 serving engine for transformer models, developed in the open at `github.com/vllm-project/vllm`. It began as the system around the PagedAttention paper (SOSP 2023) and has been rebuilt since on the V1 architecture announced in January 2025. Anyone serving open-weight models can run it, behind an OpenAI-compatible HTTP server or as an offline Python library. This teardown describes the engine, not any operator's deployment: how a provider configures it, routes to it or patches it is not public.
+
+Unlike most teardowns, almost everything here can be read in source. The difficulty is the rate of change: v0.30.0, v0.31.0 and v0.32.0 shipped on 22 September, 5 October and 18 October 2026. Every file reference below is to v0.32.0 at commit `5df63a7`, the latest release on 2026-10-28. Line-level behaviour can differ at any later commit.
+
+## The system
+
+<Diagram
+  title="vLLM V1: one request's path through the processes"
+  nodes={[
+    { id: "client", label: "Client", note: "HTTP, streamed" },
+    { id: "api", label: "API server process", note: "tokenize, detokenize, stream" },
+    { id: "metrics", label: "Metrics", note: "Prometheus /metrics" },
+    { id: "sched", label: "Scheduler", note: "token budget per step" },
+    { id: "kv", label: "KV block manager", note: "block pool, block tables" },
+    { id: "prefix", label: "Prefix cache", note: "block hash to block" },
+    { id: "runner", label: "Model runner", note: "persistent batch, CUDA graphs" },
+  ]}
+  edges={[
+    { from: "client", to: "api", label: "OpenAI API" },
+    { from: "api", to: "sched", label: "ZeroMQ" },
+    { from: "sched", to: "api", label: "outputs, stats" },
+    { from: "api", to: "metrics", label: "intervals" },
+    { from: "sched", to: "kv", label: "allocate_slots" },
+    { from: "kv", to: "prefix", label: "lookup" },
+    { from: "sched", to: "runner", label: "tokens per request" },
+    { from: "runner", to: "sched", label: "sampled tokens" },
+  ]}
+  rows={[["client"], ["api", "metrics"], ["sched"], ["kv", "prefix"], ["runner"]]}
+/>
+
+**API server process.** The OpenAI-compatible frontend accepts the request, applies the chat template, tokenizes, preprocesses images or audio, and later detokenizes and streams tokens back. The V1 release post moved this CPU-heavy work out of the process that drives the GPU so it overlaps with the engine loop instead of stretching every step. The frontend talks to the engine core over ZeroMQ sockets.
+
+**Scheduler.** It lives in the engine core process, whose busy loop in `vllm/v1/engine/core.py` repeats three calls: `scheduler.schedule()`, `model_executor.execute_model()`, `scheduler.update_from_output()`. `schedule()` produces a map from request id to tokens to compute this step, bounded by `max_num_batched_tokens` and `max_num_seqs`. It serves running requests first, then admits waiting ones if nothing was preempted, under a first-come-first-served or priority policy. Prompts and outputs are the same kind of token to it; a prefill is a request whose computed count lags far behind its known count.
+
+**KV block manager.** At startup the engine reserves a share of GPU memory for the KV cache, set by `gpu_memory_utilization` (0.92 by default in v0.32.0), and carves it into a preallocated pool of blocks of 16 tokens by default. Each `KVCacheBlock` carries an id, a hash once full, a reference count and pointers into a doubly linked free queue, so moving a block to the tail of the queue is constant time. `allocate_slots()` gives a request the blocks for the tokens scheduled this step, or fails, which is when the scheduler preempts. Since `scheduler_reserve_full_isl` defaults to on, admission also checks that the request's whole input fits, not just its first chunk.
+
+**Prefix cache.** Full blocks are indexed by a hash of the parent block's hash, the block's token ids and extra keys (LoRA id, multimodal hashes, `cache_salt`). A new request walks its prompt block by block until the first miss and takes a reference on every hit, removing unreferenced hits from the free queue. Freed blocks keep their hashes in the free queue until allocation reaches them at the head, which makes the cache an LRU over idle blocks with no separate memory budget. The design doc's name for this is automatic prefix caching; it has been on by default since V1.
+
+**Model runner.** It turns the scheduler's output into one forward pass. V1 keeps the input tensors as a persistent batch and applies only the diff each step (requests added, removed, tokens appended), captures piecewise CUDA graphs, and compiles the model with `torch.compile`. With tensor parallelism, workers cache request state and receive only per-step diffs. Async scheduling, which overlaps the next step's scheduling with the current step's execution, is enabled by default in `vllm/config/vllm.py` unless the configuration rules it out.
+
+**Metrics.** The engine core records timestamps for queued, scheduled, preempted and new-token events and ships them with each step's outputs; the API server computes intervals and exports Prometheus metrics. Doing the arithmetic in the frontend keeps it off the engine loop, at the cost of a rule the design doc spells out: intervals must use timestamps from one process, because monotonic clocks differ between processes.
+
+## One request, start to finish
+
+A scenario on one replica: 100 requests are already decoding, the budget is 2,048 tokens, and a chat request arrives with a 5,000-token prompt whose first 2,000 tokens are a system prompt other requests have used.
+
+<Trace
+  title="A 5,000-token chat request through vLLM v0.32.0"
+  note="scenario numbers; block size 16"
+  steps={[
+    { actor: "user", text: "POST /v1/chat/completions with stream on. The API server applies the chat template, tokenizes to 5,000 tokens and sends the request to the engine core.", tokens: 5000 },
+    { actor: "scheduler", text: "The request waits in the waiting queue behind earlier arrivals. Its queued timestamp starts the queue interval." },
+    { actor: "kv", text: "On admission the prefix cache walks the prompt's blocks: the system prompt's 125 full blocks (2,000 tokens) hit and gain a reference each. The full input needs 313 blocks (5,000 / 16 = 312.5), so 188 are new.", tokens: 2000, note: "Only full blocks are cached; a hit never covers the last prompt token." },
+    { actor: "scheduler", text: "Step 1: the 100 decodes take 100 tokens of the budget; the prompt gets the remaining 1,948.", tokens: 1948 },
+    { actor: "runner", text: "Step 2: the prompt gets its last 1,052 tokens alongside the decodes, the sampler draws its first token, and the API server streams it. TTFT is measured from arrival to this point.", tokens: 1052 },
+    { actor: "scheduler", text: "Decode steps: one token per step alongside whatever else is running. A new block every 16 tokens; each block is hashed into the prefix cache as it fills." },
+    { actor: "kv", text: "After 400 output tokens the cache is full and a request earlier in the running list needs a block. Under FCFS the scheduler preempts the last request in the running list, which in this scenario is this one.", note: "All-or-nothing: every block of the sequence is released." },
+    { actor: "scheduler", text: "Preemption: its 338 blocks are released (5,400 / 16 = 337.5), the 125 shared ones keep their other references, its computed count goes to zero, and it goes to the front of the waiting queue." },
+    { actor: "kv", text: "Readmission: the system prompt hits again. Its own 213 blocks were evicted from the free queue in the meantime, so 3,400 tokens of prompt and output are prefilled again in chunks before it can emit token 401.", tokens: 3400 },
+    { actor: "runner", text: "It finishes at a stop token. Its blocks return to the free queue, the API server detokenizes and closes the stream, and the request's histograms record one preemption." },
+  ]}
+/>
+
+The preemption in steps 7 to 9 shows up nowhere in the response body. It shows up as one very long inter-token gap, because the metrics design assigns a preemption during decode to inter-token latency, and in `vllm:num_preemptions` and `vllm:request_num_preemptions`.
+
+## Context strategy
+
+For a serving engine, context is KV cache, and vLLM manages three scopes of it. Within a request, the KV grows a block at a time and is discarded on finish or preemption; recomputation, not swapping, is the only recovery path in V1. Across requests, the prefix cache shares full blocks by hash, so a stable system prompt or a long multi-turn history is computed once while it stays resident. Across steps, chunked prefill spreads a long prompt over several steps under the token budget, and the full-input admission check stops the engine from starting prompts it cannot finish.
+
+Nothing is persisted beyond GPU memory in the default configuration. KV connectors that offload to CPU, disk or other nodes exist but are outside this teardown. Caching decisions are exact: a one-token difference early in the prompt changes every later block hash.
+
+## Tools and permission model
+
+vLLM has no tools in the agent sense; its permission model is about who may call what. The security docs are blunt about the limits. `--api-key` protects only routes under `/v1`, `/v2`, `/inference` and `/cohere`. With a key set, `/invocations` still serves the same inference without authentication, operational routes such as `/pause`, `/abort_requests` and `/update_weights` stay open, and so do `/metrics`, `/tokenize` and `/health`. The docs say not to rely on the key alone.
+
+Within one process vLLM does not isolate tenants, and the prefix cache is a timing side channel: a fast first token reveals that someone sent the same prefix. `cache_salt` limits sharing to requests with the same salt, and the docs recommend a secret random salt per user or per organisation. Traffic between nodes in a multi-node deployment (PyTorch distributed, KV transfer) is unauthenticated and unencrypted by default, and dynamic LoRA loading is not a secure operation. The intended posture is an isolated network with only the API port reachable, behind a gateway that does authentication and per-tenant limits.
+
+## Cost and latency
+
+Three costs dominate a step: the forward pass, CPU work around it, and waiting for it. The V1 rewrite's reported gain of up to 1.7 times over V0 came from cutting CPU overhead with nearly identical kernels, which says how much of a small model's step time used to be Python. The token budget sets the step's worst-case length, and its default depends on the GPU the engine finds: the OpenAI-compatible server uses 2,048 on A100s and smaller GPUs, 8,192 on 70 GiB and larger non-A100 GPUs, and 16,384 at 160 GiB and above. Prefix caching costs under 1% of throughput at a zero hit rate by the V1 post's measurement and saves whole prefills when it hits.
+
+Preemption is the cost that hides. In the trace, one eviction after 400 output tokens forces 3,400 tokens of recomputation, the 3,000 uncached prompt tokens again plus the 400 it had generated. With about 100 decodes taking their share of a 2,048 budget, that is two steps of prefill (1,948 + 1,452 tokens) before token 401, delivered as a stall in the middle of a stream that had been running at one token per step.
+
+## Failure modes
+
+- **Preemption churn.** Admission outruns KV capacity, and requests evict and recompute each other. Signs: `vllm:kv_cache_usage_perc` near 1, `vllm:num_preemptions` rising, ITL spikes on preempted requests. Remedies in the docs: more memory for the cache, fewer concurrent sequences or a smaller budget, more parallelism; the `watermark` setting keeps headroom at admission.
+- **Budget drift across hardware.** An unpinned `max_num_batched_tokens` follows the detected GPU, so the same configuration on A100s and H100s runs different latency trade-offs.
+- **Silent prefix misses.** A timestamp or request id near the start of the system prompt changes every block hash after it. Hit rate falls to zero with no error; `vllm:prefix_cache_queries` and `vllm:prefix_cache_hits` are the only signal.
+- **Exposed control routes.** Treating `--api-key` as the access control leaves `/invocations` and operational routes open to anyone who reaches the port.
+- **Misread metrics.** A comment in `loggers.py` warns that `vllm:iteration_tokens_total` may be wrong when several API server processes share Prometheus multiprocess mode.
+
+## What is not public
+
+Little about the engine itself, since the source is open; the gaps are in how it behaves in anyone's production. The defaults, their reasons and their benchmarks are spread across pull requests and release notes that this teardown did not read (the A100 budget exception cites PR 17885), and the V1 post does not fully specify its benchmark configuration. No source here reports prefix-cache hit rates, preemption rates or budget settings from a real deployment. And any excerpt is only true at its commit: scheduler settings such as `scheduler_reserve_full_isl` and `long_prefill_token_threshold_adaptive` are recent, and the next release may rename or change them.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"After a vLLM upgrade, p99 time to first token on your chat service doubled while throughput stayed flat. Walk through the request path and say where you would look first."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>TTFT is queue time plus the prefill steps, and the metrics split them. If queue time grew, admission changed: <code>max_num_seqs</code>, the full-input admission check or a watermark. If prefill time grew, the budget or the prefix cache changed: a different default budget for the GPU, or a hash change that dropped the hit rate. Diff the effective configuration the two versions log at startup before reading any code.</p>
+</Fragment>
+<Fragment slot="long">
+<p>I would start from the request path. A request queues in the waiting queue, gets a prefix lookup on admission, runs its uncached prompt in chunks under the budget alongside decodes, then samples its first token. Each part has its own metric: <code>vllm:request_queue_time_seconds</code>, <code>vllm:request_prefill_time_seconds</code>, prefix-cache queries and hits, and tokens per step.</p>
+<p>If queue time doubled at flat throughput, the engine is admitting differently. A full-input admission check that the old version lacked, a lower <code>max_num_seqs</code> default, or a watermark would all hold requests in the queue that used to start and then preempt. That trade may be intended: fewer preemptions, better ITL, worse TTFT.</p>
+<p>If prefill time doubled, look at the budget first, since its default follows the GPU and can change between versions, and at the hit rate, since a hash or template change makes every system prompt a miss and multiplies prefill work at unchanged throughput. Then check preemptions during prefill, which the metrics assign to TTFT.</p>
+<p>The fix is to pin the settings that encode our latency policy, not to roll back by reflex, and to add a startup check that fails the deploy when the effective budget, sequence cap or prefix-caching state differs from the pinned values.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The diff shows the new admission check is the cause, and it cut preemptions by half. Product wants the old TTFT back. Which do you keep?</em></li>
+<li><em>Prefix hit rate fell from high to near zero after the upgrade but no template changed. What else feeds the block hash?</em></li>
+<li><em>Two teams share the replica pool and only one set <code>cache_salt</code>. What does each team leak to the other?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+<SelfRate id="lesson:inference/batching/vllm-request-path" />

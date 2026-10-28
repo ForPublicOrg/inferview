@@ -1,0 +1,140 @@
+---
+title: Permissions, freshness and the ANN index
+track: rag
+module: retrieval-foundations
+order: 2
+kind: lesson
+level: staff
+minutes: 14
+summary: Access control, deletes and freshness all work against an approximate index, so the design decision is where the permission predicate runs relative to the scan, how the index is partitioned, and which of three clocks (content, permission, deletion) each mechanism is allowed to lag.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: pgvector README (v0.8.7 install instructions, checked 2026-10-28)
+    url: https://github.com/pgvector/pgvector
+    note: "filtering applied after the approximate index scan; 10% match with ef_search 40 returns about 4 rows; B-tree on the filter column gives exact search and works for low-percentage conditions; partial indexes for few values, partitioning for many; shared index lets one tenant affect another's recall and speed; iterative scans from 0.8.0 with strict_order and relaxed_order; hnsw.max_scan_tuples 20,000 by default, approximate, does not affect the initial scan; hnsw.scan_mem_multiplier 1 by default; dead tuples reduce results; HNSW vacuum slow, reindex first; monitor recall against exact search"
+  - title: pgvector CHANGELOG (checked 2026-10-28)
+    url: https://github.com/pgvector/pgvector/blob/master/CHANGELOG.md
+    note: "0.8.0 (2024-10-30) iterative index scans and better cost estimation when filtering; 0.8.3 (2026-06-17) fixed possible index corruption with HNSW vacuuming; 0.8.4 (2026-06-30) fixed 'hnsw graph not repaired' error and inserts during HNSW vacuuming; 0.8.7 released 2026-10-01"
+  - title: Pinecone docs, Implement multitenancy (API version 2026-07, checked 2026-10-28)
+    url: https://docs.pinecone.io/guides/index-data/implement-multitenancy
+    note: "one namespace per tenant; operations target one namespace; physical isolation; metadata-filter queries scan the whole namespace regardless of filters; $in and $nin limited to 10,000 values; 100 tenants of 1 GB cost 1 RU per query vs 100 RUs in one filtered namespace; namespaces per serverless index from 100 (Starter) to 1,000,000 (Enterprise); deleting a namespace offboards a tenant"
+  - title: Pinecone docs, Check data freshness (checked 2026-10-28)
+    url: https://docs.pinecone.io/guides/index-data/check-data-freshness
+    note: "eventually consistent; compare x-pinecone-request-lsn on the write with x-pinecone-max-indexed-lsn on the query"
+  - title: Microsoft Learn, Data, Privacy, and Security for Microsoft Copilot (ms.date 2026-07-09, checked 2026-10-28)
+    url: https://learn.microsoft.com/en-us/copilot/microsoft-365/microsoft-365-copilot-privacy
+    note: "Microsoft 365 Copilot renamed Microsoft Copilot; surfaces only organizational data the user has at least view permission to; Semantic Index honors the user identity-based access boundary; honors usage rights on Purview-encrypted content; asks admins to use the Microsoft 365 permission models so the right users have access"
+  - title: "Douze et al., The Faiss Library (arXiv 2401.08281 v4, 2025-10-23)"
+    url: https://arxiv.org/abs/2401.08281
+    note: "vector-first vs metadata-first filtered search; in the BigANN filtered track, metadata-first with brute force when the estimated subset S/N is below 3 x 10^-4 (an empirical threshold); HNSW does not support suppression and mutation, HNSWlib and FreshDiskANN use rebuild heuristics"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+An approximate index returns the nearest candidates it found, then the database applies everything else in the query. For a single-tenant corpus where every user sees everything, that order is harmless. With per-user permissions, deletes and freshness requirements it is the main source of wrong answers: rows the user may not see, rows that were deleted, and pages with three results where the caller asked for ten. The design has three parts: where the permission predicate runs relative to the scan (before, during or after), how the index is partitioned, and which mechanism enforces each of three clocks, content freshness, permission revocation and deletion, whose acceptable lag differs by orders of magnitude.
+
+The closest database analogy is the planner choosing between an index on the filter column and an index on the sort key. The difference is that the vector index is approximate and bounded: unless told to scan iteratively, it does not keep producing rows until the `LIMIT` is satisfied, it hands back a fixed-size candidate list.
+
+## Why filtering after the scan starves
+
+The pgvector README states the behaviour and the arithmetic. With approximate indexes, filtering is applied after the index is scanned; if a condition matches 10% of rows, with HNSW and the default `hnsw.ef_search` of 40, "only 4 rows will match on average". The general form is candidates times the visible fraction, assuming the predicate is independent of distance to the query. The expectation hides the tail, which is what a user experiences as a short page:
+
+```python
+from math import comb
+
+
+def p_full_page(k, candidates, visible):
+    """Chance that at least k of the ANN candidates pass a permission filter keeping fraction `visible`.
+    Assumes the filter is independent of distance to the query."""
+    short = sum(comb(candidates, i) * visible**i * (1 - visible) ** (candidates - i) for i in range(k))
+    return 1 - short
+
+
+for candidates, visible in [(40, 0.10), (100, 0.10), (200, 0.10), (1000, 0.01), (2000, 0.01), (20000, 0.0005)]:
+    print(f"candidates={candidates:6d} visible={visible:7.2%} expected={candidates * visible:5.1f} "
+          f"P(10 rows)={p_full_page(10, candidates, visible):.3f}")
+# candidates=    40 visible= 10.00% expected=  4.0 P(10 rows)=0.005
+# candidates=   100 visible= 10.00% expected= 10.0 P(10 rows)=0.549
+# candidates=   200 visible= 10.00% expected= 20.0 P(10 rows)=0.996
+# candidates=  1000 visible=  1.00% expected= 10.0 P(10 rows)=0.543
+# candidates=  2000 visible=  1.00% expected= 20.0 P(10 rows)=0.995
+# candidates= 20000 visible=  0.05% expected= 10.0 P(10 rows)=0.542
+```
+
+Setting the candidate count to exactly k divided by the visible fraction fills the page about half the time. Twice that fills it almost always, which is the oversampling factor to start from when you post-filter on purpose.
+
+Since 0.8.0 (October 2024), pgvector can scan iteratively: with `hnsw.iterative_scan` set to `strict_order` or `relaxed_order`, it keeps scanning the index until enough rows pass the filter or until `hnsw.max_scan_tuples` (20,000 by default) or the memory cap (`hnsw.scan_mem_multiplier` times `work_mem`) stops it. Relaxed order returns results slightly out of distance order with better recall; a materialised CTE re-sorts them. The cap is approximate and does not count the initial scan, but it still bounds what a narrow filter can return.
+
+<Predict id="rag-rf-iterative-floor" question="Below what visible fraction of the corpus, in percent, does an average query return fewer than 10 rows?" answer={0.05} tolerance={0.01} unit="%">
+<Fragment slot="prompt">
+<p>pgvector with iterative scans on and the defaults left alone: up to about 20,000 tuples visited per query. A query asks for <code>LIMIT 10</code> with a permission predicate that is independent of vector distance.</p>
+</Fragment>
+<p><b>0.05%.</b> 20,000 visited tuples times a visible fraction f gives 20,000f expected matches, which is 10 at f = 10 / 20,000 = 0.0005. In a 10M-chunk corpus that is a user who can see 5,000 chunks; at that fraction the page is full only 54% of the time, from the last row of the table above. Raising <code>max_scan_tuples</code> moves the floor down linearly and the latency up with it, which is why narrow filters are better served by a different plan, not a bigger scan.</p>
+</Predict>
+
+## Before the scan, when the visible set is small
+
+The other plan is metadata-first: find the rows the user may see, then compute exact distances over that set. pgvector's README recommends starting with an ordinary index on the filter column, which gives exact nearest-neighbour search and works well for conditions that match a low percentage of rows; 0.8.0 also improved the planner's cost estimates for choosing between the two when filtering. The Faiss paper describes the same choice as vector-first versus metadata-first. In the BigANN filtered-search track, Faiss estimates the subset size from term frequencies and switches to metadata-first with brute force when the subset is below 3 x 10<sup>-4</sup> of the database, a threshold the authors call empirical. At 10M vectors that is 3,000 vectors; at 40M it is 12,000.
+
+So the selectivity bands map to plans. A visible set below a few thousand vectors goes metadata-first: exact, cheap, perfect recall. A large visible fraction, say above 10%, goes through the ANN index with iterative scans and a modest `ef_search`. The middle band is where neither works well, and it is the band that a partitioning decision should remove. Your application already knows the visible count for a user, from the ACL tables it joins against, so the routing decision can be made before the query is planned rather than left entirely to the planner's estimates.
+
+## Partitions for tenants, filters for documents
+
+Tenant boundaries and document ACLs are different shapes and deserve different mechanisms. pgvector's README says a shared approximate index lets one tenant's vectors affect another tenant's recall and speed, and recommends list partitioning or separate tables for tenant isolation; partial HNSW indexes fit a filter column with only a few values. A partition per tenant turns a 0.1% tenant filter into a 100% scan of a small index, which removes the middle band for the most common predicate.
+
+Pinecone's multitenancy guide (API version 2026-07) makes the same split with a price attached. One namespace per tenant gives physical isolation, every read or write targets exactly one namespace, and a tenant is offboarded by deleting its namespace. Metadata filtering in one shared namespace scans the whole namespace regardless of the filter, and a query costs 1 read unit per GB of namespace: the guide's own example is 100 tenants of 1 GB each, where a tenant query costs 1 RU in its namespace and 100 RU in a shared one. The limits matter for document ACLs too: an `$in` or `$nin` filter takes at most 10,000 values, and a serverless index allows from 100 namespaces on the Starter plan to 1,000,000 on Enterprise.
+
+Inside a tenant, document permissions become a filter on allowed principals stored with each chunk, matched against the user's expanded group list. Two things break this in practice. Group expansion grows without bound in large directories, and a user in thousands of groups hits filter-size limits. And source systems express permissions the allow-list cannot: inheritance, deny entries, sharing links. When the index cannot represent the rule, the index can only narrow the candidates; the final decision has to come from the source of truth.
+
+## A public reference: Microsoft Copilot
+
+Microsoft's privacy documentation for Microsoft Copilot (renamed from Microsoft 365 Copilot; page dated 9 July 2026) states the contract rather than the mechanism. Copilot surfaces only organisational data the user has at least view permission to; the Semantic Index honours the user's identity-based access boundary so that grounding reaches only content the user is authorised to access; content encrypted through Microsoft Purview is subject to the usage rights granted to the user. The same page asks administrators to use the Microsoft 365 permission models to make sure the right users have access to the right content.
+
+The engineering consequence is that retrieval inherits the source system's permissions, including every overshared site. Before a model sat on top, a file shared with the whole company was reachable but rarely found; ranked retrieval finds it on the first relevant question. A permission-correct design is therefore not the same as a safe rollout, and an access review of the most broadly shared sources belongs in the launch plan. The page does not say whether trimming happens before or after ranking or how quickly a revoked permission takes effect in the Semantic Index, and nothing here assumes either.
+
+## Three clocks
+
+Content freshness is a quality property: a runbook edited ten minutes ago and still served in its old form produces a stale answer. Revocation and deletion are security and compliance properties: a user removed from a group, or a document deleted under a legal request, must stop appearing within a stated bound. They need separate mechanisms because the cheap one for content is wrong for the other two.
+
+- **Index write visibility.** Pinecone is eventually consistent. Each write returns `x-pinecone-request-lsn` and each query returns `x-pinecone-max-indexed-lsn`; when the second is at least the first, the query reflects that write. Postgres with pgvector is transactional: a committed delete is invisible to later queries. Neither tells you anything about permission changes in the source system, which reach the index only through your sync.
+- **Deletes inside the graph.** In pgvector, deleted rows remain as dead tuples until vacuum, and the README lists dead tuples next to filters as a reason an HNSW query returns fewer rows. Vacuuming HNSW indexes is slow; the README suggests reindexing concurrently first. Version 0.8.3 (17 June 2026) fixed possible index corruption during HNSW vacuuming and 0.8.4 fixed a "hnsw graph not repaired" error, so a delete-heavy workload needs 0.8.3 at least; the README installs 0.8.7 as of 28 October 2026. Faiss's HNSW does not support removal at all; HNSWlib and FreshDiskANN implement rebuild heuristics.
+- **Revocation.** The bound that matters is from the change in the source system to the first query that no longer returns the document. A sync pipeline's bound is its schedule plus its backlog on the worst day. A read-time check of the final candidates against the source system, or a permissions cache with its own short TTL, bounds it by that TTL, at the cost of k lookups per query and dropped rows that the retriever must over-fetch to replace.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You are building retrieval over 40M chunks for 2,000 enterprise tenants; the largest tenant holds 30% of the chunks. Document permissions come from each tenant's file system and include group inheritance. Security requires revocation to take effect within five minutes. Retrieval has a 250 ms p95 budget, and three engineers run it on Postgres. Where does the permission check run, and how is the index partitioned?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Partition by tenant, with the largest tenants in their own partitions so tenant scoping never goes through a filter. Inside a tenant, store allowed principals on each chunk and route by the user's visible count: exact search when it is small, HNSW with iterative scans when it is large. Then check the final candidates against a permissions service with a TTL under five minutes, and over-fetch to cover what that check removes. The index-side ACL is for recall; the read-time check is the security control.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Partitioning. List-partition by tenant. The largest tenant has 12M chunks; the 3 x 10<sup>-4</sup> metadata-first threshold from the Faiss paper puts the exact-search band below about 3,600 visible chunks in that partition. Thousands of small tenants can share partitions grouped by size, since a small partition's filter is cheap either way.</p>
+<p>Routing. The application already resolves the user's groups; a count of visible chunks per principal set, refreshed with the sync, picks the plan. Below the threshold, a join from the ACL table to chunks and an exact distance sort. Above about 10% visibility, HNSW with relaxed iterative scans and an <code>ef_search</code> of at least twice k over the visible fraction. The middle band gets a raised <code>max_scan_tuples</code>, and I measure its recall against exact search in a nightly job, as the README suggests.</p>
+<p>Enforcement. Group inheritance cannot be evaluated by an allow-list filter, so the five-minute bound comes from a read-time check of the top 20 to 30 candidates against a permissions cache with a TTL under five minutes, fed by change events where the source offers them. What I give up: p95 headroom for the lookups, a second system on the critical path, and recall in the middle band. Written down: the revocation bound we actually guarantee, measured from source change to enforcement, and the fail-closed rule when the permissions service is down.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The read-time check adds 60 ms at p95 and pushes you over budget. Security offers to drop it if the index ACLs sync every 60 seconds. Do you accept?</em> Only if the sync also evaluates inheritance and its lag is monitored with an alert on the five-minute bound; otherwise cut re-rank depth or candidate count before cutting the control, and put the trade in writing with security's sign-off.</li>
+<li><em>What would you need to see to collapse the tenant partitions into one shared index?</em> Recall against exact search for small tenants on the shared index matching the partitioned layout at the same latency, and an operational cost of partitions (vacuum, reindex, planner time) that the team can show is the larger risk.</li>
+<li><em>A tenant leaves and its contract requires deletion within 24 hours, with proof. How?</em> Drop the tenant's partition, record the time, and cover replicas, backups and any derived caches with their own retention dates; a shared index would need row deletes, vacuum and a reindex, which is harder to prove.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The arithmetic assumes the permission predicate is independent of distance to the query. It rarely is. A team's documents cluster together, and a user usually searches for their own team's material, so real pages are often fuller than the binomial predicts. The opposite case is the dangerous one: a user whose visible documents are all far from the query gets a short page that looks like a retrieval failure. Measure filtered recall on real user and query pairs, not on random filters.
+
+Partitioning by tenant has costs this lesson does not count: cross-tenant queries for internal support staff become fan-outs, per-tenant lexical statistics change BM25 scores for hybrid search, and thousands of partitions add planning time and maintenance work in Postgres. Pinecone's prices, namespace limits and filter limits are from its documentation for API version 2026-07 and change with plans.
+
+Finally, a correct permission filter is the floor, not the whole control. Prompt injection through a document the user is allowed to read, and answers that combine several permitted documents into something no single document would disclose, pass every check described here; the safety and security tracks cover them.
+
+<SelfRate id="lesson:rag/retrieval-foundations/permissions-freshness" />

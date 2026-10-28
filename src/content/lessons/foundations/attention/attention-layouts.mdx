@@ -1,0 +1,164 @@
+---
+title: "MHA, GQA, MLA, windows and hybrids: picking a layout for a context target"
+track: foundations
+module: attention
+order: 2
+kind: lesson
+level: staff
+minutes: 16
+summary: The attention layout fixes KV bytes per token, which sets how many long sequences a GPU can hold; the lesson computes it from four published configs and turns it into a decision for a 128K target.
+prerequisites: [foundations/attention/attention-mechanics]
+updated: 2026-10-28
+sources:
+  - title: "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints (Ainslie et al., 2023)"
+    url: https://arxiv.org/abs/2305.13245
+    note: multi-query attention can degrade quality; uptraining a multi-head checkpoint uses 5% of original pre-training compute; GQA reaches quality close to multi-head at speed comparable to multi-query
+  - title: "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model (2024)"
+    url: https://arxiv.org/abs/2405.04434
+    note: multi-head latent attention; the paper reports a 93.3% smaller KV cache and 5.76 times the maximum generation throughput of DeepSeek 67B
+  - title: DeepSeek-V3 config.json (checked 2026-10-28)
+    url: https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json
+    note: 61 layers, 128 heads, kv_lora_rank 512, qk_rope_head_dim 64, qk_nope_head_dim 128, v_head_dim 128, YaRN factor 40 from 4096 positions
+  - title: DeepSeek-V3 model card (checked 2026-10-28)
+    url: https://huggingface.co/deepseek-ai/DeepSeek-V3
+    note: 671B total and 37B activated parameters, 128K context, FP8 weights
+  - title: Meta Llama 3.1 70B Instruct, config.json (unsloth mirror, checked 2026-10-28)
+    url: https://huggingface.co/unsloth/Meta-Llama-3.1-70B-Instruct/blob/main/config.json
+    note: 80 layers, hidden 8192, 64 heads, 8 key-value heads, max positions 131072 with llama3 rope scaling from 8192
+  - title: Gemma 3 Technical Report (2025)
+    url: https://arxiv.org/abs/2503.19786
+    note: 5 local layers per global layer, local span 1024; global RoPE base raised to 1M, local kept at 10k; 128K context except the 1B; section 5.2, minimal perplexity impact from the ratio and from shrinking the window; a 2B model at 32K has about 60% KV memory overhead with global-only attention and under 15% with 1:3 and window 1024
+  - title: Gemma 3 27B, config.json (unsloth mirror, checked 2026-10-28)
+    url: https://huggingface.co/unsloth/gemma-3-27b-it/blob/main/config.json
+    note: 62 layers, 32 heads, 16 key-value heads, head_dim 128, sliding_window 1024, sliding_window_pattern 6
+  - title: gpt-oss-120b and gpt-oss-20b model card (OpenAI, 2025)
+    url: https://arxiv.org/html/2508.10925
+    note: alternating banded-window (bandwidth 128) and dense layers; 64 query heads of dimension 64, 8 key-value heads; learned softmax bias per head; dense layers extended to 131,072 tokens with YaRN; 36 layers; checkpoint 60.8 GiB
+  - title: openai/gpt-oss-120b config.json (checked 2026-10-28)
+    url: https://huggingface.co/openai/gpt-oss-120b/blob/main/config.json
+    note: layer_types alternate sliding_attention and full_attention, 18 each; sliding_window 128
+  - title: Dao-AILab/flash-attention README (checked 2026-10-28)
+    url: https://github.com/Dao-AILab/flash-attention
+    note: sliding window (local) attention from version 2.3; paged KV cache from 2.5
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import FoundationsAttentionLayoutCompare from '../../../../components/widgets/FoundationsAttentionLayoutCompare.astro';
+
+## The decision this lesson drives
+
+At long context the KV cache, not the weights, decides how many sequences a GPU decodes together, and the cache's size per token is fixed by the attention layout the model was trained with. Choosing a layout, or an open model because of its layout, is like choosing a storage format for the hottest table you own: it is decided at schema time and cannot be changed by a flag at serving time. The difference from a storage format is that changing it means training, and that each layout's saving comes with a quality claim you have to check on your own task.
+
+The four layouts in current open models fit one formula, applied per layer and summed:
+
+- **Multi-head or grouped-query attention (MHA, GQA)**: 2 × KV heads × head_dim × bytes per token per layer. GQA lowers the KV head count below the query head count; multi-query attention lowers it to one.
+- **Multi-head latent attention (MLA)**: (latent width + rotary key width) × bytes per token per layer. Keys and values are reconstructed from one cached latent.
+- **Sliding-window layers**: the same per-token cost as GQA, but the layer stops growing at the window w.
+- **Hybrids**: a stack that mixes the above, and in some models layers with no growing cache at all.
+
+## The numbers from four configs
+
+Each figure below is computed from the published config, in bf16, for one sequence of 131,072 tokens.
+
+**Llama 3.1 70B, GQA.** 80 layers, 64 query heads, 8 KV heads, head_dim 8,192 / 64 = 128. Per token: 2 × 80 × 8 × 128 × 2 = 327,680 bytes. Per sequence: 40 GiB. With one KV head per query head the same model would need 8 times as much, 320 GiB, which is the gap GQA closed. The GQA paper reports quality close to multi-head attention at speed close to multi-query, and that an existing multi-head checkpoint can be uptrained to it with 5% of the original pre-training compute.
+
+**DeepSeek-V3, MLA.** 61 layers, kv_lora_rank 512, qk_rope_head_dim 64. Per token: 61 × (512 + 64) × 2 = 70,272 bytes. Per sequence: 8.58 GiB. The comparison inside the model is starker: its 128 heads with 192-wide keys (128 + 64) and 128-wide values would cache 128 × 320 = 40,960 values per layer per token under plain multi-head attention, against 576, about 71 times less. The DeepSeek-V2 paper, which introduced MLA, reports a 93.3% smaller KV cache and 5.76 times the maximum generation throughput of DeepSeek 67B; those are the authors' own measurements against their own earlier dense model.
+
+**Gemma 3 27B, local and global.** 62 layers with sliding_window_pattern 6: every sixth layer is global, so 10 global and 52 local with a 1,024-token window. Each layer caches 2 × 16 × 128 × 2 = 8,192 bytes per token. Global layers: 10 × 8,192 × 131,072 = 10 GiB. Local layers: 52 × 8,192 × 1,024 = 416 MiB, the same at any context above 1,024.
+
+<Predict id="gemma-128k" question="Gemma 3 27B, bf16 cache: 10 global layers and 52 local layers with a 1,024-token window, 8,192 bytes per token per layer. How many GiB does one 131,072-token sequence need? Then compare with all 62 layers global." answer={10.41} tolerance={0.3} unit="GiB">
+<p>Global: 10 × 8,192 × 131,072 bytes = 10 GiB. Local: 52 × 8,192 × 1,024 bytes = 416 MiB = 0.41 GiB. Total <b>10.41 GiB</b>. All 62 layers global would be 62 GiB, so the 5:1 layout cuts the cache at 128K by a factor of about 6.</p>
+</Predict>
+
+**gpt-oss-120b, alternating windows.** 36 layers alternating a 128-token window and full attention, 18 of each; 8 KV heads of dimension 64. Each layer caches 2 × 8 × 64 × 2 = 2,048 bytes per token. Full layers: 18 × 2,048 × 131,072 = 4.5 GiB. Windowed layers: 18 × 2,048 × 128 = 4.5 MiB. Per sequence: 4.5 GiB, the smallest of the four, from a model with 116.83 billion parameters.
+
+The widget puts the four side by side. Change the context to see where the windowed layouts stop mattering, set the cache to 8 bits, and tick the last box to see what happens to the capacity plan if the engine allocates windowed layers at full length.
+
+<FoundationsAttentionLayoutCompare />
+
+## What changed in the last two years and why
+
+Llama 3.1 (2024) reached 128K with GQA in every layer and no change to the layout: its config stretches 8,192 original positions by a factor of 8 to 131,072 with RoPE scaling, plus long-context training. Several open models since have changed the layout instead. DeepSeek moved to MLA with V2 in 2024 and kept it in V3. Gemma 3 (March 2025) raised its local-to-global ratio to 5:1 with a 1,024-token window, raised the global layers' RoPE base to 1M and kept the local layers at 10k. gpt-oss (August 2025) alternates 128-token windows with full layers and adds a learned bias to each head's softmax denominator, so a head can attend to nothing.
+
+The reason is the arithmetic above. At 128K, Llama 3.1 70B needs 40 GiB of cache per sequence against about 130 GiB of bf16 weights (70 billion × 2 bytes), so three long sequences cost about as much memory as the model, and the number of concurrent long sequences per GPU is the cost of the product. Windowing makes most layers' cost constant in context; MLA makes every layer's cost small.
+
+## Quality evidence and its conditions
+
+Each layout's saving is measured; its quality claim is measured on something other than your task.
+
+- GQA's claim is close-to-multi-head quality on the paper's benchmarks after uptraining. It is the most widely deployed of the four, which is evidence of a different kind.
+- Gemma 3's ablations in section 5.2 report minimal perplexity impact from changing the local-to-global ratio and from shrinking the window. Perplexity averages over every token's prediction, most of which depend on nearby text; it says little about whether a fact on page 3 is used correctly on page 300. The memory measurement is also on a 2B model at 32K with a 1:3 ratio, not the shipped 5:1.
+- MLA's claims are DeepSeek's comparisons with its own previous models.
+- gpt-oss's model card describes the layout; the long-context behaviour you need has to be measured.
+
+The test that decides between layouts for a 128K product is a long-context evaluation on your own documents, with the evidence for each question placed at controlled depths in the window. A windowed model that holds up at the first and last quarter and fails in the middle is telling you how much information its global layers carry.
+
+## A function that reads any of the four configs
+
+```python
+def kv_bytes(cfg, n_tokens, dtype_bytes=2):
+    """KV cache bytes for one sequence of n_tokens, from a Hugging Face style config dict."""
+    layers = cfg["num_hidden_layers"]
+    if "kv_lora_rank" in cfg:                                   # MLA: one latent plus one shared rotary key
+        return layers * (cfg["kv_lora_rank"] + cfg["qk_rope_head_dim"]) * dtype_bytes * n_tokens
+    head_dim = cfg.get("head_dim") or cfg["hidden_size"] // cfg["num_attention_heads"]
+    per_layer_token = 2 * cfg["num_key_value_heads"] * head_dim * dtype_bytes
+    types = cfg.get("layer_types")
+    if types is None and cfg.get("sliding_window_pattern"):    # Gemma 3: every p-th layer is global
+        p = cfg["sliding_window_pattern"]
+        types = ["full_attention" if (i + 1) % p == 0 else "sliding_attention" for i in range(layers)]
+    types = types or ["full_attention"] * layers
+    window = cfg.get("sliding_window") or n_tokens
+    return sum(per_layer_token * (n_tokens if t == "full_attention" else min(n_tokens, window)) for t in types)
+```
+
+Fed the fields above, it prints 40.00, 8.58, 10.41 and 4.50 GiB at 131,072 tokens. Config conventions differ by model family and by library version, so check each new model's field names before trusting the function with it; Llama 3.1 70B's config has no head_dim field, which is why the code falls back to hidden size over head count.
+
+## The decision procedure for a 128K target
+
+1. **Weights fit first.** DeepSeek-V3's 671 billion parameters in its released FP8 are at least 671 GB, more than a node of eight 80 GB GPUs holds, whatever its cache costs.
+2. **Bytes per token for the layers that grow.** Multiply by your token distribution, not the maximum context, to get memory per session.
+3. **Whether the engine realises the saving.** A windowed layer saves memory only if the engine allocates it at the window. FlashAttention has supported sliding-window attention since version 2.3 and a paged cache since 2.5; whether your engine combines them per layer is a question for its owners, answered with a measured peak at 128K.
+4. **Kernel maturity.** A layout your team has not operated adds a class of incidents during the launch window.
+5. **Quality on your task**, at controlled depths, against a full-attention baseline.
+6. **Write down what reverses it**: a quality gap at depth beyond an agreed margin, or a measured cache size above the computed one.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+Your company serves its own fine-tuned 30B model with full multi-head attention. Product needs a 128K tier within one quarter on the GPUs you already have, and at today's layout it fits two long sessions per node. Options on the table: uptrain your model to GQA, move your fine-tune onto an open model with a smaller cache per token, or quantize the cache to 8 bits. Which do you pick?
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>The 8-bit cache first, because it ships this quarter and doubles capacity, and in parallel move the fine-tune to an open GQA or hybrid model, because only a layout change gives the factor of four to eight the tier needs. Uptraining our own model to GQA is the right call only if the fine-tune's quality cannot be reproduced on an open base, since it costs a pre-training-scale run, about 5% of the original compute by the GQA paper's figure.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Size the gap. Two long sessions per node is the baseline; quantizing the cache to 8 bits gives four; GQA with 8 KV heads in place of, say, 64 gives a factor of 8 on the cache. The tier needs the second kind of change, and the quarter allows only the first without risk.</p>
+<p>Option one, the 8-bit cache. No retraining; cost is a quality check on long-context tasks, where quantization error accumulates over more keys. It halves memory and nothing more.</p>
+<p>Option two, a new base. Re-run the fine-tune on an open model whose layout already caches less: GQA, or windows if the evaluation at depth holds. Cost: the fine-tune and its evaluation from scratch, and a behaviour change customers will notice.</p>
+<p>Option three, uptrain to GQA. Keeps the model the business knows. Cost: a training run at roughly 5% of the original pre-training compute, which is a training project rather than a configuration change, and a quality check after it.</p>
+<p>The constraint conflict is the deadline against the size of the saving. I would ship option one for the launch with a capacity cap written into the tier, start option two immediately, and keep option three as the fallback if the open bases fail the fine-tune evaluation. The failure mode of that plan: the 8-bit cache passes short-context evals and degrades at 100K, exactly where the tier is sold; gate it on an evaluation at depth, not the standard suite.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Finance says option two doubles the evaluation budget this quarter. Which evaluation do you cut, and which risk do you accept in writing?</em></li>
+<li><em>What would you need to see from the 8-bit cache at 100K before you let it carry the tier without a cap?</em></li>
+<li><em>Two senior engineers disagree: one trusts the open model's published long-context scores, the other wants your own depth evaluation first. How do you decide without deciding by rank?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Bytes per token is a memory figure, not a throughput figure. MLA reconstructs keys and values from the latent, which adds arithmetic per decode step; whether that costs time depends on the kernel. Windowed layers make the cache smaller and the attention kernel more complex. The capacity number is real; the latency number has to be measured.
+
+Tensor parallelism changes the per-GPU figure. A GQA cache splits by KV head across GPUs, which works while there are at least as many KV heads as GPUs; with 8 KV heads and 16-way tensor parallelism, heads are replicated. An MLA latent is shared by all heads, so splitting by head does not split it at all; engines handle it by splitting the batch or the sequence instead.
+
+Linear-attention layers in hybrid models keep a fixed-size state rather than a growing cache. The formula gives them zero growth, which is correct for memory and silent about what such a layer can recall from far back.
+
+Prefix sharing and paging change what a session costs: a shared system prompt is stored once, and pages waste up to one partly filled page per sequence. The per-sequence figures above are the upper bound for unshared sessions.
+
+<SelfRate id="lesson:foundations/attention/attention-layouts" />

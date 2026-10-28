@@ -1,0 +1,265 @@
+---
+id: trn-068
+title: A LoRA layer that serves many adapters in one batch
+subtitle: alpha over r, zero-initialised B, merge and unmerge
+track: training
+module: adapting
+type: code
+difficulty: medium
+seniority: [senior, staff]
+minutes: 35
+core: false
+tags: [lora, peft, multi-adapter, merging, initialisation]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: "LoRA: Low-Rank Adaptation of Large Language Models (Hu et al., arXiv 2106.09685 v2, 2021-10-16)"
+    url: https://arxiv.org/abs/2106.09685
+    note: "The low-rank update W + BA on a frozen W; the paper reports 10,000x fewer trainable parameters than full fine-tuning. Checked 2026-10-28."
+  - title: "PEFT documentation, LoRA package reference (main branch)"
+    url: https://huggingface.co/docs/peft/main/en/package_reference/lora
+    note: "Scaling lora_alpha/r by default and lora_alpha/sqrt(r) with use_rslora; default initialisation has A Kaiming-uniform and B zero so the adapter is a no-op before training. Checked 2026-10-28."
+  - title: "LoRA Without Regret (Thinking Machines Lab, 2025-09-29)"
+    url: https://thinkingmachines.ai/blog/lora/
+    note: "Standard setup: A uniform with scale 1/sqrt(d_in), B zero, W' = W + (alpha/r)BA. Checked 2026-10-28."
+code:
+  starter: |
+    import math
+    import random
+
+
+    class LoRALinear:
+        """A frozen linear layer, y = x W^T + bias, serving any number of named LoRA adapters.
+
+        W is a list of d_out rows of d_in floats and is frozen: do not modify the caller's list.
+        """
+
+        def __init__(self, W, bias=None):
+            raise NotImplementedError
+
+        def add_adapter(self, name, r, alpha, seed=0):
+            """Create adapter `name` with scale alpha / r: A (r x d_in) drawn uniformly from
+            [-1/sqrt(d_in), 1/sqrt(d_in)] with random.Random(seed), and B (d_out x r) all zeros."""
+            raise NotImplementedError
+
+        def set_weights(self, name, A, B):
+            """Replace the adapter's A (r x d_in) and B (d_out x r), checking shapes."""
+            raise NotImplementedError
+
+        def forward(self, X, adapters):
+            """X is a list of rows of d_in floats; adapters holds one adapter name or None per row.
+            None means the layer's current weights. An unknown name raises KeyError.
+            Returns one output row of d_out floats per input row."""
+            raise NotImplementedError
+
+        def merge(self, name):
+            """Fold adapter `name` into the weights, so a row with None reproduces that adapter.
+            Rows that name an adapter while one is merged are your policy decision."""
+            raise NotImplementedError
+
+        def unmerge(self):
+            """Return the weights to the base."""
+            raise NotImplementedError
+  tests: |
+    W = [[1.0, 2.0, 0.0], [0.0, -1.0, 3.0]]
+    layer = LoRALinear(W, bias=[0.5, -0.5])
+    layer.add_adapter("legal", r=2, alpha=4, seed=1)
+    x = [[1.0, 1.0, 1.0], [2.0, 0.0, -1.0]]
+    assert layer.forward(x, [None, None]) == [[3.5, 1.5], [2.5, -3.5]], "no adapter: x W^T + b"
+    assert layer.forward(x, ["legal", "legal"]) == layer.forward(x, [None, None]), "B starts at zero, so a new adapter changes nothing"
+    layer.set_weights("legal", A=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], B=[[1.0, 0.0], [0.0, 1.0]])
+    assert layer.forward([[1.0, 1.0, 1.0]], ["legal"]) == [[5.5, 3.5]], "delta = (alpha / r) B A x = 2 * [1, 1]"
+    assert layer.forward([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], ["legal", None]) == [[5.5, 3.5], [3.5, 1.5]], "each row uses its own adapter"
+    layer.merge("legal")
+    assert layer.forward([[1.0, 1.0, 1.0]], [None]) == [[5.5, 3.5]], "after merge, no adapter means the merged weights"
+    layer.unmerge()
+    assert layer.forward([[1.0, 1.0, 1.0]], [None]) == [[3.5, 1.5]], "unmerge restores the base"
+  hidden: |
+    import copy, math, random, time
+    def close(a, b, tol=1e-9):
+        return all(abs(p - q) <= tol * max(1.0, abs(q)) for ra, rb in zip(a, b) for p, q in zip(ra, rb)) and len(a) == len(b)
+    def rmat(rng, n, m, s=1.0):
+        return [[rng.uniform(-s, s) for _ in range(m)] for _ in range(n)]
+    def ref(W, bias, x, A=None, B=None, scale=0.0):
+        y = [sum(w * xi for w, xi in zip(row, x)) + b for row, b in zip(W, bias)]
+        if A is not None:
+            h = [sum(a * xi for a, xi in zip(row, x)) for row in A]
+            y = [v + scale * sum(bk * hk for bk, hk in zip(brow, h)) for v, brow in zip(y, B)]
+        return y
+    rng = random.Random(7)
+    for trial in range(5):
+        d_in, d_out, r = rng.randint(2, 9), rng.randint(2, 9), rng.randint(1, 4)
+        W = rmat(rng, d_out, d_in); bias = [rng.uniform(-1, 1) for _ in range(d_out)]
+        W0 = copy.deepcopy(W)
+        L = LoRALinear(W, bias=bias)
+        L.add_adapter("a", r=r, alpha=2 * r, seed=trial)
+        X = rmat(rng, 3, d_in)
+        assert close(L.forward(X, ["a"] * 3), [ref(W0, bias, x) for x in X]), "a fresh adapter of any rank is the identity on the base"
+        A, B = rmat(rng, r, d_in), rmat(rng, d_out, r)
+        L.set_weights("a", A, B)
+        assert close(L.forward(X, ["a"] * 3), [ref(W0, bias, x, A, B, 2.0) for x in X]), "forward matches base + (alpha / r) B A x"
+        assert W == W0, "the caller's W is never modified"
+    L = LoRALinear([[1.0, 0.0], [0.0, 1.0]])
+    L.add_adapter("s", r=4, alpha=4, seed=0)
+    L.add_adapter("t", r=4, alpha=4, seed=0)
+    try:
+        L.forward([[1.0, 1.0]], ["missing"])
+        assert False, "an unknown adapter name raises KeyError"
+    except KeyError:
+        pass
+    # merged state: any row naming an adapter either raises or gets exactly base + that adapter
+    rng = random.Random(11)
+    W = rmat(rng, 5, 6); bias = [0.0] * 5
+    L = LoRALinear(W, bias=bias)
+    Aa, Ba, Ab, Bb = rmat(rng, 2, 6), rmat(rng, 5, 2), rmat(rng, 3, 6), rmat(rng, 5, 3)
+    L.add_adapter("a", r=2, alpha=2); L.set_weights("a", Aa, Ba)
+    L.add_adapter("b", r=3, alpha=6); L.set_weights("b", Ab, Bb)
+    x = rmat(rng, 1, 6)[0]
+    L.merge("a")
+    assert close(L.forward([x], [None]), [ref(W, bias, x, Aa, Ba, 1.0)]), "merged weights reproduce the adapter"
+    for name, A, B, s in (("a", Aa, Ba, 1.0), ("b", Ab, Bb, 2.0)):
+        try:
+            got = L.forward([x], [name])
+        except (ValueError, RuntimeError):
+            continue
+        assert close(got, [ref(W, bias, x, A, B, s)]), "while merged, a row naming an adapter gets base + that adapter, never two deltas"
+    L.unmerge()
+    for _ in range(20):
+        L.merge("b"); L.unmerge()
+    assert close(L.forward([x], [None]), [ref(W, bias, x)], 1e-12), "repeated merge and unmerge return to the base"
+    # performance: four rows, four different rank-16 adapters on a 256 x 256 layer
+    rng = random.Random(3)
+    d, r = 256, 16
+    W = rmat(rng, d, d); bias = [0.0] * d
+    L = LoRALinear(W, bias=bias)
+    names = ["p", "q", "s", "t"]
+    for i, n in enumerate(names):
+        L.add_adapter(n, r=r, alpha=r, seed=i)
+        L.set_weights(n, rmat(rng, r, d, 0.1), rmat(rng, d, r, 0.1))
+    X = rmat(rng, 4, d)
+    def best(f, k=3):
+        t = []
+        for _ in range(k):
+            s0 = time.perf_counter(); f(); t.append(time.perf_counter() - s0)
+        return min(t)
+    t_base = best(lambda: [ref(W, bias, x) for x in X])
+    t_lora = best(lambda: L.forward(X, names))
+    assert t_lora < 6 * t_base, "a mixed batch costs about one base matmul plus r * (d_in + d_out) per row; building B A per row is too slow"
+  solution: |
+    import math
+    import random
+
+
+    class LoRALinear:
+        def __init__(self, W, bias=None):
+            self.d_out = len(W)
+            self.d_in = len(W[0])
+            self.base = [list(map(float, row)) for row in W]
+            self.W = [row[:] for row in self.base]
+            self.bias = list(bias) if bias is not None else [0.0] * self.d_out
+            self.adapters = {}
+            self.merged = None
+
+        def add_adapter(self, name, r, alpha, seed=0):
+            if name in self.adapters:
+                raise ValueError("adapter %r exists" % name)
+            rng = random.Random(seed)
+            bound = 1.0 / math.sqrt(self.d_in)
+            A = [[rng.uniform(-bound, bound) for _ in range(self.d_in)] for _ in range(r)]
+            B = [[0.0] * r for _ in range(self.d_out)]
+            self.adapters[name] = {"A": A, "B": B, "r": r, "scale": alpha / r}
+
+        def set_weights(self, name, A, B):
+            ad = self.adapters[name]
+            r = ad["r"]
+            if len(A) != r or any(len(row) != self.d_in for row in A):
+                raise ValueError("A must be r x d_in")
+            if len(B) != self.d_out or any(len(row) != r for row in B):
+                raise ValueError("B must be d_out x r")
+            if self.merged == name:
+                raise RuntimeError("unmerge before changing a merged adapter")
+            ad["A"] = [list(map(float, row)) for row in A]
+            ad["B"] = [list(map(float, row)) for row in B]
+
+        def _delta(self, ad, x):
+            # x A^T (length r), then B (length d_out), scaled: never builds B A
+            h = [sum(a * xi for a, xi in zip(row, x)) for row in ad["A"]]
+            s = ad["scale"]
+            return [s * sum(b * hk for b, hk in zip(row, h)) for row in ad["B"]]
+
+        def forward(self, X, adapters):
+            if len(adapters) != len(X):
+                raise ValueError("one adapter entry per row")
+            for name in adapters:
+                if name is not None and name not in self.adapters:
+                    raise KeyError(name)
+            out = []
+            for x, name in zip(X, adapters):
+                # policy: a named adapter is always applied to the base weights,
+                # so rows naming an adapter ignore whatever is merged
+                Wm = self.W if name is None else self.base
+                y = [sum(w * xi for w, xi in zip(row, x)) + b for row, b in zip(Wm, self.bias)]
+                if name is not None:
+                    d = self._delta(self.adapters[name], x)
+                    y = [a + b for a, b in zip(y, d)]
+                out.append(y)
+            return out
+
+        def merge(self, name):
+            if self.merged is not None:
+                raise RuntimeError("adapter %r is already merged" % self.merged)
+            ad = self.adapters[name]
+            s, A, B = ad["scale"], ad["A"], ad["B"]
+            cols = list(zip(*A))  # d_in columns of A, each length r
+            self.W = [[w + s * sum(bk * ak for bk, ak in zip(brow, col)) for w, col in zip(wrow, cols)]
+                      for wrow, brow in zip(self.base, B)]
+            self.merged = name
+
+        def unmerge(self):
+            self.W = [row[:] for row in self.base]
+            self.merged = None
+---
+
+## Question
+
+Implement `LoRALinear`: one frozen linear layer that serves several named LoRA adapters, where every row of a batch can name a different adapter or none. Each adapter adds `(alpha / r) * B A x` to the base output, with `A` drawn from a seeded uniform distribution and `B` starting at zero.
+
+Requirements:
+
+- A fresh adapter changes nothing until its weights change, at any rank.
+- Rows are independent: a row's output depends only on that row and the adapter it names.
+- `merge(name)` folds one adapter into the weights for adapter-free serving; `unmerge()` restores the base. While an adapter is merged, what a row that names an adapter gets is your decision; whatever you choose must never produce a wrong number.
+- A batch of 4 rows on a 256 x 256 layer, each row with a different rank-16 adapter, must cost about as much as the base matmul for those rows, measured against a plain Python reference.
+
+Standard library only. The visible tests cover the basic contract; hidden tests check properties on random shapes, the merged state, and the time budget.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how many multiply-adds the adapter term costs per row if you never form a d_out x d_in matrix, and compare it with the base matmul.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what a row that names the merged adapter should receive, and count how many times that adapter's update would be added.</p></details>
+
+## Answer
+
+The adapter term is computed right to left: `h = A x` has length `r`, then `B h` has length `d_out`, scaled by `alpha / r`. That is `r * (d_in + d_out)` multiply-adds per row, 8,192 for the 256 x 256, rank-16 test, against 65,536 for the base matmul. Forming `B A` first costs `d_out * d_in * r` = 1,048,576 multiply-adds per adapter, 16 times the base row, which is what the timing test catches when every row names a different adapter.
+
+At initialisation `B` is zero, so the delta is exactly zero whatever `A` is: the layer is the base layer at step 0, which is why training starts from the pretrained model's behaviour. The `alpha / r` scale is stored per adapter because adapters of different rank share the layer.
+
+The reference keeps an untouched copy of the base weights. `merge` writes `base + (alpha / r) B A` into the working weights once, which is the one place forming `B A` is right: it is paid once, not per request. `unmerge` copies the base back rather than subtracting, so repeated cycles cannot accumulate rounding error.
+
+The policy decision is the merged state. The reference applies a named adapter to the base weights, ignoring the merge, so a row naming the merged adapter gets its update once and a row naming another adapter is still correct. Raising an error is equally defensible and simpler to reason about in a server; it costs availability during a merge window. The failure the hidden tests reject is the obvious implementation that adds the adapter's delta to the merged weights, so the merged adapter is applied twice and silently.
+
+How the reference can still fail: `set_weights` on a merged adapter would leave the merged weights stale, so it refuses; a server that hot-swaps adapter weights needs the same rule or a re-merge.
+
+## Follow-ups
+
+- *In a real serving engine, rows naming different adapters are grouped so each adapter's `A` and `B` run as one batched matmul per group, or a kernel gathers per-row adapter weights. What does each cost when 500 adapters are loaded and a batch of 64 names 60 of them?*
+- *A team wants to merge the adapter into a 4-bit quantised base for deployment. What changes in the numbers your merged forward produces, and how would you measure whether it matters?*
+- *Your service keeps 200 adapters resident on one GPU. Which policy for the merged state would you ship, and what would make you reverse it?*
+
+## Common mistakes
+
+- Forming `B A` per row or per request, which turns a cheap term into one larger than the base matmul.
+- Initialising both `A` and `B` randomly, so the model changes before training starts.
+- Applying the merged adapter's delta again to rows that name it.
+- Scaling by `alpha` instead of `alpha / r`, which makes the right learning rate depend on rank.
+- Subtracting the delta to unmerge, which drifts after many cycles; keep the base.

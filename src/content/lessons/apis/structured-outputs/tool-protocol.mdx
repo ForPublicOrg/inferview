@@ -1,0 +1,157 @@
+---
+title: "The tool-call protocol: the model proposes, your code disposes"
+track: apis
+module: structured-outputs
+order: 2
+kind: lesson
+level: senior
+minutes: 14
+summary: A tool call is a request your code may refuse, so validation, authorisation and idempotency belong in the executor, which also owns ordering, error results, streamed inputs and the iteration cap.
+prerequisites: [apis/structured-outputs/output-guarantees]
+updated: 2026-10-28
+sources:
+  - title: OpenAI API docs, function calling
+    url: https://developers.openai.com/api/docs/guides/function-calling
+    note: "function_call with call_id, name and JSON-encoded arguments, answered by function_call_output with the call_id; tool_choice auto, required, a forced function, allowed_tools, none; parallel_tool_calls false means zero or one call; parallel calls disabled is recommended for gpt-4.1-nano-2025-04-14 because it can return several calls to the same tool; Responses normalises to strict when strict is omitted, Chat Completions stays non-strict; aim for fewer than 20 functions; definitions billed as input tokens; argument streaming events. Checked 2026-10-28."
+  - title: Claude docs, handle tool calls
+    url: https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls
+    note: "tool_use id, name, input; tool_result with tool_use_id, content and is_error; results must immediately follow the tool_use turn and come first in the user message, or the request returns 400; untrusted content belongs inside tool_result blocks; Claude retries an invalid call 2 to 3 times with corrections before apologising; instructive error messages. Checked 2026-10-28."
+  - title: Anthropic, Writing effective tools for agents (11 September 2025)
+    url: https://www.anthropic.com/engineering/writing-tools-for-agents
+    note: "consolidate multi-step workflows into one tool; namespacing; return names rather than opaque ids; concise response format 72 tokens against 206 for detailed; Claude Code limits tool responses to 25,000 tokens by default; errors with specific, actionable improvements. Checked 2026-10-28."
+  - title: Claude docs, API errors
+    url: https://platform.claude.com/docs/en/api/errors
+    note: "Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1 reject tool_choice any or a named tool with a 400; thinking and redacted_thinking blocks must be passed back exactly as received with tool use; on Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 a replayed thinking block is accepted only while the system prompt, tools and earlier messages are unchanged, enforced for accounts created on or after 31 August 2026 or when prefix_mismatch_behavior is error. Checked 2026-10-28."
+  - title: Claude docs, streaming messages
+    url: https://platform.claude.com/docs/en/build-with-claude/streaming
+    note: "input_json_delta fragments; current models emit one complete key and value at a time, so there can be delays between events; eager_input_streaming per tool; tool use blocks cannot be partially recovered after an interrupted stream. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## A proposal, not a command
+
+When a model returns a tool call, nothing has happened yet. The response is a proposal: a name and an argument object that your code may run, refuse, run differently, or answer with an error. The closest systems analogy is an RPC arriving from an untrusted client, and the difference is that this client is also the one reading your error messages and deciding what to try next.
+
+That framing settles where each check belongs. A prompt can make a bad call less likely; only the executor can make it impossible. Validation, authorisation, idempotency, ordering and budgets all sit between the proposal and the effect, in code you own and can test.
+
+## The wire contract
+
+Both major APIs implement the same protocol with different names.
+
+On Claude, the assistant turn carries `tool_use` blocks, each with an `id`, a `name` and an `input`. You reply with a user message whose content starts with `tool_result` blocks, each carrying the matching `tool_use_id`, the result as `content`, and `is_error: true` when the tool failed. The results must immediately follow the assistant turn, and inside the user message every `tool_result` must come before any text; either violation returns a 400.
+
+On OpenAI's Responses API, the output contains `function_call` items with a `call_id`, a `name` and `arguments` as a JSON-encoded string. You send back `function_call_output` items referencing the same `call_id`. Note the type difference: Claude hands you a parsed object, OpenAI a string you parse, and a string can fail to parse when strict mode is off.
+
+The control knobs differ more than the payloads:
+
+- OpenAI's `tool_choice` takes `auto` (default), `required`, a forced function, `allowed_tools` (a subset of the declared tools, which keeps the tool list and therefore the cached prefix constant), or `none`. Setting `parallel_tool_calls: false` limits a turn to zero or one call.
+- On Claude Opus 5.5, Sonnet 5.5, Fable 5.1 and Mythos 5.1, `tool_choice` of `any` or a named tool returns a 400. Only `auto` and `none` are accepted, and the documented substitutes are strict tools under `auto`, or structured outputs when the response itself must have a shape. Code written against older models that forced a tool to get structured output breaks on these.
+- Strictness defaults differ. Responses tries to normalise every function to strict mode when `strict` is omitted and falls back to non-strict if it cannot; Chat Completions stays non-strict by default.
+
+Tool definitions are input tokens on every request, billed as such, and they sit at the front of the cached prefix. OpenAI's guide gives a soft suggestion of fewer than 20 functions at the start of a turn. Anthropic's tools post argues for fewer, broader tools: a `schedule_event` that finds availability and books, rather than `list_users`, `list_events` and `create_event` that the model must chain.
+
+## What the executor owns
+
+**Validation.** Schema validation first, unless the tool is strict and the provider enforces every keyword you use. Then the rules the schema cannot express: the amount does not exceed the refundable balance, the end is after the start. A failure becomes an error result, not an exception that kills the turn.
+
+**Authorisation.** Identity comes from the session, never from an argument. A `user_id` parameter the model fills is a parameter a prompt-injected document can fill. Claude's documentation adds the matching rule for the other direction: content from outside your control belongs inside `tool_result` blocks, not in the system prompt or plain user text.
+
+**Idempotency.** The obvious key, the call id, is the wrong one. A `tool_use_id` is unique per proposal, so when the model proposes the same refund again in the next turn, or the whole conversation is retried after a crash, the id is new and the key never matches. The key has to come from the business action: the order, the amount, the conversation. Use the call id for pairing results, and the action for deduplication.
+
+**Ordering.** When a turn contains several calls, the model is asserting they are independent, and it can be wrong. `create_event` and `invite_attendees(event_id=...)` in one turn means the second depends on an id the first has not produced. Read-only calls can run concurrently; calls with side effects run serially in the order proposed, and a call whose input refers to something that does not exist yet gets an error result telling the model to call it again after the first completes. OpenAI's guide recommends disabling parallel calls on `gpt-4.1-nano-2025-04-14` because it can return several calls to the same tool in one turn, which is the same hazard from the other side. Results go back in proposal order regardless of completion order.
+
+**Error results.** An error result is a message to a reader that will act on it. Claude's guide says the model retries an invalid call two to three times with corrections before apologising to the user, so the error text determines what those attempts look like. "error" produces guesses; "amount 90000 exceeds the refundable balance of 45000 EUR; offer up to 45000" produces a correct second call. Anthropic's tools post makes the same point about returning names rather than opaque ids, and about response size: Claude Code caps tool responses at 25,000 tokens by default, and the post's example of a concise format used 72 tokens where the detailed one used 206.
+
+**History.** The executor appends; it never edits. With tool use, Claude requires thinking and redacted thinking blocks to come back exactly as received, and a loop that filters the assistant turn down to text and tool calls gets a 400. On Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 a replayed thinking block is accepted only while the system prompt, tools and earlier messages are unchanged; for accounts created on or after 31 August 2026 a changed prefix is an error by default. Rewriting an earlier tool result to redact it is a history edit, and on these models it has a cost beyond the cache.
+
+## Streamed inputs
+
+When streaming, tool arguments arrive as fragments: `input_json_delta` events on Claude, `response.function_call_arguments.delta` on OpenAI followed by a `.done` event with the complete arguments. Claude's documentation says current models emit one complete key and value at a time, chunked into several deltas, so a tool with a long argument can pause between events while the model works. Per-tool `eager_input_streaming` changes that granularity for latency-sensitive tools.
+
+The executor's rule is simple: nothing executes until the block's stop event, or the `.done` event, and the arguments parse. A UI may display a partially parsed object; an executor never acts on one. If the stream fails mid-block, the tool call is gone: Claude's streaming docs say tool use blocks cannot be partially recovered.
+
+## Iteration caps
+
+A model is not guaranteed to stop calling tools. The executor needs a cap on model calls per task, and usually a cap on calls per tool, because the expensive failure is not one runaway loop but many conversations each doing a few more steps than they need. The loop also gets more expensive per step, because every step re-sends the conversation.
+
+<Predict id="api-tool-loop-input" question="A loop starts with 3,000 input tokens (system prompt, tool definitions, user message). Each step adds 400 tokens (one call plus its result) to the conversation, and every model call re-sends the whole conversation. How many input tokens do 8 model calls consume in total, before any caching?" answer={35200} tolerance={0} unit="tokens">
+<p><b>35,200.</b> Call i (counting from 0) sends 3,000 + 400 × i tokens. Summed over i = 0 to 7: 8 × 3,000 + 400 × (0 + 1 + ... + 7) = 24,000 + 400 × 28 = 35,200. The growth term is quadratic in the number of steps, so doubling the cap to 16 gives 16 × 3,000 + 400 × 120 = 96,000, nearly three times as much. Prefix caching cuts the price of the repeated part, not its presence in the context window.</p>
+</Predict>
+
+When the cap hits, return a distinct failure the caller can count, not the last text the model produced. A cap that silently returns partial work hides exactly the conversations you most need to see.
+
+## An executor in code
+
+```python
+import json
+
+class Executor:
+    def __init__(self, tools, session, ledger):
+        self.tools, self.session, self.ledger = tools, session, ledger   # ledger: durable idempotency store
+
+    def run(self, name, args):
+        spec = self.tools.get(name)
+        if spec is None:
+            return f"unknown tool {name}; available: {', '.join(sorted(self.tools))}", True
+        if not isinstance(args, dict):
+            return f"{name}: arguments must be an object", True
+        problems = spec.validate(args, self.session)          # schema plus business rules
+        if problems:
+            return f"{name} not run: {'; '.join(problems)}", True
+        if not spec.allowed(self.session):                   # identity and scope from the session
+            return f"{name} is not permitted for this user; do not retry", True
+        key = None
+        if spec.mutating:
+            key = spec.action_key(args, self.session)         # business action, not tool_use_id
+            earlier = self.ledger.get(key)
+            if earlier is not None:
+                return f"{name} already done in this conversation; result: {earlier}", True
+        try:
+            out = json.dumps(spec.fn(**args))
+        except TimeoutError:
+            return f"{name} timed out; the outcome is unknown, check with {spec.status_tool} before retrying", True
+        except Exception as e:
+            return f"{name} failed: {type(e).__name__}: {e}", True
+        if key is not None:
+            self.ledger.put(key, out)
+        return out, False
+```
+
+The timeout branch is the one most executors get wrong. A timeout on a mutating call means the effect may have happened, so the error tells the model to check rather than retry, and the tool needs a status query for that to be possible.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+"Our support agent issues refunds through a tool. Last month it refunded one order twice after a payment timeout, and the fix has to ship this week without adding a human approval step, because the support queue cannot absorb it. Where does the fix go, and what does it cost?"
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>In the executor and the payment call, not the prompt. A durable idempotency key derived from the order and amount, checked before the payment call and passed to the payment provider, so a retried proposal cannot refund twice. A timeout returns "outcome unknown, check status" rather than a plain failure, with a status tool to check. The cost is a durable store on the refund path and one more tool, and the residual risk is a legitimate second refund of the same amount on the same order, which now needs a different path.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The double refund has two causes. The model proposed the refund again after an error result, which is the documented behaviour: errors invite retries. And the executor treated the timeout as a failure when the provider had accepted the payment. Fixing only the prompt ("never retry refunds") moves the problem to the next conversation where the instruction is ignored.</p>
+<p>The key choice is the decision. Keying on <code>tool_use_id</code> does nothing, because the retry is a new proposal with a new id. Keying on order and amount stops the duplicate and also blocks a second legitimate refund of the same amount on the same order (two identical items damaged); keying on order, amount and conversation allows that second refund in a new conversation and blocks it in this one. I would choose the second and accept that a customer with two identical damaged items needs a second conversation or an agent, and write that down.</p>
+<p>The deadline means the durable store is whatever the refund service already has: a unique constraint on the key in its database, checked inside the same transaction as the refund record. Passing the same key to the payment provider, if it supports idempotency keys, closes the gap between our record and theirs.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The payment provider has no idempotency keys. Your record and their charge can now disagree after a crash. Which way do you fail, and who reconciles?</em></li>
+<li><em>What would you need to see in a month of refund logs to add the human approval step after all?</em></li>
+<li><em>The model now asks "should I check the refund status?" in every timeout case and customers find it confusing. Do you change the error text, the tool, or the prompt?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+This lesson treats the model as the only caller of a tool. Tools are often also called by other services and by people, so the executor's checks have to hold for them too, and putting them only in an agent-specific wrapper leaves the tool unprotected.
+
+It assumes the provider runs nothing. Server tools, such as Claude's web search, run inside the provider and come back already executed, with their own error handling; the executor rules apply to client tools only.
+
+And the model-specific facts here, such as which `tool_choice` values return a 400 and when thinking blocks must be byte-identical, were read from the providers' documentation on 28 October 2026. Both differ between model versions; pin them in tests that run against the real API, not in comments.
+
+<SelfRate id="lesson:apis/structured-outputs/tool-protocol" />

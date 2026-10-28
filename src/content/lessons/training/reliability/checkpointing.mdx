@@ -1,0 +1,183 @@
+---
+title: Checkpointing that does not stall training
+track: training
+module: reliability
+order: 2
+kind: lesson
+level: senior
+minutes: 14
+summary: A distributed checkpoint is one file set per rank, resharded at load and saved asynchronously from a CPU copy, and its interval is chosen from the failure rate and the save stall, then proven by restoring and comparing steps.
+prerequisites: [training/reliability/failures-at-scale]
+updated: 2026-10-28
+sources:
+  - title: PyTorch 2.14 docs, Distributed Checkpoint (torch.distributed.checkpoint)
+    url: https://docs.pytorch.org/docs/2.14/distributed.checkpoint.html
+    note: "Multiple files per checkpoint, at least one per rank; operates in place; load-time resharding; save has each rank write only its local shards; load reads the least data needed for the requested state_dict, each rank must pass the same keys, and tensors must be allocated first; async_save stages to CPU memory by default and saves in a separate thread or process, marked experimental, returning staging_completion and upload_completion futures; no backward-compatibility guarantee across PyTorch versions; get_state_dict and set_state_dict use canonical FQNs, and set_state_dict only before backward() or after step(). Page last updated 2026-07-08. Checked 2026-10-28."
+  - title: TorchTitan (arXiv 2410.06511), section 2.3.1
+    url: https://arxiv.org/abs/2410.06511
+    note: "DCP with DTensor matches stored shards to the current parallelism at load; asynchronous checkpointing persists in a separate thread and reduced checkpointing overhead 5-15x against synchronous DCP for Llama 3.1 8B. The paper reports, citing a PyTorch team forum post. Checked 2026-10-28."
+  - title: Kimi K2 technical report (arXiv 2507.20534), sections 3.3.2 and appendix G
+    url: https://arxiv.org/html/2507.20534
+    note: "1.04T total parameters; a distributed checkpoint engine co-located on training nodes broadcasts parameters to inference engines, parameter by parameter in a pipeline; a full parameter update in under 30 seconds; a network file system judged impractical because the aggregate bandwidth needed reaches several petabytes per second; three device buffers per GPU. The paper reports. Checked 2026-10-28."
+  - title: The Llama 3 Herd of Models (arXiv 2407.21783), section 3.3.1
+    url: https://arxiv.org/html/2407.21783
+    note: "Tectonic storage fabric with 240 PB on 7,500 servers, 2 TB/s sustained and 7 TB/s peak; bursty checkpoint writes saturate the fabric; each GPU's checkpointed state ranges from 1 MB to 4 GB. The paper reports. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+A training checkpoint is a consistent snapshot of a distributed state machine, taken while thousands of processes keep mutating it. Like a database backup, the hard parts are consistency and the pause it imposes on writers. Unlike a database, the writers are GPUs that cost the same whether they are computing or waiting, every one of them pauses for the same snapshot, and the snapshot is only useful if a different set of machines, possibly in a different parallel layout, can load it and continue the same trajectory.
+
+Three decisions follow: what goes into the checkpoint, how the save avoids stalling the GPUs, and how often to save.
+
+## What a resumable checkpoint contains
+
+A checkpoint for inference is the weights. A checkpoint for resuming training must restore everything that determines the next step:
+
+- model parameters, in the precision the optimizer updates (often FP32 master weights alongside BF16 compute copies);
+- optimizer state, which for Adam-family optimizers is two moment tensors per parameter plus a step count;
+- learning-rate scheduler state and the global step;
+- data loader position, so the run neither repeats nor skips data;
+- random number generator states, if dropout or sampling affects training.
+
+The optimizer state is usually the largest part. Assuming FP32 master weights and two FP32 Adam moments plus BF16 weights, a 405B-parameter model carries 405 × 10⁹ × (4 + 4 + 4 + 2) bytes = 5.67 TB of state. Spread evenly over 16,384 GPUs that is about 346 MB per GPU. The Llama 3 paper reports each GPU's checkpointed state at 1 MB to 4 GB; it does not break that range down, so the arithmetic is a floor, not a reconstruction of Meta's checkpoint.
+
+## Sharded saves and resharded loads
+
+The naive save gathers all state to one rank and writes one file. At 5.67 TB that is a single-host write bottleneck and a gather that needs more memory than any host has. PyTorch Distributed Checkpoint (DCP) does the opposite: each rank writes only its local shards, so a checkpoint is many files, at least one per rank, plus metadata describing which global slice of each tensor each file holds.
+
+Load is where the design pays off. DCP loads in place: the model and optimizer are constructed and sharded for the current job first, then each rank reads exactly the slices its local shards cover. The TorchTitan paper describes this as DCP matching the stored shards to the current DTensor parameters and optimizer states. A checkpoint saved with 64-way data parallelism can therefore load into a job with 48-way data parallelism after a node is lost, which is what elastic restart depends on.
+
+Two properties of that load path catch teams.
+
+**It loads what you ask for.** The docs say each rank reads "the least amount of data necessary to fulfill the requested state_dict". If the state dict passed to load has no entries for the optimizer's moment tensors, nothing loads them and nothing fails. The `get_state_dict` and `set_state_dict` helpers exist to build complete, canonically keyed state dicts for model and optimizer, and the docs warn that `set_state_dict` must run before `backward()` or after `step()`, otherwise the optimizer states will not be initialized correctly. Problem trn-029 is a restore that hit the first of these.
+
+**Every rank must ask for the same keys.** The docs say mismatched keys across ranks may result in hangs or errors. A rank that conditionally adds an entry turns a restore into a hang that looks like a network fault.
+
+The docs also state that there is no backward-compatibility guarantee for saved state across PyTorch versions. A framework upgrade during a long run needs a tested conversion path or a plan to stay on one version until the run ends.
+
+## Asynchronous saves
+
+A synchronous save stalls every GPU for the full write. An asynchronous save splits it in two. `async_save` first copies the state dict to staging storage, CPU memory by default, then writes from that copy in a separate thread (or a separate process). The returned object carries two futures: `staging_completion`, after which training can mutate the GPU tensors again, and `upload_completion`, after which the checkpoint exists. The GPU stall shrinks to the device-to-host copy. The TorchTitan paper reports that asynchronous DCP cut checkpointing overhead 5 to 15 times against synchronous DCP for Llama 3.1 8B. The docs mark the feature experimental.
+
+The costs move rather than vanish:
+
+- **Host memory.** The staged copy lives in host RAM. At the Llama 3 upper bound of 4 GB per GPU and eight GPUs per server, one staged copy is 32 GB per server, competing with the data loader and pinned buffers.
+- **Storage bursts.** Every rank uploads at once. The Llama 3 paper says its checkpoint writes are "highly bursty" and saturate the storage fabric for short periods, on a fabric rated at 2 TB/s sustained and 7 TB/s peak.
+- **A checkpoint is not durable until upload completes.** A failure during upload loses the checkpoint in flight, so the effective age of the last good checkpoint is the interval plus the upload time.
+- **At most one upload in flight.** If the next save starts before the previous upload completes, either training waits or two staged copies are held. The interval cannot be shorter than the upload.
+
+<Predict id="trn-rel-storage" question="16,384 GPUs each write 4 GB of checkpoint state at once to a fabric sustaining 2 TB/s. How many seconds does the write take, at best?" answer={32.8} tolerance={1} unit="seconds">
+16,384 × 4 GB = 65.5 TB, and 65.5 TB / 2 TB/s = 32.8 s. At the 7 TB/s peak it is 9.4 s. With a synchronous save every GPU waits that long; with an asynchronous save they wait only for the copy to host memory, and the 33 s becomes the floor on the interval.
+</Predict>
+
+## Choosing the interval
+
+Let M be the mean time between failures of the job, δ the time training stalls per save, τ the interval between saves, and R the restart cost (detection, rescheduling, loading, warm-up). Per unit of wall-clock time, saves cost δ/τ. Each failure loses on average τ/2 of work plus R, and failures arrive at rate 1/M. The fraction of time lost is
+
+overhead(τ) = δ/τ + (τ/2 + R)/M
+
+Setting the derivative to zero, −δ/τ² + 1/(2M) = 0, gives τ* = √(2δM). This is a first-order result: it assumes failures are rare relative to τ and that saves and failures are independent.
+
+Take the Llama 3 rate at 16,384 GPUs, M = 185.6 minutes (from the [previous lesson](/learn/training/reliability/failures-at-scale)), and a scenario restart cost of R = 10 minutes.
+
+| Save path (scenario stall) | τ* | Overhead at τ* |
+| --- | --- | --- |
+| Synchronous, δ = 60 s | 19.3 min | 15.8% |
+| Asynchronous, δ = 5 s | 5.6 min | 8.4% |
+| Asynchronous, δ = 5 s, R cut to 2 min | 5.6 min | 4.1% |
+
+<Predict id="trn-rel-interval" question="With a 5-second save stall and a mean time between failures of 185.6 minutes, what interval minimizes the overhead, in minutes?" answer={5.56} tolerance={0.15} unit="minutes">
+τ* = √(2 × (5/60) × 185.6) = √30.9 = 5.56 minutes. The 33 s upload from the storage arithmetic above fits inside it, but only just; a slower fabric or a larger state pushes the interval up to the upload time, not down to τ*.
+</Predict>
+
+The table carries the main lesson. Going asynchronous halves the overhead, and after that the restart cost R is the dominant term: R/M is 5.4 points of the 8.4. Further cuts to the interval cannot touch it. The Llama 3 paper names reduced job startup and checkpointing time as the levers Meta pulled to keep effective training time above 90%.
+
+The overhead curve is flat near its minimum. At δ = 5 s, intervals from 4 to 8 minutes all land within 0.2 points of the optimum (computed from the formula above), so choose for operational reasons inside that band: upload time, storage contention with other jobs, and how much host memory the staged copy can have.
+
+## A different job for the same machinery: RL weight sync
+
+Reinforcement learning on LLMs moves weights every iteration, from the trainer to the inference engines that generate rollouts, and each side shards differently. Kimi K2's report treats this as a checkpoint problem. Its checkpoint engine runs co-located on the training nodes: each worker takes a local copy of parameters from the training engine, the full parameter set is broadcast across the checkpoint engine workers, and each inference engine takes the shard it needs. For a 1.04T-parameter model the paper reports a full parameter update in under 30 seconds, done parameter by parameter in a pipeline to bound memory. A network file system was ruled out because the aggregate bandwidth needed to keep the overhead low reaches several petabytes per second. The same engine handles startup so the cluster reads the checkpoint from disk once.
+
+The connection to failure recovery is the design principle: when the same state is needed by many consumers in a different layout, reshard in memory over the fast network and touch storage once.
+
+## Proving a restore
+
+A restore that loads without error proves nothing about the optimizer state. The test that does is a fork: run to step k and save; keep running to step k + j, recording loss and a checksum of parameters and optimizer state at each step; then restore the step-k checkpoint in a fresh process and run the same j steps on the same data. With the same parallel layout and deterministic kernels, the two branches should match bitwise. After a reshard, compare within a tolerance, because a different reduction order changes floating-point sums.
+
+The toy below shows why the weights alone are not enough. Adam's first update after a reset has bias-corrected moments m̂ = g and v̂ = g², so every coordinate moves by the full learning rate in the sign of its gradient, regardless of how small the gradient is. At scale that is a step far larger than the steps around it.
+
+```python
+import math, random
+
+def grads(w, rng):
+    # Noisy gradient of (w0 - 3)^2 + 100 (w1 - 3)^2.
+    return [2 * (w[0] - 3) + rng.gauss(0, 0.5), 200 * (w[1] - 3) + rng.gauss(0, 0.5)]
+
+def adam_step(w, s, g, lr=0.05, b1=0.9, b2=0.999, eps=1e-8):
+    s["t"] += 1
+    for i, gi in enumerate(g):
+        s["m"][i] = b1 * s["m"][i] + (1 - b1) * gi
+        s["v"][i] = b2 * s["v"][i] + (1 - b2) * gi * gi
+        mh, vh = s["m"][i] / (1 - b1 ** s["t"]), s["v"][i] / (1 - b2 ** s["t"])
+        w[i] -= lr * mh / (math.sqrt(vh) + eps)
+
+def run(steps, w, s, seed):
+    rng = random.Random(seed)
+    for _ in range(steps):
+        adam_step(w, s, grads(w, rng))
+    return w
+
+fresh = lambda: {"t": 0, "m": [0.0, 0.0], "v": [0.0, 0.0]}
+copy = lambda s: {"t": s["t"], "m": list(s["m"]), "v": list(s["v"])}
+w, s = [0.0, 0.0], fresh()
+run(200, w, s, seed=1)
+ckpt_w, ckpt_s = list(w), copy(s)
+
+full = run(20, list(ckpt_w), copy(ckpt_s), seed=2)
+again = run(20, list(ckpt_w), copy(ckpt_s), seed=2)
+dropped = run(20, list(ckpt_w), fresh(), seed=2)   # weights restored, optimizer state not
+print(full == again)                                # True: the fork test passes
+print([round(x, 4) for x in full])                  # [3.0715, 3.0005]
+print([round(x, 4) for x in dropped])               # [3.173, 3.0168]
+```
+
+Run the fork test in CI on a small model with the production checkpoint code path, and once at the start of every large run, before the first real failure makes it urgent.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+"A 2,048-GPU run starts Monday. Measured restart cost is 15 minutes. A synchronous save stalls the job 60 seconds; the asynchronous path stalls it 5 seconds but needs about 23 GB of pinned host memory per server that the data team wants for prefetch, and nobody has run a fork test on it. Which do you launch with, and at what interval?"
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>At the Llama 3 per-GPU rate scaled to 2,048 GPUs, the mean time between failures is about 1,485 minutes. Synchronous at τ* = √(2 × 1 × 1,485) = 54.5 minutes costs 4.7% of the run; asynchronous at τ* = 15.7 minutes costs 2.1%, about 1,250 GPU-hours a day less. I would launch synchronous at about 55 minutes, run the fork test on the asynchronous path this week, and switch at the first planned restart if it passes and prefetch survives the memory cut.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Overhead is δ/τ + (τ/2 + R)/M. Synchronous: 1/54.5 + (27.2 + 15)/1,485 = 1.8% + 2.8% = 4.7%. Asynchronous with a one-minute upload added to the lost work: 0.083/15.7 + (7.9 + 1 + 15)/1,485 = 0.5% + 1.6% = 2.1%. The difference, 2.5 points of 2,048 GPUs over 24 hours, is about 1,250 GPU-hours a day.</p>
+<p>That is a real saving, but an untested restore path is a correctness risk with no upper bound: a restore that silently drops optimizer state, found two weeks later, can cost more than the whole saving. Two answers are defensible. Launch asynchronous now and run the fork test in parallel on a small model, accepting the risk for a few days; or launch synchronous, which already has a tested restore, and switch after the test. The second costs about 1,250 GPU-hours per day of delay. I take it for at most one week and write the switch date and the rollback trigger into the run plan: if the first asynchronous restore fails the fork comparison, return to synchronous at the next save.</p>
+<p>The host memory conflict is real: 23 GB per server for staging comes out of prefetch. Measure data-loader stall time with prefetch reduced before the switch; if loader stalls exceed the 2.5 points saved, asynchronous saves are not a win on this cluster. Failure mode of the recommendation: the 15-minute restart cost still dominates both options, so if nobody works on restart time, the checkpoint decision is optimizing the smaller term.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Storage tells you two other jobs checkpoint on the same fabric and your upload will take four minutes at peak. What happens to the asynchronous interval and the overhead?</em></li>
+<li><em>The research lead wants a full checkpoint kept every 2,000 steps for evaluation and rollback, regardless of the recovery interval. How do you keep both without doubling storage, and what is deleted when?</em></li>
+<li><em>What would make you go back to synchronous saves mid-run?</em> A fork test that fails after a reshard, or evidence that staging copies race with optimizer updates, either of which makes the saving worthless.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The √(2δM) interval assumes independent failures with a constant rate and a save time much shorter than M. Failure storms violate both: when a bad batch of hardware fails three times in an hour, a fixed interval is wrong in both directions, and the formula says nothing about shortening the interval after a failure.
+
+Lost work is not always τ/2. If failures are more likely right after a save (the storage burst, the power swing the Llama 3 paper describes when every GPU pauses at once), the average loss is smaller than half an interval and the recovery cost is higher. Measure both from the job's log.
+
+Full-state checkpoints are not the only design. In-memory checkpoints replicated to peer hosts, and recovery from redundant data-parallel replicas, avoid storage on the recovery path altogether; they trade host memory and network for restart time, and they fail when the peers holding the copy fail together.
+
+The Kimi K2 number is for weight transfer between engines in an RL loop, not for recovery from failure, and it is the authors' own measurement on their cluster.
+
+<SelfRate id="lesson:training/reliability/checkpointing" />

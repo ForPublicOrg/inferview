@@ -1,101 +1,107 @@
 ---
 id: fnd-006
-title: Search broke after the embedding upgrade
-subtitle: find the cause
+title: Search quality fell the week of the model upgrade
+subtitle: find the cause, then plan the cut-over
 track: foundations
 module: embeddings
 type: debug
 difficulty: medium
-seniority: [mid, senior]
-minutes: 15
-core: true
-tags: [embeddings, matryoshka, normalisation, vector-search]
+seniority: [senior]
+minutes: 20
+core: false
+tags: [embeddings, migration, vector-search, cut-over]
 companies: []
 updated: 2026-10-28
 sources:
-  - title: amitshekhariitbhu, AI Engineering Interview Questions
-    url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
-    note: lists questions on handling a new embedding model in production and on embedding dimensionality and cost
-  - title: EmbeddingGemma model card
-    url: https://huggingface.co/google/embeddinggemma-300m
-    note: 768-dimension output; truncate to 512, 256 or 128 and then re-normalise; queries take a task prefix
-  - title: Gemini API docs, embeddings
-    url: https://ai.google.dev/gemini-api/docs/embeddings
-    note: gemini-embedding-001 needs manual normalisation below 3072 dimensions; gemini-embedding-2 normalises for you
   - title: OpenAI API docs, embeddings guide
     url: https://developers.openai.com/api/docs/guides/embeddings
-    note: shortening vectors by hand requires re-normalising them
-  - title: Matryoshka Representation Learning (Kusupati et al., 2022)
-    url: https://arxiv.org/abs/2205.13147
-    note: the first k dimensions of the vector form a usable embedding
+    note: "text-embedding-3-small 1536 and text-embedding-3-large 3072 dimensions by default, 8192-token input; embeddings normalised to length 1; the dimensions parameter shortens them and manual shortening needs re-normalising. Checked 2026-10-28."
+  - title: OpenAI API docs, text-embedding-3-small model page
+    url: https://developers.openai.com/api/docs/models/text-embedding-3-small
+    note: "$0.02 per million input tokens, checked 2026-10-28; used only to price the re-embed in the answer."
 choices:
-  - text: Old and new vectors are mixed in one index, so new queries are compared against vectors from the old model
-    correct: false
-    why: The log shows the index was rebuilt from scratch with 2,400,118 vectors, the same as the corpus count, all written by the new pipeline. Mixed spaces would be a good guess on a partial migration, not this one.
-  - text: The queries are embedded without the model's query prefix, so they land in the wrong region of the space
-    correct: false
-    why: The query path adds QUERY_PREFIX on every call. A missing prefix is a real silent bug with instruction-aware models, but the code rules it out here.
-  - text: The vectors were truncated from 768 to 256 dimensions without re-normalising, and the index ranks by dot product, so documents whose first 256 values hold more of their length win
+  - text: The index now holds vectors from two models, so model B queries are scored against old model A vectors
     correct: true
-    why: The stored norms run from 0.78 to 0.97 instead of 1.0. With a dot product, a document's score is scaled by its own norm, which has nothing to do with relevance, and the measured symptom (long boilerplate pages winning) fits a length-dependent bias.
-  - text: The HNSW search parameter ef_search is too low for 256-dimension vectors, so the approximate search misses the true nearest neighbours
+    why: The backfill upserts B vectors into the same index while the query side switched to B on Tuesday, so about 62% of documents are compared in a space their query was never embedded in, and recall recovers only as the backfill advances.
+  - text: The query cache is keyed by text alone, so repeated queries get vectors from the model they replaced
     correct: false
-    why: Exact brute-force search over the same vectors returns the same top 10 as HNSW for the sampled queries, so the approximate index is faithful. The ranking itself is wrong.
+    why: A real defect that will bite again at the next cut-over, but recall on cache misses alone is 0.52 against 0.53 overall, so the cache is not what moved the number.
+  - text: In-place upserts left stale links in the HNSW graph, so approximate search misses what exact search finds
+    correct: false
+    why: Exact search agrees with HNSW on 48 of 50 sampled queries. Heavy upserts can degrade a graph, but the ranking itself is wrong here, not the search over it.
+  - text: Model B is weaker than model A on this corpus, and its benchmark lead does not carry over to this domain
+    correct: false
+    why: On a separate index built from a 5% sample with B alone, B scores 0.81 against A's 0.78 on the same queries. Benchmark transfer is a fair worry, and the sample rules it out for this corpus.
 ---
 
 ## Question
 
-Scenario: a team replaced its embedding model with EmbeddingGemma and, to save memory, kept only the first 256 of its 768 dimensions. They rebuilt the index on Monday. Since then, recall at 10 on their labelled query set dropped from 0.81 to 0.64, and reviewers say long boilerplate pages (terms of service, release notes) keep appearing in the top results.
+A team moved its document search from embedding model A to model B. Both output 1,024 dimensions, so the existing index accepted the new vectors without errors. All numbers below are from this scenario.
 
-The pipeline:
+```yaml
+# shared config, read by the ingest workers, the backfill job and the query service
+embedding:
+  model: model-b            # was model-a until Tuesday's deploy
+  dims: 1024
+index:
+  name: docs-v1
+  metric: cosine
+  kind: hnsw
+query_cache:
+  key: sha256(query_text)
+  ttl_hours: 24
+```
 
 ```python
-DOC_PREFIX = ...     # document prompt from the model card
-QUERY_PREFIX = ...   # query prompt from the model card
-
-def embed_docs(texts):
-    vecs = model.encode([DOC_PREFIX + t for t in texts])   # 768 dims, unit length
-    return [v[:256] for v in vecs]                          # Matryoshka: keep 256
-
-def embed_query(q):
-    v = model.encode([QUERY_PREFIX + q])[0]
-    return v[:256]
-
-index = VectorIndex(metric="dot", dims=256, kind="hnsw", ef_search=64)
+def backfill(batch):
+    vecs = embed([c.text for c in batch])           # uses config.embedding.model
+    index.upsert([(c.id, v, {"source": c.source}) for c, v in zip(batch, vecs)])
 ```
 
-What they checked:
+What they checked on Wednesday:
 
 ```text
-corpus documents:            2,400,118
-vectors in rebuilt index:    2,400,118   (index created Monday, empty before backfill)
-norms of 1,000 stored docs:  min 0.78, median 0.89, max 0.97
-brute-force top 10 vs HNSW top 10 on 50 queries: identical on 50 of 50
+chunks in corpus:                   3,200,000
+backfill progress:                  38% (started Tuesday after the deploy)
+recall@10, 500 labelled queries:    Monday 0.78   Tuesday 0.49   Wednesday 0.53
+recall@10, cache misses only (Wed): 0.52
+exact vs HNSW top 10, 50 queries:   identical on 48 of 50
+model B on a separate index of a 5% corpus sample, same queries restricted to it:
+                                    model B 0.81   model A 0.78
 ```
 
-Which cause best explains the drop?
+Which cause best explains the drop? Then say what you would do today and how you would run the migration again.
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>What should the norm of every stored vector be if the index ranks by dot product?</p></details>
-<details class="hint"><summary>Hint 2</summary><p>Each check rules out one of the four choices. Match them up.</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask which model wrote each vector now in docs-v1, and whether anything stored with the vector says so.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request recall on Thursday, when the backfill is further along, and compare it with the backfill percentage.</p></details>
 
 ## Answer
 
-The vectors were truncated without re-normalising. Each 768-dimension vector had length 1, but its first 256 values hold only part of that length, and how much varies by document: here between 0.78 and 0.97. The index ranks by dot product, and a dot product scales with the document's length, so documents that happened to keep more of their norm in the first 256 dimensions get a boost unrelated to relevance. EmbeddingGemma's card says to re-normalise after truncating, as do OpenAI's docs for manual shortening; gemini-embedding-2 is the exception that does it for you.
+The index holds two embedding spaces. Model A and model B were trained separately, so dimension k of one has no relationship to dimension k of the other, and a cosine between a B query and an A document is a number with no meaning. On Tuesday the query service switched to B through the shared config while 100% of documents were still A vectors; the backfill then started overwriting them in place. Recall tracks the backfill: lowest when almost nothing was migrated, slightly better at 38%. Matching dimensions are what let the bug ship, because a 1,024-dimension B vector is a valid write to a 1,024-dimension A index. Nothing in the upsert records which model wrote the vector, so the mix cannot be filtered out by a query.
 
-The fix is one line in both paths: divide each truncated vector by its norm before writing or querying, then rebuild the index. The query side matters less for ranking (one query's norm scales every score equally) but should be normalised too so scores are comparable across queries and thresholds keep working.
+What to do today. Stop the backfill, because every batch it writes makes the A index worse for A queries. Then choose:
 
-Why the other choices are tempting. Mixed vector spaces is the classic upgrade bug, ruled out because the index was empty before the backfill and the counts match. A missing query prefix is the second classic, ruled out by the code. ef_search is a real knob, ruled out because exact search returns the same results, which proves the approximate index is not the problem.
+- If a snapshot of docs-v1 from Monday exists, restore it, add ingest-time changes since Monday from the change log re-embedded with A, and pin the query service back to A. Recall returns to Monday's level within the restore time.
+- If no snapshot exists, the 38% of documents now holding B vectors must be re-embedded with A before A queries can find them, or the team accepts reduced recall until a clean B index is ready.
+
+How to run the migration. Build docs-v2 as a separate index, named for its model, with the model id and preprocessing version stored on every vector. Pin each writer and the query service to an explicit model per index rather than a shared default. Dual-write new and changed documents to both indexes from the moment the backfill starts, so docs-v2 is complete when the backfill catches up. Evaluate docs-v2 on the labelled queries, then move reads by flag, a fraction of traffic first, with the query cache key including the model id. Keep docs-v1 and dual-writes running for a rollback window, then delete docs-v1.
+
+Costs, computed. A second copy at 1,024 float32 values is 3,200,000 × 1,024 × 4 bytes = 13.1 GB of raw vectors, before the HNSW graph. Re-embedding at an assumed 300 tokens per chunk is 960 million tokens; at text-embedding-3-small's listed $0.02 per million tokens, that is $19.20. The storage and the dual-write window cost more than the embedding calls.
+
+The failure mode of this plan is the dual-write window: a document updated during the backfill is written to docs-v2 by the dual-write and then overwritten by an older copy from the backfill if the backfill reads from a snapshot. Order the backfill by a version or timestamp and skip any document whose docs-v2 copy is newer.
+
+Why the wrong choices are tempting. The cache bug is real: cached A vectors would keep scoring against B documents for up to 24 hours after any switch, so the cache key needs the model id. It is not this incident, since cache misses alone show the same recall. HNSW degradation under heavy upserts is a real operational issue, ruled out because exact search returns the same results. A model that underperforms off-benchmark is the obvious suspect after any upgrade, ruled out by the 5% sample index.
 
 ## Follow-ups
 
-- *How would you catch this before it shipped?* An ingestion assertion that every vector's norm is 1 within a small tolerance, plus the recall check on the labelled set before switching reads.
-- *Is 256 dimensions a reasonable choice once fixed?* Measure recall at 768, 512 and 256 on the labelled set; the card lists all three as supported truncations, and the right one is the smallest that keeps recall.
-- *What if the index metric were cosine?* Cosine divides by the norms, so this bug would not have changed rankings. That is a reason to prefer cosine when you are not sure every writer normalises.
+- The corpus is 300 million chunks and a full re-embed takes nine days. What do you serve during those nine days, and what recall do you promise?
+- Could you query both indexes, each with its own query embedding, and merge? What breaks when you merge by score, and what does merging by rank cost?
+- Model B returns 1,024 dimensions and you want 512 to halve storage. What has to be true of B before you truncate, and what extra step does truncation need?
 
 ## Common mistakes
 
-- Blaming the new model and rolling back without checking norms.
-- Tuning the HNSW parameters first, which costs latency and fixes nothing here.
-- Re-normalising only the queries.
+- Rolling the query service back to A while the backfill keeps writing B vectors.
+- Treating equal dimension counts as compatibility.
+- Leaving the model id out of the stored metadata and the query cache key, so the next mix is detectable only by a drop in recall.

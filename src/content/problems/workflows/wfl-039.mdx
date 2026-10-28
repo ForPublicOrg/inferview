@@ -1,0 +1,101 @@
+---
+id: wfl-039
+title: An evaluation platform with async runs and LLM graders
+track: workflows
+module: operating-workflows
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 45
+core: false
+tags: [evals, llm-judge, batch, rate-limits, durable-execution, system-design]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: techinterview.org, LangChain interview guide (published 2026-04-24, updated 2026-07-12)
+    url: https://www.techinterview.org/companies/langchain/
+    note: lists "Design the evaluation platform supporting async runs across thousands of datasets with LLM-graders" as a system design prompt; the page reads as a synthesised guide, not a candidate report, so no company tag
+  - title: Duolingo engineering blog, A production-ready AI agent platform (2026-08-04)
+    url: https://blog.duolingo.com/production-ready-ai-agent-platform/
+    note: eval suites run on Temporal, a child workflow per case and repetition; deterministic graders are the foundation, LLM-as-judge optional
+  - title: Claude docs, batch processing
+    url: https://platform.claude.com/docs/en/build-with-claude/batch-processing
+    note: Message Batches cost 50 percent less; most batches finish within 1 hour; batches expire if not done in 24 hours; at most 100,000 requests or 256 MB per batch; under load more requests can expire (checked 2026-10-28)
+  - title: Temporal docs, Python testing suite
+    url: https://docs.temporal.io/develop/python/testing-suite
+    note: replay and time-skipping tests for the orchestration code (checked 2026-10-28)
+---
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+Design an evaluation platform for an AI product company. Engineers start runs from CI and from a web UI. A run takes a dataset, a target (a prompt version and model, or an agent build) and a set of graders, and produces per-item scores and a comparison against a baseline run.
+
+Scenario figures and constraints:
+
+- About 3,000 datasets. The median has 200 items and the largest has 50,000.
+- Most graders call a model; a few are code.
+- Eval traffic uses the same model-provider organization as production. That organization has a limit of 4 million input tokens per minute, and production peaks at 2.5 million.
+- Results must land in the existing trace store, which another team owns and will not change.
+- Four engineers build and run the platform.
+- CI runs on a pull request must report within 20 minutes.
+
+Cover orchestration, how a run survives worker loss, how grader calls are scheduled against the shared limit, caching, how grader changes are handled, and what a run reports. Choose the numbers you need and show the arithmetic. End with what you give up and a rollout plan.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the token count per item for the target call and for each grader call, and how many repetitions a run uses.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask which runs block a merge and which are read the next morning.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask how often graders change compared with targets, and whether old runs must be re-scored when a grader changes.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>A run is a durable workflow that shards the dataset into batches of items and runs each shard as a child workflow, so a lost worker costs one shard's in-flight calls, not the run. Target outputs are cached by target version and input hash, so a new grader re-scores old outputs without re-running the target. Every model call, target or grader, goes through one admission controller that holds eval traffic under a token budget below what production leaves free. CI runs use the synchronous API with a small, fixed dataset; large and nightly runs use the batch API at half price and accept hours of latency. Code graders run first and gate the model graders. A run reports per-item scores, a paired comparison with its baseline and an interval, and writes to the trace store through an adapter.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The arithmetic sets the shape. Take, as scenario figures, 2,000 input tokens for a target call and 3,000 for each of two model graders: 8,000 input tokens per item. The largest dataset is 50,000 × 8,000 = 400 million input tokens. Production peaks at 2.5 million of the 4 million per minute, so the most eval can use without touching production is 1.5 million; leaving a third of that as headroom for production spikes gives an eval budget of 1 million per minute. At that budget the largest dataset takes 400 minutes, close to seven hours, and a median dataset of 200 items (1.6 million tokens) takes under two minutes. The 20-minute CI limit is therefore a constraint on CI dataset size, not on the platform: at 1 million per minute shared by concurrent CI runs, a CI dataset of a few hundred items fits, and 50,000 never will.</p>
+<p>That gives the decision with two defensible answers: how large runs are sent. The synchronous API under the admission controller gives results in hours, and every token competes with production. The batch API costs 50 percent less, and Anthropic's docs say most batches finish within an hour. But a batch can take up to 24 hours, expires after that, and the docs warn that more requests can expire under heavy demand; a batch also holds at most 100,000 requests or 256 MB. I send nightly and large runs through batches, split into batches under those limits, and resubmit expired requests in a follow-up batch. CI runs stay synchronous because 24 hours is not a gate. The cost of the split is two code paths for calling a model, and two sets of failure handling.</p>
+<p>Orchestration. Duolingo runs eval suites as Temporal workflows, a child workflow per case and repetition. At 50,000 items, a child per item makes the parent's history as long as the dataset, so I group items into shards of a few hundred, one child workflow per shard. Each model call is an activity with a retry policy capped at a few attempts, so a provider outage fails a shard, not the platform. Shard results go to object storage, and the parent aggregates them.</p>
+<p>Caching. Target outputs are keyed by target version, input hash and sampling parameters. Repetitions exist to measure variance, so each repetition index is part of the key; the cache must never return repetition 1 as repetition 2. Grader outputs are keyed by grader version and the target output hash. A grader change then re-scores a run from cached outputs, at grader cost only.</p>
+<p>Graders. Code graders run first, as Duolingo does: schema, exact fields, forbidden strings, length, tool calls made. Model graders run only on items that pass them, which also cuts the token bill. Each model grader has a version, a pinned model, and a stored agreement figure against a human-labelled sample; a grader without one reports scores marked as uncalibrated.</p>
+<p>What a run reports. Per-item scores, then the comparison with the baseline on the same items as a paired difference with an interval, not two separate means. A difference inside the noise measured between two runs of the baseline is reported as no change.</p>
+<p>The trace store. Results go through an adapter that writes the store's existing span and attribute shape; the platform's own schema lives in its database. When the other team changes their ingest, only the adapter changes.</p>
+</Fragment>
+</Depth>
+
+### What you give up
+
+Nightly results arrive hours later, and some mornings later than that when batches slow down. CI evaluates a small dataset, so a regression that only shows on rare items is found overnight, after merge. Cached target outputs mean a change in provider behaviour under the same model name is invisible until the cache is bypassed.
+
+### The failure mode of this design
+
+The admission controller protects production by starving evals. During a long production peak, the eval budget falls toward zero and CI runs queue behind it, so the 20-minute limit is missed exactly on the busiest days. Teams then bypass the platform with their own keys, and the shared limit is no longer protected at all. Two mitigations: reserve a small fixed slice of the budget for CI runs that production cannot take, and alert on the age of the oldest queued CI run, not on queue length.
+
+### Rollout plan
+
+1. Weeks 1 to 4: orchestration, shards, cache and the code graders, on 20 datasets owned by one team, synchronous calls only. Trace-store adapter behind a flag.
+2. Weeks 5 to 8: admission controller, then model graders with versions and stored agreement figures. CI integration for that team.
+3. Weeks 9 to 12: batch path for nightly runs, then open to all teams.
+
+Rollback triggers:
+
+- Any production request rejected by the provider for rate limit while an eval was running; the admission controller then goes back to a lower budget.
+- More than 5 percent of a week's CI runs missing the 20-minute limit. The 5 percent is a choice; anything from 2 to 10 percent is defensible, and the signal to read next to it is teams running evals outside the platform.
+- A grader re-score that disagrees with the original run on cached outputs, which means the cache key is wrong.
+
+## Follow-ups
+
+- *Your model graders cost three times the target calls. Which graders do you cut, and what risk do you accept in writing?* Cut the graders whose verdict a code grader already predicts on the labelled sample, and run the rest on a sample of items rather than all of them; the accepted risk is a regression confined to rare items that the sample misses.
+- *What would you need to see to give evals their own provider organization instead of sharing the limit?* Weeks where the eval budget fell low enough that CI missed its limit, or a production incident traced to eval traffic. Either makes the cost of a second organization and a second contract cheaper than the shared one.
+- *The judge model is retired in 60 days, and 12 of 40 model graders disagree with their replacement beyond tolerance on the labelled sample. Which ship degraded, and who signs off?* Re-label a fresh sample for the 12, ship the 28 that agree, and mark the 12 as uncalibrated until they pass; the owning teams sign off on their own graders, because they read the results.
+- *Why not one workflow per item?* The parent's history grows with the dataset, and a 50,000-item run turns every shard-level retry into history traffic; shards keep the parent's history proportional to the number of shards.
+
+## Common mistakes
+
+- Sizing the platform for the largest dataset in CI instead of separating CI from nightly runs.
+- Letting eval traffic call the provider directly, so a large run degrades production latency.
+- Caching target outputs without the repetition index in the key, so variance looks like zero.
+- Comparing two runs' means instead of the paired difference on the same items.
+- Treating a grader change as a new run and re-running every target call to get it.

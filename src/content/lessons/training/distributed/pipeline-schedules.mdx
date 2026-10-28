@@ -1,0 +1,182 @@
+---
+title: Pipeline parallelism and its schedules
+track: training
+module: distributed
+order: 5
+kind: lesson
+level: senior
+minutes: 14
+summary: Pipeline parallelism cuts the model into stages and pays an idle bubble of (p - 1)/m of the useful time, which 1F1B keeps while capping in-flight activations at p micro-batches, interleaving divides by v at v times the communication, and zero-bubble and DualPipe schedules fill it by splitting the backward pass.
+prerequisites: [training/distributed/step-memory]
+updated: 2026-10-28
+sources:
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: AFAB bubble (p - 1)/m; 1F1B has the same bubble but stores activations for p micro-batches instead of m; interleaved bubble (p - 1)/(v m) at v times the communication; zero bubble splits backward into B (inputs) and W (weights), W can be placed anywhere after the matching B, ZB-H2 is a theoretical zero-bubble schedule; DualPipe propagates two streams from both ends and needs measured op durations and an ILP; Llama 3.1 uses 1F1B with interleaved stages and a tunable depth-first versus breadth-first priority; PP throughput drops only 14% from p = 8 to p = 16 at small m against about 43% for cross-node TP; PP prefers large grad_acc to hide the bubble. Checked 2026-10-28.
+  - title: Narayanan et al., Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM (arXiv 2104.04473)
+    url: https://arxiv.org/abs/2104.04473
+    note: abstract reports the interleaved pipeline schedule improves throughput by 10+% with memory comparable to existing approaches; 1T parameters on 3,072 GPUs at 502 petaFLOP/s, 52% of peak. Checked 2026-10-28.
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: Table 2 bubble and memory, 1F1B (PP-1)(F+B), 1x parameters, PP activations; ZB1P (PP-1)(F+B-2W); DualPipe (PP/2-1)(F&B+B-3W), 2x parameters, PP+1 activations; chunks split into attention, all-to-all dispatch, MLP, all-to-all combine, backward split into input and weight parts; requires stages and micro-batches divisible by 2; bubble and activation memory do not grow with micro-batches; PP16 on 2,048 H800 GPUs. Checked 2026-10-28.
+  - title: Liang et al., TorchTitan (arXiv 2410.06511v3)
+    url: https://arxiv.org/html/2410.06511v3
+    note: six pipeline schedules including GPipe, 1F1B, Interleaved 1F1B, Looped-BFS, Flexible-Interleaved-1F1B and ZeroBubble; Llama 3.1 405B on 512 GPUs with FSDP 4, TP 8, PP 16, 100 tokens/s per GPU with 1F1B and 130 with Interleaved 1F1B (+30%), memory 78.0 to 80.3 GiB. Checked 2026-10-28.
+  - title: Dubey et al., The Llama 3 Herd of Models (arXiv 2407.21783)
+    url: https://arxiv.org/html/2407.21783
+    note: PP 16 in all published 405B configurations; schedule with a tunable number of contiguous micro-batches, removing the need for batch size divisible by stages; first and last stages have one fewer layer to balance memory and compute; FP32 gradient accumulation across micro-batches. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Layers on different GPUs
+
+Pipeline parallelism gives each of p GPUs a contiguous slice of layers, a stage, and passes activations forward and gradients backward across stage boundaries with point-to-point sends. Its communication is small and infrequent compared with tensor parallelism: one activation tensor of s x b x h per micro-batch per boundary, not four collectives per layer. That is why it is the dimension that crosses nodes. The Playbook measured throughput dropping only 14% when it stretched pipeline parallelism from one node (p = 8) to two (p = 16) at a small number of micro-batches, against around 43% for tensor parallelism across nodes.
+
+The cost is idle time. It is an assembly line with a fill and a drain, with the difference that the line must drain completely at every optimizer step, because the weights change between steps.
+
+## The bubble
+
+Split the step's batch into m micro-batches. Let one micro-batch's forward through one stage take t_f and its backward t_b. In the all-forward-all-backward schedule (AFAB, as in GPipe), stage 0 starts all m forwards back to back; the last stage starts its first forward only after p - 1 forward slots; the backward pass then mirrors it. The step takes (m + p - 1)(t_f + t_b), of which m(t_f + t_b) is useful. The ratio of idle to useful time is
+
+```
+bubble = (p - 1) / m
+```
+
+<Predict id="trn-dist-pp-bubble" question="With p = 8 pipeline stages and m = 16 micro-batches per step, what is the bubble as a percentage of the useful compute time, (p - 1)/m?" answer={43.75} tolerance={0.5} unit="%">
+<p>(8 - 1) / 16 = <b>43.75%</b>. As a share of the whole step it is (p - 1)/(m + p - 1) = 7/23 = 30.4%: almost a third of the step, every GPU idle. Raising m to 64 brings the ratio to 10.9%. That is the lever the Playbook names: pipeline parallelism prefers large gradient accumulation, which means a large global batch.</p>
+</Predict>
+
+The global batch is the constraint. m micro-batches times the micro-batch size times the data-parallel degree is the global batch, which is set by optimization, not by the systems team. Adding data-parallel ranks at a fixed global batch reduces m and grows the bubble. Pipeline depth, data-parallel width and batch size are one budget.
+
+## 1F1B: same bubble, bounded memory
+
+AFAB has a memory problem the formula hides. Stage 0 runs all m forwards before any backward, so it holds activations for m micro-batches at once.
+
+One-forward-one-backward (1F1B) reorders the same work. Each stage runs a warm-up of p - s - 1 forwards (s is its index), then alternates one forward and one backward, then drains the remaining backwards. A micro-batch's activations are freed as soon as its backward runs, so stage 0 holds at most p micro-batches in flight instead of m. The Playbook's statement of the result: the bubble is the same size; the activation memory is p micro-batches instead of m. Since m is chosen large to shrink the bubble, the difference is large.
+
+The simulator below runs both schedules as dependency-driven event lists, with backward taking twice as long as forward, and reports the step time, the bubble ratio and the peak activations held by stage 0.
+
+```python
+def schedule(p, m, kind):
+    """Per-stage op order: ('F', i) or ('B', i). kind is 'afab' or '1f1b'."""
+    orders = []
+    for s in range(p):
+        if kind == "afab":
+            ops = [("F", i) for i in range(m)] + [("B", i) for i in range(m)]
+        else:
+            warm = min(p - s - 1, m)
+            ops = [("F", i) for i in range(warm)]
+            f, b = warm, 0
+            while b < m:
+                if f < m:
+                    ops.append(("F", f)); f += 1
+                ops.append(("B", b)); b += 1
+        orders.append(ops)
+    return orders
+
+
+def simulate(p, m, kind, tf=1.0, tb=2.0):
+    orders = schedule(p, m, kind)
+    done, free, pos, live, peak = {}, [0.0] * p, [0] * p, [0] * p, [0] * p
+    while any(pos[s] < len(orders[s]) for s in range(p)):
+        progressed = False
+        for s in range(p):
+            if pos[s] == len(orders[s]):
+                continue
+            op, i = orders[s][pos[s]]
+            if op == "F":
+                dep = [(s - 1, "F", i)] if s > 0 else []
+            else:
+                dep = [(s, "F", i)] + ([(s + 1, "B", i)] if s < p - 1 else [])
+            if all(d in done for d in dep):
+                start = max([free[s]] + [done[d] for d in dep])
+                done[(s, op, i)] = free[s] = start + (tf if op == "F" else tb)
+                live[s] += 1 if op == "F" else -1
+                peak[s] = max(peak[s], live[s])
+                pos[s] += 1
+                progressed = True
+        assert progressed, "deadlock"
+    makespan = max(free)
+    return makespan, (makespan - m * (tf + tb)) / (m * (tf + tb)), peak[0]
+
+
+for kind in ("afab", "1f1b"):
+    t, bubble, peak = simulate(p=8, m=16, kind=kind)
+    print(kind, t, round(bubble, 4), peak)
+# afab 69.0 0.4375 16
+# 1f1b 69.0 0.4375 8
+```
+
+Same step time, same 43.75% bubble, half the peak activations at m = 16, and the gap widens with m. The [pipeline schedule lab](/labs/pipeline-schedule) extends this simulator to interleaved and zero-bubble schedules and checks the formulas below. That is why 1F1B, not AFAB, is the baseline every later schedule is compared against.
+
+## Interleaving: smaller bubble, more sends
+
+The bubble is proportional to the time one micro-batch takes to cross the pipeline. Interleaving shortens that by giving each GPU v non-contiguous chunks of layers instead of one contiguous stage: with 32 layers on 8 GPUs and v = 2, GPU 0 holds layers 0 to 1 and 16 to 17. A micro-batch now crosses the GPUs v times, each time through a chunk 1/v as long, and the fill and drain shrink by v:
+
+```
+bubble_interleaved = (p - 1) / (v * m)
+```
+
+The price, by the Playbook's account, is v times the point-to-point communication, since every micro-batch crosses v times as many boundaries.
+
+<Predict id="trn-dist-pp-interleave" question="Keep p = 8 and m = 16 and interleave with v = 2 chunks per GPU. What is the bubble as a percentage of useful compute?" answer={21.875} tolerance={0.5} unit="%">
+<p>7 / (2 x 16) = <b>21.9%</b>, half the 43.75%. The activation sends per step double. Whether that trade wins depends on whether the sends overlap with compute; on a node boundary with idle bandwidth it usually does, because a PP send is one s x b x h tensor per micro-batch.</p>
+</Predict>
+
+Published runs show the size of the effect. Megatron-LM's abstract reports the interleaved schedule improving throughput by 10+% at comparable memory. TorchTitan's Llama 3.1 405B run on 512 GPUs, FSDP 4, TP 8 and PP 16, went from 100 tokens per second per GPU with 1F1B to 130 with interleaved 1F1B, 30%, at 80.3 GiB against 78.0 GiB. Llama 3's own schedule is interleaved 1F1B with a tunable number of contiguous micro-batches, which the report says removes the constraint that the batch size be divisible by the number of stages, and with one fewer layer on the first and last stages to balance the embedding and output head.
+
+## Zero bubble: split the backward pass
+
+The backward pass of a matmul is two matmuls: the gradient with respect to the input, B, which the previous stage is waiting for, and the gradient with respect to the weights, W, which nobody needs until the optimizer step. 1F1B runs them together, so the previous stage waits for both. Zero-bubble schedules run B immediately to unblock the upstream stage and defer W into slots that would otherwise be bubble. The Playbook describes ZB-H2 as a theoretical schedule with zero bubble built this way. DeepSeek-V3's Table 2 gives the accounting, with F, B and W the times of forward, full backward and weight backward chunks:
+
+| Schedule | Bubble | Parameters | Activations |
+|---|---|---|---|
+| 1F1B | (PP - 1)(F + B) | 1x | PP |
+| ZB1P | (PP - 1)(F + B - 2W) | 1x | PP |
+| DualPipe | (PP/2 - 1)(F&B + B - 3W) | 2x | PP + 1 |
+
+## DualPipe
+
+DeepSeek-V3's schedule feeds micro-batches from both ends of the pipeline at once, so each GPU holds two stages' parameters, one per direction: the 2x in the table. Each chunk is split into attention, all-to-all dispatch, MLP and all-to-all combine, with backward chunks further split into input and weight parts, and a forward chunk of one micro-batch is paired with a backward chunk of another so that one's all-to-all runs during the other's computation. The point was not only the bubble. DeepSeek-V3 has a computation-to-communication ratio of about 1:1 for cross-node expert parallelism, and DualPipe is how it hides that communication.
+
+The constraints are explicit: stages and micro-batches must each be divisible by 2, and neither the bubble nor the activation memory grows with the number of micro-batches. The report says the doubled parameters do not raise memory much because its large expert-parallel degree leaves each GPU few parameters. The Playbook adds the operational cost: tuning such a schedule requires measuring the duration of each operation and solving an integer linear program.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"A 400B dense model runs PP 16, TP 8 and data parallelism on 1,024 GPUs with 1F1B. Optimization has fixed the global batch at 1,024 sequences of 8K tokens and the micro-batch at 1. The step has a large bubble, the run starts in three weeks, and memory headroom is 3 GiB per GPU. Interleaving, a zero-bubble schedule, or fewer pipeline stages: which do you choose?"**
+</Callout>
+
+<p class="tiny">The model, cluster and constraints are a scenario.</p>
+
+<Depth>
+<Fragment slot="short">
+<p>1,024 GPUs at TP 8 and PP 16 leave data parallelism 8, so m = 1,024 / 8 = 128 micro-batches per pipeline and the bubble is 15/128 = 11.7%. Interleaving at v = 2 halves it to 5.9% at about 2 GiB more memory on TorchTitan's 405B figures, which fits the 3 GiB headroom. Fewer stages would need more memory per GPU that we do not have. Zero-bubble is the larger win in theory but the riskiest in three weeks.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Compute m first: GPUs per pipeline replica are TP x PP = 128, so data parallelism is 1,024 / 128 = 8 and each replica gets 128 sequences, one per micro-batch: m = 128. The 1F1B bubble is 15/128 = 11.7% of useful time. Interleaving at v = 2 gives 15/256 = 5.9%; TorchTitan's 405B run measured 30% more throughput from interleaving at a 2.3 GiB increase, though its m was smaller and its starting bubble larger, so expect less here.</p>
+<p>Halving PP to 8 halves the bubble too but doubles parameters and optimizer state per GPU, which a 3 GiB headroom cannot absorb without ZeRO-3 across the data-parallel dimension, and PP with ZeRO-3 is a combination the Playbook says is rarely used because it needs a larger global batch to amortise. A zero-bubble schedule removes most of the remaining 5.9% but changes the backward pass of every module, and a correctness bug there corrupts gradients quietly. I would ship interleaved 1F1B, check memory on the first and last stages, which hold the embedding and the output head, and schedule zero-bubble as an experiment for the next run. Failure mode: interleaving doubles PP sends; if those share the NIC with data-parallel reduce-scatters, the gain shrinks, so profile the NIC on day one.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Interleaving fits on middle stages but the last stage, with the output head and a 128K vocabulary, runs out of memory. What do you move, and what does it cost the other stages?</li>
+<li>The optimization team offers to halve the global batch for the first 10% of training. Recompute the bubble and say whether your schedule choice changes for that phase.</li>
+<li>A colleague proposes DualPipe because DeepSeek-V3 used it. What in their setting made it pay that is absent here?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The bubble formulas assume equal stages. Real stages are not equal: the first holds the embedding, the last holds the output head and the loss, and the slowest stage sets the pace for all. Llama 3 removed a layer from each end for this reason. Balance by measured time per stage, not by layer count.
+
+They also assume point-to-point sends are free. With interleaving at large v and small micro-batches, the sends become numerous and latency-bound, and the measured bubble stops following (p - 1)/(v m).
+
+The memory figure for 1F1B, p micro-batches in flight on stage 0, is for the first stage; later stages hold fewer. Interleaving raises the in-flight count; TorchTitan measured 2.3 GiB more per GPU with it on the 405B run. Plan memory for stage 0, the worst stage, not for the average.
+
+Finally, the bubble is idle compute only if nothing else can use it. Schedules like DualPipe and zero-bubble earn their complexity when there is other work, deferred weight gradients or expert all-to-all, to place in it.
+
+<SelfRate id="lesson:training/distributed/pipeline-schedules" />

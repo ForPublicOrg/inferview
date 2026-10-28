@@ -1,0 +1,179 @@
+---
+title: How Anthropic contains Claude across products
+track: security
+module: sandboxing-secrets
+order: 4
+kind: teardown
+level: staff
+minutes: 12
+summary: A teardown of Anthropic's published containment design for claude.ai code execution, Claude Code and Cowork (a gVisor container, an OS sandbox with approvals, a local VM, and the proxies and allowlists around them) and of the three incidents that tested it, each walked as a trace.
+prerequisites: [security/sandboxing-secrets/isolation-playbook, security/sandboxing-secrets/what-sandboxes-leave-out, security/sandboxing-secrets/secrets-out-of-context]
+updated: 2026-10-28
+sources:
+  - title: Anthropic Engineering, How we contain Claude across products (25 May 2026; McGuinness, Grace, De Jonghe, Eaton, Ribbink)
+    url: https://www.anthropic.com/engineering/how-we-contain-claude
+    note: "risk as likelihood times blast radius; three risk categories and three defended components; claude.ai code execution in a gVisor container on isolated infrastructure with an ephemeral per-session filesystem; Claude Code approvals approved about 93% of the time, OS sandbox, 84% fewer prompts, auto mode blocking about 0.4% of benign commands and missing about 17% of overeager actions; Cowork VM on Apple Virtualization framework or HCS, workspace and .claude mounted, credentials in the host keychain, agent loop and local MCP servers moved to the host, mount modes, symlink resolution, MDM mount allowlists, pull-based OTLP logs; three incidents; Gray Swan ART figures for Claude Opus 4.7 of about 0.1% single-attempt and 5-6% after 100 adaptive attempts; three principles; open questions."
+  - title: Anthropic Engineering, Beyond permission prompts, making Claude Code more secure and autonomous (20 October 2025)
+    url: https://www.anthropic.com/engineering/claude-code-sandboxing
+    note: "filesystem and network isolation and why both are needed; proxy outside the sandbox enforcing domain restrictions; Claude Code on the web keeps git credentials and signing keys outside the sandbox behind a git proxy that checks branch and repository and attaches the real token; sandbox runtime open-sourced."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Diagram from '../../../../components/Diagram.astro';
+import Trace from '../../../../components/Trace.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What it is and who runs it
+
+Anthropic runs Claude as an agent in three products with three different answers to "where does the code run and what can it touch": code execution on claude.ai, Claude Code on developers' machines and in the cloud, and Cowork, a desktop agent for people who do not read shell commands. Its engineering post of 25 May 2026 describes all three and the incidents that tested them. This teardown uses only that post and Anthropic's October 2025 sandboxing post.
+
+Risk is likelihood times blast radius. Model-layer work keeps pushing likelihood down but never to zero, so the engineering job is to cap the blast radius with boundaries that hold whatever the model does. The post sorts threats into three categories (a user directing harm, the model misbehaving unasked, and external attackers through prompt injection or conventional attacks on tools, files and network paths) and defends three components: the environment, the model, and external content such as MCP servers, plugins and web tools.
+
+## The system
+
+<Diagram
+  title="Three containment patterns and the egress layer they share"
+  nodes={[
+    { id: "user", label: "User or prompt", note: "including a phished one" },
+    { id: "claudeai", label: "claude.ai code execution", note: "server-side, per session" },
+    { id: "cc", label: "Claude Code", note: "approvals, auto mode" },
+    { id: "cowork", label: "Cowork agent loop", note: "on the host" },
+    { id: "gvisor", label: "gVisor container", note: "ephemeral filesystem" },
+    { id: "ossandbox", label: "OS sandbox", note: "Seatbelt or bubblewrap" },
+    { id: "gitproxy", label: "Git proxy", note: "Claude Code on the web" },
+    { id: "vm", label: "Cowork VM", note: "own kernel, mounted workspace" },
+    { id: "keychain", label: "Host keychain", note: "credentials stay here" },
+    { id: "vmproxy", label: "API proxy in the VM", note: "own session token only" },
+    { id: "egress", label: "Egress proxies", note: "domain allowlists" },
+    { id: "net", label: "Allowed destinations", note: "registries, GitHub, api.anthropic.com" }
+  ]}
+  edges={[
+    { from: "user", to: "claudeai" },
+    { from: "user", to: "cc" },
+    { from: "user", to: "cowork" },
+    { from: "claudeai", to: "gvisor", label: "code" },
+    { from: "cc", to: "ossandbox", label: "shell" },
+    { from: "cc", to: "gitproxy", label: "scoped credential" },
+    { from: "cowork", to: "vm", label: "code" },
+    { from: "cowork", to: "keychain" },
+    { from: "vm", to: "vmproxy", label: "API calls" },
+    { from: "gvisor", to: "egress", label: "design not published" },
+    { from: "ossandbox", to: "egress" },
+    { from: "vmproxy", to: "egress" },
+    { from: "gitproxy", to: "net", label: "real token" },
+    { from: "egress", to: "net", label: "allowed hosts" }
+  ]}
+  rows={[["user"], ["claudeai", "cc", "cowork"], ["gvisor", "ossandbox", "gitproxy"], ["vm", "keychain"], ["vmproxy"], ["egress"], ["net"]]}
+/>
+
+**claude.ai code execution in a gVisor container.** Code runs server-side in a gVisor container on isolated infrastructure, never on the user's machine. The filesystem is ephemeral and per session, with no persistent workspace and no access to the user's files. The threat model is the reverse of the other two products: it protects Anthropic's infrastructure and its tenants from each other, not a user's laptop from the agent. It is the multi-tenant interpreter case from the playbook.
+
+**Claude Code: an OS sandbox plus approvals.** Claude Code launched asking for approval on writes, shell commands and network access. The post reports that users approved about 93% of those prompts, which is the measurement that says the prompts had stopped being a control. The response was an OS sandbox, Seatbelt on macOS and bubblewrap on Linux, with reads allowed, writes allowed inside the workspace and network denied by default. Anthropic reports 84% fewer permission prompts, open-sourced the sandbox runtime, and publishes a reference dev container for unattended runs. Auto mode, a model-based classifier, sits inside the sandbox as one more layer, with published error rates of about 0.4% of benign commands blocked and about 17% of overeager actions missed.
+
+**Git proxy for Claude Code on the web.** From the October 2025 post: each web session runs in an isolated cloud sandbox, and git credentials and signing keys are never inside it. The sandboxed git client authenticates to a proxy with a scoped credential; the proxy checks the git interaction, such as pushes only to the configured branch, validates the repository, and attaches the real token before forwarding to GitHub.
+
+**Cowork in a local VM.** Cowork runs a full VM on the platform hypervisor, Apple's Virtualization framework on macOS and HCS on Windows. The VM has its own Linux kernel, filesystem and process table. Only the workspace the user selects and the `.claude` folder are mounted, and credentials stay in the host keychain. Two later changes moved things out of the VM: the agent loop now runs on the host, so Claude can still respond when the VM fails, while code execution stays inside; and local MCP servers run outside the VM, treated like any locally installed software. Mounts can be read-only, read-write or read-write-no-delete, symlinks are resolved before path validation, and enterprises can set mount-path allowlists through MDM.
+
+**API proxy inside the VM.** Added after the third incident below: a proxy inside the VM intercepts traffic to Anthropic's API, passes only requests that carry the VM's own provisioned session token, and blocks headers that would make the server fetch something on the request's behalf. It sits inside the VM because only the VM knows which requests it originated.
+
+**Egress proxies and allowlists.** Every pattern ends in a proxy that decides which hosts are reachable. The post names a custom proxy as the piece that broke in its most consequential incident, and the Cowork section describes its allowlist proxy failing.
+
+## The incidents as traces
+
+Each trace is assembled from the post's prose, which gives no packet-level detail, timestamps or detection data.
+
+<Trace
+  title="Incident 1: project configuration ran before the trust prompt"
+  note="three vulnerabilities reported mid-2025 to January 2026"
+  steps={[
+    { actor: "attacker", text: "Commits project-local configuration to a repository, for example a hook in .claude/settings.json." },
+    { actor: "user", text: "Clones the repository and starts Claude Code in it." },
+    { actor: "harness", text: "Parses project-local configuration at start-up, before asking whether to trust the folder.", note: "The defect: configuration that can run code was read before the consent decision." },
+    { actor: "tool", text: "The hook runs with the user's full access." },
+    { actor: "user", text: "Sees the trust prompt after the code has already run." },
+    { actor: "system", text: "Fix: parsing and execution of project-local configuration are deferred until the user accepts the trust prompt." }
+  ]}
+/>
+
+<Trace
+  title="Incident 2: a phished prompt read cloud credentials and posted them"
+  note="internal red-team exercise, February 2026"
+  steps={[
+    { actor: "attacker", text: "A researcher phishes an employee into launching Claude Code with a malicious prompt." },
+    { actor: "user", text: "The prompt asks Claude to read ~/.aws/credentials, encode them and POST them to an external endpoint." },
+    { actor: "assistant", text: "Reads the file, encodes it and sends the request.", note: "Completed in 24 of 25 retries." },
+    { actor: "system", text: "Model-layer defences see nothing anomalous: the instruction came from the user, so this was direct prompt injection through the user." },
+    { actor: "system", text: "Response: rely on environment controls, egress and filesystem boundaries; a canary string placed in a shared Slack thread detects whether internal agents read the payload." }
+  ]}
+/>
+
+<Trace
+  title="Incident 3: files uploaded to an attacker's account through an allowlisted domain"
+  note="Cowork, reported by a third party; date not given"
+  steps={[
+    { actor: "attacker", text: "Plants a file in the user's mounted workspace with hidden instructions and the attacker's Anthropic API key." },
+    { actor: "assistant", text: "Reads the file, then reads other files in the workspace." },
+    { actor: "assistant", text: "Calls the Anthropic Files API with the attacker's key to upload them." },
+    { actor: "proxy", text: "The egress allowlist permits the request: api.anthropic.com is correctly allowed.", note: "The destination check passed; the account check did not exist." },
+    { actor: "attacker", text: "The files appear in the attacker's Anthropic account." },
+    { actor: "system", text: "Fix: a proxy inside the VM passes only requests with the VM's own session token and blocks headers that trigger server-side fetches." }
+  ]}
+/>
+
+Incidents 1 and 3 share a shape: the standard boundary held (the trust prompt as a design, the VM) and the failure was in code Anthropic wrote around it, a configuration loading order and an allowlist that checked destinations but not identities. The post makes this one of its three principles: be wary of custom components, because standard primitives held where the surrounding work did not.
+
+## Context strategy
+
+The containment design is deliberately indifferent to what is in the context. Incident 2 is the reason: when the user is the attacker, or has been phished, the context contains a legitimate-looking instruction and no classifier has anything to catch. The post's numbers for the model layer: on Gray Swan's Agent Red Teaming benchmark, Claude Opus 4.7 had about 0.1% attack success on single attempts and about 5 to 6% after 100 adaptive attempts. The deterministic boundary is what an attack meets when every probabilistic layer misses.
+
+Cowork mounts only the chosen workspace and `.claude`, so the agent cannot read what was never mounted. The canary string from incident 2, placed in content internal agents might read, is the post's one context-side control.
+
+## Tools and permission model
+
+The ordering principle is to match isolation strength to the user's capacity for oversight. Developers using Claude Code can read a shell command, so they get a per-command OS sandbox, approvals for what leaves it, and optionally auto mode. Cowork users largely cannot, so the whole execution environment is a VM, mounts are explicit with a no-delete mode, and enterprises restrict mount paths centrally. claude.ai users never see the code run, so it runs on Anthropic's infrastructure where no user resource is in reach.
+
+The third incident changed how the post describes allowlists: an allowlist entry is better treated as a capability grant than as a destination filter. Allowing `api.anthropic.com` granted every capability that host offers to any account, and the fix narrowed it to Anthropic's API acting for this VM's session.
+
+## Cost and latency
+
+The post publishes prompt counts, not compute costs: the cost Anthropic measured was human attention. It publishes no latency or memory figures for the gVisor container or the Cowork VM. One operational cost is stated: isolation hides the VM from host endpoint detection tools, and the current mitigation is pull-based OTLP log export, which the post says is not the same as live monitoring.
+
+## Failure modes
+
+Configuration as code. Any file the harness reads at start-up that can cause execution (hooks, MCP server definitions, settings) is code, and the consent decision has to come before it is read. Incident 1 was three separate reports of the same class.
+
+The user as the injection channel. Model-side layers see a legitimate request, so only filesystem and egress boundaries stop it, and only if the credential file is outside the read scope or the endpoint is outside the allowlist.
+
+Allowed destinations with multi-account semantics. Incident 3 generalises to every API host that authenticates by a key the request carries: package registries, storage, Git hosts, model APIs. A destination allowlist cannot tell the user's account from the attacker's.
+
+Monitoring gaps from isolation. With detection moved to pulled logs, an attack inside the VM is found after the fact if at all.
+
+## What is not public
+
+Absent from the post: CVE identifiers for the three trust-prompt vulnerabilities and the dates each was fixed; who reported the Cowork upload and when, and how long the exposure lasted; whether the February 2026 exercise ran with the sandbox enabled, and which model was used; how the Slack canary is monitored and whether it has fired; the design of claude.ai's egress proxy; which incident the post means when it says its custom proxy broke in its most consequential one, and what exactly broke; the contents of any allowlist; and any performance figures for the gVisor container or the Cowork VM. Claims about any of these are guesses unless they cite a later Anthropic source.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You are shipping a desktop agent for finance teams in six weeks. It mounts user folders, calls your own model API, and product wants web research enabled at launch. Security wants Anthropic-style containment. What do you build first, what do you defer, and what do you accept in writing?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>A VM for execution with explicit mounts, read-only by default, and credentials kept on the host. An egress proxy whose allowlist is reviewed as capability grants, and a proxy in front of my own API that accepts only the VM's session token, because my API is the allowed host most likely to be abused. Web research ships through a fetch tool on the host with no access to mounted files rather than as open egress from the VM. I would defer live monitoring and accept pull-based logs in writing for launch.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Finance users cannot review commands, so oversight is low and isolation has to be the strongest of the three patterns: a VM. Mounts are the user's explicit choice, read-only or no-delete by default, with symlinks resolved before validation.</p>
+<p>Egress is where the incident record says to spend the six weeks. Every allowed host gets a written answer to "what can a request with someone else's key do here". My own API is on the list by necessity, so it gets the identity check from incident 3 at launch, not after a report. Web research is the conflict: open egress from a VM holding finance files is the trifecta. I would run the fetcher on the host, give it no access to mounts, and return text to the agent, accepting that fetched pages are untrusted input to a session that holds files.</p>
+<p>What I accept in writing: injected instructions in fetched pages can still steer actions inside the mounts, bounded by no-delete mounts and the egress list; and detection is log-based for launch, with live monitoring dated for a later release.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Product says the host-side fetcher makes research answers worse because the agent cannot run code on what it fetched. Which constraint do you relax, and what does the risk note say?</em></li>
+<li><em>Your security lead wants the agent loop inside the VM so nothing agent-controlled runs on the host; your reliability lead wants it outside, as Anthropic moved it. How do you decide without deciding by rank?</em></li>
+<li><em>A month after launch, the API proxy's logs show requests from inside VMs carrying keys that are not the session's. What do you need to know before deciding whether this is an attack or a customer workflow?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+<SelfRate id="lesson:security/sandboxing-secrets/anthropic-containment" />

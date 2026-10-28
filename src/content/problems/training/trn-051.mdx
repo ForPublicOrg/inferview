@@ -1,0 +1,125 @@
+---
+id: trn-051
+title: The GRPO run that got faster and then fell apart
+subtitle: rank the explanations, then choose a correction you can defend on cost
+track: training
+module: rl
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: true
+tags: [grpo, rl-infrastructure, importance-sampling, vllm, fp8, on-policy]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Yao, Liu, Zhang, Dong, Shang and Gao, On the Rollout-Training Mismatch in Modern RL Systems (NeurIPS 2025, OPT workshop)
+    url: https://neurips.cc/virtual/2025/124259
+    note: "rollouts in vLLM and training in FSDP give significantly different token probabilities for the same weights, which makes nominally on-policy RL off-policy; truncated importance sampling corrects the gap and, the authors report, keeps training stable with quantized rollouts. Checked 2026-10-28."
+  - title: He and Thinking Machines Lab, Defeating Nondeterminism in LLM Inference (2025-09-10)
+    url: https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+    note: "vendor's own measurements: on Qwen 2.5-VL 8B, RL without importance weighting collapsed with a loss spike near step 318 that coincided with a KL spike; with importance weighting the sampler-trainer KL stayed near 0.001; with batch-invariant kernels it was 0. 1,000 sequences on Qwen3-8B took 26 s with default vLLM, 55 s deterministic unoptimised, 42 s with an improved attention kernel. Checked 2026-10-28."
+  - title: Hugging Face TRL, GRPO Trainer (main branch docs)
+    url: https://huggingface.co/docs/trl/main/en/grpo_trainer
+    note: "on main as of 2026-10-28: vllm_importance_sampling_correction defaults to True with mode sequence_mask; truncate modes clip the ratio to [C_min, C_max], mask modes zero samples outside it; vllm_importance_sampling_clip_max defaults to 3.0; the original TIS used only an upper bound."
+  - title: Shao et al., DeepSeekMath (v3, 2024-04-27)
+    url: https://arxiv.org/abs/2402.03300
+    note: "the GRPO ratio is against the old policy that generated the samples. Checked 2026-10-28."
+choices:
+  - text: The tokens were sampled from the engine's distribution but the loss weights them as the trainer's, and FP8 widened that gap
+    correct: true
+    why: The collapse follows the engine-trainer KL, which went from 0.0011 to 0.019 at step 50 when rollouts moved to FP8, and nothing in the loss reweights tokens by trainer probability over engine probability.
+  - text: Turning the KL penalty off at the same time let the policy drift from the reference until the run collapsed without an anchor
+    correct: false
+    why: A real choice to revisit, but the bf16 run also had beta 0 and was stable for 600 steps, so the penalty is not what changed.
+  - text: Switching to a token-mean loss gave the longest rollouts the most weight, and raising the length cap made those rollouts unstable
+    correct: false
+    why: The token-mean loss and the longer cap change gradient weighting, but neither explains why the spike in engine-trainer KL precedes the collapse.
+  - text: The PPO ratio should use the engine's log-probs as the old policy, so the clip is measuring distance from the wrong distribution
+    correct: false
+    why: Swapping the ratio's denominator folds the mismatch into the clip, which silently drops the most mismatched tokens instead of reweighting them; it is a different correction, not the cause.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="The round">
+"We made our GRPO rollouts faster and the run fell apart. Find out why, and tell me whether we keep the speedup."
+</Callout>
+
+As a scenario: GRPO on a 7B model for maths with a rule-based verifier, G = 8, rollouts in a separate vLLM fleet, training in FSDP with bf16 weights, one optimiser step per rollout batch, split into four minibatches. The previous run used bf16 rollouts and trained for 600 steps without incident. For the new run, three things changed in one pull request: rollouts moved to FP8 weights for throughput, the loss moved from per-sequence mean to token mean, and the generation cap went from 4,096 to 8,192 tokens. The KL coefficient was 0 in both runs.
+
+The training step, unchanged apart from the normaliser:
+
+```python
+def grpo_step(batch, policy, opt, eps_low=0.2, eps_high=0.28):
+    # batch.tokens and batch.mask come from the rollout fleet; batch.adv is per sequence
+    with torch.no_grad():
+        old_logp = policy.token_logprobs(batch.tokens)
+    for mb in batch.minibatches(4):
+        logp = policy.token_logprobs(mb.tokens)
+        ratio = torch.exp(logp - old_logp[mb.idx])
+        adv = mb.adv[:, None]
+        surr = torch.minimum(ratio * adv, ratio.clamp(1 - eps_low, 1 + eps_high) * adv)
+        loss = -(surr * mb.mask).sum() / mb.mask.sum()
+        loss.backward()
+    opt.step(); opt.zero_grad()
+```
+
+The rollout fleet returns its own per-token log-probs in `batch.engine_logp`, which the step logs but does not use. Logged metrics, the mean per-token KL estimate between engine and trainer on sampled tokens:
+
+| step | bf16 run: reward | bf16 run: engine-trainer KL | FP8 run: reward | FP8 run: engine-trainer KL | FP8 run: mean length |
+|---|---|---|---|---|---|
+| 50 | 0.31 | 0.0011 | 0.30 | 0.019 | 1,210 |
+| 150 | 0.44 | 0.0012 | 0.45 | 0.024 | 1,480 |
+| 250 | 0.52 | 0.0012 | 0.49 | 0.061 | 1,930 |
+| 300 | 0.55 | 0.0013 | 0.21 | 0.340 | 3,850 |
+
+Nobody has run FP8 rollouts with the old loss and cap, or looked at which tokens carry the mismatch. Pick the explanation for the collapse, rank the other changes, say what you would collect, and say whether to keep FP8 rollouts.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the engine-trainer KL broken down by the trainer's probability of the sampled token.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the engine-trainer KL was on step 50 of a run with FP8 rollouts and the old loss and cap.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask how much wall-clock time per step the FP8 rollouts saved.</p></details>
+
+## Answer
+
+**The cause: the samples are not from the policy the loss assumes.** The ratio in the code is against `old_logp`, which the trainer recomputes, and the optimiser steps once after all four minibatches, so the ratio is exactly 1 on every token and the clip never fires. That makes the update the policy gradient for samples drawn from the trainer's distribution. They were drawn from the engine's. When the two match closely, as in the bf16 run at a KL of about 0.001, the bias is small. FP8 rollouts start at 0.019, about seventeen times that, and the gap grows as the policy moves, which is what the table shows from step 150 onward. Tokens the engine over-samples relative to the trainer get pushed as if the trainer chose them, and the policy chases the engine's quantisation error. Yao et al. describe exactly this: separate rollout and training stacks make nominally on-policy RL off-policy.
+
+The correction the code is missing is a per-token weight of trainer probability over engine probability on each sampled token, which the logged `engine_logp` makes free to compute: `w = exp(old_logp - engine_logp)`. Truncated importance sampling multiplies the surrogate by `min(w, C)`.
+
+Computed for one token: if the trainer gives the sampled token 0.60 and the FP8 engine gave it 0.05, then w = 0.60 / 0.05 = 12. Without a cap that token's gradient is multiplied by 12; with C = 3 it is multiplied by 3. The reverse token, trainer 0.05 and engine 0.60, gets w = 0.083, so it barely moves the policy, which is the point: the engine sampled it far more often than the trainer would have.
+
+**Why the others are tempting, and how they rank.**
+
+1. *The length cap and token-mean loss* rank second. Mean length doubles between step 150 and 250 and triples by 300, and the token-mean loss gives long rollouts more weight in the batch, so this change amplifies whatever the long tokens carry. But the bf16 run with the same algorithm stayed near 0.001 KL, and the spike in mismatch precedes the length jump, so length is an amplifier, not the cause. It must still be separated by an ablation.
+2. *The KL penalty* was 0 in both runs. A reference KL anchors the policy to its starting point, not to the engine, so turning it on would slow the drift without removing the bias.
+3. *Using `engine_logp` as the ratio's denominator* is a correction some frameworks use, so it looks like the defect. It makes the clip absorb the mismatch: a token whose engine-trainer ratio is already outside the clip gets zero gradient, so the most mismatched tokens drop out unseen. That can be acceptable, and it is close to the masked variant below, but it is a design choice, not why the current run collapsed.
+
+**What to collect.** The engine-trainer KL by trainer probability of the sampled token, to see whether the mismatch concentrates in rare tokens; an FP8 run with the old loss and cap for 300 steps; the fraction of tokens whose w exceeds 3; and the time per step under bf16 and FP8 rollouts. Without the ablation, the decision below still stands, because the correction is needed whether or not length contributed.
+
+**The decision: correct the mismatch or remove it.** Both are defensible.
+
+- *Keep FP8 and add truncated importance sampling.* Cost: a truncation bias on every capped token and higher gradient variance. Yao et al. report that TIS keeps training stable with quantized rollouts. TRL's GRPO trainer on main ships this correction on by default, with a masked sequence-level mode as the default and 3.0 as the default upper bound.
+- *Remove the mismatch.* Go back to bf16 rollouts, or go further with batch-invariant kernels so the engine and trainer agree bitwise; Thinking Machines report sampler-trainer KL of exactly 0 that way. Cost: their own measurement on Qwen3-8B was 42 s for 1,000 sequences against 26 s for default vLLM, about 1.6 times slower, plus the engineering to keep kernels matched across upgrades.
+
+The constraint conflict is rollout throughput against gradient correctness, and the throughput gain has not been measured on this setup. The quantity to choose is C. Reasonable values sit between about 2 and 5: TRL's default of 3 caps the 12x token above at 3. No cap is unreasonable, because a token the FP8 engine assigned 0.001 can carry a weight in the hundreds. C = 1 is also unreasonable, because it down-weights every token the trainer likes more than the engine and biases the gradient toward the engine's distribution.
+
+My pick: keep FP8, add TIS with C = 3, and run the ablation in parallel.
+
+**Failure mode of the recommendation.** TIS bounds the damage per token but does not stop the gap from growing. If the policy drifts into regions where FP8 quantisation is poor, more tokens hit the cap, the correction becomes mostly truncation, and the gradient is biased again with no alarm. Alert on the fraction of capped tokens, not only on the mean KL, and fall back to bf16 rollouts above a threshold you set from the first few hundred steps.
+
+## Follow-ups
+
+- The capped-token fraction rises from 1% to 9% over a week of training. Do you lower C, re-quantise the engine from the current weights, or switch to bf16 rollouts, and what do you write in the run log as the accepted risk?
+- What would you need to see in the ablation to conclude that the length cap, not FP8, caused the collapse, and would that change your decision on TIS?
+- The infrastructure lead wants batch-invariant kernels so the question never comes up again; the research lead wants the throughput. How do you decide without deciding by rank?
+- Moving rollouts to a separate fleet with one step of staleness adds a second source of mismatch. Does one importance weight cover both, and what do you log to tell them apart?
+
+## Common mistakes
+
+- Treating a recomputed `old_logp` as proof the run is on-policy; it only proves the trainer agrees with itself.
+- Turning on the reference KL penalty to fix a sampler-trainer gap.
+- Attributing the collapse to whichever of the three changes was discussed most, without the ablation.
+- Importance weighting with no cap and reading the resulting gradient spikes as a learning-rate problem.

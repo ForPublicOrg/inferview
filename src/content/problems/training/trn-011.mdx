@@ -1,0 +1,126 @@
+---
+id: trn-011
+title: Eight GPUs waiting on their input
+subtitle: storage, CPU, batching, transfer or synchronisation
+track: training
+module: gpu-kernels
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [data-loading, input-pipeline, pinned-memory, synchronisation, tokenization]
+companies:
+  - name: Mistral AI
+    url: https://prachub.com/interview-questions/keep-gpus-fed-with-an-efficient-data-preparation-pipeline
+updated: 2026-10-28
+sources:
+  - title: PracHub, Keep GPUs fed with an efficient data-preparation pipeline (Mistral AI, Software Engineer, technical screen)
+    url: https://prachub.com/interview-questions/keep-gpus-fed-with-an-efficient-data-preparation-pipeline
+    note: "candidate report aggregated by PracHub and linked to a Mistral AI interview experience, posted 2026-09-01, updated 2026-09-21: diagnose GPU input starvation across storage, CPU preprocessing, batching, transfer and synchronisation, then improve bounded overlap while preserving data correctness. The scenario below is original. Checked 2026-10-28."
+  - title: PyTorch 2.14 documentation, CUDA semantics
+    url: https://docs.pytorch.org/docs/2.14/notes/cuda.html
+    note: "host-to-GPU copies are much faster from pinned memory; non_blocking=True overlaps a copy with compute only from pinned memory; DataLoader pin_memory=True; launches are asynchronous and CPU-GPU synchronising calls stall the CPU. Checked 2026-10-28."
+choices:
+  - text: "Pageable host memory makes each batch copy synchronous, so the GPU stalls on every transfer to it"
+    correct: false
+    why: "The copy is real and unoverlapped, but half a megabyte per step cannot account for a 60 ms wait."
+  - text: "The per-step loss.item() call blocks the CPU, so it cannot pull the next batch while the GPU runs"
+    correct: false
+    why: "It is a real stall, but it delays the CPU by at most the step's remaining GPU time, and the wait is measured inside the loader."
+  - text: "Network storage cannot stream the compressed shards fast enough for eight ranks reading at once"
+    correct: false
+    why: "Reads run at under a tenth of the quota, and storage starvation would show workers blocked on I/O, not at full CPU."
+  - text: "Two workers per rank tokenize more slowly than the step consumes, so every step waits on the queue"
+    correct: true
+    why: "The workers are pegged, 48 cores are idle, and the per-step wait equals the gap between batch production time and step time."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Our GPUs sit at about 70% utilisation during pretraining and the profiler shows them idle between steps. Find the cause and fix it without changing what data the model sees."
+</Callout>
+
+The setup, as a scenario: one node, 8 H100s, 64 CPU cores, one data-parallel rank per GPU. Each rank reads zstd-compressed JSONL shards from network storage, tokenizes on the fly and packs tokens into rows of 8,192; a micro-batch is 8 rows, 65,536 tokens.
+
+```python
+class PackedStream(IterableDataset):
+    def __init__(self, shard_paths, tokenizer, seq_len=8192):
+        self.shards, self.tok, self.seq_len = shard_paths, tokenizer, seq_len
+
+    def __iter__(self):
+        info = get_worker_info()
+        mine = self.shards[info.id :: info.num_workers]
+        buf = []
+        for path in mine:
+            for line in read_zstd_jsonl(path):
+                buf.extend(self.tok.encode(line["text"]) + [EOS_ID])
+                while len(buf) >= self.seq_len:
+                    yield torch.tensor(buf[: self.seq_len])
+                    buf = buf[self.seq_len :]
+
+loader = DataLoader(PackedStream(rank_shards, tok), batch_size=8,
+                    num_workers=2, prefetch_factor=2, pin_memory=False)
+
+for step, ids in enumerate(loader):
+    ids = ids.cuda(non_blocking=True)
+    loss = model(ids).loss
+    loss.backward()
+    opt.step(); opt.zero_grad()
+    log(step, loss.item())
+```
+
+What the team measured on rank 0 over 200 steps (scenario):
+
+```text
+step time                           210 ms (mean)
+GPU kernels busy per step           150 ms
+time blocked in next(loader)         60 ms (mean), every step
+host-to-device copy per step        8 x 8192 int64 = 0.5 MB
+storage reads, whole node           38 MB/s against a 400 MB/s quota
+top: 16 dataloader processes at ~100% CPU each, 48 cores idle
+```
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the loader's throughput measured alone, with no model and no GPU, on one rank.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask how a worker's time splits between reading, decompressing, tokenizing and packing.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what a checkpoint records about the data position, and whether a restarted run sees the same samples in the same order.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>The two workers per rank are CPU-bound on tokenization and produce a batch about every 210 ms while the GPU needs one every 150 ms; the 60 ms wait is the difference, and prefetching cannot hide a rate gap. The fix that is fast to ship is more workers (64 cores allow about six per rank), at the cost of changing which worker reads which shard, so sample order changes and resume must account for it. The fix that removes the problem is pre-tokenizing into packed token shards that are memory-mapped and indexed by position, at the cost of an offline job and a re-run whenever the tokenizer changes.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>Why this cause.</b> The step is 210 ms, of which 150 ms is GPU work and 60 ms is waiting inside the loader. Each rank's two workers are at full CPU while 48 cores are idle, so the loader is limited by CPU in the workers, not by storage (under a tenth of the quota) or by the copy (half a megabyte). A bounded prefetch queue only absorbs variation: when production is slower than consumption on average, the queue drains and each step waits for the gap, here 210 − 150 = 60 ms.</p>
+<p><b>What is missing, and what to do without it.</b> Nobody measured the loader alone or split a worker's time across read, decompress, tokenize and pack. Collect both; until then, assume tokenization dominates, since decompressing zstd is cheap against encoding text in Python, and verify with one profiled worker before committing to the larger fix.</p>
+<p><b>Two defensible fixes.</b> Raise <code>num_workers</code> to six per rank: if tokenization scales per process, batch time falls to about 210 × 2 / 6 = 70 ms, under the step. The cost is correctness, not speed: shards are assigned by <code>info.id :: num_workers</code>, so changing the worker count changes which samples each worker yields and in what order, and a run resumed with a different count sees different data. Record the worker count in the checkpoint and resume with it, or move shard assignment out of the worker. It also costs RAM per worker for the tokenizer and prefetch buffers. Alternatively, pre-tokenize offline into packed rows stored as integer arrays, memory-map them, and index by global sample number: the per-step CPU cost becomes a slice, resume is exact by index, and the order is independent of worker count. The cost is an offline job before the run, storage for the tokens, and a full re-tokenization if the tokenizer changes. With a run already in flight, ship more workers with the count pinned in the checkpoint now, and build the pre-tokenized path for the next run.</p>
+<p><b>Failure mode of the quick fix.</b> Six workers per rank is 48 worker processes plus 8 trainers on 64 cores, so any extra CPU work on the node (checkpoint serialisation, logging, a heavier tokenizer) brings the wait back. Alert on time blocked in the loader as a run metric.</p>
+<p><b>Secondary defects, ranked.</b> Second: <code>loss.item()</code> every step synchronises the CPU with the GPU, so the CPU cannot enqueue the next step's kernels ahead of time; log every N steps from a GPU-side accumulator. Third: <code>pin_memory=False</code> with <code>non_blocking=True</code>; from pageable memory the copy cannot overlap with compute, so set <code>pin_memory=True</code>. Both are worth fixing, and neither explains a 60 ms wait measured inside the loader.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Pre-tokenizing needs two weeks and the run has three weeks left. Do you build it now or only raise workers, and what risk do you write down?</li>
+<li>After raising workers, loss curves of the resumed run differ from a run that never stopped. How do you show whether that is the data order or a bug?</li>
+<li>What measurement would make you move tokenization onto the GPU instead?</li>
+</ul>
+</Fragment>
+</Depth>
+
+**Why the wrong choices are tempting.** The pageable copy and the <code>.item()</code> call are both real defects that appear in every checklist of input-pipeline problems, and both serialise something; neither accounts for 60 ms measured as time blocked in the loader. Network storage is the usual suspect when the data lives remotely, but the read rate and the CPU-bound workers rule it out.
+
+## Follow-ups
+
+- The tokenizer team ships a faster tokenizer. What do you measure before relying on it, and what changes if its output differs by one token on some inputs?
+- How would you test that the packed rows are identical between the on-the-fly path and the pre-tokenized path?
+
+## Common mistakes
+
+- Raising `prefetch_factor`. A deeper queue does not raise the production rate.
+- Treating 70% GPU utilisation as a GPU problem and tuning kernels.
+- Changing `num_workers` mid-run without recording it, so a resumed run trains on a different order.

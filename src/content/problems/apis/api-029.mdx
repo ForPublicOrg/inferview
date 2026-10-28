@@ -1,0 +1,246 @@
+---
+id: api-029
+title: Model a provider's prefix cache
+subtitle: predict reads and writes for a request trace
+track: apis
+module: context-engineering
+type: code
+difficulty: hard
+seniority: [senior, staff]
+minutes: 45
+core: true
+tags: [prompt-caching, simulation, cost]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Claude docs, prompt caching
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: up to 4 breakpoints; writes only at breakpoints; lookback of at most 20 positions per breakpoint, counting the breakpoint; 5-minute lifetime measured from the start of the request and refreshed on use; minimum cacheable length 512 tokens on Opus 5.5, shorter prompts processed without caching and without error; charged reads up to the highest hit and writes from there to the last breakpoint; checked 2026-10-28
+  - title: OpenAI API docs, prompt caching
+    url: https://developers.openai.com/api/docs/guides/prompt-caching
+    note: cache entries live on individual machines and routing uses a hash of the initial tokens; used in the follow-ups; checked 2026-10-28
+code:
+  starter: |
+    class PrefixCache:
+        """A model of a provider prefix cache, built from the Claude prompt-caching docs.
+
+        blocks: list of (content, tokens, breakpoint) in serialisation order. content is hashable.
+        t: request start time in seconds, non-decreasing across calls.
+        """
+
+        def __init__(self, ttl=300, min_tokens=512, lookback=20, max_entries=10_000):
+            raise NotImplementedError
+
+        def entries(self):
+            """Number of entries currently held (live or not yet evicted)."""
+            raise NotImplementedError
+
+        def request(self, t, blocks):
+            """Return {"read": tokens read from cache, "write": tokens written, "uncached": the rest}."""
+            raise NotImplementedError
+  tests: |
+    def conv(n_turns, sys_tokens=2000, turn_tokens=300, per_turn=1):
+        blocks = [("tools", 1000, False), ("system", sys_tokens, False)]
+        for k in range(n_turns):
+            for p in range(per_turn):
+                blocks.append((f"turn{k}.{p}", turn_tokens, False))
+        blocks[-1] = (blocks[-1][0], blocks[-1][1], True)
+        return blocks
+
+    c = PrefixCache()
+    r1 = c.request(0, conv(1))
+    assert r1 == {"read": 0, "write": 3300, "uncached": 0}, "first request writes everything up to the breakpoint"
+    r2 = c.request(10, conv(2))
+    assert r2 == {"read": 3300, "write": 300, "uncached": 0}, "a growing conversation reads the earlier prefix"
+
+    c = PrefixCache()
+    c.request(0, conv(3))
+    changed = conv(3)
+    changed[1] = ("system v2", 2000, False)
+    assert c.request(5, changed)["read"] == 0, "a change early in the prompt misses everything after it"
+
+    c = PrefixCache()
+    c.request(0, conv(2))
+    assert c.request(301, conv(3))["read"] == 0, "an entry unused for longer than the TTL is gone"
+
+    c = PrefixCache()
+    small = [("system", 300, True), ("msg", 50, False)]
+    assert c.request(0, small) == {"read": 0, "write": 0, "uncached": 350}, "below the minimum nothing is cached"
+
+    c = PrefixCache()
+    two_bp = [("tools", 1000, False), ("system", 2000, True), ("turn0", 300, True)]
+    c.request(0, two_bp)
+    other = [("tools", 1000, False), ("system", 2000, True), ("other user turn", 400, True)]
+    assert c.request(1, other) == {"read": 3000, "write": 400, "uncached": 0}, "a breakpoint after the system prompt is shared across conversations"
+  hidden: |
+    import random, time
+
+    def conv(n_turns, per_turn=1, turn_tokens=300):
+        blocks = [("tools", 1000, False), ("system", 2000, False)]
+        for k in range(n_turns):
+            for p in range(per_turn):
+                blocks.append((f"turn{k}.{p}", turn_tokens, False))
+        blocks[-1] = (blocks[-1][0], blocks[-1][1], True)
+        return blocks
+
+    # Lookback: a single automatic breakpoint that moves more than 20 blocks per turn finds nothing.
+    c = PrefixCache()
+    c.request(0, conv(1, per_turn=25))
+    assert c.request(1, conv(2, per_turn=25))["read"] == 0, "the earlier entry is more than 20 positions back"
+    c = PrefixCache()
+    c.request(0, conv(1, per_turn=19))
+    assert c.request(1, conv(2, per_turn=19))["read"] == 3000 + 19 * 300, "an entry inside the lookback window is found"
+
+    # Refresh on read keeps an entry alive past its first TTL.
+    c = PrefixCache()
+    c.request(0, conv(1))
+    c.request(200, conv(1))
+    assert c.request(450, conv(1))["read"] == 3300, "each read refreshes the lifetime"
+
+    # More than four breakpoints is rejected.
+    try:
+        PrefixCache().request(0, [(f"b{i}", 600, True) for i in range(5)])
+        raise AssertionError("expected ValueError for five breakpoints")
+    except ValueError:
+        pass
+
+    # Conservation, bounds and capacity on a random trace.
+    rng = random.Random(7)
+    c = PrefixCache(max_entries=8)
+    prefixes = [[(f"p{p}.{i}", rng.randint(50, 900), False) for i in range(rng.randint(1, 30))] for p in range(6)]
+    t = 0
+    for _ in range(400):
+        t += rng.choice([1, 5, 60, 400])
+        blocks = list(rng.choice(prefixes)) + [(f"u{rng.randint(0, 3)}", rng.randint(10, 500), False) for _ in range(rng.randint(0, 6))]
+        for i in rng.sample(range(len(blocks)), k=min(len(blocks), rng.randint(0, 4))):
+            blocks[i] = (blocks[i][0], blocks[i][1], True)
+        total = sum(b[1] for b in blocks)
+        r = c.request(t, blocks)
+        assert r["read"] >= 0 and r["write"] >= 0 and r["uncached"] >= 0
+        assert r["read"] + r["write"] + r["uncached"] == total, "every token is billed exactly once"
+        assert c.entries() <= 8, "the cache never holds more than max_entries"
+        again = c.request(t, blocks)
+        assert again["write"] == 0, "repeating a request at once writes nothing new"
+
+    # Performance: 300 steps of an agent run that adds 25 blocks per step, four breakpoints per request.
+    c = PrefixCache()
+    blocks = [("tools", 1000, True), ("system", 2000, False)]
+    start = time.perf_counter()
+    for k in range(300):
+        blocks = [(b[0], b[1], i == 0) for i, b in enumerate(blocks)]
+        blocks.extend((f"step{k}.{p}", 30, False) for p in range(25))
+        for i in (len(blocks) - 1, len(blocks) - 40, len(blocks) - 80):
+            if i > 0:
+                blocks[i] = (blocks[i][0], blocks[i][1], True)
+        r = c.request(k, blocks)
+    assert r["read"] > 0 and time.perf_counter() - start < 1.5, "300 requests of up to 7,500 blocks in under 1.5 seconds"
+  solution: |
+    from collections import OrderedDict
+
+
+    class PrefixCache:
+        def __init__(self, ttl=300, min_tokens=512, lookback=20, max_entries=10_000):
+            self.ttl = ttl
+            self.min_tokens = min_tokens
+            self.lookback = lookback
+            self.max_entries = max_entries
+            self._live = OrderedDict()   # prefix key -> last_used, least recently used first
+
+        def entries(self):
+            return len(self._live)
+
+        def request(self, t, blocks):
+            bps = [i for i, b in enumerate(blocks) if b[2]]
+            if len(bps) > 4:
+                raise ValueError("at most 4 breakpoints")
+            last = bps[-1] if bps else -1
+            keys, cum = [], []
+            h, total = 0, 0
+            for i, (content, tokens, _) in enumerate(blocks):
+                total += tokens
+                if i <= last:
+                    h = hash((h, content))
+                    keys.append(h)
+                    cum.append(total)
+            eligible = [i for i in bps if cum[i] >= self.min_tokens]
+            hit = -1
+            for bp in eligible:
+                for j in range(bp, max(-1, bp - self.lookback), -1):
+                    if j <= hit:
+                        break
+                    used = self._live.get(keys[j])
+                    if used is not None and t - used < self.ttl:
+                        hit = j
+                        break
+            read = cum[hit] if hit >= 0 else 0
+            write = cum[eligible[-1]] - read if eligible else 0
+            stamp = [hit] if hit >= 0 else []
+            for j in stamp + eligible:
+                self._live[keys[j]] = t
+                self._live.move_to_end(keys[j])
+            while len(self._live) > self.max_entries:
+                self._live.popitem(last=False)
+            return {"read": read, "write": write, "uncached": total - read - write}
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The prompt">
+Our cost model assumes a 90 percent cache hit rate for the new agent. Before finance signs off, build a simulator of the provider's prefix cache from its documentation and run our request traces through it.
+</Callout>
+
+Implement `PrefixCache` from the rules the Claude prompt-caching page documents. A request is a list of blocks `(content, tokens, breakpoint)` in serialisation order (tools, system, messages already flattened), sent at time `t` in seconds.
+
+- The prefix at position *i* is blocks 0 to *i* by content. Two prefixes match only if every block is equal and in the same order.
+- A request may carry at most four breakpoints; more is a `ValueError`. A breakpoint whose prefix holds fewer than `min_tokens` tokens neither reads nor writes.
+- Entries are written only at breakpoints. For each breakpoint, look for a live entry at the breakpoint and up to `lookback − 1` positions before it, nearest first; the search for that breakpoint stops after `lookback` positions. The highest position found over all breakpoints is the read point, and `read` is the prefix's tokens up to it.
+- An entry is live while `t − last_used < ttl`. A hit refreshes it to `t`. After the request, every eligible breakpoint's prefix is live with `last_used = t`.
+- `write` is the tokens up to the last eligible breakpoint minus `read`. `uncached` is everything else.
+- The cache never holds more than `max_entries` entries. Which entry to evict is your decision; say why.
+
+Then answer: to replay one day of traffic for 400 tenants, each with a few hundred conversations, what `max_entries` would you choose, and what does a too-small value do to the predicted hit rate?
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>How long are the longest requests in the trace, and how many breakpoints does each carry?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the simulator's output feeds: if a misprediction of a few percent changes a budget decision, how exact must the prefix comparison be?</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the distribution of gaps between consecutive requests per conversation before choosing a capacity.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Compute one key per position as a chain, h<sub>i</sub> = hash(h<sub>i−1</sub>, content<sub>i</sub>), so all prefix keys of a request cost one pass. Look up only the lookback window behind each eligible breakpoint, take the highest live hit, charge reads to it and writes from it to the last eligible breakpoint, then stamp the hit and every eligible breakpoint. An ordered dict with move-to-end gives LRU eviction in constant time.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The cost of the naive version is in the keys. Building <code>tuple(content for block in blocks[:j + 1])</code> for each window position is O(n) per key, and hashing a tuple is O(n) again, so a 7,500-block request with four breakpoints costs up to 80 such keys. The chain makes every key O(1) after one pass over the request, which is what the performance test checks: 300 growing requests of up to 7,500 blocks in under 1.5 seconds.</p>
+<p>The lookback rule is the behaviour most worth simulating, because it produces misses that a "longest shared prefix" model never predicts. With one automatic breakpoint at the end, a turn that adds 25 positions leaves the previous entry outside the 20-position window, and the request reads nothing. The hidden tests include that case and its 19-position twin, which hits.</p>
+<p>Key representation is a decision with two defensible answers. A hash chain stores one integer per entry and is fast, but two different prefixes can collide and produce a phantom hit, and Python's string hashing is salted per process, so keys cannot be persisted or compared across workers. Exact keys (a trie of block contents, or interned tuples) are collision-free but cost memory proportional to every prefix stored. For a cost simulator, a collision probability near 2<sup>−64</sup> per comparison is far below the other errors in the model; for anything that serves content, use a cryptographic hash of the bytes.</p>
+<p>Eviction is the second decision. LRU keeps hot tenants and evicts idle ones, which matches how the provider behaves only if the provider's capacity is the binding constraint; evicting the entry closest to expiry keeps the simulation closest to "the TTL is the only limit". The visible behaviour that both must preserve is that a request repeated at once writes nothing, which the hidden tests check with a capacity of 8.</p>
+<p>Capacity for the 400-tenant replay is a quantity to choose: the number of entries that can be live at once is roughly concurrent conversations within one lifetime times breakpoints per request. A few hundred conversations per tenant spread over a working day, at most four breakpoints each, is tens of thousands of entries at peak; a cap of 100,000 leaves headroom. A cap below the live set makes the simulator evict entries the provider would still hold and predicts a hit rate that is too low, which is the safe direction for a budget but makes the cache look worse than it is.</p>
+<p>Failure mode of the recommended simulator: it predicts what the documented algorithm would do, not what the service does. Provider caches are best effort, and the trace's own hit rate from <code>cache_read_input_tokens</code> is the ground truth to compare against. A simulator that disagrees with measured reads by more than a few points is mis-modelling the request layout, usually the position count (consecutive tool_use or tool_result blocks count as one position on the Claude API).</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Finance pushes back: the simulator took a week and predicts 71 percent where the model assumed 90. Do you trust the simulator or the assumption?</em> Neither alone: replay a day of production traffic with real usage fields and compare both against measured reads.</li>
+<li><em>What would make you stop maintaining the simulator?</em> A provider change that makes its documented rules unpredictive (routing-dependent hits, as OpenAI documents with machine-local entries and overflow above 15 requests per minute), at which point measured reads per template are the only model worth keeping.</li>
+<li><em>What changes to run this inside a real client?</em> Keys from a cryptographic hash of the serialised bytes, positions counted the way the API counts them, and the simulator used as a pre-merge check that a prompt change does not move the predicted read point.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Add the 1-hour lifetime.* Entries carry their own TTL, 1-hour breakpoints must precede 5-minute ones, and writes split into a 1-hour segment and a 5-minute segment priced separately.
+- *Two senior engineers disagree on LRU against earliest-expiry eviction. How do you decide without deciding by rank?* Replay the same trace under both and compare each to measured reads; the policy that tracks reality is the one to keep.
+- *The agent fires parallel tool calls. What changes in your position count?* Consecutive tool_use blocks, and consecutive tool_result blocks, each count as one position on the Claude API, so the trace has to be flattened the same way before simulation.
+
+## Common mistakes
+
+- Treating the cache as longest-common-prefix with any earlier request, which ignores that entries exist only at breakpoints.
+- Searching the whole request backwards instead of stopping after the lookback window.
+- Refreshing the lifetime only on writes.
+- Building a full tuple per prefix, which passes small tests and fails the timing test.
+- Evicting an entry the current request just wrote or read.

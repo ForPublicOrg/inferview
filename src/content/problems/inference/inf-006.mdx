@@ -1,62 +1,67 @@
 ---
 id: inf-006
-title: Paged KV cache block allocator
-subtitle: with copy-on-write forks
+title: Paged KV block manager with a prefix cache
+subtitle: allocation, copy-on-write forks and preemption, with hidden invariant tests
 track: inference
 module: batching
 type: code
 difficulty: hard
 seniority: [senior, staff]
-minutes: 40
+minutes: 50
 core: true
-tags: [pagedattention, allocator, kv-cache, copy-on-write, reference-counting]
+tags: [pagedattention, kv-cache, prefix-caching, copy-on-write, preemption, allocator]
 companies: []
 updated: 2026-10-28
 sources:
-  - title: techinterview.org, AI inference infrastructure interview prep 2026 (updated 2026-05-06)
-    url: https://www.techinterview.org/post/3233475331/ai-inference-infrastructure-interview-prep-2026-vllm-triton/
-    note: lists "Implement a memory allocator for variable-size KV cache" as a coding prompt
-  - title: "Efficient Memory Management for Large Language Model Serving with PagedAttention (Kwon et al., SOSP 2023)"
+  - title: "Efficient Memory Management for Large Language Model Serving with PagedAttention (Kwon et al., SOSP 2023, arXiv 2309.06180)"
     url: https://arxiv.org/abs/2309.06180
-    note: block tables, default block size 16, copy-on-write at block granularity for shared blocks
-  - title: vLLM launch blog (2023-06-20)
-    url: https://vllm.ai/blog/2023-06-20-vllm
-    note: sharing cuts memory by up to 55% for parallel sampling and beam search
+    note: "block tables, copy-on-write at block granularity, preemption by recompute or swap; the abstract reports 2 to 4 times the throughput of FasterTransformer and Orca at the same latency, more with longer sequences, larger models and more complex decoding. Checked 2026-10-28."
+  - title: vLLM docs, Automatic prefix caching design (latest, checked 2026-10-28)
+    url: https://docs.vllm.ai/en/latest/design/prefix_caching.html
+    note: "only full blocks are cached; a block's hash covers its parent's hash, its tokens and extra keys such as LoRA ids, multimodal hashes and a cache salt in the first block; freed blocks join the tail of the free queue in reverse order and the head is evicted first; a block is freed only at reference count zero. Checked 2026-10-28."
+  - title: vLLM source, v1/core/sched/scheduler.py (main branch, read 2026-10-28)
+    url: https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/sched/scheduler.py
+    note: "under FCFS the preemption victim is the last request in the running list; under the priority policy it is the running request with the largest (priority, arrival time). Checked 2026-10-28."
+  - title: vLLM docs, Optimization and tuning (latest, checked 2026-10-28)
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: "in V1 the default preemption mode is recompute rather than swap, and preempted requests are recomputed when KV space is available again. Checked 2026-10-28."
 code:
   starter: |
-    class BlockAllocator:
-        """Paged KV cache allocator. Each request owns a list of physical block ids (its block table)."""
+    class KVCache:
+        """Paged KV cache with a prefix cache, fork with copy on write, and preemption. Ids and counts only."""
 
         def __init__(self, num_blocks, block_size=16):
             raise NotImplementedError
 
         def num_free(self):
-            """Number of blocks on the free list."""
+            """Blocks no running request holds, whether empty or still caching a prefix."""
             raise NotImplementedError
 
-        def can_allocate(self, num_tokens):
-            """True if a new request of num_tokens prompt tokens would fit right now."""
+        def add(self, rid, tokens):
+            """Admit a request with prompt tokens, reusing cached full blocks that match its prefix.
+            Return the number of prompt tokens served from the cache. All or nothing: MemoryError if it does not fit."""
             raise NotImplementedError
 
-        def allocate(self, rid, num_tokens):
-            """Give a new request enough blocks for its prompt. All or nothing: raise MemoryError if it does not fit."""
-            raise NotImplementedError
-
-        def append(self, rid):
-            """Add one generated token. Take a new block only when the last one is full.
-            If the last block is shared with another request and not full, copy on write.
-            Raise MemoryError and leave the state unchanged if no block is free."""
+        def append(self, rid, token):
+            """Write one generated token. MemoryError, with nothing changed, if a block is needed and none is free."""
             raise NotImplementedError
 
         def fork(self, parent, child):
-            """Create child sharing all of parent's blocks, as in parallel sampling. No copying."""
             raise NotImplementedError
 
         def free(self, rid):
-            """Release a request. A block goes back to the free list only when no request holds it."""
+            raise NotImplementedError
+
+        def preempt_for(self, n, protect=()):
+            """Free running requests, never one in protect, until n blocks are free. Return {rid: its tokens} for the
+            victims so the scheduler can recompute them. Raise MemoryError, preempting nobody, if n cannot be reached."""
             raise NotImplementedError
 
         def block_table(self, rid):
+            raise NotImplementedError
+
+        def block_tokens(self, block_id):
+            """The tokens stored in a physical block, standing in for its keys and values."""
             raise NotImplementedError
 
         def length(self, rid):
@@ -69,151 +74,362 @@ code:
             return True
         return False
 
-    a = BlockAllocator(8, block_size=16)
-    a.allocate("r1", 40)
-    assert len(a.block_table("r1")) == 3 and a.num_free() == 5, "40 tokens need 3 blocks of 16"
-    for _ in range(8):
-        a.append("r1")
-    assert a.length("r1") == 48 and len(a.block_table("r1")) == 3, "tokens 41 to 48 fill the third block"
-    a.append("r1")
-    assert len(a.block_table("r1")) == 4 and a.num_free() == 4, "token 49 opens a fourth block"
-    assert a.can_allocate(64) and not a.can_allocate(65), "can_allocate counts whole blocks"
-    assert raises(MemoryError, a.allocate, "big", 65), "a request that does not fit raises MemoryError"
-    assert a.num_free() == 4 and raises(KeyError, a.block_table, "big"), "a failed allocate leaves no trace"
-    a.free("r1")
-    assert a.num_free() == 8, "free returns every block"
+    def seq(kv, rid):
+        return [t for b in kv.block_table(rid) for t in kv.block_tokens(b)]
 
-    b = BlockAllocator(4, block_size=16)
-    b.allocate("p", 20)
-    b.fork("p", "c")
-    assert b.block_table("c") == b.block_table("p") and b.num_free() == 2, "fork shares blocks without copying"
-    shared_last = b.block_table("p")[-1]
-    b.append("c")
-    assert b.block_table("c")[-1] != shared_last and b.block_table("p")[-1] == shared_last, "appending to a shared partial block copies it"
-    assert b.block_table("c")[0] == b.block_table("p")[0] and b.num_free() == 1, "full shared blocks stay shared"
-    b.free("p")
-    assert b.num_free() == 2, "freeing the parent releases only blocks nobody else holds"
-    b.free("c")
-    assert b.num_free() == 4, "everything returns once both are freed"
+    kv = KVCache(8, block_size=4)
+    assert kv.add("a", list(range(10))) == 0 and len(kv.block_table("a")) == 3 and kv.num_free() == 5, "10 tokens take 3 blocks of 4"
+    kv.append("a", 10)
+    kv.append("a", 11)
+    kv.append("a", 12)
+    assert len(kv.block_table("a")) == 4 and seq(kv, "a") == list(range(13)), "token 13 opens a fourth block"
+    assert kv.add("b", list(range(8)) + [99, 98]) == 8, "b reuses the two full blocks it shares with a"
+    assert kv.block_table("b")[:2] == kv.block_table("a")[:2] and seq(kv, "b") == list(range(8)) + [99, 98]
+    assert kv.add("c", list(range(8))) == 4, "a fully cached prompt still computes its last block, so only 4 tokens come from cache"
+    kv.free("a")
+    kv.free("b")
+    kv.free("c")
+    assert kv.num_free() == 8, "freed blocks count as free even while they stay cached"
+    assert kv.add("d", list(range(12)) + [5]) == 12, "the blocks a left behind still serve a later prompt"
+    kv.free("d")
 
-    c = BlockAllocator(2, block_size=4)
-    c.allocate("x", 8)
-    assert raises(MemoryError, c.append, "x") and c.length("x") == 8, "append with no free block raises and changes nothing"
+    kv = KVCache(4, block_size=4)
+    kv.add("p", [1, 2, 3, 4, 5, 6])
+    kv.fork("p", "q")
+    assert kv.block_table("q") == kv.block_table("p") and kv.num_free() == 2, "fork copies nothing"
+    kv.append("q", 70)
+    assert kv.block_table("q")[0] == kv.block_table("p")[0] and kv.block_table("q")[1] != kv.block_table("p")[1], "a write to the shared partial block copies it"
+    assert seq(kv, "p") == [1, 2, 3, 4, 5, 6] and seq(kv, "q") == [1, 2, 3, 4, 5, 6, 70]
+    kv.add("r", [9, 9])
+    kv.fork("p", "t")
+    assert raises(MemoryError, kv.append, "p", 71) and seq(kv, "p") == [1, 2, 3, 4, 5, 6] and kv.length("p") == 6, "p shares its partial block with t and no block is free: MemoryError, nothing changed"
+    assert raises(MemoryError, kv.add, "s", [3]) and raises(KeyError, kv.block_table, "s"), "a failed add leaves no trace"
+
+    kv = KVCache(6, block_size=2)
+    kv.add("x", [1, 2, 3, 4])
+    kv.add("y", [5, 6, 7, 8])
+    kv.add("z", [9, 10])
+    gone = kv.preempt_for(3, protect=("x",))
+    assert "x" not in gone and kv.num_free() >= 3 and all(kv.length(r) for r in ["x"]), "x is protected and three blocks are free"
+    assert all(raises(KeyError, kv.length, r) for r in gone) and all(gone[r] in ([5, 6, 7, 8], [9, 10]) for r in gone), "victims are gone and their tokens come back for recompute"
+    assert kv.preempt_for(1) == {}, "nothing is preempted when a block is already free"
+  hidden: |
+    import random
+    import time
+
+    def raises(exc, fn, *args):
+        try:
+            fn(*args)
+        except exc:
+            return True
+        return False
+
+    def consistent(kv, model, total, bs):
+        held = set()
+        for rid, toks in model.items():
+            t = kv.block_table(rid)
+            if [x for b in t for x in kv.block_tokens(b)] != toks or kv.length(rid) != len(toks):
+                return False
+            if len(t) != -(-len(toks) // bs):
+                return False
+            held.update(t)
+        return kv.num_free() + len(held) == total
+
+    def run_random(seed):
+        rng = random.Random(seed)
+        bs = rng.choice([2, 4, 8])
+        total = rng.randint(10, 40)
+        kv = KVCache(total, block_size=bs)
+        systems = [[rng.randrange(50) for _ in range(rng.randint(0, 20))] for _ in range(3)]
+        model, n = {}, 0
+        for _ in range(400):
+            op = rng.random()
+            live = list(model)
+            free_before = kv.num_free()
+            if op < 0.3 or not live:
+                rid = f"r{n}"
+                n += 1
+                toks = rng.choice(systems) + [rng.randrange(50) for _ in range(rng.randint(1, 10))]
+                try:
+                    got = kv.add(rid, toks)
+                except MemoryError:
+                    if kv.num_free() != free_before or not raises(KeyError, kv.length, rid):
+                        return False
+                else:
+                    if got % bs or got >= len(toks):
+                        return False
+                    model[rid] = list(toks)
+            elif op < 0.65:
+                rid = rng.choice(live)
+                tok = rng.randrange(50)
+                try:
+                    kv.append(rid, tok)
+                    model[rid].append(tok)
+                except MemoryError:
+                    if kv.num_free() != free_before:
+                        return False
+            elif op < 0.75:
+                parent = rng.choice(live)
+                child = f"r{n}"
+                n += 1
+                kv.fork(parent, child)
+                model[child] = list(model[parent])
+            elif op < 0.92:
+                rid = rng.choice(live)
+                kv.free(rid)
+                del model[rid]
+            else:
+                want = rng.randint(1, 4)
+                protect = tuple(rng.sample(live, min(2, len(live))))
+                try:
+                    gone = kv.preempt_for(want, protect)
+                except MemoryError:
+                    if kv.num_free() != free_before:
+                        return False
+                else:
+                    if kv.num_free() < want or set(gone) & set(protect):
+                        return False
+                    for rid, toks in gone.items():
+                        if model.pop(rid) != toks:
+                            return False
+            if not consistent(kv, model, total, bs):
+                return False
+        return True
+
+    assert all(run_random(s) for s in range(40))
+    kv = KVCache(7, block_size=2)
+    kv.add("a", [1, 2, 3, 4])
+    kv.free("a")
+    kv.add("b", [11, 12, 13, 14, 15, 16, 17, 18])
+    assert kv.add("c", [1, 2, 3, 4, 5]) == 4, "cached blocks are evicted only when no empty block is left"
+    kv = KVCache(12, block_size=2)
+    for i in range(5):
+        kv.add(f"q{i}", [i] * 4)
+    gone = kv.preempt_for(5)
+    assert len(gone) == 2 and kv.num_free() >= 5 and kv.num_free() - 2 < 5, "no request is preempted beyond the ones needed"
+    kv = KVCache(4, block_size=2)
+    kv.add("x", [1, 2, 3, 4])
+    kv.add("y", [5, 6, 7, 8])
+    assert raises(MemoryError, kv.preempt_for, 3, ("x",)) and kv.length("y") == 4, "an impossible request preempts nobody"
+    kv = KVCache(70000, block_size=16)
+    system = list(range(8192))
+    t0 = time.perf_counter()
+    for i in range(50):
+        kv.add(f"r{i}", system + [i] * 8192)
+    for i in range(50):
+        kv.free(f"r{i}")
+    hits = sum(kv.add(f"s{i}", system + [i] * 8192) for i in range(50))
+    elapsed = time.perf_counter() - t0
+    assert hits == 50 * 16368, "every second-round prompt hits all but its last block"
+    assert elapsed < 3, f"the bookkeeping for 100 prompts of 16,384 tokens took {elapsed:.1f} s; the limit is 3 s"
   solution: |
-    class BlockAllocator:
+    from collections import OrderedDict
+
+
+    class KVCache:
         def __init__(self, num_blocks, block_size=16):
+            self.num_blocks = num_blocks
             self.block_size = block_size
-            self.free_list = list(range(num_blocks - 1, -1, -1))   # pop() hands out block 0 first
+            self.empty = list(range(num_blocks - 1, -1, -1))   # blocks holding nothing reusable
+            self.evictable = OrderedDict()                      # cached full blocks nobody holds, least recently freed first
+            self.cached = {}                                    # block hash -> block id
+            self.bhash = [None] * num_blocks                    # hash of a full block's tokens and its whole prefix
             self.refs = [0] * num_blocks
+            self.data = [[] for _ in range(num_blocks)]
             self.tables = {}
             self.lengths = {}
+            self.order = {}                                     # running requests, oldest first
 
         def num_free(self):
-            return len(self.free_list)
+            return len(self.empty) + len(self.evictable)
 
-        def blocks_for(self, num_tokens):
-            return -(-num_tokens // self.block_size)
-
-        def can_allocate(self, num_tokens):
-            return self.blocks_for(num_tokens) <= len(self.free_list)
-
-        def _take(self):
-            b = self.free_list.pop()
-            self.refs[b] = 1
-            return b
-
-        def _drop(self, b):
-            self.refs[b] -= 1
-            if self.refs[b] == 0:
-                self.free_list.append(b)
-
-        def allocate(self, rid, num_tokens):
-            if rid in self.tables:
-                raise ValueError(f"{rid} already allocated")
-            if not self.can_allocate(num_tokens):
-                raise MemoryError("not enough free blocks")
-            self.tables[rid] = [self._take() for _ in range(self.blocks_for(num_tokens))]
-            self.lengths[rid] = num_tokens
-
-        def append(self, rid):
-            table, n = self.tables[rid], self.lengths[rid]
-            if n % self.block_size == 0:
-                if not self.free_list:
-                    raise MemoryError("no free block for the next token")
-                table.append(self._take())
-            elif self.refs[table[-1]] > 1:
-                # Copy on write: the partly filled last block is shared, so this request gets its own copy.
-                if not self.free_list:
-                    raise MemoryError("no free block for copy on write")
-                new = self._take()
-                self._drop(table[-1])
-                table[-1] = new
-            self.lengths[rid] = n + 1
-
-        def fork(self, parent, child):
-            if child in self.tables:
-                raise ValueError(f"{child} already allocated")
-            for b in self.tables[parent]:
-                self.refs[b] += 1
-            self.tables[child] = list(self.tables[parent])
-            self.lengths[child] = self.lengths[parent]
-
-        def free(self, rid):
-            for b in self.tables.pop(rid):
-                self._drop(b)
-            del self.lengths[rid]
+        def block_tokens(self, b):
+            return list(self.data[b])
 
         def block_table(self, rid):
             return list(self.tables[rid])
 
         def length(self, rid):
             return self.lengths[rid]
+
+        def _take(self):
+            if self.empty:
+                b = self.empty.pop()
+            else:
+                b, _ = self.evictable.popitem(last=False)       # evict only when no empty block is left
+                del self.cached[self.bhash[b]]
+                self.bhash[b] = None
+            self.refs[b] = 1
+            self.data[b] = []
+            return b
+
+        def _hold(self, b):
+            if self.refs[b] == 0:
+                del self.evictable[b]
+            self.refs[b] += 1
+
+        def _drop(self, b):
+            self.refs[b] -= 1
+            if self.refs[b] == 0:
+                h = self.bhash[b]
+                if h is not None and self.cached.get(h) == b:
+                    self.evictable[b] = None
+                else:
+                    self.bhash[b] = None
+                    self.empty.append(b)
+
+        def _seal(self, table, i):
+            """Block i of a table just became full: hash it with its parent and offer it to the prefix cache."""
+            b = table[i]
+            parent = self.bhash[table[i - 1]] if i else None
+            h = hash((parent, tuple(self.data[b])))
+            self.bhash[b] = h
+            self.cached.setdefault(h, b)
+
+        def add(self, rid, tokens):
+            if rid in self.tables:
+                raise ValueError(f"{rid} already present")
+            bs = self.block_size
+            hits, parent = [], None
+            for i in range((len(tokens) - 1) // bs):            # never the whole prompt: one token must be computed
+                chunk = tokens[i * bs:(i + 1) * bs]
+                h = hash((parent, tuple(chunk)))
+                b = self.cached.get(h)
+                if b is None or self.data[b] != chunk:
+                    break
+                hits.append(b)
+                parent = h
+            need = -(-len(tokens) // bs) - len(hits)
+            if need > self.num_free() - sum(1 for b in hits if self.refs[b] == 0):
+                raise MemoryError("not enough free blocks")
+            for b in hits:
+                self._hold(b)
+            table = list(hits)
+            for i in range(len(hits), -(-len(tokens) // bs)):
+                b = self._take()
+                self.data[b] = list(tokens[i * bs:(i + 1) * bs])
+                table.append(b)
+                if len(self.data[b]) == bs:
+                    self._seal(table, i)
+            self.tables[rid] = table
+            self.lengths[rid] = len(tokens)
+            self.order[rid] = None
+            return len(hits) * bs
+
+        def append(self, rid, token):
+            table, n, bs = self.tables[rid], self.lengths[rid], self.block_size
+            if n % bs == 0:
+                if not self.num_free():
+                    raise MemoryError("no free block for the next token")
+                table.append(self._take())
+            elif self.refs[table[-1]] > 1:
+                if not self.num_free():
+                    raise MemoryError("no free block for copy on write")
+                new = self._take()
+                self.data[new] = list(self.data[table[-1]])
+                self._drop(table[-1])
+                table[-1] = new
+            self.data[table[-1]].append(token)
+            self.lengths[rid] = n + 1
+            if len(self.data[table[-1]]) == bs:
+                self._seal(table, len(table) - 1)
+
+        def fork(self, parent, child):
+            if child in self.tables:
+                raise ValueError(f"{child} already present")
+            for b in self.tables[parent]:
+                self._hold(b)
+            self.tables[child] = list(self.tables[parent])
+            self.lengths[child] = self.lengths[parent]
+            self.order[child] = None
+
+        def free(self, rid):
+            for b in reversed(self.tables.pop(rid)):            # the tail is least likely to be shared, so it goes first
+                self._drop(b)
+            del self.lengths[rid]
+            del self.order[rid]
+
+        def tokens(self, rid):
+            return [t for b in self.tables[rid] for t in self.data[b]]
+
+        def _released_if_freed(self, victims):
+            drop = {}
+            for rid in victims:
+                for b in self.tables[rid]:
+                    drop[b] = drop.get(b, 0) + 1
+            return sum(1 for b, c in drop.items() if self.refs[b] == c)
+
+        def preempt_for(self, n, protect=()):
+            """Free running requests until n blocks are available. Victims: the most recently added first."""
+            if self.num_free() >= n:
+                return {}
+            candidates = [r for r in reversed(self.order) if r not in protect]
+            if self.num_free() + self._released_if_freed(candidates) < n:
+                raise MemoryError("even preempting every other request would not free enough blocks")
+            out = {}
+            for rid in candidates:
+                out[rid] = self.tokens(rid)
+                self.free(rid)
+                if self.num_free() >= n:
+                    break
+            return out
 ---
-import Callout from '../../../components/Callout.astro';
 
 ## Question
 
-<Callout kind="interview" label="As listed">
-"Implement a memory allocator for variable-size KV cache."
-</Callout>
+Write the KV block manager of a paged inference engine. GPU memory for keys and values is a pool of `num_blocks` blocks of `block_size` tokens. Each running request has a block table, the physical blocks holding its tokens in order. No tensors move here: `block_tokens(b)` returns the tokens stored in block `b` and stands in for its keys and values, and the tests rebuild every request's sequence from its table to check that nothing was overwritten.
 
-Implement the allocator at the heart of a paged inference engine. GPU memory for the KV cache is a pool of `num_blocks` fixed-size blocks, each holding `block_size` tokens. Every request owns a block table: the list of physical block ids holding its tokens, in order.
+The rules:
 
-- `allocate(rid, num_tokens)` gives a new request enough blocks for its prompt, all or nothing.
-- `append(rid)` adds one generated token, taking a new block only when the last one is full.
-- `fork(parent, child)` makes a second sequence that shares all of the parent's blocks, as parallel sampling does. Nothing is copied.
-- When a request appends into a last block that is **shared and not full**, it must first get its own copy of that block (copy on write). Full shared blocks stay shared; nobody writes into them again.
-- `free(rid)` releases a request. A block returns to the free list only when no request holds it any more.
-- If there is no free block when one is needed, raise `MemoryError` and leave all state unchanged. The scheduler upstream decides whether to queue or preempt.
+- `add(rid, tokens)` admits a request. Full blocks of its prompt that are already cached, whether a running request holds them or they were freed earlier, are reused rather than recomputed. A cached block matches only if every token before it matches too. At least one prompt token is always computed, because the engine needs logits for the next token. It returns the number of prompt tokens served from the cache. All or nothing: `MemoryError` if the prompt does not fit.
+- `append(rid, token)` writes one generated token. A request never writes into a block another request also holds.
+- `fork(parent, child)` starts a second sample sharing every block of the parent, copying nothing.
+- `free(rid)` releases a request. Its full blocks stay cached until the memory is needed. `num_free()` counts them as free, and a cached block is evicted only when no empty block is left.
+- `preempt_for(n, protect)` frees running requests until `n` blocks are free, never one named in `protect`, and returns each victim's tokens so the scheduler can recompute it. Preempt no more requests than needed. If `n` cannot be reached, raise `MemoryError` and preempt nobody.
+- Any `MemoryError` leaves the state exactly as it was.
 
-You do not copy any tensor data; ids and reference counts are the whole job. Standard library only.
+Two policies are yours: which cached block to evict, and which request to preempt. Say why you chose each.
+
+The pool can be large. Admitting 100 prompts of 16,384 tokens that share an 8,192-token prefix into a 70,000-block pool, freeing them and admitting them again has to finish in under 3 seconds, including in the browser. Standard library only.
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>Keep a reference count per physical block; fork increments, free decrements, zero means back to the free list.</p></details>
-<details class="hint"><summary>Hint 2</summary><p>The number of blocks for n tokens is n divided by the block size, rounded up: <code>-(-n // block_size)</code>.</p></details>
-<details class="hint"><summary>Hint 3</summary><p>In <code>append</code>, check whether the current length is a multiple of the block size before deciding between "new block", "copy on write" and "write in place".</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask whether two blocks with identical tokens but different prefixes may share, and whether tenants may share at all.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what the scheduler does after a <code>MemoryError</code> from <code>append</code>, and what it will do with the tokens you return.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Time your <code>add</code> on one 16,384-token prompt at block size 16, then at block size 4. If it takes far more than four times as long, look for work that grows with the prefix length.</p></details>
 
 ## Answer
 
-The reference solution keeps four pieces of state: a free list of block ids, a reference count per block, a block table per request and a token count per request.
+The reference solution keeps, per physical block, a reference count, its tokens and, once full, a hash. Free blocks sit in two places: a stack of empty blocks, and an ordered map of cached blocks nobody holds, least recently freed first. A dictionary maps each hash to the one block registered under it.
 
-`allocate` computes the blocks needed by ceiling division and checks the free list before touching anything, which makes it all or nothing. `append` has three cases. If the request's length is a multiple of the block size, its last block is full (or it has none), so it takes a fresh block. Otherwise the token goes into the last block, which is fine if this request is the only holder; if the reference count is above one, the block is shared with a fork, so the request takes a fresh block, drops one reference to the shared one, and swaps it into its table. A real engine would also copy the partial block's keys and values on the GPU at that point. Both cases that need a block check the free list first, so a `MemoryError` leaves the length and the table unchanged.
+**The hash.** A full block's key is `hash((parent_key, tuple(tokens)))`, with the parent block's key standing in for the whole prefix. This is the vLLM design, and it is what the performance test checks. A key built from the whole prefix tuple costs time proportional to the prefix for every block, so a 16,384-token prompt at block size 16 hashes about 8.4 million token positions (16 × (1 + 2 + ... + 1,024)) instead of 16,384. On a laptop the reference solution ran the timed test in under 0.1 seconds; the same code with whole-prefix keys took 14 seconds. On a hit the solution also compares the block's stored tokens with the prompt chunk, so a hash collision on that block costs a miss rather than wrong keys and values. Python's hash of a tuple of integers is not salted per process, so these keys are reproducible, but they are 64-bit and not meant to cross a process boundary.
 
-`fork` copies the parent's table (a list of ids, not data) and increments each block's count. `free` decrements, and only blocks that reach zero go back to the free list, which is why freeing the parent in the tests releases just one block while the child still holds the shared full block.
+**Admission.** `add` walks the prompt one full block at a time and stops at the first miss. It never matches the last block when the prompt is an exact multiple of the block size, so at least one token is computed. It counts the new blocks it needs against `num_free()`, minus the hits that are themselves sitting in the cached pool, before touching anything; that check is what makes it all or nothing. New full blocks are hashed and registered. If another block already holds that key, the new one stays unregistered and goes back to the empty stack when freed.
 
-This is the mechanism behind two numbers in the vLLM work: paging limits waste to the unfilled part of each request's last block, and block sharing with copy-on-write is what cuts memory for parallel sampling and beam search.
+**Writes.** `append` takes a new block when the length is a multiple of the block size. Otherwise it writes into the last block, copying it first if its reference count is above one. That only happens after a fork: cached blocks are full, and full blocks are never written. A block that fills is hashed then, so generated tokens become cacheable too.
+
+**Eviction.** Empty blocks go out first. A cached block is evicted only when none is left, least recently freed first. `free` releases a table from the tail, so a request's last blocks, which hash the most tokens and are the least likely to be shared, are evicted first. That is also the order vLLM uses. The alternative is to evict by how often a block was hit. It keeps a hot system prompt resident through a burst of one-off documents, but costs a counter per block and a heap instead of an ordered map. I would switch only if the hit-rate metric showed the system prompt being evicted.
+
+**The preemption decision.** Two orders are defensible, and each has a cost:
+
+- *The most recently admitted request first*, as vLLM's FCFS policy does. The oldest requests keep their progress, so every request finishes eventually, and the victim usually has the least computed. The cost: under sustained pressure the newest request is preempted again every time it comes back, and its time to first token has no bound.
+- *The request whose release frees the most blocks*. Fewest preemptions per event. The cost: it picks long requests, which have the most to recompute because prefill is paid again in full, and a request near its last token can lose all of it.
+
+The solution takes the first. It checks that freeing every unprotected request would reach `n`, so a failure preempts nobody, then frees in that order and stops as soon as `n` blocks are free. The returned tokens are the prompt plus everything generated, so the scheduler re-admits the victim as a longer prompt. Because a victim's full blocks stay cached, its recompute often hits most of them, which is part of why vLLM V1 defaults to recompute rather than swap.
+
+**Where this design fails.** The prefix cache is shared by every request in the pool. In a multi-tenant engine, one tenant's request can hit blocks another tenant's prompt produced: a measurable timing difference and a data-boundary question. vLLM's answer is a cache salt mixed into the first block's hash, so only requests with the same salt share. The cost is the hit rate on prefixes common across tenants. The bookkeeping above does not change; the key does.
 
 ## Follow-ups
 
-- *How would you add prefix caching?* Hash each full block from its parent block's hash plus its tokens, keep freed blocks with a known hash in an evictable pool instead of the free list, and look up new prompts block by block.
-- *What eviction policy for that pool?* Least recently used over blocks with a zero reference count; never evict a block a running request holds.
-- *What does the scheduler do on `MemoryError` in `append`?* Preempt a running request (vLLM V1 frees its blocks and recomputes it later) or stop admitting new ones.
-- *Thread safety?* The engine's scheduler owns the allocator and calls it from one thread per step; if not, guard it with a lock.
+- *Security asks for per-tenant salts, and your measurements say that halves the hit rate on the shared system prompt. Which do you ship, and what risk do you accept in writing?*
+- *What would you need to see in production to move from recompute to swap?* Preempted requests with long contexts whose recompute shows up in time to first token, with host memory bandwidth to spare. The PagedAttention paper found swapping more expensive than recompute at small block sizes.
+- *What changes to run this inside a real engine?* The copy in copy on write becomes a block copy on the GPU, batched for the step. Block tables become a tensor the attention kernel reads. The hash has to be stable across processes if prefix caching spans workers or nodes. The scheduler owns this object from one thread and calls it once per step.
 
 ## Common mistakes
 
-- Returning shared blocks to the free list when the first holder frees them, which corrupts the other sequence.
-- Copying on write for full shared blocks. They are never written again, so sharing them is safe.
-- Allocating partially before discovering there is not enough memory, then leaking the blocks already taken.
-- Counting blocks with floor division and losing the last partial block.
+- Keying a block by the whole prefix, which is correct and quadratic in the prompt length.
+- Matching a block on its own tokens alone, so two prompts with the same chunk after different prefixes share keys and values that are wrong for one of them.
+- Serving an entire prompt from the cache, which leaves the engine with no logits for the first generated token.
+- Returning a shared block to the free list when its first holder frees it.
+- Checking for room after taking some blocks, so a failed `add` or `append` leaks them.
+- Evicting cached blocks while empty ones remain, which throws away hits for nothing.

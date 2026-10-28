@@ -1,0 +1,124 @@
+---
+title: The roofline for a training step
+track: training
+module: gpu-kernels
+order: 2
+kind: lesson
+level: senior
+minutes: 12
+summary: Arithmetic intensity against the H100's ratio of about 295 FLOPs per byte classifies every op in a transformer block as compute-bound, bandwidth-bound or overhead-bound, and that classification decides what to fuse.
+prerequisites: [training/gpu-kernels/gpu-hierarchy]
+updated: 2026-10-28
+sources:
+  - title: How to Scale Your Model, All About Rooflines
+    url: https://jax-ml.github.io/scaling-book/roofline/
+    note: "arithmetic intensity as FLOPs over bytes communicated; BF16 matmul intensity BDF / (BD + DF + BF), about B when B is small against D and F; H100 SXM at 9.89e14 dense BF16 FLOPs/s and 3.35e12 bytes/s, about 295; 'closer to 300' for GPUs against 240 on TPU v5e; the dot product's intensity tends to 1/2; communication rooflines between chips. Checked 2026-10-28."
+  - title: Horace He, Making Deep Learning Go Brrrr From First Principles
+    url: https://horace.io/brrr_intro.html
+    note: "compute, memory and overhead regimes; in BERT, non-matmul ops are 0.2% of FLOPs, and normalisation and pointwise ops reach 250x and 700x fewer FLOPS than matmuls; fusing x.cos().cos() cuts 4 global reads and writes to 2; PyTorch reached about 280 thousand operations per second on tiny tensors in the post's measurement; achieving 80% of peak FLOPS means at least 80% compute-bound. Checked 2026-10-28."
+  - title: NVIDIA H100 product page
+    url: https://www.nvidia.com/en-us/data-center/h100/
+    note: "H100 SXM: 1,979 BF16 TFLOPS with sparsity (989.5 dense), 67 FP32 TFLOPS, 3.35 TB/s. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The classification decides the fix
+
+Every op in a training step is limited by one of three things: the arithmetic units, the bytes it moves to and from HBM, or the fixed cost of launching it. The fix differs for each. A compute-bound matmul gets faster only from a better kernel or a narrower number format. A bandwidth-bound norm gets faster only by moving fewer bytes, usually by fusing it into a neighbour. An overhead-bound op gets faster only by launching fewer kernels. Spending a week on the wrong one of these is the common mistake, and the classification takes a few lines of arithmetic per op.
+
+## Intensity against the machine's ratio
+
+The scaling book defines arithmetic intensity as the FLOPs an op performs divided by the bytes it has to move. An H100 SXM does 9.89 × 10<sup>14</sup> dense BF16 FLOPs per second on its tensor cores and moves 3.35 × 10<sup>12</sup> bytes per second from HBM. The ratio, 9.89 × 10<sup>14</sup> / 3.35 × 10<sup>12</sup> ≈ 295 FLOPs per byte, is the critical intensity. An op below it spends longer moving data than computing; above it, the reverse.
+
+For a BF16 matmul of X with shape B × D by W with shape D × F, the op does 2BDF FLOPs and moves 2(BD + DF + BF) bytes, so its intensity is BDF / (BD + DF + BF). When B is small against D and F, the denominator is dominated by DF, the weight, and the intensity is about B. In a training step, B is the number of tokens in the micro-batch, sequences times sequence length, not the number of sequences.
+
+<Predict id="trn-roof-b256" question="A BF16 matmul with B = 256 tokens and D = F = 8,192. What is its arithmetic intensity in FLOPs per byte, to the nearest whole number?" answer={241} tolerance={2} unit="FLOPs/byte">
+<p>BDF / (BD + DF + BF) = 256 × 8,192² / (8,192 × (256 + 8,192 + 256)) = 256 × 8,192 / 8,704 = <b>about 241</b>. Below 295, so on an H100 this matmul is bandwidth-bound, not by much. At B = 512 the same formula gives 512 × 8,192 / 9,216 ≈ 455, comfortably compute-bound. The scaling book's rule that B must be "closer to 300" on GPUs is this calculation with B much smaller than D and F.</p>
+</Predict>
+
+The matmuls of pretraining run far above this line. A micro-batch of 4,096 tokens through a projection with D = F = 8,192 has an intensity of 4,096 × 8,192 / (8,192 + 4,096 + 4,096) = 2,048. Where B shrinks, the line comes back: the per-expert matmuls of a mixture-of-experts layer see only the tokens routed to that expert, and the decode step of inference sees one token per sequence.
+
+## Classifying one transformer block
+
+Take a scenario block: hidden size d = 8,192, an MLP that expands to 4d = 32,768, a micro-batch of T = 4,096 tokens, BF16 activations and weights, attention with head dimension 128 over a 4,096-token sequence. For each op, the FLOPs and the minimum HBM bytes give a floor on its time at 989 TFLOPS or 3.35 TB/s, whichever is slower.
+
+| Op | Intensity (FLOPs/byte) | Floor | Limited by |
+|---|---|---|---|
+| MLP up projection, 4,096 × 8,192 by 8,192 × 32,768 | about 2,521 | 2.22 ms of compute; bytes alone 0.26 ms | compute |
+| QKV projection, 8,192 to 24,576 | about 2,458 | compute | compute |
+| One head's QKᵀ, 4,096 × 128 by 128 × 4,096, with S written to HBM | about 120 | bytes | bandwidth |
+| Softmax over S | about 1 | bytes | bandwidth |
+| GELU on the 4,096 × 32,768 output | a few FLOPs per 4 bytes | 0.16 ms | bandwidth |
+| LayerNorm on 4,096 × 8,192 | under 2 | 0.04 ms | bandwidth |
+| Residual add, 4,096 × 8,192 | 1 FLOP per 6 bytes | 0.06 ms | bandwidth |
+
+The arithmetic behind the rows: the MLP up projection does 2 × 4,096 × 8,192 × 32,768 = 2.2 × 10<sup>12</sup> FLOPs, 2.22 ms at 989 TFLOPS, and must move 67 MB of input, 537 MB of weight and 268 MB of output, 872 MB in 0.26 ms. GELU reads and writes the 268 MB output, 537 MB, 0.16 ms. LayerNorm reads and writes 67 MB each, 0.04 ms. The residual add reads two 67 MB tensors and writes one, 0.06 ms.
+
+Two rows deserve a second look. The attention score matmul is a matmul, but with a reduction dimension of 128 and an output of 4,096 × 4,096 per head its intensity is 4,096 × 128 × 4,096 / (2 × 4,096 × 128 + 4,096²) ≈ 120, under the line, because the output dominates the bytes. That is the bandwidth problem FlashAttention removes by never writing S to HBM. And the pointwise ops do not run on the tensor cores at all, so the comparison is against the 67 TFLOPS FP32 vector rate, a ratio of 20 FLOPs per byte. A BF16 elementwise op moves 4 bytes per element and would need about 80 FLOPs per element to become compute-bound; GELU, even in its tanh form, does a small fraction of that.
+
+The time split follows. In this block, the GELU after the MLP up projection costs 0.16 / 2.22 = 7% of the matmul it follows, and the norms and residuals add their own fraction. Horace He's BERT measurement makes the same point from the other side: non-matmul ops were 0.2% of the FLOPs, but normalisation and pointwise ops achieved 250x and 700x fewer FLOPS than the matmuls, so their share of runtime is far larger than their share of work.
+
+<Predict id="trn-roof-fuse-gelu" question="Fuse the GELU into the epilogue of the MLP up projection in the scenario block, so the pre-activation is never written to HBM. How many milliseconds of HBM traffic does that remove per micro-batch, at 3.35 TB/s?" answer={0.16} tolerance={0.02} unit="ms">
+<p>Unfused, the matmul writes the 268 MB pre-activation, GELU reads it and writes 268 MB of output. Fused, the matmul writes only the 268 MB output. The removed traffic is one write and one read of 268 MB, 537 MB / 3.35 TB/s = <b>about 0.16 ms</b>, per layer per micro-batch in the forward pass. The backward pass needs the pre-activation to compute GELU's gradient, so the saving survives only if the backward recomputes it from the matmul inputs or the fused kernel also writes it for later use.</p>
+</Predict>
+
+## The backward pass and the optimizer
+
+For Y = XW, the backward pass computes dX = dY Wᵀ and dW = Xᵀ dY. Each is a matmul with the same 2BDF FLOPs as the forward, so the backward does twice the forward's matmul FLOPs and a training step does three times. Both backward matmuls keep the same three dimensions, so a matmul that is compute-bound in the forward is compute-bound in the backward. The bandwidth-bound ops are mirrored too: every norm and pointwise op in the forward has a backward that reads its saved inputs and the incoming gradient.
+
+The optimizer step is the purest bandwidth-bound op in training. AdamW with FP32 master weights and states reads the parameter, its gradient and two moments (16 bytes) and writes the parameter and both moments (12 bytes), 28 bytes per parameter for about a dozen FLOPs. One billion parameters on one GPU is 28 GB of traffic, 28 / 3,350 = 8.4 ms at the HBM floor. A fused optimizer kernel cuts launches, not bytes; sharding the optimizer state across data-parallel ranks is what divides the bytes.
+
+## Overhead, the third regime
+
+An op on a small tensor takes almost no time on the GPU and the full cost of a launch on the CPU. In Horace He's measurement PyTorch issued about 280 thousand operations per second on tiny tensors, about 3.6 µs each. A 4,096-element BF16 tensor is 16 KB of traffic, 16,384 / 3.35 × 10<sup>12</sup> ≈ 5 ns at the HBM floor, so an op on it is overhead-bound by a factor of several hundred. In training this appears in small models, in the bias and scale ops of norms, in optimizer loops that launch per parameter tensor, and in any step where the CPU issues kernels more slowly than the GPU finishes them.
+
+The test is to compare achieved FLOPs with peak, as Horace He puts it: a kernel at 80% of peak FLOPS is at least 80% compute-bound. For a bandwidth-bound op, compare achieved bytes per second with 3.35 TB/s instead. An op far below both is overhead-bound or badly written, and a profiler trace showing gaps between kernels on the GPU timeline separates the two.
+
+## What to fuse
+
+The procedure for one block:
+
+1. Leave the large projections alone. They are compute-bound and the library kernel is near its floor; the next gain there is a narrower format, not fusion.
+2. Fuse chains of pointwise ops and norms into one kernel each, or into the epilogue of the matmul that produces their input. Each removed intermediate saves one write and one read of that tensor.
+3. Keep the attention score matrix on chip. At sequence lengths where S is large, this is the biggest single saving in the block.
+4. Group small launches: multi-tensor optimizer steps, and CUDA graphs where shapes are static, which the next lesson covers.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+Scenario figures throughout.
+
+**"A 7-billion-parameter pretraining run on H100s shows 38% MFU. You have two engineer-weeks before the run is relaunched. One proposal is to fuse every norm and pointwise op with custom Triton kernels; the other is to double the micro-batch to raise matmul efficiency, which needs activation checkpointing to fit. Which do you fund?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Measure before choosing: take one step's profile and sum kernel time by class. If bandwidth-bound ops are a large share of step time, fusion recovers it without changing the training recipe. If the matmuls themselves run well below peak because the micro-batch is small, a larger micro-batch helps, but checkpointing adds a recomputed forward, up to a third more matmul FLOPs if everything is recomputed. With a 4,096-token micro-batch the matmuls are already far above 295 FLOPs per byte, so the micro-batch proposal is the weaker one unless the profile says otherwise.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The two proposals attack different regimes. Fusion attacks bandwidth-bound time: in a block like the scenario above, the GELU alone is 7% of the time of its matmul, and norms, residuals, dropout and softmax add more. A larger micro-batch attacks matmul efficiency, which only matters if B is near the 295 line or if the kernels suffer wave quantisation at the current shapes.</p>
+<p>Check the cost of each. Full activation checkpointing recomputes the forward during the backward, so a step goes from three forward-equivalents of matmul FLOPs to four, a third more work that the larger micro-batch must win back before it helps. Custom fused kernels carry correctness risk: each one needs a numerical comparison against the unfused reference in forward and backward, and two engineer-weeks covers a handful of kernels, not every op.</p>
+<p>A defensible plan: spend two days profiling and trying the compiler's automatic fusion first, which covers pointwise chains without custom code; write custom kernels only for what it leaves, such as a fused norm with its residual. Keep the micro-batch unless the profile shows matmul kernels far from their floor. The failure mode of this plan is that the compiler's fusion introduces recompilations or graph breaks in the real training loop, so the measured gain on one step does not appear in the run; check it over a few hundred steps before relaunch.</p>
+<p>The number that moves MFU is the share of step time in non-matmul kernels, which nobody in the room has yet. Ask for it.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The profile shows 20% of step time in the backward of LayerNorm and only 5% in its forward. What explains the asymmetry, and does it change which kernel you fuse first?</li>
+<li>Your fused kernel matches the reference to 1e-3 in forward but the loss curve diverges at step 40,000. Who owns that risk, and what gate would have caught it?</li>
+<li>What measurement would make you fund the micro-batch change after all?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The roofline gives a floor, not a prediction. Real matmul kernels reach a fraction of 989 TFLOPS, and that fraction depends on shape. One cause is wave quantisation: an output of 1,536 × 1,536 cut into 128 × 128 tiles is 144 tiles, which on 132 SMs, at one tile per SM at a time, takes two waves with 12 tiles in the second, so the SMs are busy 144 / 264 = 55% of the kernel's time. A shape that looks compute-bound by intensity can run far from peak for this reason alone.
+
+The bandwidth floor assumes every byte goes to HBM once. An op whose input is still in the 50 MB L2 from the previous kernel runs faster than its floor, and an op with a poor access pattern runs far slower.
+
+The one-device roofline also ignores the network. In data-parallel and tensor-parallel training, gradients and activations cross NVLink or InfiniBand, and the scaling book applies the same intensity reasoning to bytes sent between chips, where the threshold depends on different dimensions. A step can be compute-bound on every GPU and still limited by communication.
+
+<SelfRate id="lesson:training/gpu-kernels/roofline-training" />

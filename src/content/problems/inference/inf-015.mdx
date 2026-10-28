@@ -1,86 +1,117 @@
 ---
 id: inf-015
 title: Design an LLM inference API with autoscaling and SLOs
+subtitle: replicas take minutes to start, and the reservation does not cover the peak
 track: inference
 module: operating
 type: design
 difficulty: hard
-seniority: [senior, staff]
+seniority: [staff]
 minutes: 50
 core: false
-tags: [system-design, autoscaling, slo, streaming, batch, capacity]
+tags: [system-design, autoscaling, slo, error-budget, cold-start, capacity]
 companies: []
 updated: 2026-10-28
 sources:
-  - title: techinterview.org, Design an LLM Inference API (2026-04-16)
+  - title: techinterview.org, Design an LLM Inference API (published 2026-04-16, updated 2026-10-16)
     url: https://www.techinterview.org/post/3233460079/design-an-llm-inference-api/
-    note: the prompt and its assumptions (10M calls per day, about 1,000 rps peak, TTFT under 500 ms, at least 30 tokens per second) and the follow-ups on slow model loads and per-customer adapters
-  - title: Google Cloud, best practices for autoscaling LLM inference workloads on GKE
+    note: "third-party interview prompt, no company named: 10M API calls a day, a peak of 1,000 requests per second, an average response of 500 tokens at about 30 tokens per second (about 17 s of streaming), TTFT under 500 ms, at least 30 tokens per second, 7B, 70B and 405B models, SSE streaming and batch; a follow-up on autoscaling when a GPU cold start takes 5 to 10 minutes to load weights. Checked 2026-10-28."
+  - title: Google Cloud, Best practices for autoscaling LLM inference workloads with GPUs on GKE (page updated 2026-10-26)
     url: https://docs.cloud.google.com/kubernetes-engine/docs/best-practices/machine-learning/inference/autoscaling
-    note: autoscale on queue size or batch size; GPU utilization does not measure work done while active
-  - title: Google SRE workbook, implementing SLOs
+    note: "queue size and batch size are the server metrics to scale on; GPU utilization does not measure how much work is done while the GPU is active; start a queue-size threshold between 3 and 5 and raise it until latency is at the target; set a batch-size target slightly below the measured maximum; HPA defaults are a 5-minute scale-down stabilization window and none for scale-up. Checked 2026-10-28."
+  - title: Google SRE workbook, Implementing SLOs
     url: https://sre.google/workbook/implementing-slos/
-    note: SLIs as good over total events; error budget is 100% minus the SLO
-  - title: A Proof for the Queuing Formula L = lambda W (Little, 1961)
+    note: "an SLI is good events over total events; the error budget is 100% minus the SLO; a four-week rolling window is a good general-purpose interval; latency SLIs as the share of requests faster than a threshold. Checked 2026-10-28."
+  - title: vLLM V1 metrics loggers (source, main branch)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/v1/metrics/loggers.py
+    note: "vllm:num_requests_waiting, vllm:num_requests_running, vllm:kv_cache_usage_perc, vllm:num_preemptions, vllm:time_to_first_token_seconds, vllm:request_time_per_output_token_seconds. Checked 2026-10-28."
+  - title: "Little, A Proof for the Queuing Formula L = lambda W (Operations Research, 1961)"
     url: https://pubsonline.informs.org/doi/10.1287/opre.9.3.383
-    note: Little's law
+    note: "Little's law, used for requests in flight. Checked 2026-10-28."
   - title: OpenAI, Batch API guide
     url: https://developers.openai.com/api/docs/guides/batch
-    note: an example of a batch interface with a 24-hour completion window
+    note: "one public example of a batch interface with a 24-hour completion window. Checked 2026-10-28."
 ---
 import Callout from '../../../components/Callout.astro';
 import Depth from '../../../components/Depth.astro';
 
 ## Question
 
-<Callout kind="interview" label="As published">
-"Design an LLM inference API" with streaming and batch modes, several model sizes, about 1,000 requests per second at peak, TTFT under 500 ms and at least 30 tokens per second per stream.
+<Callout kind="interview" label="Design round, 50 minutes">
+"Design an LLM inference API" with streaming and batch, three model sizes, and the follow-up that matters here: how do you autoscale and keep your SLOs when a new replica takes minutes to start?
 </Callout>
 
-The prompt's numbers: 10 million calls per day, about 1,000 requests per second at peak, TTFT under 500 ms, at least 30 output tokens per second per streaming request. Customers can choose between a small and a large model. The interviewer will follow up on autoscaling when loading a model takes minutes, and on serving per-customer fine-tuned adapters. These are interview assumptions, not industry data.
+The published prompt gives the load: 10 million calls a day, a peak of 1,000 requests per second, an average answer of 500 tokens at no less than 30 tokens per second, TTFT under 500 ms, and 7B, 70B and 405B models. Its follow-up puts a cold start at 5 to 10 minutes. What you learn by asking (scenario):
+
+- Traffic by model: 7B 60%, 70B 35%, 405B 5%. Enterprise customers send 40% of requests and have a contract SLO; self-serve sends 60% and has none.
+- A load test found the most concurrent streams one replica holds with p99 inter-token latency under 33 ms: 7B on 1 GPU, 128; 70B on 4 GPUs, 64; 405B on 8 GPUs, 24.
+- A one-year reservation of 640 GPUs is signed. On-demand GPUs arrive in about 8 minutes when the cloud has stock; twice last quarter a request went unfilled for over an hour.
+- The gateway (auth, billing, per-tenant limits) belongs to the platform team. You can configure routes and limits on it, not rewrite it.
+- Five engineers, ten weeks to general availability. Finance wants the reserved GPUs at least 60% busy averaged over a day.
+
+Write the SLOs, size the pools, specify the autoscaling policy and what happens to a spike that arrives faster than a replica can start, and say what you give up. Write the rollout plan for the autoscaler itself, with its rollback triggers.
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>Turn "at least 30 tokens per second" into a per-step latency budget, then into a batch size per replica.</p></details>
-<details class="hint"><summary>Hint 2</summary><p>Batch requests have no latency target. How can they help the streaming fleet?</p></details>
-<details class="hint"><summary>Hint 3</summary><p>Slow model loads mean spare capacity has to exist before the spike, not after it.</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask what share of the day's requests arrives in the peak hour, and how far ahead the peak can be predicted.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask which tier's traffic the reservation has to protect, and what the contract says happens when the SLO is missed.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request the measured breakdown of the 8-minute start, and which parts of it repeat when a pod restarts on a node that already exists.</p></details>
 
 ## Answer
 
 <Depth>
 <Fragment slot="short">
-<p>A gateway (auth, per-tenant token limits, routing by model and mode) in front of per-model pools of inference replicas running continuous batching with paged KV cache. Streaming requests go to the pools directly; batch jobs go to a durable queue drained into spare capacity. SLOs on TTFT and per-request ITL; the 30 tokens per second target means ITL under 33 ms, which caps the batch per replica, found by load test. Size pools with Little's law at peak, autoscale on queue depth, hold warm spare replicas for spikes shorter than a model load, and pack adapters onto shared base-model replicas with adapter-aware routing.</p>
+<p>Three pools behind the existing gateway, one per model, each running continuous batching with paged KV. SLOs per tier, not one latency number: for enterprise, 99% of requests with TTFT under 500 ms and 99% with a mean inter-token gap under 33 ms, over a four-week window. Little's law sizes the peak: 1,000 requests a second times about 17.2 s in the system is 17,200 streams, which the measured concurrency turns into 749 GPUs at the load-test limit and 933 at 80% of it. The reservation covers the enterprise share of that peak, 373 GPUs, with room to spare; self-serve rides on on-demand capacity scheduled ahead of the daily ramp and is degraded or shed when the cloud has no stock. Pools scale on waiting requests and running batch size, never GPU utilisation, and scale in slowly because each replica costs 8 minutes to replace. Batch jobs fill the night, which is the only way the reservation gets near 60% busy.</p>
 </Fragment>
 <Fragment slot="long">
-<p>Numbers first. 10 million a day averages 116 requests per second, so the 1,000 peak is about 8.6 times the average: a large night-time trough the batch mode can use. 30 tokens per second means at most 33 ms per decode step for every stream in a batch; the load test finds the largest concurrency per replica with p99 ITL under that, per model size. TTFT under 500 ms covers queueing plus prefill, so queues must stay short and long prompts need chunked prefill or their own pool.</p>
-<p>Capacity. Little's law: requests in flight = arrival rate x time in system. If a mean streamed response takes 8 s, peak needs about 8,000 concurrent sequences across the fleet; divide by measured concurrency per replica times a headroom factor to get replicas per pool. Re-run when prompt or output lengths shift.</p>
-<p>API. Streaming over SSE with OpenAI-compatible request shapes; batch as an upload of request files with a job id, a completion window and results written to storage. Idempotency keys on batch submission. Usage in every response for billing.</p>
-<p>Request path. Gateway authenticates, checks the tenant's token bucket (reserve prompt plus max_tokens, settle after), picks the pool by model, and routes to the replica with the shortest queue, preferring replicas that already hold the tenant's prefix or adapter. Replicas run continuous batching, paged KV cache, prefix caching and chunked prefill with a token budget chosen for the ITL target.</p>
-<p>Autoscaling. Signal: waiting requests and batch size (GKE's recommendation), with KV cache usage as a second trigger; never GPU utilisation alone. Because a replica takes minutes to load, keep warm spare replicas sized for the largest spike that can arrive within one load time, scale ahead of known daily peaks, scale in slowly, and shed lower tiers with 429 before the TTFT SLO breaks. Batch jobs soak up the trough and are paused first when streaming traffic rises.</p>
-<p>Adapters. Serve per-customer LoRA adapters on shared base-model replicas, load them on demand with an LRU of resident adapters, and route by adapter so requests land where the adapter is loaded; cold adapter loads count against TTFT, so popular adapters stay pinned.</p>
-<p>SLOs and operations. SLIs: share of requests with TTFT under 500 ms, share with p99 ITL under 33 ms, success rate. Error budget is 100% minus the SLO; spend it on deploys deliberately, with canaries that compare latency, output length and eval scores before widening.</p>
+<p><strong>The arithmetic, in front of the room.</strong> 10,000,000 / 86,400 = 116 requests a second on average, so the 1,000 peak is 8.6 times the mean. Time in the system at the floor rate is 0.5 + 500 / 30 = 17.2 s, so at peak 1,000 × 17.2 = 17,200 streams are in flight. Split by model and divided by measured concurrency:</p>
+<table>
+<thead><tr><th>Pool</th><th>Streams at peak</th><th>Replicas at the load-test limit</th><th>GPUs</th><th>GPUs at 80% of the limit</th></tr></thead>
+<tbody>
+<tr><td>7B, 1 GPU</td><td>10,320</td><td>10,320 / 128 = 81</td><td>81</td><td>10,320 / 102.4 = 101</td></tr>
+<tr><td>70B, 4 GPUs</td><td>6,020</td><td>6,020 / 64 = 95</td><td>380</td><td>6,020 / 51.2 = 118 replicas, 472</td></tr>
+<tr><td>405B, 8 GPUs</td><td>860</td><td>860 / 24 = 36</td><td>288</td><td>860 / 19.2 = 45 replicas, 360</td></tr>
+<tr><td>Total</td><td>17,200</td><td></td><td>749</td><td>933</td></tr>
+</tbody>
+</table>
+<p>The headroom is the quantity you choose. Running at the load-test limit means p99 ITL sits at 33 ms with no room for a longer-than-tested prompt mix; 80% buys room for bursts and for requests that hold more KV than the test's average. Anything from 70% to 90% is defensible if you say what it buys; 100% is not, and neither is sizing without a measured concurrency.</p>
+<p><strong>SLOs and the error budget.</strong> SLIs as good over total requests, per tier: TTFT under 500 ms, per-request mean inter-token gap under 33 ms (the 30 tokens per second floor), and success. Enterprise SLO 99% on each latency SLI and 99.9% on success over a rolling four weeks; self-serve gets internal objectives and no promise. Enterprise sends 4 million requests a day, so the latency budget is 1% of 112 million requests over four weeks, 1.12 million slow requests. The written error budget policy: when enterprise has spent half its budget, engine and model upgrades stop until the burn rate falls; when it has spent all of it, self-serve is shed first during any shortfall.</p>
+<p><strong>The decision: what the reservation covers.</strong> 640 reserved GPUs cannot hold the 933-GPU peak. Two defensible answers:</p>
+<ul>
+<li><em>Protect enterprise on the reservation, put self-serve on on-demand.</em> Enterprise at peak needs 40% of 933, about 373 GPUs, so the reservation covers it with 267 GPUs of warm spare. Self-serve needs about 560 more at peak; scheduled scale-ahead requests them 30 minutes before the daily ramp. Cost: when the cloud has no stock, as happened twice last quarter, self-serve 70B traffic falls back to the 7B pool with a shorter max_tokens, then to 429 with Retry-After. Self-serve users see a worse model at peak on those days.</li>
+<li><em>Raise the reservation to the full peak.</em> No stock risk and no degraded mode. Cost: about 293 more reserved GPUs that sit idle most of the day; the average load is 116 / 1,000 = 11.6% of peak, so even with 640 GPUs the streaming traffic alone keeps them about 749 × 0.116 / 640 = 14% busy, against finance's 60%.</li>
+</ul>
+<p>I would take the first. It honours the contract with reserved capacity and leaves the risk where there is no promise. That is the constraint conflict in this design: finance's utilisation target against an SLO that needs idle headroom. The batch mode is how the two meet: jobs with a 24-hour window are drained into the pools' spare replicas at night and paused first when the waiting queue grows. Reaching 60% means about 384 of 640 GPUs busy on average, so batch has to fill roughly 300 GPUs' worth of the day; whether that demand exists is a question for product, not for the autoscaler.</p>
+<p><strong>The autoscaling policy.</strong> Per pool, an HPA on `vllm:num_requests_waiting` per replica with a threshold found by load test (GKE suggests starting between 3 and 5), and on `vllm:num_requests_running` with a target just below the measured maximum. Scale-up stabilization stays at zero. Scale-down does not: the default 5-minute window removes replicas that cost 8 minutes to replace, so I would raise it to 30 minutes and remove at most 10% of a pool per step. A scheduled floor per pool follows the daily curve, because a reactive signal that fires when the queue forms is 8 minutes late by construction. KV usage and preemptions alert, they do not scale.</p>
+<p><strong>A spike faster than a cold start.</strong> Between the queue forming and a new replica serving, the only capacity is what is already running. Enterprise has the 267 reserved GPUs of spare; self-serve has whatever on-demand has already arrived. The gateway's per-tenant limits do the rest: self-serve concurrency is capped per tenant, and past the cap it degrades, then sheds. Shortening the start helps every option: the image cached on the node and weights streamed from storage close to the GPUs attack the parts that repeat on every start.</p>
+<p><strong>What you give up.</strong> A latency promise for self-serve; the 405B pool sized for its peak only on days the cloud has stock; finance's 60% unless batch demand appears; and autoscaling that reacts to surprise traffic, since only scheduled capacity is on time.</p>
+<p><strong>Rollout plan for the autoscaler, as written.</strong></p>
+<ul>
+<li>Weeks 1 and 2: shadow mode. The policy computes desired replicas per pool every 30 s and logs them next to what the current static fleet does. Pass: the policy never asks for fewer replicas than were needed to keep the enterprise TTFT SLI above 99% in any hour.</li>
+<li>Week 3: live on the 7B pool only. Rollback to the static fleet if the enterprise TTFT SLI on that pool falls below 99% for 30 minutes, if the pool changes direction more than four times in an hour, or if any pod stays pending for longer than 15 minutes without an alert having fired.</li>
+<li>Weeks 4 to 6: the 70B pool, then 405B, with the same triggers. The static fleet stays defined for a one-command rollback until the four-week enterprise budget closes unspent.</li>
+</ul>
+<p><strong>Where this design fails.</strong> Every number above rests on one load test. If a model update makes answers 40% longer, time in the system goes from 17.2 s to 0.5 + 700 / 30 = 23.8 s, streams in flight rise by 38% at the same request rate, and enterprise now needs 373 × 1.38 = 516 of the 640 reserved GPUs, leaving 124 spare instead of 267, before anyone notices that the request rate never changed. The second failure is the scheduled scale-ahead on a day without stock: the queue signal fires, pods sit pending, and the autoscaler looks healthy while self-serve degrades for the whole peak. Alert on pending pods and unfilled capacity requests, not only on the queue, and re-run the load test on every model or engine change.</p>
 </Fragment>
 <Fragment slot="followups">
 <ul>
-<li><em>One customer sends 30% of all traffic. What changes?</em> Per-tenant limits and possibly a dedicated pool, so their spikes cannot breach other tenants' SLOs.</li>
-<li><em>How do you roll out a new model version?</em> Load it on a canary pool, shadow or split a small share of traffic, compare TTFT, ITL, tokens per request and eval results, then shift traffic by routing, keeping the old pool warm until the error budget is safe.</li>
-<li><em>Region failure?</em> A second region with enough headroom for the critical tiers, and a declared degraded mode (smaller model, lower max_tokens) for the rest.</li>
+<li><em>Why not scale on KV cache usage?</em> It rises with longer sequences as well as with more of them, and it sits high on a healthy, well-packed replica; preemptions are the signal that it has run out.</li>
+<li><em>Per-customer adapters on the 70B pool: what changes in the capacity table?</em> Each adapter load is a cold start inside a warm replica; concurrency per replica drops when many adapters are resident, so the load test has to run with the real adapter mix.</li>
 </ul>
 </Fragment>
 </Depth>
 
-What the interviewer is checking: the 30 tokens per second target translated into a per-step budget and a measured concurrency, capacity derived with stated assumptions rather than guessed, the right autoscaling signal, an explicit answer to slow model loads, and batch mode used to fill the trough rather than built as a separate system.
-
 ## Follow-ups
 
-- *Small and large models: separate fleets or shared GPUs?* Separate pools by default, since each replica serves one model; consider packing small models several per GPU if their traffic is low.
-- *What is the first dashboard you build?* TTFT and ITL percentiles per pool, queue depth, batch size, KV usage, preemptions, and error rate per tenant tier.
-- *How do you price it?* Per input and output token, with a discount for batch that reflects using otherwise idle capacity.
+- *Pushback: finance says 14% busy is indefensible and wants the reservation cut from 640 to 400 GPUs. Enterprise at peak needs about 373. What do you accept in writing about the spare that remains, and which tier pays for the next stockout?*
+- *Reversal: what would you need to see in production to move self-serve onto the reservation instead of on-demand?* Batch demand that keeps the reserved GPUs above the utilisation target at night, or a quarter without a stockout plus a measured cost of degraded self-serve sessions that exceeds the reservation price.
+- *Operating: the 70B model's replacement gives answers 40% longer on your evals, and the current model's support ends in sixty days. Do you ship it on the current reservation, and which tier's objective do you degrade until the capacity arrives?*
 
 ## Common mistakes
 
-- One "latency" SLO that mixes TTFT and inter-token latency.
-- Autoscaling on GPU utilisation.
-- Capacity numbers with no stated per-replica concurrency or response time behind them.
-- Treating batch mode as a separate fleet instead of trough filler.
-- Ignoring adapter placement, so every request for a fine-tuned model pays a cold load.
+- One latency SLO that mixes TTFT and inter-token latency, or one SLO for every tier.
+- Autoscaling on GPU utilisation, which reads busy at very different loads.
+- Keeping the default 5-minute scale-down window for replicas that take 8 minutes to replace.
+- Capacity with no measured concurrency per replica behind it, or no headroom choice stated.
+- Treating on-demand GPUs as always available, so the design has no degraded mode for a stockout.
+- Building batch as a separate fleet instead of the work that fills the reservation at night.

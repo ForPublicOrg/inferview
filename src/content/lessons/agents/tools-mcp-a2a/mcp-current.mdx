@@ -1,0 +1,200 @@
+---
+title: "MCP at the 2026-07-28 revision: transports, stateless requests and migration"
+track: agents
+module: tools-mcp-a2a
+order: 2
+kind: lesson
+level: senior
+minutes: 15
+summary: The 2026-07-28 MCP revision removed the initialize handshake and protocol sessions, so every request carries its own version and capabilities and server-to-client questions become multi round-trip requests, and a stateful server migrates by moving session state into handles and sealed request state while serving both eras for as long as its legacy clients last.
+prerequisites: [agents/tools-mcp-a2a/tool-design]
+updated: 2026-10-28
+sources:
+  - title: MCP specification, latest (checked 2026-10-28)
+    url: https://modelcontextprotocol.io/specification/latest
+    note: "current revision 2026-07-28; hosts, clients, servers; JSON-RPC 2.0; stateless, self-contained requests; per-request capability negotiation; tasks, skills over MCP and MCP Apps as extensions"
+  - title: MCP specification 2026-07-28, changelog
+    url: https://modelcontextprotocol.io/specification/2026-07-28/changelog
+    note: "SEP-2567 sessions and Mcp-Session-Id removed; SEP-2575 handshake removed, _meta version and capabilities, server/discover, subscriptions/listen, ping and logging/setLevel removed, resumability removed; SEP-2322 MRTR and resultType; SEP-2663 tasks to an extension; SEP-2243 Mcp-Method and Mcp-Name headers; SEP-2549 ttlMs and cacheScope; deterministic tools/list order; SEP-2596 lifecycle policy with a minimum twelve-month deprecation window"
+  - title: MCP 2026-07-28, Multi Round-Trip Requests
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr
+    note: "InputRequiredResult with inputRequests and requestState; requestState is attacker-controlled, integrity protection (HMAC or AEAD) when it affects authorisation or business logic; bind principal, short TTL and originating request; not single-use by itself; retry uses a different JSON-RPC id; only prompts/get, resources/read and tools/call"
+  - title: MCP 2026-07-28, Streamable HTTP transport
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http
+    note: "single POST endpoint; JSON or per-request SSE; no server requests on streams; closing the stream cancels; no Last-Event-ID resumption; MCP-Protocol-Version, Mcp-Method, Mcp-Name required; header mismatch 400 with -32020; Mcp-Param headers from x-mcp-header; Origin validation with 403; legacy GET or DELETE answered 405, Mcp-Session-Id ignored; dual-era detection by inspecting the 400 body"
+  - title: MCP 2026-07-28, Versioning and compatibility
+    url: https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning
+    note: "modern, legacy and dual-era terms; UnsupportedProtocolVersionError -32022 with supported list; compatibility matrix: legacy client against modern-only server fails with no fall-forward; dual-era server selects legacy on initialize; clients cache the era per process or origin"
+  - title: MCP versioning (checked 2026-10-28)
+    url: https://modelcontextprotocol.io/specification/versioning
+    note: "YYYY-MM-DD identifiers; draft, current, final; deprecated features stay at least twelve months, or ninety days under the expedited-removal exception"
+  - title: MCP 2026-07-28, Deprecated features registry
+    url: https://modelcontextprotocol.io/specification/2026-07-28/deprecated
+    note: "roots, sampling, logging and Dynamic Client Registration deprecated in 2026-07-28, earliest removal the first revision on or after 2027-07-28; HTTP+SSE deprecated in 2025-03-26, removal three months after SEP-2596 reaches Final"
+  - title: MCP 2026-07-28, Tools
+    url: https://modelcontextprotocol.io/specification/2026-07-28/server/tools
+    note: "tools/list must not vary per connection, may vary by authorisation; deterministic order; stateful tools through explicit handles authorised on every call"
+  - title: MCP 2026-07-28, server/discover
+    url: https://modelcontextprotocol.io/specification/2026-07-28/server/discover
+    note: "mandatory RPC returning supportedVersions, capabilities, serverInfo and instructions; optional for clients; the stdio backward-compatibility probe"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import AgentsMcpFlow from '../../../../components/widgets/AgentsMcpFlow.astro';
+
+## What the revision changed
+
+Revisions up to and including 2025-11-25 open a session: an `initialize` request and an `initialized` notification negotiate version and capabilities once, and over HTTP the server can assign an `Mcp-Session-Id` that every later request then carries. When a tool needed something from the user, the server sent its own request (an elicitation, a sampling call, a roots query) down an open stream and waited, holding the half-finished call in memory. That design behaves like a connection-oriented protocol with server-side session state: the load balancer pins each session to the instance that created it, and a deploy or crash on that instance loses the sessions on it.
+
+The 2026-07-28 revision, the current one as of this lesson's date, removes all of that. The changelog lists the handshake and protocol sessions as removed (SEP-2575, SEP-2567); every request carries its protocol version and client capabilities in `_meta`; server-to-client requests are replaced by multi round-trip requests (SEP-2322); every result carries a required `resultType`; `ping` and `logging/setLevel` are removed, with log level set per request; SSE stream resumption is removed; experimental tasks move into an official extension (SEP-2663); and a new `server/discover` RPC is mandatory for servers. The specification's own summary of the base protocol now reads as stateless, self-contained requests with per-request capability negotiation.
+
+The rest of this lesson follows one request through the new wire format, then covers what a server with session state has to change and how long it has to keep speaking the old protocol.
+
+## The request carries its own context
+
+Each request's `_meta` holds `io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities`; clients SHOULD add `clientInfo`, and servers SHOULD return `serverInfo` in each result's `_meta`. On Streamable HTTP, every message is its own POST to one endpoint, and the transport mirrors three body fields into headers so a gateway can route without parsing JSON: `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name` (the tool name, prompt name or resource URI). A server that processes the body MUST reject a request whose headers and body disagree with HTTP 400 and JSON-RPC error `-32020` (`HeaderMismatch`). The reason given is the split-brain case: a load balancer routing or rate-limiting on the header while the server executes the body.
+
+Servers can also mark a tool parameter with `x-mcp-header`, and conforming clients then send its value as `Mcp-Param-{Name}`, for example a region to route on. The spec says servers SHOULD NOT mark sensitive parameters this way, because intermediaries see headers. It also tells intermediaries that enforce policy on mirrored headers to reject requests whose version predates header validation, since an older client's headers were never checked against its body.
+
+Version negotiation is per request. A server that does not support the requested version answers 400 with `UnsupportedProtocolVersionError` (code `-32022`) listing the versions it does support, and the client retries with one of them. `server/discover` returns the supported versions, capabilities and identity in one call; clients may skip it and handle the error inline.
+
+<AgentsMcpFlow />
+
+## Multi round-trip requests
+
+A server that needs input in the middle of `tools/call`, `prompts/get` or `resources/read` (the only three methods allowed to do this) returns a result with `resultType: "input_required"`, an `inputRequests` map of elicitation, sampling or roots requests keyed by server-chosen ids, and optionally a `requestState` string. The client gathers the answers and sends the original request again with a different JSON-RPC id, an `inputResponses` map with the same keys, and the `requestState` echoed byte for byte. The spec states the purpose directly: handle server-to-client requests without shared storage across instances or stateful load balancing. Any instance can take the retry, because the retry carries everything.
+
+The state therefore travels through the client, and the spec treats it as attacker-controlled. If `requestState` influences authorisation, resource access or business logic, the server MUST protect its integrity (HMAC or AEAD) and reject state that fails verification, and SHOULD bind inside the protected payload the authenticated principal, a short expiry, and an identifier of the originating request such as the method and a digest of its parameters. Those bindings stop cross-user and cross-request reuse within the expiry; they do not make the state single-use, and the spec says a server that needs at-most-once consumption MUST enforce it server-side.
+
+Two design consequences follow for tool authors. The server MUST NOT assume the client will retry, so a tool that performs a side effect and then asks a question leaves the side effect done and the call abandoned; ask for input before acting. And a server may answer the retry with another `input_required` if answers are missing, so the interaction is a loop the client bounds, not a single exchange.
+
+## Streams, cancellation and retries
+
+The server answers each POST with a JSON object or with an SSE stream scoped to that request, carrying progress and log notifications for it and then the response. The server MUST NOT send independent requests on any stream. Closing the stream is the cancellation signal on HTTP. Resumption with `Last-Event-ID` is gone: a broken response stream loses the in-flight request, and the client MUST re-issue it as a new request with a new id. For a tool with side effects that is an at-least-once delivery path, and the idempotency design from the [previous lesson](/learn/agents/tools-mcp-a2a/tool-design) is what keeps it from acting twice.
+
+Change notifications that used to arrive on a standalone GET stream now arrive on the response stream of a `subscriptions/listen` POST, which stays open and carries only the notification types the client opted into. A modern-only server that receives a legacy GET or DELETE SHOULD answer 405, and SHOULD ignore an `Mcp-Session-Id` header rather than echo or mint one.
+
+## Lists become cacheable
+
+Because there is no connection state, `tools/list` MUST NOT vary per connection or as a side effect of other requests, though it MAY vary by the authorisation on the request, which is per-request input. List and read results now carry `ttlMs`, a freshness hint, and `cacheScope`, `public` or `private`, which says whether shared intermediaries may cache them (SEP-2549). Servers SHOULD return tools in a deterministic order, and the changelog gives the reason as client-side caching and higher prompt cache hit rates: a host that renders tool definitions into the model prefix gets a different prefix every time the order shuffles.
+
+## The deprecation window
+
+The revision also adopts a feature lifecycle policy (SEP-2596): a deprecated feature stays in the specification for at least twelve months, or ninety days under an expedited-removal exception, before it becomes eligible for removal. The registry as of 2026-10-28:
+
+<div class="tablewrap">
+<table>
+<thead><tr><th>Feature</th><th>Deprecated in</th><th>Migration path</th><th>Earliest removal</th></tr></thead>
+<tbody>
+<tr><td>Roots</td><td>2026-07-28</td><td>Directories or files through tool parameters, resource URIs or server configuration</td><td>First revision on or after 2027-07-28</td></tr>
+<tr><td>Sampling</td><td>2026-07-28</td><td>Call the model provider's API directly</td><td>First revision on or after 2027-07-28</td></tr>
+<tr><td>Logging</td><td>2026-07-28</td><td>stderr on stdio; OpenTelemetry</td><td>First revision on or after 2027-07-28</td></tr>
+<tr><td>Dynamic Client Registration</td><td>2026-07-28</td><td>Client ID Metadata Documents</td><td>First revision on or after 2027-07-28</td></tr>
+<tr><td>HTTP+SSE transport</td><td>2025-03-26</td><td>Streamable HTTP</td><td>Three months after SEP-2596 reaches Final</td></tr>
+</tbody>
+</table>
+</div>
+
+The sampling row is an organisational change as much as a code change. A server that used sampling borrowed the host's model and the host's bill; after migration it needs its own provider credentials, its own spend limits and its own data-handling review.
+
+## Migrating a stateful server
+
+The spec names three kinds of implementation: modern (2026-07-28 and later, per-request metadata), legacy (2025-11-25 and earlier, `initialize` handshake), and dual-era. Its compatibility matrix decides the migration plan. A dual-era server works with both kinds of client: an `initialize` request selects legacy semantics scoped to that session or stdio process, and a request with modern `_meta` is served statelessly, concurrently on the same endpoint. A modern-only server fails every legacy client, and legacy clients have no fall-forward mechanism; the spec asks such a server to name its supported versions in the error it returns to `initialize`, because that error may be the only diagnostic the user sees. Dual-era clients probe: on HTTP they send a modern request and fall back only if a 400 body is not a recognised modern error; on stdio they send `server/discover` first.
+
+The migration work, in order:
+
+1. Inventory what lives in the session today: per-connection tool lists, open transactions, cursors, cached credentials, pending elicitations.
+2. Move cross-call state into explicit handles returned by a creating tool and passed as arguments, authorised against the caller on every call, with the lifetime stated in the tool description.
+3. Replace server-initiated requests with `input_required` results, putting whatever the server held in memory into a sealed `requestState`; move every side effect after the last question.
+4. Implement `server/discover`, the required headers and header validation, `resultType` on every result, deterministic list order and the cache fields.
+5. Serve both eras behind the same endpoint, with sticky routing kept only for requests that carry a legacy session id, and measure the legacy share by client.
+6. Remove the legacy path when that share reaches a threshold agreed in advance with the people who own the remaining clients.
+
+<Predict id="agt-mcp-legacy-tail" question="Legacy traffic is 40% of requests today and halves every three months. After how many months does it fall below 2%?" answer={13} tolerance={2} unit="months">
+<p><b>About 13 months.</b> The share has to fall by a factor of 40 / 2 = 20, which takes log<sub>2</sub> 20 = 4.32 halvings; at three months per halving that is 4.32 x 3 = 13.0 months. Read quarterly it is the fifth quarter, month 15, at 1.25%. The decay rate is a scenario input: measure it per client from the dual-era server's logs, because a long tail usually sits in a few installs that never upgrade, and those set the date rather than the curve.</p>
+</Predict>
+
+The core of a dual-era front door and a sealed `requestState`, in standard-library Python:
+
+```python
+import base64, hashlib, hmac, json, time
+
+SUPPORTED = ["2026-07-28", "2025-11-25"]        # modern first; legacy kept for the window
+KEY = b"rotate-me"                               # from a secret store in a real server
+
+
+def era(msg, headers):
+    """Pick the era from how the client opens, as a dual-era server must."""
+    if msg.get("method") == "initialize":
+        return "legacy"
+    version = msg.get("params", {}).get("_meta", {}).get("io.modelcontextprotocol/protocolVersion")
+    if version is None:
+        return "legacy" if "Mcp-Session-Id" in headers else "reject"
+    if headers.get("MCP-Protocol-Version") != version:
+        return "header_mismatch"                # 400 with JSON-RPC error -32020
+    return "modern" if version in SUPPORTED else "unsupported"   # 400 with -32022 and the list
+
+
+def _digest(method, name, args):
+    return hashlib.sha256(json.dumps([method, name, args], sort_keys=True).encode()).hexdigest()
+
+
+def seal(principal, method, name, args, state, ttl_s=300):
+    """requestState bound to the caller, the originating request and an expiry."""
+    body = json.dumps({"p": principal, "d": _digest(method, name, args),
+                       "exp": int(time.time()) + ttl_s, "s": state}).encode()
+    return base64.urlsafe_b64encode(hmac.new(KEY, body, hashlib.sha256).digest() + body).decode()
+
+
+def unseal(token, principal, method, name, args):
+    raw = base64.urlsafe_b64decode(token.encode())
+    mac, body = raw[:32], raw[32:]
+    if not hmac.compare_digest(mac, hmac.new(KEY, body, hashlib.sha256).digest()):
+        raise ValueError("tampered")
+    c = json.loads(body)
+    if c["p"] != principal or c["d"] != _digest(method, name, args) or c["exp"] < time.time():
+        raise ValueError("wrong caller, wrong request or expired")
+    return c["s"]
+
+
+tok = seal("user:42", "tools/call", "create_ticket", {"title": "Disk full"}, {"step": "need_project"})
+print(unseal(tok, "user:42", "tools/call", "create_ticket", {"title": "Disk full"}))  # {'step': 'need_project'}
+```
+
+HMAC gives integrity, not secrecy: anything in the state is readable by the client, so a server that must hide it uses an AEAD cipher instead, which the standard library does not provide. Key rotation needs two keys accepted during the overlap, or every in-flight retry fails at the switch.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your API gateway fronts 30 internal MCP servers. Security wants per-tool rate limits and an audit log at the gateway by the end of the quarter; the platform team will not let the gateway parse request bodies because of the latency and cost at your traffic. Twelve servers are already on 2026-07-28, the rest are on 2025-11-25 or older and their owners have other priorities. What do you build, and what do you tell security it does not cover?"**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Route, limit and log on the mirrored headers (<code>MCP-Protocol-Version</code>, <code>Mcp-Method</code>, <code>Mcp-Name</code>) for modern traffic, which needs no body parsing, and rely on the servers' required header-body validation to reject a forged header. Legacy traffic has no such headers, so the gateway either parses bodies for that share only or limits legacy servers per server rather than per tool until they migrate. I tell security that per-tool controls cover only modern traffic and that the audit log records what the header claimed, made trustworthy by the server's check, not the gateway's.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Modern path. The spec requires the three headers on every POST and requires any server that processes the body to reject a mismatch with 400 and -32020. So the gateway can key rate limits on Mcp-Name and log method and name without reading JSON, provided the gateway also rejects requests that claim an older version or omit the version header, as the spec recommends for intermediaries that enforce policy on mirrored headers.</p>
+<p>Legacy path. 2025-11-25 traffic carries a session id and no method header. Options: parse bodies for the eighteen legacy servers only, which bounds the cost to their share of traffic; or apply per-server limits and push owners to migrate with a date. I would parse for the few servers with destructive tools and limit the rest per server, and publish the legacy share per server weekly.</p>
+<p>What I give up. A per-server limit on legacy servers is coarse: one busy read tool can starve a write tool on the same server. Written down: the coverage gap by server, the date each owner commits to, and the rule that a server that drops header validation loses its per-tool policy.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>One modern server's SDK version skips header-body validation. What does that do to your audit log, and how do you find out?</em> Send a mismatched request from a test client and expect -32020.</li>
+<li><em>Security pushes back: "the gateway must see the arguments for data-loss prevention." Which half of the latency budget do you spend on that, and for which tools?</em></li>
+<li><em>Two server owners disagree: one wants to go modern-only now and break three customer installs, the other wants to stay dual-era for two years. How do you decide without deciding by rank?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+This lesson is pinned to the 2026-07-28 revision as read on 2026-10-28. The changelog cited here also lists items that were renumbered during drafting (error codes moved into a reserved range), which is a sign that SDKs and servers will disagree with each other and with the text for a while; test against the SDK versions you ship, not the specification alone.
+
+Most deployed servers and clients were written against 2025-11-25 or earlier, and the ecosystem moves at the pace of its slowest clients, so for a server with external users the dual-era period is the normal state, not a transition. The twelve-month window applies to features of the current revision, not to how long legacy revisions are supported; nothing in the spec obliges a server to keep serving 2025-11-25, and nothing obliges a client to stop.
+
+Statelessness moves state, it does not remove it. Handles live in a store the server runs, sealed request state grows with every round trip, and a design that needed a session for a long-running interaction may be better served by the tasks extension or by a durable workflow behind a single tool, which the [workflows track](/learn/workflows) covers.
+
+<SelfRate id="lesson:agents/tools-mcp-a2a/mcp-current" />

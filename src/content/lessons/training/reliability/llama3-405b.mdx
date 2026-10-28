@@ -1,0 +1,172 @@
+---
+title: Llama 3 405B infrastructure
+track: training
+module: reliability
+order: 4
+kind: teardown
+level: staff
+minutes: 14
+summary: A teardown of how Meta trained Llama 3 405B on up to 16K H100s, from the published paper only, covering 4D parallelism, MFU by stage, the failure taxonomy, the batch-size ramp, long-context extension, annealing and six post-training rounds, and what the paper leaves out.
+prerequisites: [training/reliability/failures-at-scale, training/reliability/checkpointing]
+updated: 2026-10-28
+sources:
+  - title: The Llama 3 Herd of Models (Meta, arXiv 2407.21783), section 3.3 Infrastructure, Scaling, and Efficiency
+    url: https://arxiv.org/html/2407.21783
+    note: "Up to 16K H100 GPUs (700 W TDP, 80 GB HBM3), eight per server over NVLink; MAST scheduler; Tectonic storage, 240 PB on 7,500 servers, 2 TB/s sustained, 7 TB/s peak, 1 MB to 4 GB checkpoint state per GPU; RoCE three-layer Clos on 24K GPUs, 16 GPUs per rack, 3,072-GPU pods at full bisection, 1:7 oversubscription above; 16 flows per GPU pair with E-ECMP; deep-buffer spine and no DCQCN; 4D parallelism ordered [TP, CP, PP, DP]; Table 4 configurations and BF16 MFU 43%, 41%, 38%; pipeline bubble (PP - 1)/(V * M); all-gather context parallelism; FP32 gradient accumulation and reduce-scatter; NCCLX. The paper reports. Checked 2026-10-28."
+  - title: The Llama 3 Herd of Models, section 3.3.4 Reliability and Operational Challenges
+    url: https://arxiv.org/html/2407.21783
+    note: "466 interruptions in 54 days, 47 planned, 419 unexpected; Table 5 root causes; effective training time above 90%; three significant manual interventions; flight recorder; stragglers; diurnal 1-2% throughput variation; tens-of-megawatts power swings. The paper reports. Checked 2026-10-28."
+  - title: The Llama 3 Herd of Models, sections 1, 3.4 and 4.1
+    url: https://arxiv.org/html/2407.21783
+    note: "3.8 x 10^25 FLOPs, 405B parameters, 15.6T text tokens; AdamW peak learning rate 8 x 10^-5, 8,000 warmup steps, cosine decay to 8 x 10^-7 over 1,200,000 steps; batch 4M tokens at sequence 4,096, then 8M at 8,192 after 252M tokens, then 16M after 2.87T tokens; long context in six stages from 8K to 128K over about 800B tokens; annealing on the final 40M tokens to learning rate 0 with checkpoint averaging; post-training in six rounds of reward modelling, rejection sampling, SFT (learning rate 10^-5, 8.5K to 9K steps) and DPO (learning rate 10^-5, beta 0.1). The paper reports. Checked 2026-10-28."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Diagram from '../../../../components/Diagram.astro';
+import Trace from '../../../../components/Trace.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## What it is and who runs it
+
+Llama 3 405B is Meta's dense 405-billion-parameter language model, pre-trained on 15.6T text tokens with 3.8 × 10²⁵ FLOPs, on up to 16K H100 GPUs in Meta's production clusters. The figure is consistent with the usual 6 × parameters × tokens estimate for dense training: 6 × 405 × 10⁹ × 15.6 × 10¹² = 3.79 × 10²⁵. Everything below comes from Meta's paper, "The Llama 3 Herd of Models" (July 2024). It covers hardware, network, parallelism, failure data and the full training recipe of one run in a single document.
+
+Meta moved Llama 3 from its research supercluster to production clusters, and the paper frames the move as a choice for production-grade reliability. The reliability numbers in this teardown are therefore numbers from a fleet that already had production operations around it.
+
+## The system
+
+<Diagram
+  title="Llama 3 405B pre-training, as the paper describes it"
+  nodes={[
+    { id: 'mast', label: 'MAST scheduler', note: 'topology-aware placement' },
+    { id: 'job', label: 'Training job', note: 'up to 16,384 H100' },
+    { id: 'tp', label: 'TP 8', note: 'inside a server' },
+    { id: 'cp', label: 'CP 1 or 16', note: 'long-context stage' },
+    { id: 'pp', label: 'PP 16', note: 'interleaved' },
+    { id: 'dp', label: 'FSDP 8 to 128', note: 'outermost' },
+    { id: 'nccl', label: 'NCCLX', note: '16 flows per pair' },
+    { id: 'store', label: 'Tectonic', note: '2 TB/s sustained' },
+    { id: 'net', label: 'RoCE Clos', note: '3,072-GPU pods' },
+    { id: 'fr', label: 'Flight recorder', note: 'dump on timeout' },
+  ]}
+  edges={[
+    { from: 'mast', to: 'job', label: 'places' },
+    { from: 'job', to: 'tp' },
+    { from: 'job', to: 'cp' },
+    { from: 'job', to: 'pp' },
+    { from: 'job', to: 'dp' },
+    { from: 'pp', to: 'nccl', label: 'p2p' },
+    { from: 'dp', to: 'nccl', label: 'AG, RS' },
+    { from: 'nccl', to: 'net' },
+    { from: 'nccl', to: 'fr', label: 'traces' },
+    { from: 'job', to: 'store', label: 'checkpoints' },
+  ]}
+  rows={[['mast'], ['job'], ['tp', 'cp', 'pp', 'dp'], ['nccl', 'store'], ['net', 'fr']]}
+/>
+
+**Compute and scheduler.** Grand Teton servers with eight H100s (700 W TDP, 80 GB HBM3) and two CPUs each, GPUs connected by NVLink inside the server. Jobs are scheduled by MAST, Meta's global training scheduler, which the paper says is optimized, along with the parallelism layout, to keep communication inside pods.
+
+**4D parallelism.** GPUs are grouped in the order [TP, CP, PP, DP], innermost first. Tensor parallelism splits weight matrices and needs the most bandwidth, so it stays inside a server on NVLink. Context parallelism splits the sequence. Pipeline parallelism splits layers into stages. Data parallelism is FSDP and sits outermost because it tolerates latency: weights are prefetched and gradients reduced asynchronously. FSDP here shards optimizer state and gradients, but the paper says model shards are not resharded after the forward pass, which trades memory for avoiding an extra all-gather in the backward pass. The ordering is the same principle as placing chatty services in one rack and batch replication across regions.
+
+**Pipeline schedule.** Existing schedules required the per-GPU batch to be divisible by the number of stages and left the first and last stages imbalanced (the first holds the embedding and warm-up micro-batches, the last computes output and loss). Meta made the number of consecutive micro-batches per stage tunable, removed one transformer layer from each of the first and last stages, used an interleaved schedule with a bubble ratio of (PP − 1)/(V × M) for V stages per rank and M micro-batches, and made point-to-point communication asynchronous.
+
+**Collectives.** NCCLX is Meta's fork of NCCL, tuned for the tens-of-microseconds latency of the outer network layers. It chunks transfers to fit those latencies and gives small control messages priority so they are not stuck behind bulk data in the deep-buffer core switches.
+
+**Network.** RoCE over a three-layer Clos of 24K GPUs, of which up to 16K ran this job. A rack is 16 GPUs in two servers behind one top-of-rack switch; 192 racks form a pod of 3,072 GPUs with full bisection bandwidth; eight pods form the cluster, with 1:7 oversubscription at the aggregation layer. GPUs connect at 400 Gbps. The collective library opens 16 flows between each pair of GPUs and the Enhanced-ECMP protocol hashes on extra RoCE header fields to spread them across paths. With deep-buffer spine switches and that load balancing, the paper reports running without DCQCN congestion control.
+
+**Storage.** Tectonic, Meta's distributed file system, serves 240 PB from 7,500 SSD servers at 2 TB/s sustained and 7 TB/s peak. The paper calls checkpoint writes "highly bursty", saturating the fabric for short periods, with each GPU's checkpointed state between 1 MB and 4 GB.
+
+**Diagnostics.** The PyTorch NCCL flight recorder records every collective into a ring buffer and dumps automatically on watchdog or heartbeat timeout, and NCCLX exposes its internal state to PyTorch so a failing collective can be snapshotted with its finished and pending transfers per rank.
+
+## MFU by stage
+
+| Stage | GPUs | TP | CP | PP | DP | Sequence | Batch per DP group | Tokens per batch | TFLOPs per GPU | BF16 MFU |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Pre-training | 8,192 | 8 | 1 | 16 | 64 | 8,192 | 32 | 16M | 430 | 43% |
+| Pre-training | 16,384 | 8 | 1 | 16 | 128 | 8,192 | 16 | 16M | 400 | 41% |
+| Long context | 16,384 | 8 | 16 | 16 | 8 | 131,072 | 16 | 16M | 380 | 38% |
+
+The paper explains the drop from 43% to 41%: doubling DP to 128 while keeping 16M tokens per batch halves the batch each DP group processes, which gives the pipeline fewer micro-batches to fill its bubbles. More GPUs at a fixed global batch means less work per GPU per step and a larger share of fixed costs. The long-context configuration trades data parallelism for 16-way context parallelism at 131,072 tokens and pays three more points.
+
+## The run, stage by stage
+
+<Trace
+  title="Llama 3 405B from first step to released model"
+  note="as described in sections 3.4 and 4.1"
+  steps={[
+    { actor: 'pretrain', text: 'Starts with 4M-token batches of 4,096-token sequences. AdamW, peak learning rate 8 × 10⁻⁵, 8,000 warm-up steps, cosine decay to 8 × 10⁻⁷ over 1,200,000 steps.', note: 'Small batches early for stability.' },
+    { actor: 'pretrain', text: 'After 252M tokens, batches double to 8M tokens of 8,192-token sequences.' },
+    { actor: 'pretrain', text: 'After 2.87T tokens, batches double again to 16M tokens, the size in every Table 4 configuration.', note: 'The paper reports few loss spikes and no divergence interventions.' },
+    { actor: 'pretrain', text: 'The data mix shifts during training: more non-English data, upsampled maths, more recent web data late in training, and downsampled subsets later judged lower quality.' },
+    { actor: 'long-context', text: 'Context grows from 8K to 128K in six stages over about 800B tokens. Each stage runs until short-context evaluations recover and needle-in-a-haystack tasks pass at that length.', note: 'Context parallelism 16 at 131,072 tokens, 38% MFU.' },
+    { actor: 'anneal', text: 'On the final 40M tokens the learning rate falls linearly to 0 at 128K context, with very high-quality sources upsampled. Checkpoints taken during annealing are averaged to give the final pre-trained model.' },
+    { actor: 'post-train', text: 'A reward model is trained on human preference data. It ranks samples for rejection sampling, which feeds SFT (learning rate 10⁻⁵ for 8.5K to 9K steps).' },
+    { actor: 'post-train', text: 'DPO (learning rate 10⁻⁵, β = 0.1) on the latest preference batches, with formatting tokens masked from the loss and an added NLL term on chosen responses.', note: 'The paper reports DPO needed less compute than PPO at this scale.' },
+    { actor: 'post-train', text: 'Six rounds in all, each collecting new preference annotations and SFT data, with synthetic data sampled from the latest model.' },
+  ]}
+/>
+
+Each stage changes something the infrastructure has to absorb. The batch ramp changes per-GPU work and therefore MFU, the long-context stage changes the parallel layout from DP 128 to CP 16 and DP 8, and post-training rounds turn one long job into a sequence of shorter jobs with their own checkpoints and evaluation gates. A checkpoint format that cannot reshard between layouts would force a conversion step at the long-context boundary.
+
+## Context strategy
+
+The paper delays long sequences to the end of pre-training because self-attention compute grows quadratically with sequence length, and extends context gradually in six stages, moving on only when short-context quality has recovered.
+
+Context parallelism splits each sequence into 2 × CP chunks and gives rank i chunks i and 2 × CP − 1 − i, so every rank holds an early and a late chunk and causal attention work is balanced. Instead of the ring-style overlap of earlier CP implementations, Meta all-gathers keys and values and computes attention for the local queries. The paper gives two reasons: all-gather supports arbitrary masks such as the document mask, and with grouped-query attention the K and V tensors are much smaller than Q, so the exposed all-gather is small next to the attention compute. The price is that the all-gather sits on the critical path, which is acceptable only because GQA shrinks it.
+
+## Tooling and operator control
+
+The paper does not describe permissions in the sense an agent teardown would; the closest equivalent is who and what may intervene in a running job. Automation handled all but three of the interruptions in the 54-day window. Heavier tracing could be switched on live through online configuration changes, without a code release or job restart. Automated maintenance (firmware and kernel upgrades) was allowed to interrupt training, at least once a day. For numerics, the paper says Meta compared training loss across parallelism setups to find numerical issues and moved gradient accumulation across micro-batches, and the FSDP reduce-scatter, to FP32.
+
+## Cost and latency
+
+The paper gives FLOPs, not dollars or wall-clock days. A floor can be computed. At the 16,384-GPU configuration's 400 TFLOPs per GPU, 3.8 × 10²⁵ FLOPs take 3.8 × 10²⁵ / (400 × 10¹² × 3,600) = 26.4M GPU-hours, which is 67 days on 16,384 GPUs with no interruptions. At 90% effective training time it is 74.6 days. The real run mixed configurations (8,192 GPUs at 430 TFLOPs, the long-context stage at 380), so this is an order-of-magnitude check, not the run's duration, which the paper does not publish.
+
+## Failure modes
+
+The failure data is covered in the [failures-at-scale lesson](/learn/training/reliability/failures-at-scale): 419 unexpected interruptions in 54 days, dominated by faulty GPUs and HBM3, with a percentage in Table 5 that does not match its count. The paper adds:
+
+- NVLink failures that stall kernels without an error code, so detection relies on timeouts.
+- Stragglers that slow thousands of GPUs while looking like slow communication; found by ranking suspicious communications and checking the top few.
+- A diurnal 1% to 2% throughput swing attributed to mid-day temperatures affecting GPU frequency scaling.
+- Power swings of tens of megawatts when every GPU idles at once, for a checkpoint, a collective, or job start and stop.
+- Bursty checkpoint writes that saturate a 2 TB/s storage fabric.
+
+## What is not public
+
+The paper does not publish:
+
+- **Cluster-level failure handling.** How failures are detected, how a bad host is drained and replaced, and how MAST reschedules the job are described only as automation. Restart time is not given.
+- **Checkpoint interval and size breakdown.** The interval is not stated. The 1 MB to 4 GB per-GPU range is not broken down; weights plus Adam state spread evenly over 16,384 GPUs come to about 0.35 GB per GPU, and the paper does not explain the larger values.
+- **Which Table 5 number is wrong.** The Faulty GPU row gives 148 interruptions and 30.1%, but 148 is 35.3% of 419. The paper's 58.7% GPU share and "about 78%" hardware share inherit the ambiguity.
+- **The denominator of the failure data.** The GPU count across the 54-day snapshot is "up to 16K", and the paper does not say which 54 days of pre-training the snapshot covers.
+- **Run duration and cost.** Total wall-clock time and the share of time in each Table 4 configuration are not given.
+
+Anything said in an interview about these should be labelled as an estimate or a question, not as Meta's design.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+"Your 405B-class run is planned on 8,192 GPUs for 90 days. Leadership offers 16,384 GPUs to finish in about half the time, because a competitor ships in ten weeks. Using Llama 3's published numbers, what do you actually get, and what would you ask for instead?"
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Not half. Table 4 drops from 43% to 41% MFU at fixed global batch, and the failure rate doubles with the GPU count. With the Llama 3 rate, a 5-second save stall and a scenario 10-minute restart, effective training time falls from about 95.2% to 91.6%. Throughput rises by 2 × (0.41 × 0.916) / (0.43 × 0.952) = 1.84, so 90 days become about 49. To get closer to half, ask for a larger global batch or work on restart time.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Step efficiency: Meta kept 16M tokens per batch when doubling DP, so per-group batch halved and MFU fell two points; that is the paper's explanation. Failures: at the Llama 3 per-GPU rate the mean time between failures is about 371 minutes at 8,192 GPUs and 186 at 16,384. With overhead = δ/τ + (τ/2 + R)/M at τ* = √(2δM), δ = 5 seconds and R = 10 minutes (scenario), the overhead is 4.8% and 8.4%. Combined: 2 × (0.41 × 0.916) / (0.43 × 0.952) = 1.84 times the throughput, 90 / 1.84 = 49 days.</p>
+<p>Two defensible responses. Take the GPUs and accept 49 days, which still beats ten weeks if nothing else slips. Or take the GPUs and raise the global batch so per-group work stays constant, which recovers the MFU point but changes training dynamics late in a run whose batch schedule was tuned; the cost is a convergence risk that only shows up in loss curves weeks later. The constraint conflict is deadline against an untested recipe change. I would keep the batch schedule, put engineering time into restart cost, which is the dominant term at 16K (R/M is 5.4 of the 8.4 points), and write down the trigger for adding the batch change: the run projected to miss the date by more than a week at the 30% mark.</p>
+<p>Failure mode of the recommendation: the doubled cluster may include newer racks with a higher early failure rate than the Llama 3 average, which makes both the 91.6% and the 49 days optimistic. The first two weeks of interruption logs replace the prior.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>The extra 8,192 GPUs are in another building, joined by links far below the pod bisection bandwidth. Which parallel dimension do you let cross the boundary, and what does Table 4 tell you about the cost?</em></li>
+<li><em>Research says changing the batch schedule mid-run invalidates their ablations. How do you decide without deciding by rank?</em></li>
+<li><em>What would you need to see after two weeks to give the extra GPUs back?</em> Effective training time well below the 91.6% planned, driven by a failure rate the larger job cannot absorb, so that 16K GPUs deliver less than 1.84 times the throughput of 8K.</li>
+</ul>
+</Fragment>
+</Depth>
+
+Other questions this teardown supports: why DP is the outermost dimension and what breaks if PP is placed across pods instead; why Meta all-gathers K and V for context parallelism rather than overlapping a ring; why annealing ends with an average of checkpoints and what that requires from checkpoint retention; and what the 1:7 oversubscription above the 3,072-GPU pod implies for a 16,384-GPU job, which has to span at least six pods.
+
+<SelfRate id="lesson:training/reliability/llama3-405b" />

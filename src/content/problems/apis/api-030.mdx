@@ -1,0 +1,159 @@
+---
+id: api-030
+title: The cache read share fell to zero after a release
+subtitle: rank the causes, then decide how to fix it
+track: apis
+module: context-engineering
+type: debug
+difficulty: hard
+seniority: [staff]
+minutes: 30
+core: false
+tags: [prompt-caching, incident, cost, observability]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Claude docs, prompt caching
+    url: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    note: cache hits require 100 percent identical prompt segments up to the cache_control block; prefix order tools, system, messages; tool definition changes invalidate every level; usage fields cache_read_input_tokens, cache_creation_input_tokens and input_tokens, total input is their sum; 5-minute lifetime; checked 2026-10-28
+  - title: Claude docs, pricing
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: Opus 5.5 at $4 base input, $5 for a 5-minute cache write, $0.20 for a cache hit, $20 output per million tokens; checked 2026-10-28
+choices:
+  - text: The trace id rendered into the system template makes every request's cached prefix unique
+    correct: true
+    why: A per-request value in the system prompt makes the bytes before the breakpoint differ on every call, so each request writes a new entry and none is ever read.
+  - text: Sorting the tools by name changed the first block of every prompt and invalidated the cache
+    correct: false
+    why: The sort is real and did invalidate every entry once, but it is deterministic, so each tenant's next request would read again within minutes, not stay at zero for hours.
+  - text: Doubling max_tokens changed a request parameter that the provider folds into the cache key
+    correct: false
+    why: The invalidation table lists tools, toggles, tool_choice, images, thinking and effort; max_tokens is not among them, and it is not part of the prompt bytes.
+  - text: The hit-rate query omits cache writes, so it shows zero while every entry is being rewritten
+    correct: false
+    why: The query's formula is flawed, but reads are genuinely zero in the raw usage too; a better formula would show the same collapse, not hide or cause it.
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The incident">
+The cache read share of the support assistant dropped from above 0.9 to zero after the 14:05 release and has stayed there for five hours. Traffic is flat. Which change explains the symptom, how do you rank the others, and what do you ship in the next hour?
+</Callout>
+
+The release diff, three files:
+
+```diff
+--- a/assistant/prompt_builder.py
++++ b/assistant/prompt_builder.py
+-from .tools import TOOLS
++from .registry import load_tools
+
+ SYSTEM_TEMPLATE = load_template("support_system.md")
+
+ def build_request(conv, ctx):
+-    tools = TOOLS
++    tools = sorted(load_tools(ctx.tenant), key=lambda t: t["name"])
+     system = SYSTEM_TEMPLATE.format(**ctx.template_vars())
+     return {
+         "model": "claude-opus-5-5",
+-        "max_tokens": 1024,
++        "max_tokens": 2048,
+         "tools": tools,
+         "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+         "messages": conv.messages,
+     }
+
+--- a/assistant/context.py
++++ b/assistant/context.py
+     def template_vars(self):
+-        return {"tenant_name": self.tenant.name, "locale": self.locale}
++        return {"tenant_name": self.tenant.name, "locale": self.locale, "trace_id": self.request_id}
+
+--- a/assistant/templates/support_system.md
++++ b/assistant/templates/support_system.md
++Trace: {trace_id}
+ You are the support assistant for {tenant_name}. Answer in {locale}.
+```
+
+The dashboard, built on these queries:
+
+```sql
+-- hit_rate
+SUM(cache_read_input_tokens) / SUM(cache_read_input_tokens + input_tokens)
+-- cost_estimate_usd
+SUM(input_tokens) * 4.00 / 1e6 + SUM(output_tokens) * 20.00 / 1e6
+```
+
+| Hour | Requests | hit_rate | cost_estimate_usd |
+|---|---|---|---|
+| 12:00 | 17,900 | 0.93 | 362 |
+| 13:00 | 18,200 | 0.93 | 368 |
+| 14:00 | 18,000 | 0.08 | 371 |
+| 15:00 | 18,100 | 0.00 | 375 |
+| 18:00 | 17,800 | 0.00 | 369 |
+
+Two consecutive requests from one conversation at 16:12, 40 seconds apart:
+
+| | cache_creation_input_tokens | cache_read_input_tokens | input_tokens |
+|---|---|---|---|
+| Request 1 | 40,180 | 0 | 2,950 |
+| Request 2 | 40,180 | 0 | 3,410 |
+
+You do not have the rendered prompts.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the count of distinct system-prompt hashes per tenant per hour, before and after the release.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for two rendered requests from the same conversation, byte-diffed up to the breakpoint.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the cost panel reads, and what the invoice for the same hours says.</p></details>
+
+## Answer
+
+The trace id explains the symptom. `template_vars` now passes the request id, and the template renders it on the first line of the system prompt, before the breakpoint. The prefix up to the breakpoint is therefore different on every request. The usage rows show the signature: the same 40,180 tokens written on two requests 40 seconds apart, with nothing read, which is what a prefix of constant length and changing content produces.
+
+Ranking the rest:
+
+1. **The tool sort** is a real defect in the narrow sense: tools are the start of the prefix, so changing their order invalidated every cached entry at deploy. But the sort is deterministic per tenant, so each tenant's first request after the deploy wrote the new prefix and the next one read it. That explains a dip at 14:00, not five hours at zero.
+2. **The cost panel** is a real defect that explains why nobody acted for five hours. It prices `input_tokens` only, which excludes both cache fields, so it moved from 362 to 375 while the real input bill multiplied. The hit-rate query also omits writes; it still showed the collapse.
+3. **max_tokens** is not in the cache key and changes nothing here.
+
+What the drop costs, computed from the panel's traffic and Opus 5.5 prices: before, each request read 40,180 tokens at $0.20 per million, $0.008; now it writes them at $5 per million, $0.201. At about 18,000 requests an hour that is roughly (0.201 − 0.008) × 18,000 ≈ $3,470 an hour.
+
+What to collect, in order: two rendered requests from one conversation, byte-diffed up to the breakpoint (the first difference should be on the trace line); the count of distinct system-prompt hashes per tenant per hour (about one before the release, about one per request after); and the invoice line for the period, to confirm the panel's error. Without that evidence, the trace line is still the only change that injects a per-request value before the breakpoint, which is enough to act on.
+
+<Depth>
+<Fragment slot="short">
+<p>Ship a forward fix: remove the trace line from the template and record the request id against the conversation in your own logs. Keep the tool sort. Fix the cost panel to price all three usage fields. Every hour of delay costs about $3,470, so the fix goes out on the next deploy slot, not the next sprint.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Two defensible responses, each with a cost.</p>
+<ul>
+<li><strong>Roll back the whole release.</strong> Fastest path to a known-good state, with no new code to review. It also reverts the tool registry and the max_tokens change that other teams wanted, and reverting the sort invalidates every tenant's entry once more, one write per tenant.</li>
+<li><strong>Forward fix.</strong> Delete the trace line from the template and the trace_id from template_vars, keeping the registry and sort. Smaller blast radius for the features, but it is new code under incident pressure, and the cost accrues while it is reviewed and deployed.</li>
+</ul>
+<p>Choose by deploy latency: if a reviewed one-line fix ships in under an hour, the forward fix; if not, roll back and reapply the release without the trace line. The constraint conflict is support's need for a trace id in transcripts against the cost; it resolves by moving the id out of the prompt, since the model has no use for it. Join transcripts to traces on the conversation and request ids in your own logs.</p>
+<p>Failure mode of the forward fix: someone moves the trace id to the end of the newest user message instead of removing it. That keeps the cache (the history is append-only) but sends an identifier the model may repeat in answers, and the next template change can move it back above the breakpoint. A CI test that renders two requests and asserts byte equality up to the last breakpoint prevents the whole class.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Support says transcripts without the trace id cost them an hour per escalation, and you have one deploy slot today. Do you ship the removal anyway?</em> Yes, with the log-side join in the same deploy; if the join cannot ship today, the removal still ships and support gets a query that maps conversation id and timestamp to trace id.</li>
+<li><em>What would make you put a per-request value back in the system prompt?</em> A measured quality gain that needs it there, priced against a write on every request, and signed off by whoever owns the cost target.</li>
+<li><em>Finance asks why a five-hour regression was invisible. What do you change in alerting?</em> Alert on the read share per template and on spend computed from all three usage fields, reconciled daily against the invoice, so a panel that prices the wrong field is caught within a day.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *The rendered diff shows the trace line, and also that two tenants' tool lists differ in a description field between pods. Does that change the ranking?* It adds a second, smaller cause for those tenants; a non-deterministic description is a per-pod prefix and caps their read share after the trace fix.
+- *How do you prove the fix worked within ten minutes?* cache_read_input_tokens on consecutive requests of one conversation returns to roughly the prefix size, and cache_creation drops to the new tokens per turn.
+- *What else in this diff would you flag in review?* `load_tools(ctx.tenant)` makes the tool list tenant-dependent, so tenants no longer share a cached tool prefix; harmless here because tenants are isolated by their system prompts anyway, but worth stating.
+
+## Common mistakes
+
+- Picking the tool sort because it is the change closest to the start of the prefix, without checking whether it would recover.
+- Trusting the cost panel because it did not move.
+- Rolling back without stating what the rollback reverts besides the cause.
+- Moving the trace id later in the prompt instead of out of it.

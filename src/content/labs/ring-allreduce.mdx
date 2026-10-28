@@ -1,0 +1,331 @@
+---
+title: Build a ring all-reduce simulator
+track: training
+module: distributed
+kind: lab
+minutes: 75
+summary: Grow one simulator over six steps, from ranks as lists to a reduce-scatter, an all-gather, the composed all-reduce, a per-rank byte count that matches 2(N - 1)/N of the buffer, and the naive design it replaces.
+updated: 2026-10-28
+sources:
+  - title: Hugging Face, The Ultra-Scale Playbook, appendix A0 (Ring AllReduce)
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "an all-reduce splits into a reduce-scatter and an all-gather; each GPU sends K/N values per transfer, 2 x (N - 1) x K / N in total, approaching 2K for large N (steps 2 to 5). Checked 2026-10-28."
+  - title: Austin et al., How to Scale Your Model, GPUs chapter (JAX scaling book)
+    url: https://jax-ml.github.io/scaling-book/gpus/
+    note: "H100 NVLink 450 GB/s per direction per GPU; InfiniBand NDR 50 GB/s per GPU across nodes (used in the closing note). Checked 2026-10-28."
+steps:
+  - title: Ranks as lists
+    brief: |
+      Each rank is a list of numbers of the same length K, and the network is a ring: rank r may only send to rank (r + 1) mod N. Write `chunk_bounds(k, n)`, which cuts K positions into N contiguous chunks whose sizes differ by at most one, and a `Ring` class that copies the buffers it is given, rejects a send to anyone but the right-hand neighbour with ValueError, and meters every message: `sent[r]` counts the values rank r has put on the wire and `messages[r]` the messages. `send` returns the values the receiver gets, as a new list. The meter is the point of the lab: every later step is judged by what it sends, not only by what it computes.
+    starter: |
+      def chunk_bounds(k, n):
+          """Return n (lo, hi) pairs covering range(k) in order; sizes differ by at most one."""
+          raise NotImplementedError
+
+
+      class Ring:
+          def __init__(self, buffers):
+              """Copy the buffers; set n, k, bufs, sent (values per rank) and messages (per rank)."""
+              raise NotImplementedError
+
+          def send(self, src, dst, values):
+              """Meter one message from src to its right-hand neighbour and return a copy of values."""
+              raise NotImplementedError
+    tests: |
+      assert chunk_bounds(8, 4) == [(0, 2), (2, 4), (4, 6), (6, 8)]
+      b = chunk_bounds(10, 4)
+      assert b[0][0] == 0 and b[-1][1] == 10 and sorted(hi - lo for lo, hi in b) == [2, 2, 3, 3]
+      src = [[1, 2], [3, 4], [5, 6]]
+      ring = Ring(src)
+      assert ring.n == 3 and ring.k == 2 and ring.bufs == src and ring.bufs[0] is not src[0]
+      got = ring.send(2, 0, [9, 9])
+      assert got == [9, 9] and ring.sent == [0, 0, 2] and ring.messages == [0, 0, 1]
+      try:
+          ring.send(0, 2, [1])
+          raised = False
+      except ValueError:
+          raised = True
+      assert raised, "rank 0 may only send to rank 1"
+    hidden: |
+      import random
+      _r = random.Random(1)
+      _ok = True
+      for _ in range(200):
+          n = _r.randint(1, 20)
+          k = _r.randint(0, 60)
+          b = chunk_bounds(k, n)
+          sizes = [hi - lo for lo, hi in b]
+          _ok = _ok and len(b) == n and b[0][0] == 0 and b[-1][1] == k and all(b[i][1] == b[i + 1][0] for i in range(n - 1))
+          _ok = _ok and max(sizes) - min(sizes) <= 1
+      assert _ok
+      try:
+          Ring([[1, 2], [3]])
+          _raised = False
+      except ValueError:
+          _raised = True
+      assert _raised, "buffers of different lengths are rejected"
+      _ring = Ring([[0]] * 4)
+      _v = [1, 2]
+      _out = _ring.send(3, 0, _v)
+      _v.append(3)
+      assert _out == [1, 2], "send returns a copy"
+    solution: |
+      def chunk_bounds(k, n):
+          base, extra = divmod(k, n)
+          out, lo = [], 0
+          for c in range(n):
+              hi = lo + base + (1 if c < extra else 0)
+              out.append((lo, hi))
+              lo = hi
+          return out
+
+
+      class Ring:
+          def __init__(self, buffers):
+              self.n = len(buffers)
+              self.k = len(buffers[0]) if buffers else 0
+              if any(len(b) != self.k for b in buffers):
+                  raise ValueError("every rank needs a buffer of the same length")
+              self.bufs = [list(b) for b in buffers]
+              self.sent = [0] * self.n
+              self.messages = [0] * self.n
+
+          def send(self, src, dst, values):
+              if dst != (src + 1) % self.n:
+                  raise ValueError("a rank may only send to its right-hand neighbour")
+              values = list(values)
+              self.sent[src] += len(values)
+              self.messages[src] += 1
+              return values
+  - title: Reduce-scatter
+    brief: |
+      Write `reduce_scatter(ring)`. Run N - 1 steps; in each, every rank sends one chunk to its neighbour, and the neighbour adds it into its own copy of that chunk. Collect a step's messages before applying any of them, so no rank forwards a chunk it changed in the same step. At the end every rank holds one chunk that is the full sum over all ranks; return a list `owned` where `owned[r]` is the index of that chunk. Which rank ends with which chunk is your choice, as long as each chunk is owned by exactly one rank. With N ranks each rank sends (N - 1) chunks, (N - 1) K / N values when N divides K.
+    starter: |
+
+
+      def reduce_scatter(ring):
+          """Run the reduce-scatter in place. Return owned: owned[r] is the chunk rank r holds fully summed."""
+          raise NotImplementedError
+    tests: |
+      bufs = [[r * 10 + i for i in range(8)] for r in range(4)]
+      ring = Ring(bufs)
+      owned = reduce_scatter(ring)
+      total = [sum(col) for col in zip(*bufs)]
+      bounds = chunk_bounds(8, 4)
+      assert sorted(owned) == [0, 1, 2, 3], "each chunk is owned by exactly one rank"
+      for r, c in enumerate(owned):
+          lo, hi = bounds[c]
+          assert ring.bufs[r][lo:hi] == total[lo:hi], f"rank {r} should hold the full sum of chunk {c}"
+      assert ring.sent == [6, 6, 6, 6], ring.sent
+    hidden: |
+      import random
+      _r = random.Random(2)
+      _ok = True
+      for _ in range(80):
+          n = _r.randint(2, 10)
+          k = _r.randint(n, 50)
+          bufs = [[_r.randint(-9, 9) for _ in range(k)] for _ in range(n)]
+          ring = Ring(bufs)
+          owned = reduce_scatter(ring)
+          total = [sum(col) for col in zip(*bufs)]
+          bounds = chunk_bounds(k, n)
+          _ok = _ok and sorted(owned) == list(range(n))
+          _ok = _ok and all(ring.bufs[r][bounds[c][0]:bounds[c][1]] == total[bounds[c][0]:bounds[c][1]] for r, c in enumerate(owned))
+          _ok = _ok and max(ring.sent) <= (n - 1) * -(-k // n) and max(ring.messages) <= n - 1
+      assert _ok
+    solution: |
+      def reduce_scatter(ring):
+          n = ring.n
+          bounds = chunk_bounds(ring.k, n)
+          for t in range(n - 1):
+              wire = []
+              for r in range(n):
+                  lo, hi = bounds[(r - t) % n]
+                  wire.append(((r + 1) % n, lo, ring.send(r, (r + 1) % n, ring.bufs[r][lo:hi])))
+              for dst, lo, vals in wire:
+                  buf = ring.bufs[dst]
+                  buf[lo:lo + len(vals)] = [x + y for x, y in zip(vals, buf[lo:lo + len(vals)])]
+          # chunk c finishes its trip around the ring on rank (c - 1) mod n
+          return [(r + 1) % n for r in range(n)]
+  - title: All-gather
+    brief: |
+      Write `all_gather(ring, owned)`. Rank r holds a finished chunk `owned[r]`, and its other positions may hold anything. Run N - 1 steps in which every rank forwards a finished chunk to its neighbour, which overwrites its copy and forwards that chunk on the next step. Receivers copy; they never add. That is what makes every rank end with the same bits: each element was computed once, during the reduce-scatter, and the all-gather only moves it. The test starts from junk outside the owned chunks to make sure nothing is recomputed from stale data.
+    starter: |
+
+
+      def all_gather(ring, owned):
+          """Copy each rank's finished chunk to every other rank, in place."""
+          raise NotImplementedError
+    tests: |
+      ring = Ring([[-1] * 8 for _ in range(4)])
+      bounds = chunk_bounds(8, 4)
+      owned = [1, 2, 3, 0]
+      for r, c in enumerate(owned):
+          lo, hi = bounds[c]
+          ring.bufs[r][lo:hi] = list(range(lo, hi))
+      all_gather(ring, owned)
+      assert all(b == list(range(8)) for b in ring.bufs), ring.bufs
+      assert ring.sent == [6, 6, 6, 6], ring.sent
+    hidden: |
+      import random
+      _r = random.Random(3)
+      _ok = True
+      for _ in range(80):
+          n = _r.randint(2, 10)
+          k = _r.randint(0, 50)
+          ring = Ring([[None] * k for _ in range(n)])
+          bounds = chunk_bounds(k, n)
+          owned = list(range(n))
+          _r.shuffle(owned)
+          want = [_r.random() for _ in range(k)]
+          for r, c in enumerate(owned):
+              lo, hi = bounds[c]
+              ring.bufs[r][lo:hi] = want[lo:hi]
+          all_gather(ring, owned)
+          _ok = _ok and all(b == want for b in ring.bufs)
+          _ok = _ok and max(ring.sent) <= (n - 1) * -(-k // n) and max(ring.messages) <= n - 1
+      assert _ok
+    solution: |
+      def all_gather(ring, owned):
+          n = ring.n
+          bounds = chunk_bounds(ring.k, n)
+          holding = list(owned)
+          for _ in range(n - 1):
+              wire = []
+              for r in range(n):
+                  lo, hi = bounds[holding[r]]
+                  wire.append(((r + 1) % n, holding[r], lo, ring.send(r, (r + 1) % n, ring.bufs[r][lo:hi])))
+              for dst, c, lo, vals in wire:
+                  ring.bufs[dst][lo:lo + len(vals)] = vals
+                  holding[dst] = c
+  - title: Compose into all-reduce
+    brief: |
+      Write `all_reduce(buffers)`, which builds a Ring, runs the reduce-scatter and then the all-gather, and returns the per-rank results and the ring, so the caller can read the meter. One rank is a valid ring that sends nothing. The hidden test feeds floats spread over 16 orders of magnitude and requires every rank to return identical bits; a design in which each rank sums all buffers itself, starting from its own, fails it.
+    starter: |
+
+
+      def all_reduce(buffers):
+          """Return (results, ring): results[r] is rank r's copy of the elementwise sum."""
+          raise NotImplementedError
+    tests: |
+      bufs = [[r * 10 + i for i in range(8)] for r in range(4)]
+      out, ring = all_reduce(bufs)
+      assert out == [[60 + 4 * i for i in range(8)]] * 4
+      assert bufs[0] == list(range(8)), "the inputs are unchanged"
+      out, ring = all_reduce([[2.5, -1.0]])
+      assert out == [[2.5, -1.0]] and ring.sent == [0]
+    hidden: |
+      import math, random
+      _r = random.Random(4)
+      _ok = True
+      for _ in range(60):
+          n = _r.randint(2, 12)
+          k = _r.randint(1, 40)
+          bufs = [[_r.uniform(-1, 1) * 10 ** _r.randint(-8, 8) for _ in range(k)] for _ in range(n)]
+          out, ring = all_reduce(bufs)
+          _ok = _ok and all(o == out[0] for o in out)
+          _ok = _ok and all(abs(a - math.fsum(col)) <= 1e-9 * max(1.0, max(abs(x) for x in col)) * n for a, col in zip(out[0], zip(*bufs)))
+      assert _ok, "every rank holds the same bits and the right sum"
+      _out, _ring = all_reduce([[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]])
+      assert _out == [[25, 30]] * 5
+    solution: |
+      def all_reduce(buffers):
+          ring = Ring(buffers)
+          if ring.n > 1:
+              all_gather(ring, reduce_scatter(ring))
+          return ring.bufs, ring
+  - title: Count bytes sent per rank
+    brief: |
+      Write `traffic(ring, itemsize)`, the bytes each rank sent, and `ring_bytes_per_rank(k, n, itemsize)`, the closed form 2 (N - 1) K / N times the item size. They agree whenever N divides K, and the measured value never exceeds 2 (N - 1) ceil(K / N) items otherwise. The closed form is the reason ring all-reduce is described as bandwidth-optimal: the factor 2 (N - 1) / N is 1 at N = 2 and approaches 2 from below, so the bytes per rank barely move as ranks are added, and the time is set by the buffer size over the slowest link.
+    starter: |
+
+
+      def traffic(ring, itemsize):
+          """Bytes sent by each rank."""
+          raise NotImplementedError
+
+
+      def ring_bytes_per_rank(k, n, itemsize):
+          """2 (n - 1) k / n items, in bytes."""
+          raise NotImplementedError
+    tests: |
+      out, ring = all_reduce([[1.0] * 1024 for _ in range(8)])
+      assert traffic(ring, 2) == [ring_bytes_per_rank(1024, 8, 2)] * 8 == [3584.0] * 8
+      assert ring_bytes_per_rank(1000, 2, 4) == 4000
+    hidden: |
+      import random
+      _r = random.Random(5)
+      _ok = True
+      for _ in range(60):
+          n = _r.randint(2, 16)
+          k = _r.randint(0, 200)
+          out, ring = all_reduce([[0] * k for _ in range(n)])
+          t = traffic(ring, 4)
+          _ok = _ok and all(x <= 2 * (n - 1) * -(-k // n) * 4 for x in t) and sum(t) <= 2 * (n - 1) * -(-k // n) * 4 * n
+          if k % n == 0:
+              _ok = _ok and all(abs(x - ring_bytes_per_rank(k, n, 4)) < 1e-9 for x in t)
+      assert _ok
+      assert abs(ring_bytes_per_rank(10 ** 6, 1024, 2) / (2 * 10 ** 6 * 2) - 1023 / 1024) < 1e-12
+    solution: |
+      def traffic(ring, itemsize):
+          return [x * itemsize for x in ring.sent]
+
+
+      def ring_bytes_per_rank(k, n, itemsize):
+          return 2 * (n - 1) * k * itemsize / n
+  - title: Compare with naive gather then broadcast
+    brief: |
+      Write `naive_all_reduce(buffers)`, which sends every buffer to rank 0, sums there, and sends the sum back to every rank, returning the results and a list of values sent per rank (this design is not a ring, so it keeps its own meter). Then write `bottleneck_ratio(k, n)`: the most values any rank sends in the naive design over the most any rank sends in the ring. Rank 0 sends (N - 1) K in the naive design, so the ratio is N / 2 when N divides K. Both designs move the same total, 2 (N - 1) K values: the naive one sends (N - 1) K into rank 0 and (N - 1) K back out of it. The ring wins by spreading that total over N links instead of one.
+    starter: |
+
+
+      def naive_all_reduce(buffers):
+          """Gather at rank 0, sum, broadcast. Return (results, sent) with sent[r] the values rank r sent."""
+          raise NotImplementedError
+
+
+      def bottleneck_ratio(k, n):
+          """Most values sent by one rank, naive over ring."""
+          raise NotImplementedError
+    tests: |
+      out, sent = naive_all_reduce([[1, 2], [3, 4], [5, 6]])
+      assert out == [[9, 12]] * 3 and sent == [4, 2, 2]
+      assert bottleneck_ratio(64, 8) == 4
+      assert bottleneck_ratio(60, 4) == 2
+    hidden: |
+      import random
+      _r = random.Random(6)
+      _ok = True
+      for _ in range(40):
+          n = _r.randint(2, 16)
+          k = n * _r.randint(1, 10)
+          bufs = [[_r.randint(-5, 5) for _ in range(k)] for _ in range(n)]
+          out, sent = naive_all_reduce(bufs)
+          _ok = _ok and all(o == [sum(c) for c in zip(*bufs)] for o in out)
+          _ok = _ok and sum(sent) == 2 * (n - 1) * k and max(sent) == (n - 1) * k
+          _ok = _ok and abs(bottleneck_ratio(k, n) - n / 2) < 1e-9
+      assert _ok
+    solution: |
+      def naive_all_reduce(buffers):
+          n = len(buffers)
+          k = len(buffers[0]) if buffers else 0
+          sent = [0] * n
+          total = list(buffers[0])
+          for r in range(1, n):
+              sent[r] += k
+              total = [x + y for x, y in zip(total, buffers[r])]
+          sent[0] += (n - 1) * k
+          return [list(total) for _ in range(n)], sent
+
+
+      def bottleneck_ratio(k, n):
+          _, naive = naive_all_reduce([[0] * k for _ in range(n)])
+          _, ring = all_reduce([[0] * k for _ in range(n)])
+          return max(naive) / max(ring.sent)
+---
+
+This lab builds the collective behind data parallelism from the collectives lesson as one program. Every step adds functions to the same file and its tests run against everything written so far: the all-reduce in step 4 calls the reduce-scatter from step 2 and the all-gather from step 3, and the byte counts in steps 5 and 6 read the meter from step 1.
+
+The Ring class is a single-process stand-in for a network with one rule, that a rank only talks to its right-hand neighbour, and one instrument, the per-rank meter. Correctness is half of each test; the other half is what each rank sent. The hidden tests use seeded random sizes, including buffers that do not divide by the rank count and buffers shorter than it, and check sums, ownership, identical bits across ranks and the traffic budget. Which rank owns which chunk after the reduce-scatter is yours to choose.
+
+What separates this from NCCL is mostly what the simulation hides. A real ring moves chunks in smaller slices so sending and adding overlap, runs several rings at once to use every link, and maps those rings onto the hardware: on H100 nodes the scaling book gives 450 GB/s per direction per GPU over NVLink and 50 GB/s per GPU over InfiniBand, so a ring with one hop between nodes runs at the slower rate for every step. The latency side is also invisible here: the ring takes 2 (N - 1) sequential steps, so for small buffers the per-step latency, not the bytes, sets the time.

@@ -1,0 +1,110 @@
+---
+id: trn-052
+title: Asynchronous RL post-training for a chat model already in production
+subtitle: actors, reward inference, learners, replay, off-policy correction, KL control and rollback
+track: training
+module: rl
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 45
+core: false
+tags: [rl-infrastructure, async-rl, off-policy, kl-control, rollout, rollback]
+companies:
+  - name: Meta
+    url: https://prachub.com/interview-questions/architect-an-asynchronous-rl-post-training-system
+updated: 2026-10-28
+sources:
+  - title: PracHub, Architect an asynchronous RL post-training system (dated 2025-09-06)
+    url: https://prachub.com/interview-questions/architect-an-asynchronous-rl-post-training-system
+    note: "candidate report: attributed to a Meta machine learning engineer onsite; asks for an asynchronous system for a chat model already serving traffic, with actors, reward inference, learners, replay buffers and orchestrators, a split between serving and training clusters, off-policy corrections, KL control to a reference, credit assignment in multi-turn dialogue, reward-hacking prevention, canary gating and rollback. The scenario and answer here are original. Checked 2026-10-28."
+  - title: Yao et al., On the Rollout-Training Mismatch in Modern RL Systems (NeurIPS 2025, OPT workshop)
+    url: https://neurips.cc/virtual/2025/124259
+    note: "separate rollout (vLLM) and training (FSDP) stacks give different token probabilities for the same weights, making on-policy RL off-policy; truncated importance sampling corrects it. Checked 2026-10-28."
+  - title: Kimi Team, Kimi K2 (2025)
+    url: https://arxiv.org/html/2507.20534
+    note: "colocated training and inference engines that offload in turn; a checkpoint engine broadcasts parameters and each inference worker pulls its shard; vendor's own figure of under 30 seconds for a full parameter update of the 1T-parameter model; partial rollouts resume long-tail trajectories in the next iteration; a PTX loss on curated data against forgetting. Checked 2026-10-28."
+  - title: Shao et al., DeepSeekMath (v3, 2024-04-27)
+    url: https://arxiv.org/html/2402.03300
+    note: "GRPO adds KL to the reference directly to the loss; iterative GRPO retrains the reward model on the policy's samples with a replay of 10% historical data and resets the reference to the current policy. Checked 2026-10-28."
+  - title: Hu et al., OpenRLHF (v6, 2025-10-09)
+    url: https://arxiv.org/html/2405.11143
+    note: "inference often accounts for over 90% of RLHF or RLVR runtime; in synchronous frameworks the slowest generation can bottleneck the pipeline. Checked 2026-10-28."
+  - title: Yu et al., DAPO (2025)
+    url: https://arxiv.org/html/2503.14476
+    note: "drops the KL term for long chain-of-thought reasoning, where the policy is expected to move far from the initial model. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The round">
+"Our chat model serves production traffic. Design an asynchronous RL post-training system that keeps improving it without hurting uptime, quality or cost: actors, reward inference, learners, replay, off-policy corrections, KL control, multi-turn credit assignment, and how a new version reaches users and comes back out."
+</Callout>
+
+The operating constraints, as a scenario:
+
+- The serving stack is owned by another team and cannot be changed beyond loading a new checkpoint and routing a traffic percentage to it.
+- Training gets a fixed pool of 512 GPUs. Serving GPUs are not available.
+- Prompts may come from production logs only for users who consented to training use; thumbs up and down arrive for a few percent of turns, hours later.
+- The safety team has a regression suite that must not get worse, and a policy lead who wants a weekly release.
+
+Design the system, state what you give up, and write the release plan with its rollback triggers.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how long a weight update from the learners to the actors takes on this pool.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask what fraction of logged conversations are multi-turn, and how many turns they run.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask which metric the policy lead would accept as a reason to skip a week's release.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Production supplies prompts and preference data, never live rollouts: the training pool runs its own actors on consented prompts with a bounded-stale copy of the policy, a reward service scores them, and learners train on a version-tagged buffer that discards anything older than two policy versions and reweights the rest per token with a truncated importance ratio. KL to the production model stays in the loss because this is a chat product whose behaviour users already depend on. Thumbs feed the reward model's training data on a schedule, not the RL reward directly. A candidate checkpoint goes to production only through an offline gate, a shadow comparison and a canary with written rollback triggers. I give up the throughput of unbounded asynchrony and the fastest possible reaction to user feedback in exchange for a run I can reason about and roll back.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Components and data flow.</strong> A prompt sampler draws from consented production prompts, curated sets and the safety suite's training split, deduplicated and tagged with source. Actors are inference-engine replicas on part of the training pool; each pulls the latest published weights when it finishes a batch and writes rollouts with the prompt id, the sample index, the behaviour policy version and per-token log-probs. A reward service runs the reward model, rule checks (format, refusal-where-required, citation checks where the product has them) and a safety classifier, and writes scored rollouts. A version-tagged buffer feeds learners; an orchestrator owns the version registry, the weight broadcast and the staleness rule. Writes are keyed by (prompt id, policy version, sample index) so a retried actor or reward worker cannot double-count a sample. When the buffer is full or every buffered sample is at the staleness bound, actors pause rather than generate data that will be dropped.</p>
+<p><strong>Why not learn from live traffic.</strong> Production responses come from the serving version, which is many updates behind the learner, from a serving stack whose numerics differ from the trainer's, and with feedback that is sparse, delayed and skewed toward users who click. Using them as rollouts gives an off-policy correction with enormous variance. Use production for what it is good for: realistic prompts, and pairwise preferences to retrain the reward model.</p>
+<p><strong>Off-policy correction and the number to choose.</strong> Even a fresh actor is off-policy relative to the trainer, because separate rollout and training stacks disagree on token probabilities. Asynchrony adds version lag on top. Each sample carries its behaviour log-probs; the learner computes the ratio against them and multiplies by a truncated importance weight. The staleness bound is the quantity I choose: two versions here. One version is the conservative end and is reasonable if weight sync is fast; up to four is defensible with the correction and a measured gap; an unbounded queue is not, because a slow reward worker then feeds the learner samples from policies that no longer exist.</p>
+<p><strong>KL control.</strong> KL to a reference in the loss, as GRPO does, with the reference set to the model currently in production and reset at each release, as DeepSeekMath's iterative scheme resets it. DAPO drops KL for long reasoning, where moving far from the start is the goal; for a chat product already in use, distance from production is a proxy for user-visible change, and I want it bounded per release. I would set a per-release KL budget from the last release's measured KL and the size of its user-visible change, not a fixed coefficient.</p>
+<p><strong>Rewards and hacking.</strong> The reward model is trained on comparisons, including thumbs converted to pairs where two versions answered similar prompts; it is retrained on a schedule with the policy's own recent samples, with replay of older data so it does not forget. Thumbs never enter the RL reward directly, because a reward the policy can raise by pleasing the clicker is the easiest one to hack. Watch counter-metrics for known exploits: mean length, refusal rate, agreement with false user premises on a fixed probe set, and safety-suite scores per checkpoint.</p>
+<p><strong>Multi-turn credit.</strong> Treat each assistant turn as the unit, with the conversation so far as the prompt. Sample G continuations of the same prefix so the group baseline compares alternatives at that turn, and score with the reward model on the turn plus, when available, a delayed signal from whether the user had to rephrase. Credit across turns through a learned value is possible but brings back the critic GRPO removed; I would start without it.</p>
+<p><strong>Two defensible designs.</strong> <em>Asynchronous with a staleness bound</em>, as above: actors and learners both busy, generation (which OpenRLHF's authors put at over 90% of runtime) overlapped with training, at the cost of correction machinery and harder debugging. <em>Colocated and synchronous</em>, as Kimi K2 runs it: one pool alternates between generating and training, with a fast broadcast of new weights. Simpler to reason about and on-policy up to numerics, at the cost of idle phases and a long tail that holds the whole step. The constraint conflict is throughput on a fixed 512-GPU pool against how on-policy and debuggable the data is. I pick asynchronous with bound two because the weekly release needs the throughput, and I keep the synchronous mode as a configuration for debugging.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The reward service is the slowest stage and the buffer fills with samples at the staleness bound. Do you add reward capacity, relax the bound, or drop samples, and what does each cost?</li>
+<li>What would you need to see in the first month to move to the colocated synchronous design?</li>
+<li>The policy lead wants thumbs-up rate as the release metric. What do you propose instead, and what do you accept if they overrule you?</li>
+</ul>
+</Fragment>
+</Depth>
+
+**The release plan, written down.**
+
+1. Every N learner steps, publish a candidate checkpoint with its KL from production, reward and counter-metrics.
+2. Offline gate: the safety regression suite at or above production on every category; the fixed probe sets for length, refusal and false-premise agreement within set bands; the KL budget not exceeded.
+3. Shadow: the candidate answers a sample of consented production prompts without serving them; a grader compares against production, and a person reads a sample of the biggest disagreements.
+4. Canary at 1% of traffic for 48 hours, then 10%, then full.
+5. Rollback triggers during canary, any one sufficient: a safety classifier flag rate above production's by a set margin; user-visible error rate or latency outside the serving team's SLO; complaint or report rate above production's; a statistically clear fall in a pre-registered quality metric. Rollback is routing traffic back to the production checkpoint, which stays loaded.
+6. The reference for the next cycle is reset to whatever is in production when the cycle starts.
+
+**What you give up.** Unbounded asynchrony's throughput, a reward that reacts to user clicks within hours, and a release when the gate fails, even if the policy lead wants one that week.
+
+**Failure mode of the recommendation.** The staleness bound and the KL budget both assume the reward model is fixed within a cycle. When the reward model is retrained mid-cycle, every buffered sample's reward is from the old model and the learner sees a sudden shift in reward scale; the importance weights do not correct for that, because they correct the policy, not the reward. Retrain the reward model only at cycle boundaries, or re-score the buffer when it changes.
+
+## Follow-ups
+
+- The correction machinery and the canary process cost about as much engineering time as the RL itself. Which half do you cut for the first quarter, and what risk do you accept in writing?
+- A canary at 1% shows no difference after 48 hours. How many conversations would you need to detect a two-point fall in your quality metric, and does 1% give you that?
+- Two senior engineers disagree on whether the reference should be the production model or the original SFT model. How do you decide without deciding by rank?
+- Legal narrows consent so that half the prompt pool disappears. What changes in the system, and in what you promise the policy lead?
+
+## Common mistakes
+
+- Training directly on production responses and their thumbs as if they were on-policy rollouts.
+- An unbounded queue between actors and learners.
+- Dropping the KL term because reasoning-RL recipes do, for a product whose users notice behaviour change.
+- A rollback plan that names no trigger, or a trigger nobody is paged for.

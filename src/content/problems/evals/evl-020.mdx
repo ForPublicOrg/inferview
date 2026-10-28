@@ -1,0 +1,340 @@
+---
+id: evl-020
+title: Rebuild traces from spans that arrive out of order
+subtitle: retries, lost parents and a hundred thousand spans
+track: evals
+module: eval-thinking
+type: code
+difficulty: hard
+seniority: [senior]
+minutes: 40
+core: false
+tags: [tracing, opentelemetry, spans, trees, instrumentation]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: techinterview.org, LangChain interview guide (published 2026-04-24, updated 2026-07-12)
+    url: https://www.techinterview.org/companies/langchain/
+    note: an editorial guide, not a candidate report, that lists "trace tree construction" from a stream of log events among typical coding problems; it is the reason for this exercise and does not support a company tag; checked 2026-10-28
+  - title: OpenTelemetry, Traces (concepts)
+    url: https://opentelemetry.io/docs/concepts/signals/traces/
+    note: a span carries its trace ID, its span ID, a parent span ID that is empty for root spans, and start and end timestamps; exporters send spans to a consumer; checked 2026-10-28
+  - title: OpenTelemetry semantic conventions for GenAI spans (status Development)
+    url: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md
+    note: execute_tool spans named execute_tool {gen_ai.tool.name}; gen_ai.tool.call.arguments and gen_ai.tool.call.result are opt-in because they may contain sensitive information; checked 2026-10-28
+  - title: OpenTelemetry semantic conventions for GenAI agent spans (status Development)
+    url: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-agent-spans.md
+    note: invoke_agent, invoke_workflow and execute_tool operations, the span shapes an agent trace is built from; checked 2026-10-28
+code:
+  starter: |
+    def assemble(events):
+        """Build one tree per trace from span events that arrive in any order.
+
+        events: dicts with trace_id, span_id, parent_id (None for a root), name, start and end. The exporter retries, so
+        a span can arrive more than once; a copy sent before the span finished has end None, and a copy with an end wins.
+        Return {trace_id: [root nodes]}. A node is
+            {"span_id", "name", "start", "end", "missing": bool, "children": [nodes sorted by (start, span_id)]}
+        where missing is True only for a placeholder you create for a parent that never arrived.
+
+        Your policy, with the reason: where does a span whose parent never arrived go?
+        """
+        raise NotImplementedError
+  tests: |
+    import random, time
+
+
+    def walk(roots):
+        stack = [(r, None) for r in roots]
+        while stack:
+            node, up = stack.pop()
+            yield node, up
+            stack.extend((c, node) for c in node["children"])
+
+
+    def ev(trace, span, parent, start, end="auto"):
+        return {"trace_id": trace, "span_id": span, "parent_id": parent, "name": "op", "start": start,
+                "end": start + 1 if end == "auto" else end}
+
+
+    _t = assemble([ev("T", "a", "r", 2.0), ev("T", "b", "r", 1.0), ev("T", "r", None, 0.0)])
+    assert [n["span_id"] for n in _t["T"]] == ["r"], "the span with no parent is the only root"
+    assert [c["span_id"] for c in _t["T"][0]["children"]] == ["b", "a"], "children sorted by start, whatever the arrival order"
+    _t = assemble([ev("T1", "x1", "x", 1.0), ev("T2", "y", None, 0.0), ev("T1", "x", None, 0.0)])
+    assert sorted(_t) == ["T1", "T2"], "one entry per trace id"
+    assert [c["span_id"] for c in _t["T1"][0]["children"]] == ["x1"], "a child that arrived before its parent is attached"
+    _t = assemble([ev("T", "r", None, 0.0), ev("T", "r", None, 0.0)])
+    assert sum(1 for n, _ in walk(_t["T"]) if not n["missing"]) == 1, "the exporter sent this span twice"
+    _rng = random.Random(7)
+    _events = []
+    for _tr in range(50):
+        for _i in range(2000):
+            _events.append(ev(f"t{_tr}", f"s{_i}", None if _i == 0 else f"s{_rng.randrange(_i)}", float(_i)))
+    _rng.shuffle(_events)
+    _t0 = time.perf_counter()
+    _big = assemble(_events)
+    _elapsed = time.perf_counter() - _t0
+    assert len(_big) == 50 and all(len(r) == 1 for r in _big.values()), "50 traces with one root each"
+    assert _elapsed < 5.0, f"100,000 spans took {_elapsed:.2f} s; the budget is 5 s"
+  hidden: |
+    import random
+
+
+    def _hx_walk(roots):
+        stack = [(r, None) for r in roots]
+        while stack:
+            node, up = stack.pop()
+            yield node, up
+            stack.extend((c, node) for c in node["children"])
+
+
+    def _hx_ev(trace, span, parent, start, end="auto"):
+        return {"trace_id": trace, "span_id": span, "parent_id": parent, "name": "op", "start": start,
+                "end": start + 1 if end == "auto" else end}
+
+
+    def _hx_forest(rng, traces=4, size=25, drop=0.15):
+        events, truth = [], {}
+        for t in range(traces):
+            tid = f"T{t}"
+            for i in range(size):
+                p = None if i == 0 or rng.random() < 0.1 else f"s{rng.randrange(i)}"
+                truth[(tid, f"s{i}")] = _hx_ev(tid, f"s{i}", p, float(rng.randrange(1000)))
+        dropped = {k for k in truth if k[1] != "s0" and rng.random() < drop}
+        for k, e in truth.items():
+            if k in dropped:
+                continue
+            events.append(e)
+            if rng.random() < 0.2:
+                events.append(dict(e))
+            if rng.random() < 0.2:
+                events.append(dict(e, end=None))
+        rng.shuffle(events)
+        return events, {k: e for k, e in truth.items() if k not in dropped}
+
+
+    def _hx_check(out, kept):
+        seen = {}
+        for tid, roots in out.items():
+            for node, up in _hx_walk(roots):
+                if node["missing"]:
+                    if up is not None or (tid, node["span_id"]) in kept:
+                        return False
+                    continue
+                key = (tid, node["span_id"])
+                if key in seen or key not in kept:
+                    return False
+                seen[key] = up
+                starts = [(c["start"], c["span_id"]) for c in node["children"]]
+                if starts != sorted(starts):
+                    return False
+        if set(seen) != set(kept):
+            return False
+        for key, up in seen.items():
+            p = kept[key]["parent_id"]
+            if p is None:
+                if up is not None:
+                    return False
+            elif (key[0], p) in kept:
+                if up is None or up["missing"] or up["span_id"] != p:
+                    return False
+            elif not (up is None or (up["missing"] and up["span_id"] == p)):
+                return False
+        return True
+
+
+    _hx_rng = random.Random(2026)
+    _hx_ok = True
+    for _ in range(60):
+        _hx_e, _hx_k = _hx_forest(_hx_rng)
+        _hx_ok = _hx_ok and _hx_check(assemble(_hx_e), _hx_k)
+    assert _hx_ok
+
+    _hx_rng = random.Random(11)
+    _hx_ok = True
+    for _ in range(40):
+        _hx_e, _ = _hx_forest(_hx_rng, traces=2, size=15)
+        _hx_out = assemble(_hx_e)
+        _hx_ok = _hx_ok and all(n["end"] is not None for r in _hx_out.values() for n, _ in _hx_walk(r) if not n["missing"])
+    assert _hx_ok
+
+    _hx_out = assemble([_hx_ev("T", "a", "gone", 1.0), _hx_ev("T", "b", "gone", 2.0), _hx_ev("T", "r", None, 0.0)])
+    _hx_real = sorted(n["span_id"] for n in _hx_out["T"] if not n["missing"])
+    _hx_holders = [n for n in _hx_out["T"] if n["missing"]]
+    assert _hx_real == ["a", "b", "r"] or (
+        _hx_real == ["r"] and len(_hx_holders) == 1 and _hx_holders[0]["span_id"] == "gone"
+        and [c["span_id"] for c in _hx_holders[0]["children"]] == ["a", "b"])
+
+    _hx_out = assemble([_hx_ev("A", "1", None, 0.0), _hx_ev("B", "1", None, 0.0), _hx_ev("B", "2", "1", 1.0), _hx_ev("A", "3", "2", 1.0)])
+    assert [c["span_id"] for c in _hx_out["B"][0]["children"]] == ["2"]
+    assert sorted(n["span_id"] for n, _ in _hx_walk(_hx_out["A"]) if not n["missing"]) == ["1", "3"]
+    assert sorted(n["span_id"] for n, _ in _hx_walk(_hx_out["B"]) if not n["missing"]) == ["1", "2"]
+
+    _hx_out = assemble([_hx_ev("T", "a", "b", 0.0), _hx_ev("T", "b", "a", 1.0), _hx_ev("T", "c", "a", 2.0), _hx_ev("T", "d", "d", 3.0)])
+    assert sorted(n["span_id"] for n, _ in _hx_walk(_hx_out["T"]) if not n["missing"]) == ["a", "b", "c", "d"]
+
+
+    def _hx_canon(out):
+        rows = []
+        for tid, roots in out.items():
+            for node, up in _hx_walk(roots):
+                rows.append((tid, node["span_id"], node["missing"], None if up is None else up["span_id"],
+                             tuple(c["span_id"] for c in node["children"])))
+        return sorted(rows, key=repr)
+
+
+    _hx_rng = random.Random(5)
+    _hx_ok = True
+    for _ in range(30):
+        _hx_e, _ = _hx_forest(_hx_rng, traces=3, size=20)
+        _hx_e = [e for e in _hx_e if e["end"] is not None]
+        _hx_e += [_hx_ev("T0", "c1", "c2", 5.0), _hx_ev("T0", "c2", "c3", 6.0), _hx_ev("T0", "c3", "c1", 7.0)]
+        _hx_shuf = list(_hx_e)
+        _hx_rng.shuffle(_hx_shuf)
+        _hx_ok = _hx_ok and _hx_canon(assemble(_hx_e)) == _hx_canon(assemble(_hx_shuf))
+    assert _hx_ok
+
+    _hx_chain = [_hx_ev("deep", f"s{i}", None if i == 0 else f"s{i - 1}", float(i)) for i in range(20000)]
+    _hx_chain.reverse()
+    _hx_out = assemble(_hx_chain)
+    _hx_depth, _hx_node = 0, _hx_out["deep"][0]
+    while _hx_node["children"]:
+        _hx_node = _hx_node["children"][0]
+        _hx_depth += 1
+    assert _hx_depth == 19999
+
+    _hx_out = assemble([_hx_ev("T", "r", None, 0.0, end=None), _hx_ev("T", "r", None, 0.0, end=4.0),
+                        _hx_ev("T", "q", None, 1.0, end=6.0), _hx_ev("T", "q", None, 1.0, end=None)])
+    assert sorted((n["span_id"], n["end"]) for n in _hx_out["T"]) == [("q", 6.0), ("r", 4.0)]
+  solution: |
+    # Orphans go under one placeholder per missing parent, so siblings stay together and the gap shows in the tree.
+    # A parent cycle is cut at its member with the smallest (start, span_id), so arrival order cannot change the output.
+
+
+    def assemble(events):
+        inf = float("inf")
+        spans = {}
+        for e in events:
+            key = (e["trace_id"], e["span_id"])
+            old = spans.get(key)
+            if old is None or (old["end"] is None and e["end"] is not None):
+                spans[key] = e
+
+        parent = {}
+        for key, e in spans.items():
+            p = e.get("parent_id")
+            parent[key] = None if p is None or p == key[1] else (key[0], p)
+
+        def order(key):
+            s = spans[key]["start"]
+            return (inf if s is None else s, key[1])
+
+        state = {}
+        for first in spans:
+            if first in state:
+                continue
+            path, cur = [], first
+            while cur is not None and cur in spans and cur not in state:
+                state[cur] = 1
+                path.append(cur)
+                cur = parent[cur]
+            if cur is not None and state.get(cur) == 1:
+                cycle = path[path.index(cur):]
+                parent[min(cycle, key=order)] = None
+            for k in path:
+                state[k] = 2
+
+        nodes = {
+            key: {"span_id": key[1], "name": e["name"], "start": e["start"], "end": e["end"], "missing": False, "children": []}
+            for key, e in spans.items()
+        }
+        roots, holders = {}, {}
+        for key, node in nodes.items():
+            p = parent[key]
+            if p is None:
+                roots.setdefault(key[0], []).append(node)
+            elif p in nodes:
+                nodes[p]["children"].append(node)
+            else:
+                holder = holders.get(p)
+                if holder is None:
+                    holder = {"span_id": p[1], "name": None, "start": None, "end": None, "missing": True, "children": []}
+                    holders[p] = holder
+                    roots.setdefault(p[0], []).append(holder)
+                holder["children"].append(node)
+
+        def node_key(n):
+            if n["missing"]:
+                return (min(c["start"] for c in n["children"]), n["span_id"])
+            return (inf if n["start"] is None else n["start"], n["span_id"])
+
+        for node in list(nodes.values()) + list(holders.values()):
+            node["children"].sort(key=node_key)
+        for trace in roots.values():
+            trace.sort(key=node_key)
+        return roots
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Coding round, 40 minutes">
+Our trace viewer receives span events from a collector, in whatever order they were exported. Write the function that turns them into one tree per trace, so error analysis can start from a readable trace.
+</Callout>
+
+Each event is a dict with `trace_id`, `span_id`, `parent_id` (None for a root), `name`, `start` and `end`. Return `{trace_id: [root nodes]}`; a node holds the span's fields, a `missing` flag and its `children`, sorted by `(start, span_id)`. The starter's docstring gives the exact shape.
+
+The stream is what an exporter with retries produces:
+
+- Children often arrive before their parents.
+- A span can arrive more than once. A copy sent before the span finished has `end` set to None, and a copy with an end time wins over one without.
+- Some parents never arrive: the process that owned them crashed or sampled them out.
+- Instrumentation bugs happen. If parent links form a cycle, the function still terminates and returns every span exactly once.
+
+Two constraints. The visible tests time 100,000 spans in 50 traces of 2,000 spans each and allow 5 seconds. Some agent traces are thousands of spans deep, so a tree that is one long chain has to work too.
+
+One decision is yours: where a span whose parent never arrived goes. Put it at the root level, or under a placeholder node for the missing parent with `missing: True`. The hidden tests accept either, and the comment above your function says which and why.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask whether span ids are unique across all traces or only within one trace.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the depth of the deepest trace the viewer has had to show, and the span count of the largest.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the viewer's users do with a span whose parent is gone: search for it, or read it in place.</p></details>
+
+## Answer
+
+The reference does four passes, none of them recursive.
+
+**Deduplicate by (trace_id, span_id).** The key has to include the trace: span ids are only meaningful inside their trace, and a test fixture or a buggy SDK that reuses `"1"` in two traces otherwise grafts one trace's spans onto the other. One dict lookup per event, keeping the first copy unless a later copy has an end time and the kept one does not.
+
+**Resolve parents and cut cycles.** Each span's parent key is `(trace_id, parent_id)`. A self-parent is treated as no parent. To find cycles, walk each span's parent chain with a colour per span (on the current path, or finished); reaching a span that is on the current path means the chain closed on itself. The reference cuts the cycle at its member with the smallest `(start, span_id)`, a choice that depends only on the spans, so shuffling the input cannot change which link is cut. Each span is walked once, so this pass is linear.
+
+**Attach.** A span whose parent key exists becomes that node's child. A span with no parent is a root. A span whose parent never arrived goes under a placeholder, one per missing parent, created on first use.
+
+**Sort siblings** by `(start, span_id)`. The span id as the tie-break makes the order deterministic when two tool calls start in the same millisecond, which happens with parallel tool calls.
+
+Building the tree takes O(n log n) for the sorts and O(n) for everything else. When this problem was checked in CPython 3.12.6, the reference built the visible test's 100,000 spans in 0.75 s. A version that scans the event list for each span's parent took 3.75 s for 4,000 spans, and it grows with the square of the span count. Recursion is the other trap: a recursive build or sort is fine on the random trees, whose depth grows roughly with the logarithm of their size, and fails on the hidden 20,000-deep chain, since CPython's default recursion limit, which `sys.getrecursionlimit()` reports as 1000, is far below that.
+
+**The orphan decision.** Both answers are defensible.
+
+- *Placeholder per missing parent.* Siblings that lost the same parent stay together, the gap is visible where it happened, and a reviewer reading the trace sees "four tool calls under an agent span we never received". The cost: every consumer has to handle nodes with no name and no timing, and a dashboard that counts root spans counts placeholders unless it filters them.
+- *Promote to root.* Every node is a real span and consumers need no special case. The cost: the trace now shows several unrelated-looking roots, the fact that a parent is missing is lost unless you keep `parent_id` on the node, and siblings are scattered among real roots.
+
+The reference uses placeholders because the viewer feeds error analysis, where the question is what happened inside the agent step, and the shape answers that better than a flat list.
+
+**Where the reference fails.** It assumes the whole trace is present when it runs. In a streaming collector, a parent that arrives two seconds after the tree was built is a placeholder in the stored tree, and a trace viewed before its root span ends shows a partial root. The fix is a completeness rule: hold a trace until its root has ended and no span has arrived for a quiet period, rebuild when a late span arrives, and mark the trace incomplete in the viewer when that period passes with placeholders still in it. That trades latency for correctness. A short wait shows traces sooner with more placeholders; a long wait holds every trace in memory until it settles. The cycle cut has the same limit: it returns a tree, but which link was wrong is a guess, so the viewer should flag a trace that needed a cut instead of rendering it as normal.
+
+## Follow-ups
+
+- *What changes to run this inside a collector that never sees the whole list at once?* Partition events by trace id so one worker sees all of a trace; keep per-trace state with a quiet-period timer and a cap on spans and bytes per trace; write the tree when the timer fires and accept late spans as a re-assembly. Memory is bounded by the number of open traces times their size, so the cap and the timer are the capacity plan.
+- *Your quiet period is 30 seconds and the product team wants traces visible within 2. Which do you give up, and what do you write down?* Show partial traces immediately with an "assembling" state and placeholders, rebuild on arrival, and record that any eval or alert reading traces younger than the quiet period sees incomplete trees.
+- *What would you need to see in production to switch from placeholders to promoting orphans?* Evidence that consumers mishandle placeholders, such as root counts or latency charts that include them, and that orphans are rare enough that their scattered position does not slow reading. The orphan rate per service is the measurement.
+- *The tool spans carry `gen_ai.tool.call.arguments`, which the conventions mark opt-in. Two senior engineers disagree on turning it on for the traces error analysis reads. How do you decide without deciding by rank?* Read twenty traces with and without arguments and count how many failures can be diagnosed without them; turn capture on only where the difference is real, with redaction and a retention limit agreed with whoever owns the personal data.
+
+## Common mistakes
+
+- Keying spans by `span_id` alone, which merges traces that reuse an id.
+- Keeping whichever duplicate arrived first, so a span shows no end time even though a complete copy arrived.
+- Recursing to build or flatten the tree, which works on every test trace until the first deep agent run.
+- Following parent pointers without cycle detection, which loops forever on one malformed span.
+- Searching the whole event list for each parent, which passes on twenty spans and times out on a real trace store.
+- Dropping orphans silently. A trace that quietly loses spans is worse than one that shows where they went.

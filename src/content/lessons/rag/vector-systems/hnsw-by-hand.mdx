@@ -1,0 +1,142 @@
+---
+title: HNSW, built by hand
+track: rag
+module: vector-systems
+order: 1
+kind: lesson
+level: senior
+minutes: 14
+summary: HNSW is a stack of proximity graphs whose layer counts fall by a factor of M per layer, searched greedily from the top, and its recall depends on a neighbour-selection rule, three parameters and a delete policy that the index cannot supply for you.
+prerequisites: [rag/retrieval-foundations/postgres-or-vector-db]
+updated: 2026-10-28
+sources:
+  - title: "Malkov and Yashunin, Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs (arXiv 1603.09320 v4, 2018-08-14)"
+    url: https://arxiv.org/abs/1603.09320
+    note: "level l = floor(-ln(unif(0..1)) * mL); mL = 1/ln(M) as the simple optimal choice, matching skip-list p = 1/M; upper layers searched with ef = 1, layer 0 with ef; heuristic connects a candidate only if it is closer to the inserted element than to any already-connected candidate; nearest-neighbour connections fail to reach high recall on clustered data because search gets stuck at cluster boundaries; Mmax0 = 2M recommended, Mmax0 = M gives a strong penalty at high recall; reasonable M 5 to 48, memory proportional to M; efConstruction large enough for construction recall close to 1 (0.95 is enough for most uses); 10M SIFT index at efConstruction 100 built in 3 minutes on a 4x 10-core Xeon E5-4650 v2; memory per element (Mmax0 + mL * Mmax) * bytes_per_link, 60 to 450 bytes per object for M 6 to 48 excluding data; updates and removal listed as future work; search always starts at the top layer"
+  - title: pgvector README (checked 2026-10-28)
+    url: https://github.com/pgvector/pgvector
+    note: "HNSW m 16, ef_construction 64, hnsw.ef_search 40 by default; builds much faster when the graph fits in maintenance_work_mem, with a NOTICE when it no longer fits; filtering applied after the index scan, 10% match with ef_search 40 returns about 4 rows; dead tuples and filtering can reduce the rows an HNSW query returns; vacuuming HNSW indexes can be slow, REINDEX INDEX CONCURRENTLY first; install instructions use v0.8.7"
+  - title: pgvector CHANGELOG (checked 2026-10-28)
+    url: https://github.com/pgvector/pgvector/blob/master/CHANGELOG.md
+    note: "0.5.0 (2023-08-28) added HNSW; 0.8.0 (2024-10-30) iterative index scans; 0.8.3 (2026-06-17) fixed possible index corruption with HNSW vacuuming; 0.8.4 (2026-06-30) fixed HNSW vacuuming errors; 0.8.7 (2026-10-01)"
+  - title: "Douze et al., The Faiss Library (arXiv 2401.08281 v4, 2025-10-23)"
+    url: https://arxiv.org/abs/2401.08281
+    note: "HNSW supports adding vectors but not suppression or mutation; graph indexes suit collections below about 1M vectors and construction time often becomes the limit beyond about 10M"
+  - title: "PracHub, Vector database interview questions: HNSW, IVF, filtering and recall vs latency (2026-08-13)"
+    url: https://prachub.com/resources/vector-database-interview-questions-hnsw-ivf-filtering-and-recall-vs-latency
+    note: "synthesised question bank; topics include the roles of M, efConstruction and efSearch, memory, build and delete limits, and measuring recall@k against exact ground truth; no company attribution"
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import RagVectorSystemsHnsw from '../../../../components/widgets/RagVectorSystemsHnsw.astro';
+
+## The mechanism
+
+HNSW is a probabilistic skip list in which the links join nearby vectors instead of adjacent keys. That is the whole analogy, and the difference is where every operating problem comes from: a skip list's bottom layer is a total order, so search is exact, while HNSW's bottom layer is a proximity graph with a fixed number of links per node, so search is a greedy walk that can stop at a local minimum. Recall is a property of the graph you built and the walk you configured, not of the algorithm.
+
+Three pieces make the structure. Each inserted node draws a top layer from an exponentially decaying distribution: the paper's rule is l = floor(-ln(U) x mL) for U uniform on (0, 1), with mL = 1/ln(M) as the simple choice, which matches a skip list with p = 1/M. A node is present on every layer from 0 up to its own l. So each layer holds about 1/M of the nodes of the layer below, and with M = 16 a million nodes give about 62,500 nodes on layer 1, 3,906 on layer 2, 244 on layer 3, 15 on layer 4 and about one on layer 5; the code block below draws a million levels and lands within 1% of the counts for layers 1 and 2, with the sparse top layers noisier. The expected number of layers a node lives on is 1 + mL, which is 1.36 at M = 16, so the upper layers cost little memory.
+
+Search starts at a single entry point on the top layer. On every layer above 0 it keeps one candidate (ef = 1 in the paper's algorithm) and moves to whichever neighbour is closer to the query until no neighbour is, then drops a layer and starts from where it stopped. On layer 0 it keeps a dynamic list of the ef closest nodes found so far, expands the closest unexpanded candidate, and stops when the closest remaining candidate is further away than the furthest node in the list. That list size is `efSearch`, and it is the only knob a query has.
+
+Insertion is a search followed by wiring. The new node searches down to its own top layer, then on each layer from there to 0 runs the layer search with ef = `efConstruction`, picks M neighbours from the result and links both ways. When a neighbour's list overflows its cap, the neighbour re-selects its links. The paper caps layer 0 at Mmax0 = 2M and the upper layers at M; setting Mmax0 to M gave what it calls a very strong performance penalty at high recall, and going above 2M degraded performance and wasted memory.
+
+The selection rule is the part most implementations of "HNSW from a blog post" leave out. Taking the M nearest candidates is the obvious rule. The paper's heuristic instead walks candidates from nearest to furthest and keeps one only if it is closer to the new node than to every neighbour already kept. On clustered data, the nearest M are all in the node's own cluster, and the graph loses the long edges between clusters; the paper reports that with plain nearest-neighbour links HNSW fails to reach high recall on clustered data because the search gets stuck at cluster boundaries. The heuristic keeps a few edges that point across the gap.
+
+## Build one and break it
+
+The widget builds a small HNSW in your browser: 2,000 points in 8 dimensions drawn around 16 cluster centres, M = 8, a layer-0 cap of 16 and `efConstruction` 40, with a fixed seed so the graph is the same on every visit. It runs 40 fixed queries and compares the top 10 with brute force over the rows that pass the filter.
+
+<RagVectorSystemsHnsw />
+
+Things to try, with what this toy produced when it was checked on 28 October 2026. With the heuristic and no filter, recall@10 is 0.97 at `efSearch` 10 and 1.00 from 20 up, at about 87 to 284 distance computations per query against 2,000 for brute force. Switch to "Nearest M" and recall stalls at 0.70 to 0.73 whatever `efSearch` you choose: more search effort does not fix a graph that lacks the edges between clusters. That is the paper's clustered-data result, reproduced at toy scale.
+
+Now set the filter to 10% with "After the search". At `efSearch` 40 the query returns 4.1 rows on average, which is the pgvector README's own example (a 10% condition at its default `ef_search` of 40 returns about 4 rows). At 1% the page is nearly empty at every setting. Switch to "During traversal", which walks through failing nodes but admits only passing ones to the result list: recall returns to 1.00 with the heuristic, and the distance computations climb to about 2,000 per query at 1%, which is brute force with extra steps. With "Nearest M" at 1% it returns 6.5 rows at 0.46 recall, because some passing rows are not reachable at all. The filtered-search playbook in this module picks up from here.
+
+## The three parameters
+
+**M** sets the links per node and therefore memory and the graph's connectivity. The paper gives a reasonable range of 5 to 48: smaller M did better at lower recall and on lower-dimensional data, larger M at high recall and high dimensions, and memory grows in proportion. pgvector's default `m` is 16. M is fixed at build time; changing it is a rebuild.
+
+**efConstruction** is the search width while wiring. The paper's rule is to raise it until the construction-time search reaches recall close to 1, with 0.95 enough for most uses; it reports a 10M-vector SIFT index built at `efConstruction` 100 in 3 minutes on a 4-socket, 10-core-per-socket Xeon server, and little gain beyond that for much longer builds. pgvector defaults to 64. In Postgres the binding constraint is usually memory, not the parameter: builds are much faster while the graph fits in `maintenance_work_mem`, and the server prints a notice when it stops fitting.
+
+**efSearch** is the query's candidate list, at least k. pgvector's `hnsw.ef_search` defaults to 40. It is the knob you tune on a recall curve, and it is also the hidden cap on filtered queries: a post-filtered query can never return more passing rows than the candidates it kept.
+
+## Memory per node
+
+The paper's estimate of graph memory per element is (Mmax0 + mL x Mmax) x bytes per link, with four-byte links good for about four billion elements. It excludes the vectors.
+
+<Predict id="rag-vs-hnsw-link-bytes" question="Graph bytes per node, excluding the vector?" answer={151} tolerance={3} unit="bytes">
+<Fragment slot="prompt">
+<p>M = 16, Mmax0 = 2M, Mmax = M, mL = 1/ln(M) (ln 16 is about 2.77), four-byte links.</p>
+</Fragment>
+<p><b>About 151 bytes.</b> mL is 1/2.77 = 0.361, so the average node carries 32 layer-0 links plus 0.361 x 16 = 5.8 upper-layer links, 37.8 links in all, times 4 bytes. The same formula gives 61 bytes at M = 6 and 434 at M = 48, which is the paper's stated 60 to 450 bytes per object. Against a 1,024-dimension float32 vector of 4,096 bytes, the graph is under 4% of the node: the vector, not the graph, decides whether the index fits in RAM, which is why quantisation is the next lesson.</p>
+</Predict>
+
+```python
+import math
+import random
+
+
+def levels(n, m, seed=1):
+    """Draw each node's top layer as floor(-ln(U) * mL) with mL = 1 / ln(M), as in the HNSW paper."""
+    rnd, ml = random.Random(seed), 1 / math.log(m)
+    return [int(-math.log(1.0 - rnd.random()) * ml) for _ in range(n)]
+
+
+def link_bytes(m, link_bytes=4):
+    """Average graph memory per node: (Mmax0 + mL * Mmax) links, with Mmax0 = 2M and Mmax = M."""
+    return (2 * m + m / math.log(m)) * link_bytes
+
+
+lv = levels(1_000_000, 16)
+for j in range(6):
+    print(f"layer >= {j}: {sum(1 for x in lv if x >= j):>9,} drawn, {1_000_000 / 16**j:>11,.0f} expected")
+print(f"link bytes per node at M=16: {link_bytes(16):.0f}; M=6: {link_bytes(6):.0f}; M=48: {link_bytes(48):.0f}")
+# layer >= 1: 62,608 drawn, 62,500 expected ... layer >= 5: 1 drawn, 1 expected
+# link bytes per node at M=16: 151; M=6: 61; M=48: 434
+```
+
+Real engines add per-node headers, page layouts and allocator overhead on top, so treat 151 bytes as a floor and measure the built index.
+
+## Deletes
+
+The paper's discussion lists support for element updates and removal as future work, and the Faiss paper (revised October 2025) still states that its HNSW supports adding vectors but not suppression or mutation. The reason is structural. Other nodes route through a deleted node; removing it and its edges can strand the nodes whose only good path ran through it, and repairing that means re-running neighbour selection for every node that pointed at it, which is the most expensive step of an insert.
+
+So engines keep the node in the graph for routing and exclude it from results. A tombstone in a vector index behaves like a filter that every query carries: tombstoned rows still cost distance computations and still occupy the `efSearch` list, and they reduce the rows returned exactly as a post-filter does. The pgvector README names dead tuples next to filtering as the reasons an HNSW query returns fewer rows than asked for. Vacuuming repairs the graph, slowly; the README suggests `REINDEX INDEX CONCURRENTLY` before `VACUUM` to speed it up. Two recent releases changed the floor: 0.8.3 (17 June 2026) fixed possible index corruption during HNSW vacuuming and 0.8.4 (30 June 2026) fixed further vacuum errors, so a delete-heavy pgvector deployment needs 0.8.3 or later. The README's install instructions use 0.8.7 as of 28 October 2026.
+
+The policy question is when to rebuild. The signal is the fraction of the graph that is tombstoned, measured against the recall you see on a fixed query set compared with exact search. Updates are worse than deletes: an embedding change is a delete plus an insert, so re-embedding a corpus in place leaves a graph that is half tombstones until it is rebuilt.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You are moving 50M chunks of 768-dimension float32 embeddings into an in-memory HNSW index. Recall@10 against exact search must stay at or above 0.95 and p95 latency under 30 ms. Each node has 256 GB of RAM. About 2% of chunks are deleted or re-embedded every night, and the team has one quarter. Choose M, efConstruction, efSearch and the delete policy, and say what you would measure first."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Memory decides first: 768 x 4 = 3,072 bytes of vector plus about 151 bytes of links at M = 16 is about 3.2 KB a node, 161 GB for 50M, which fits one node with room for the build. I start at M = 16, raise efConstruction until construction recall is near 1, and pick efSearch as the smallest value that holds 0.95 recall@10 on a held-out query set at p95. Deletes are tombstones with a scheduled rebuild, triggered by measured recall loss, not by a calendar.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Size. 50M x (3,072 + 151) bytes is 161 GB as a floor. On 256 GB that leaves headroom for engine overhead but not for a second copy, so the rebuild has to happen on another node or replica and be swapped in; that constraint shapes the delete policy more than any parameter.</p>
+<p>Parameters. M = 16 is the middle of the paper's 5 to 48 range and pgvector's default. 768 dimensions and a 0.95 target sit in the high-recall, high-dimension region where the paper found larger M helped, so I would build M = 16 and M = 24 on a 1M sample and compare recall per millisecond; M = 24 costs about 70 more bytes a node by the same formula, 3.5 GB at 50M. efConstruction rises until the construction search reaches recall near 1 on the sample. efSearch comes from the recall curve on real queries, chosen at p95, not mean.</p>
+<p>Deletes. 2% a night means the tombstoned share grows by 2 points a night until a rebuild. Tombstones eat the efSearch list like a filter, so recall@10 falls as they accumulate; a nightly job measures recall against exact search on a fixed query set and triggers a rebuild on a second node when it crosses an agreed threshold. What I give up: a node's worth of RAM for blue-green rebuilds, and a recall that drifts between rebuilds. Written down: the recall threshold, the rebuild time measured on the full set, and the rollback (keep the previous index until the new one passes the same recall check).</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Finance refuses the second node. What do you cut, and what risk do you accept in writing?</em> Rebuild in place during a window with degraded recall, or move to halfvec or int8 storage so two copies fit on one node; each choice names the recall loss and the window.</li>
+<li><em>Recall on the nightly check is 0.97 but users report missing documents. What do you look at?</em> Whether the check's queries resemble production queries, especially filtered ones, and whether the missing documents are recent inserts or re-embedded rows that sit next to their own tombstones.</li>
+<li><em>What would make you abandon HNSW for this corpus?</em> Rebuild time on the full set exceeding the window between rebuilds, or a RAM budget that falls below the vector bytes; then an IVF or disk-resident index with a re-ranking pass is the alternative.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The logarithmic search complexity is the paper's result for data where a bounded-degree graph approximates the Delaunay graph well, which it showed empirically for low-dimensional sets; the paper itself notes that its 200M SIFT query time deviated from a pure logarithm, possibly because of dimensionality. At 768 or 1,536 dimensions, the cost per query depends on the data's intrinsic dimension and on how queries are distributed, and only a recall curve on your queries settles it.
+
+The widget's numbers come from 2,000 points in 8 dimensions with tight clusters. They show directions (the heuristic matters on clustered data, post-filters starve, traversal-time filters cost visits), not magnitudes; real embeddings are high-dimensional and less cleanly clustered, and the paper found little difference between selection rules on uniform, very high-dimensional data.
+
+The filter in the widget is independent of position. Real filters correlate with the query, in both directions, and that changes every number in the filtered rows. Finally, the Faiss paper puts graph indexes as the natural choice below about 1M vectors and says construction time often becomes the limit beyond about 10M; above that size the decision includes IVF, disk-resident graphs and object storage, which the last two lessons of this module cover.
+
+<SelfRate id="lesson:rag/vector-systems/hnsw-by-hand" />

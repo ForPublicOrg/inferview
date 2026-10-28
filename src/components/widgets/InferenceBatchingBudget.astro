@@ -1,0 +1,141 @@
+---
+// Token budget versus long prompts: per-step cost, the long prompt's time to first token, and p99 inter-token latency
+// for the running decodes over one minute. Deterministic arithmetic, no randomness. Props: title, id (unique on the page).
+// Cost model (scenario constants, stated in the widget): a step costs FLOOR_MS up to KNEE tokens, then grows linearly.
+// The shape follows Sarathi-Serve's Figure 6 (arXiv 2403.02310); the constants are the widget's own.
+interface Props {
+  title?: string;
+  id?: string;
+}
+const { title = 'Token budget: who pays for a long prompt', id = 'ibbudget' } = Astro.props;
+const f = (k: string) => `${id}-${k}`;
+---
+<div class="widget ibb" data-ibb>
+  <header><h4>{title}</h4><span class="tiny">scenario cost model: 30 ms per step up to 512 tokens, then 30 ms per further 512</span></header>
+  <div class="ibb-grid">
+    <label for={f('b')}>Token budget per step
+      <select id={f('b')} data-k="b">
+        <option value="512">512</option>
+        <option value="1024">1,024</option>
+        <option value="2048" selected>2,048</option>
+        <option value="4096">4,096</option>
+        <option value="8192">8,192</option>
+        <option value="0">No chunking (whole prompt in one step)</option>
+      </select>
+    </label>
+    <label for={f('p')}>Long prompt length
+      <select id={f('p')} data-k="p">
+        <option value="4096">4,096 tokens</option>
+        <option value="16384" selected>16,384 tokens</option>
+        <option value="65536">65,536 tokens</option>
+      </select>
+    </label>
+    <label for={f('n')}>Long prompts per minute
+      <select id={f('n')} data-k="n">
+        <option value="1">1</option>
+        <option value="6" selected>6</option>
+        <option value="20">20</option>
+      </select>
+    </label>
+    <label for={f('d')} class="ibb-wide">Running decodes <b class="mono" data-dv>128</b>
+      <input type="range" id={f('d')} min="16" max="1024" step="16" value="128" data-k="d" />
+    </label>
+  </div>
+  <div class="gauges">
+    <div><b data-o="itl"></b><span>decode gap while it prefills</span></div>
+    <div><b data-o="ttft"></b><span>long prompt, prefill time</span></div>
+    <div><b data-o="share"></b><span>decode steps stretched</span></div>
+    <div><b data-o="p99"></b><span>p99 / max decode gap</span></div>
+  </div>
+  <p class="tiny ibb-note" data-o="note"></p>
+  <p class="sr-only" aria-live="polite" data-o="live"></p>
+</div>
+
+<style>
+  .ibb-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 14px; }
+  @media (max-width: 700px) { .ibb-grid { grid-template-columns: minmax(0, 1fr); } }
+  .ibb-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--ink-2); min-width: 0; }
+  .ibb-grid .ibb-wide { grid-column: 1 / -1; }
+  .ibb-grid select { font: inherit; font-size: 14px; padding: 8px 10px; min-height: 44px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); max-width: 100%; }
+  .ibb-grid input[type='range'] { width: 100%; min-height: 44px; }
+  .ibb-note { margin: 0; overflow-wrap: anywhere; }
+</style>
+
+<script>
+  const FLOOR_MS = 30;
+  const KNEE = 512;
+  const MINUTE_MS = 60_000;
+
+  // Below the knee a step is bound by reading the weights; above it, by compute that grows with tokens.
+  const stepMs = (tokens: number) => Math.max(FLOOR_MS, (FLOOR_MS * tokens) / KNEE);
+
+  type Result = { ok: true; steps: number[]; base: number } | { ok: false; base: number };
+
+  // Decodes are scheduled first (one token each), then the prompt takes what is left of the budget.
+  function prefill(budget: number, decodes: number, prompt: number): Result {
+    const base = stepMs(decodes);
+    if (budget === 0) return { ok: true, steps: [stepMs(decodes + prompt)], base };
+    const room = budget - decodes;
+    if (room <= 0) return { ok: false, base };
+    const steps: number[] = [];
+    let left = prompt;
+    while (left > 0) {
+      const chunk = Math.min(room, left);
+      steps.push(stepMs(decodes + chunk));
+      left -= chunk;
+    }
+    return { ok: true, steps, base };
+  }
+
+  const ms = (x: number) => (x >= 1000 ? `${(x / 1000).toFixed(2)} s` : `${Math.round(x)} ms`);
+
+  document.querySelectorAll<HTMLElement>('[data-ibb]').forEach((root) => {
+    const val = (k: string) => Number(root.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-k="${k}"]`)!.value);
+    const out = (k: string) => root.querySelector<HTMLElement>(`[data-o="${k}"]`)!;
+    const render = () => {
+      const budget = val('b');
+      const prompt = val('p');
+      const perMin = val('n');
+      const decodes = val('d');
+      root.querySelector('[data-dv]')!.textContent = String(decodes);
+      const r = prefill(budget, decodes, prompt);
+      if (!r.ok) {
+        out('itl').textContent = ms(r.base);
+        out('ttft').textContent = 'never';
+        out('ttft').classList.add('bad');
+        out('share').textContent = '0%';
+        out('p99').textContent = `${ms(r.base)} / ${ms(r.base)}`;
+        out('note').textContent = `The ${decodes} decodes use the whole budget of ${budget}, so the prompt gets no tokens until some decodes finish. Decode latency looks perfect while the prompt starves.`;
+        out('live').textContent = `Budget ${budget} with ${decodes} decodes leaves no room for the prompt.`;
+        return;
+      }
+      out('ttft').classList.remove('bad');
+      const ttft = r.steps.reduce((a, x) => a + x, 0);
+      const worst = Math.max(...r.steps);
+      const busy = perMin * ttft;
+      const over = busy >= MINUTE_MS;
+      const stretched = perMin * r.steps.length;
+      const plain = over ? 0 : (MINUTE_MS - busy) / r.base;
+      const share = stretched / (stretched + plain);
+      // Every step emits one token per running decode, so the share of steps is the share of decode gaps.
+      // The p99 gap is the k-th largest of all gaps, k = 1% of steps; each prefill step occurs perMin times a minute.
+      const sorted = [...r.steps].sort((a, b) => b - a);
+      const k = Math.max(1, Math.ceil(0.01 * (stretched + plain)));
+      const p99 = k <= stretched ? sorted[Math.floor((k - 1) / perMin)]! : r.base;
+      out('itl').textContent = ms(worst);
+      out('ttft').textContent = `${ms(ttft)} in ${r.steps.length} step${r.steps.length === 1 ? '' : 's'}`;
+      out('share').textContent = over ? '100%' : `${(share * 100).toFixed(1)}%`;
+      out('share').classList.toggle('bad', over);
+      out('p99').textContent = `${ms(p99)} / ${ms(worst)}`;
+      out('note').textContent = over
+        ? `Prefilling ${perMin} prompts of ${prompt.toLocaleString('en-US')} tokens takes ${ms(busy)} per minute, more than the minute: the queue grows without bound.`
+        : `Without a long prompt a step with ${decodes} decodes costs ${ms(r.base)}. The engine spends ${ms(busy)} of each minute on steps that carry prefill.`;
+      out('live').textContent = `Budget ${budget || 'unchunked'}: decode gap ${ms(worst)} while prefilling, prompt prefill ${ms(ttft)}, p99 gap ${ms(p99)}.`;
+    };
+    root.querySelectorAll('[data-k]').forEach((el) => {
+      el.addEventListener('input', render);
+      el.addEventListener('change', render);
+    });
+    render();
+  });
+</script>

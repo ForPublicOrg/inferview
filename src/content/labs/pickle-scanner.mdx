@@ -1,0 +1,441 @@
+---
+title: A pickle import allowlist scanner
+track: security
+module: supply-chain
+kind: lab
+minutes: 90
+summary: Grow one scanner over five steps that reads a pickle's opcodes without running them, names every import, checks it against an allowlist, fails broken streams and reports where each finding sits.
+updated: 2026-10-28
+sources:
+  - title: Hugging Face Hub docs, Pickle scanning (checked 2026-10-28)
+    url: https://huggingface.co/docs/hub/security-pickle
+    note: "the Hub extracts the imports of every pickled file with pickletools.genops without executing code; GLOBAL, STACK_GLOBAL and REDUCE are the opcodes that pose a threat; the scan is not 100% foolproof; the page proposes a .gitignore-like allowlist of imports with entries such as numpy.*"
+  - title: ReversingLabs, Malicious ML models discovered on Hugging Face platform (2025-02-06)
+    url: https://www.reversinglabs.com/blog/rl-identifies-malware-ml-model-hosted-on-hugging-face
+    note: "nullifAI: payload at the start of the pickle stream, stream broken shortly after it runs; Picklescan reported an error on RL's broken test file but not the dangerous functions before it; Hugging Face changed Picklescan to flag threats in broken files"
+  - title: CVE-2025-32434 (CVE record, published 2025-04-18)
+    url: https://cveawg.mitre.org/api/cve/CVE-2025-32434
+    note: "remote command execution through torch.load with weights_only=True in PyTorch 2.5.1 and earlier; patched in 2.6.0"
+  - title: Python docs, pickletools (checked 2026-10-28)
+    url: https://docs.python.org/3/library/pickletools.html
+    note: "genops yields (opcode, arg, pos) triples from bytes or a file-like object"
+  - title: CPython 3.12 Lib/pickle.py (checked 2026-10-28 against Python 3.12.6)
+    url: https://github.com/python/cpython/blob/3.12/Lib/pickle.py
+    note: "find_class walks attributes for a dotted name when the stream's protocol is 4 or later; INST and STACK_GLOBAL both call find_class"
+steps:
+  - title: Walk the opcodes
+    brief: |
+      A pickle is a program for a small stack machine, and `pickletools.genops` decodes it one instruction at a time without running any of it. Write `walk(data)`, which returns every opcode of the first pickle in `data` with its byte offset and decoded argument, and stops at `STOP`. The tests build a stream that calls a function when unpickled and check that walking it calls nothing: everything later in this lab reads the program, it never runs it.
+    starter: |
+      import pickletools
+
+
+      def walk(data):
+          """Return [(offset, opcode_name, arg)] for the first pickle in data, in stream order, ending with STOP.
+
+          Read the opcodes; never unpickle. A broken stream may raise for now.
+          """
+          raise NotImplementedError
+    tests: |
+      import pickle
+      import sys
+      import types
+
+      ops = walk(pickle.dumps("hi", protocol=4))
+      assert [name for _, name, _ in ops] == ["PROTO", "FRAME", "SHORT_BINUNICODE", "MEMOIZE", "STOP"], ops
+      assert ops[0][0] == 0 and [o for o, _, _ in ops] == sorted(o for o, _, _ in ops), "offsets start at 0 and increase"
+
+      classic = b"cos\nsystem\n(S'id'\ntR."
+      assert [name for _, name, _ in walk(classic)] == ["GLOBAL", "MARK", "STRING", "TUPLE", "REDUCE", "STOP"]
+      assert walk(classic)[0][2] == "os system", "pickletools returns GLOBAL's two lines as one argument"
+
+      lab_stub = types.ModuleType("lab_stub")
+      lab_stub.tripped = []
+      def trip():
+          lab_stub.tripped.append(1)
+      trip.__module__, trip.__qualname__ = "lab_stub", "trip"
+      lab_stub.trip = trip
+      sys.modules["lab_stub"] = lab_stub
+      armed = b"\x80\x04\x8c\x08lab_stub\x8c\x04trip\x93)R."
+      assert pickle.loads(armed) is None and lab_stub.tripped == [1], "unpickling this stream calls trip()"
+      assert walk(armed)[-1][1] == "STOP" and lab_stub.tripped == [1], "walking it calls nothing"
+    hidden: |
+      import pickle as _p
+      import pickletools as _pt
+
+      _CODE = {op.name: op.code.encode("latin-1") for op in _pt.opcodes}
+      _data = [_p.dumps(x, protocol=p) for p in range(6) for x in ([1, "a", b"b", {"k": (1.5, None)}], {"s": {1, 2}}, "x" * 300)]
+      assert all(d[o:o + 1] == _CODE[n] for d in _data for o, n, _ in walk(d))
+      assert all(walk(d + d)[-1][0] == len(d) - 1 for d in _data)
+    solution: |
+      import pickletools
+
+
+      def walk(data):
+          return [(pos, op.name, arg) for op, arg, pos in pickletools.genops(data)]
+  - title: Collect GLOBAL and STACK_GLOBAL imports
+    brief: |
+      Every import a pickle can make goes through the unpickler's `find_class`, and three opcodes call it: `GLOBAL` (protocols 0 to 3), `INST` (protocol 0) and `STACK_GLOBAL` (protocol 4 and later). The first two carry the module and name in their argument. `STACK_GLOBAL` pops them from the stack, and the strings may have been pushed long before, then stored in the memo and fetched back with a `BINGET`. A scanner that looks at the two opcodes before a `STACK_GLOBAL` misses that, so simulate the stack: track which entries are strings the stream pushed itself, apply every other opcode's stack effect from `pickletools`' `stack_before` and `stack_after`, and report a `STACK_GLOBAL` whose arguments are anything else as unresolved. The hidden tests compare your list with the imports a real `Unpickler` asks for on random objects at every protocol.
+    starter: |
+      import io
+      import pickletools
+
+
+      def imports(data):
+          """Return [(offset, module, name)] for every import in the first pickle of data, in stream order.
+
+          GLOBAL and INST carry "module name" in their argument. STACK_GLOBAL pops the name, then the module,
+          from the stack; when either is not a string the stream itself pushed, report (offset, None, None).
+          A broken stream may raise ValueError.
+          """
+          raise NotImplementedError
+    tests: |
+      import pickle
+      from collections import OrderedDict
+
+      assert imports(b"cos\nsystem\n(S'id'\ntR.") == [(0, "os", "system")]
+      assert imports(b"\x80\x04\x8c\x02os\x8c\x06system\x93\x8c\x02id\x85R.") == [(14, "os", "system")]
+      assert imports(b"(S'id'\nios\nsystem\n.") == [(7, "os", "system")], "INST imports as well"
+      far = b"\x80\x04\x8c\x02os\x94\x8c\x06system\x9400(" + b"K\x01" * 500 + b"1" + b"h\x00h\x01\x93\x8c\x02id\x85R."
+      assert [(m, n) for _, m, n in imports(far)] == [("os", "system")], "names stored in the memo and fetched later"
+      assert [(m, n) for _, m, n in imports(pickle.dumps(OrderedDict(a=1), protocol=4))] == [("collections", "OrderedDict")]
+      assert imports(pickle.dumps({"plain": [1, 2.5, "x"]}, protocol=4)) == []
+    hidden: |
+      import io as _io
+      import pickle as _p
+      import random as _random
+      from collections import OrderedDict as _OD
+
+      assert [(m, n) for _, m, n in imports(b"\x80\x04\x8c\x0bcollections\x8c\x0bOrderedDict\x93)R2\x93)R.")] == [("collections", "OrderedDict"), (None, None)]
+      assert imports(b"\x80\x02\x82\x01)R.") == [(2, None, None)]
+
+
+      class _Rec(_p.Unpickler):
+          def __init__(self, f):
+              super().__init__(f)
+              self.calls = []
+
+          def find_class(self, module, name):
+              self.calls.append((module, name))
+              return super().find_class(module, name)
+
+
+      def _obj(rng, d=0):
+          k = rng.randrange(8 if d < 3 else 4)
+          if k == 0: return rng.randrange(-9**9, 9**9)
+          if k == 1: return bytes(rng.randrange(256) for _ in range(rng.randrange(3)))
+          if k == 2: return frozenset(range(rng.randrange(3)))
+          if k == 3: return "s%d" % rng.randrange(40)
+          if k == 4: return [_obj(rng, d + 1) for _ in range(rng.randrange(4))]
+          if k == 5: return {"k%d" % i: _obj(rng, d + 1) for i in range(rng.randrange(4))}
+          if k == 6: return _OD((str(i), _obj(rng, d + 1)) for i in range(rng.randrange(3)))
+          return {rng.randrange(9) for _ in range(rng.randrange(3))}
+
+
+      def _same(seed, n):
+          rng = _random.Random(seed)
+          for _ in range(n):
+              data = _p.dumps(_obj(rng), protocol=rng.randrange(6))
+              rec = _Rec(_io.BytesIO(data))
+              rec.load()
+              if [(m, nm) for _, m, nm in imports(data)] != rec.calls:
+                  return False
+          return True
+
+
+      assert _same(3, 300)
+    solution: |
+      import io
+      import pickletools
+
+      _MARK = object()
+
+
+      class _Lit(str):
+          """A string pushed by the stream itself, so STACK_GLOBAL can name it."""
+
+
+      _STRINGS = {"STRING", "BINSTRING", "SHORT_BINSTRING", "UNICODE", "BINUNICODE", "SHORT_BINUNICODE", "BINUNICODE8"}
+
+      # (items popped below a MARK, pops down to a MARK?, items pushed) for every opcode, from pickletools' metadata.
+      _EFFECT = {}
+      for _op in pickletools.opcodes:
+          _before = [s.name for s in _op.stack_before]
+          if "mark" in _before:
+              _EFFECT[_op.name] = (_before.index("mark"), True, len(_op.stack_after))
+          else:
+              _EFFECT[_op.name] = (len(_before), False, len(_op.stack_after))
+
+
+      def _imports_from(f, out):
+          """Append the imports of the pickle that starts at f's position to out. Raises ValueError on a broken stream."""
+          stack, memo = [], {}
+          for op, arg, pos in pickletools.genops(f):
+              name = op.name
+              if name in _STRINGS:
+                  stack.append(_Lit(arg))
+              elif name == "MARK":
+                  stack.append(_MARK)
+              elif name in ("MEMOIZE", "PUT", "BINPUT", "LONG_BINPUT"):
+                  if not stack or stack[-1] is _MARK:
+                      raise ValueError("%s at %d with nothing to store" % (name, pos))
+                  memo[len(memo) if name == "MEMOIZE" else arg] = stack[-1]
+              elif name in ("GET", "BINGET", "LONG_BINGET"):
+                  if arg not in memo:
+                      raise ValueError("%s at %d reads memo slot %r, never stored" % (name, pos, arg))
+                  stack.append(memo[arg])
+              elif name == "DUP":
+                  if not stack:
+                      raise ValueError("DUP at %d on an empty stack" % pos)
+                  stack.append(stack[-1])
+              elif name == "STACK_GLOBAL":
+                  if len(stack) < 2:
+                      raise ValueError("STACK_GLOBAL at %d with fewer than two items" % pos)
+                  qual, module = stack.pop(), stack.pop()
+                  if type(module) is _Lit and type(qual) is _Lit:
+                      out.append((pos, str(module), str(qual)))
+                  else:
+                      out.append((pos, None, None))
+                  stack.append(None)
+              else:
+                  if name in ("GLOBAL", "INST"):
+                      module, _, qual = arg.partition(" ")
+                      out.append((pos, module, qual))
+                  elif name in ("EXT1", "EXT2", "EXT4"):
+                      out.append((pos, None, None))   # the extension registry lives in the loading process, not the file
+                  before, to_mark, after = _EFFECT[name]
+                  if to_mark:
+                      k = len(stack) - 1
+                      while k >= 0 and stack[k] is not _MARK:
+                          k -= 1
+                      if k < 0:
+                          raise ValueError("%s at %d without a MARK" % (name, pos))
+                      del stack[k:]
+                  if before:
+                      if len(stack) < before or any(x is _MARK for x in stack[-before:]):
+                          raise ValueError("%s at %d pops past the stack" % (name, pos))
+                      del stack[-before:]
+                  stack.extend([None] * after)
+
+
+      def imports(data):
+          out = []
+          _imports_from(io.BytesIO(data), out)
+          return out
+  - title: Check imports against an allowlist
+    brief: |
+      Hugging Face's own write-up of its scanner proposes a file like `.gitignore`, but for imports: an allowlist, with a form such as `numpy.*` for a whole module. A denylist has to name every dangerous callable in every installed package; an allowlist names the few a weights file needs and fails closed on the rest. Two details decide whether the allowlist holds. A wildcard covers the names defined in one module, not its submodules. And under protocol 4 and later the unpickler resolves a dotted name by walking attributes from the module, so `vendorlib` with the name `helpers.os.system` reaches whatever `vendorlib.helpers` imported; a dotted name is never allowed.
+    starter: |
+      def allowed(module, name, allowlist):
+          """allowlist holds entries "module.name" (one import) and "module.*" (any name defined in that module,
+          not in its submodules). A name containing a dot is an attribute walk at load time and is never allowed,
+          and an unresolved import (None, None) is never allowed."""
+          raise NotImplementedError
+
+
+      def check(data, allowlist):
+          """Return the imports of the first pickle in data that are not allowed, as (offset, module, name)."""
+          raise NotImplementedError
+    tests: |
+      import pickle
+      from collections import OrderedDict
+
+      TORCHISH = {"collections.OrderedDict", "torch._utils._rebuild_tensor_v2", "torch.FloatStorage"}
+      assert allowed("torch._utils", "_rebuild_tensor_v2", TORCHISH)
+      assert not allowed("os", "system", TORCHISH)
+      assert allowed("collections", "OrderedDict", {"collections.*"})
+      assert not allowed("collections.abc", "Mapping", {"collections.*"}), "a wildcard does not reach submodules"
+      assert not allowed("vendorlib", "helpers.os.system", {"vendorlib.*"}), "a dotted name walks attributes at load time"
+      assert not allowed(None, None, {"collections.*"})
+      assert check(pickle.dumps(OrderedDict(a=1), protocol=4), TORCHISH) == []
+      assert check(b"cos\nsystem\n(S'id'\ntR.", TORCHISH) == [(0, "os", "system")]
+    hidden: |
+      import random as _random
+
+      assert not allowed("torch", "_utils._rebuild_tensor_v2", {"torch.*"})
+      assert not allowed("torch._utils", "_rebuild_tensor_v2", {"torch._utils._rebuild_tensor_v"})
+      assert not allowed("os", "", {"os.*"})
+
+
+      def _monotone(seed, n):
+          rng = _random.Random(seed)
+          mods = ["a", "a.b", "c", "os", "torch._utils"]
+          names = ["x", "y", "system", "z.w"]
+          for _ in range(n):
+              base = {rng.choice(mods) + "." + rng.choice(names + ["*"]) for _ in range(rng.randrange(5))}
+              extra = base | {rng.choice(mods) + "." + rng.choice(names + ["*"])}
+              m, nm = rng.choice(mods), rng.choice(names)
+              if allowed(m, nm, base) and not allowed(m, nm, extra):
+                  return False
+              if "." in nm and allowed(m, nm, extra):
+                  return False
+          return True
+
+
+      assert _monotone(5, 2000)
+    solution: |
+      def allowed(module, name, allowlist):
+          if module is None or name is None or not name or "." in name:
+              return False
+          return (module + "." + name) in allowlist or (module + ".*") in allowlist
+
+
+      def check(data, allowlist):
+          return [i for i in imports(data) if not allowed(i[1], i[2], allowlist)]
+  - title: Treat broken streams as failures
+    brief: |
+      ReversingLabs found two models on Hugging Face in early 2025 whose pickle stream broke shortly after the malicious payload ran. The unpickler executes opcodes as it reads them, so the payload at the front ran before the error; Picklescan reported the error and did not report the dangerous import before it, and Hugging Face changed Picklescan afterwards to flag threats in broken files. Write `scan`, which reads every pickle in the file back to back (loaders such as PyTorch's legacy format read more than one, and so does a file written with one `pickle.dump` per record), keeps the imports it found before any break, and never returns ok for a file that is empty, truncated, has an unknown opcode or ends in bytes that do not parse. The hidden tests include a shard of 20,000 records with a time limit: copying the rest of the file for every record is quadratic.
+    starter: |
+      import io
+
+
+      def scan(data, allowlist):
+          """Scan every pickle in data, back to back, and return
+          {"ok": bool, "imports": [(offset, module, name)], "bad": [...], "error": None or (offset, message)}.
+
+          Offsets are positions in data. A file that is empty, truncated, has an unknown opcode or trailing bytes
+          that do not parse is never ok, and the imports found before the break are still reported.
+          """
+          raise NotImplementedError
+    tests: |
+      import pickle
+      from collections import OrderedDict
+
+      ALLOW = {"collections.OrderedDict"}
+      payload = b"\x80\x02cos\nsystem\nq\x00X\x02\x00\x00\x00idq\x01\x85q\x02Rq\x03"
+      r = scan(payload + b"X\xff\xff\x00\x00.", ALLOW)
+      assert not r["ok"] and r["error"] is not None, "a stream that breaks after its payload is a failure"
+      assert [(m, n) for _, m, n in r["bad"]] == [("os", "system")], "and the payload before the break is reported"
+      good = pickle.dumps(OrderedDict(a=1), protocol=4)
+      assert scan(good, ALLOW)["ok"]
+      assert not scan(good[:-1], ALLOW)["ok"], "truncated"
+      assert not scan(b"", ALLOW)["ok"], "empty"
+      second = scan(good + b"\x80\x02cposix\nsystem\nX\x02\x00\x00\x00id\x85R.", ALLOW)
+      assert not second["ok"] and second["bad"][0][0] > len(good), "a second pickle after STOP is scanned, at its real offset"
+      assert scan(good + good, ALLOW)["ok"]
+    hidden: |
+      import pickle as _p
+      import random as _random
+      import time as _time
+      from collections import OrderedDict as _OD
+
+      _A = {"collections.OrderedDict", "builtins.set", "__builtin__.set", "copyreg._reconstructor"}
+      assert not scan(_p.dumps([1], protocol=4) + b"\x00garbage", _A)["ok"]
+      assert not scan(b"\x80\x05\xff.", _A)["ok"]
+
+
+      def _prefixes(seed, n):
+          rng = _random.Random(seed)
+          for _ in range(n):
+              d = _p.dumps({"k": [rng.random(), "v" * rng.randrange(30), _OD(a=1)]}, protocol=rng.randrange(6))
+              if not scan(d, _A)["ok"]:
+                  return False
+              if scan(d[:rng.randrange(len(d))], _A)["ok"]:
+                  return False
+          return True
+
+
+      assert _prefixes(11, 400)
+
+      _shard = b"".join(_p.dumps(_OD(id=i, text="x" * 500), protocol=4) for i in range(20000))
+
+
+      def _fast():
+          t = _time.perf_counter()
+          r = scan(_shard, _A)
+          return r["ok"] and len(r["imports"]) == 20000 and _time.perf_counter() - t < 3.0
+
+
+      assert _fast()
+    solution: |
+      import io
+
+
+      def scan(data, allowlist):
+          f = io.BytesIO(data)
+          found, error = [], None
+          if not data:
+              error = (0, "empty file: no pickle stream")
+          while error is None and f.tell() < len(data):
+              try:
+                  _imports_from(f, found)   # appends as it reads, so the imports before a break are kept
+              except Exception as e:
+                  error = (f.tell(), "broken stream: %s" % (e,))
+          bad = [i for i in found if not allowed(i[1], i[2], allowlist)]
+          return {"ok": error is None and not bad, "imports": found, "bad": bad, "error": error}
+  - title: Report with offsets
+    brief: |
+      A scanner's output is read by a person deciding whether to quarantine a file, so it has to say where each finding is: the offset lets them open the file in `pickletools.dis` or a hex viewer at the right place and see the call that follows the import. Write `report`, which turns `scan`'s result into lines in file order, one per import and one for a break, then a verdict. A file with a blocked import is unsafe even when it is also broken, because the nullifAI files were both.
+    starter: |
+      def report(data, allowlist):
+          """Return the scan as text lines, in file order:
+               one line per import:  "0x0000a1 collections.OrderedDict allowed"  or  "0x00000e os.system BLOCKED"
+                                     (an unresolved import reads "0x00001c <unresolved> BLOCKED")
+               one line for a break: "0x000040 broken: <message>"
+             then a last line: "verdict: safe", "verdict: unsafe" (any BLOCKED line) or "verdict: broken" (a break, nothing blocked).
+          Offsets are six lowercase hex digits."""
+          raise NotImplementedError
+    tests: |
+      import pickle
+      from collections import OrderedDict
+
+      ALLOW = {"collections.OrderedDict"}
+      lines = report(b"cos\nsystem\n(S'id'\ntR.", ALLOW)
+      assert lines == ["0x000000 os.system BLOCKED", "verdict: unsafe"], lines
+      good = pickle.dumps(OrderedDict(a=1), protocol=4)
+      lines = report(good, ALLOW)
+      assert lines[-1] == "verdict: safe" and lines[0].endswith("collections.OrderedDict allowed"), lines
+      lines = report(good[:-1], ALLOW)
+      assert lines[-1] == "verdict: broken" and any(" broken: " in l for l in lines), lines
+      nullif = b"\x80\x02cos\nsystem\nq\x00X\x02\x00\x00\x00idq\x01\x85q\x02Rq\x03X\xff\xff\x00\x00."
+      lines = report(nullif, ALLOW)
+      assert lines[0] == "0x000002 os.system BLOCKED" and lines[-1] == "verdict: unsafe", lines
+    hidden: |
+      import pickle as _p
+      import random as _random
+      from collections import OrderedDict as _OD
+
+
+      def _consistent(seed, n):
+          rng = _random.Random(seed)
+          for _ in range(n):
+              d = b"".join(_p.dumps(_OD(k=rng.random()), protocol=rng.randrange(6)) for _ in range(rng.randrange(1, 4)))
+              if rng.random() < 0.3:
+                  d = d[:rng.randrange(1, len(d))]
+              lines = report(d, {"collections.OrderedDict"})
+              offs = [int(l.split()[0], 16) for l in lines[:-1]]
+              if offs != sorted(offs) or not lines[-1].startswith("verdict: "):
+                  return False
+              for l in lines[:-1]:
+                  if l.endswith((" allowed", " BLOCKED")) and d[int(l.split()[0], 16):int(l.split()[0], 16) + 1] not in (b"c", b"\x93", b"i"):
+                      return False
+              if lines[-1] == "verdict: safe" and any(" broken: " in l or l.endswith("BLOCKED") for l in lines):
+                  return False
+          return True
+
+
+      assert _consistent(9, 300)
+      assert report(b"\x80\x04\x8c\x01a\x8c\x03b.c\x93.", {"a.*"})[-1] == "verdict: unsafe"
+    solution: |
+      def report(data, allowlist):
+          r = scan(data, allowlist)
+          lines = []
+          for off, module, name in r["imports"]:
+              label = "<unresolved>" if module is None else module + "." + name
+              verdict = "allowed" if allowed(module, name, allowlist) else "BLOCKED"
+              lines.append((off, "0x%06x %s %s" % (off, label, verdict)))
+          if r["error"] is not None:
+              lines.append((r["error"][0], "0x%06x broken: %s" % r["error"]))
+          lines.sort(key=lambda x: x[0])
+          out = [text for _, text in lines]
+          out.append("verdict: " + ("unsafe" if r["bad"] else "broken" if r["error"] else "safe"))
+          return out
+---
+
+This lab builds the scanner from the lesson on loading model artefacts as one program. Each step adds functions to the same file and runs its own tests against everything written so far, so the `scan` of step 4 calls the `allowed` you wrote in step 3.
+
+Every test stream is built in the browser from a few bytes or from `pickle.dumps` on harmless objects. Where a test needs a stream that would run something when unpickled, it either calls a stub function that only records the call, or it is never unpickled at all: the scanner reads the opcodes and nothing else.
+
+The scanner you finish with is a filter, not a loader. PyTorch's own restricted unpickler was bypassable through 2.5.1 (CVE-2025-32434), and Hugging Face says its own scan is not foolproof. A file that passes still belongs in a format that cannot run code, converted in a process with nothing to steal.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

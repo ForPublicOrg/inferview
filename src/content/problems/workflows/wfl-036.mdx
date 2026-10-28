@@ -1,0 +1,105 @@
+---
+id: wfl-036
+title: The span tree for a graph that calls an agent
+track: workflows
+module: operating-workflows
+type: concept
+difficulty: medium
+seniority: [senior]
+minutes: 20
+core: false
+tags: [observability, opentelemetry, tracing, privacy]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: OpenTelemetry semantic conventions for GenAI agent and framework spans
+    url: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-agent-spans.md
+    note: status Development; invoke_agent CLIENT for remote agents and INTERNAL in-process; invoke_workflow INTERNAL, not reported for standalone agents or when it is an internal detail of an agent or tool, reported for application-defined workflows even when nested; gen_ai.workflow.name must have low cardinality; conversation id must not fall back to a trace id (checked 2026-10-28)
+  - title: OpenTelemetry semantic conventions for GenAI spans, execute tool span
+    url: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md
+    note: execute_tool {gen_ai.tool.name}, kind INTERNAL; an automatically retried operation is one span covering all retries (checked 2026-10-28)
+  - title: OpenTelemetry semantic conventions for GenAI client inference
+    url: https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/client-inference.md
+    note: inference span named {gen_ai.operation.name} {gen_ai.request.model}, CLIENT for remote models; gen_ai.input.messages is Opt-In (checked 2026-10-28)
+  - title: Anthropic, How we built our multi-agent research system (2025-06-13)
+    url: https://www.anthropic.com/engineering/multi-agent-research-system
+    note: monitors agent decision patterns and interaction structures without monitoring the contents of individual conversations
+---
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+A support-triage workflow is a LangGraph `StateGraph` with four nodes: `classify` (one model call), `research`, `draft` (one model call) and `review`, which is a sub-graph the team wrote (one model call). `research` calls a tool, `ask_billing_agent`, whose implementation builds an OpenAI Agents SDK agent in the same process and calls `Runner.run(starting_agent=billing_agent)`. That agent makes two model calls and one call to its own tool, `lookup_invoice`. Every model is behind a remote HTTP API.
+
+Two instrumentation libraries are installed, one per framework. A trace from production today looks like this:
+
+```text
+invoke_workflow triage-8f2c41             INTERNAL   gen_ai.workflow.name=triage-8f2c41
+  chat model-a                            CLIENT     (classify)
+  execute_tool ask_billing_agent          INTERNAL
+    invoke_workflow Agent workflow        INTERNAL   (emitted by the Agents SDK instrumentation)
+      invoke_agent billing                CLIENT
+        chat model-b                      CLIENT
+        execute_tool lookup_invoice       INTERNAL
+        chat model-b                      CLIENT
+  chat model-a                            CLIENT     (draft)
+  chat model-a                            CLIENT     (review)
+every span: gen_ai.conversation.id = <the trace id>
+```
+
+1. Write the span tree you want for one run: operation name, span name and span kind for each span, and which spans you remove, add or change, with the rule behind each change.
+2. The prompts contain invoice lines and customer emails. The support team asks for full prompt and completion text on every inference span. The workflow runs about 50,000 times a day with five inference spans per run, and the message content averages about 6 KB per span (scenario figures). Decide what share of runs carry content, where it is stored and for how long, and defend the choice.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>For each framework, ask the team which call is the entry point a user or the application triggers, and which call is the framework's own plumbing.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask where the billing agent's code runs: in this process, or behind a network call to another service?</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask who can read the trace backend today, and what its retention period is.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>One <code>invoke_workflow triage</code> span (INTERNAL) at the root, an inference span per model call (CLIENT, since the models are remote), <code>execute_tool</code> spans (INTERNAL) for both tools, an <code>invoke_agent billing</code> span that is INTERNAL because the agent runs in-process, and a nested <code>invoke_workflow review</code> span because the review sub-graph is the application's own. Drop the Agents SDK's <code>invoke_workflow</code> under the tool: it is an internal detail of a tool, which the conventions say not to report. Fix the workflow name to a low-cardinality <code>triage</code> and stop writing the trace id into the conversation id. Keep content off by default and capture it only for flagged and sampled runs, into a separate store with short retention and narrow access.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The workflow span marks a user-facing entry point that coordinates several agents or model calls. The conventions (status Development, read 2026-10-28) say it should not be reported for a standalone agent, and should not be reported when the workflow is an internal implementation detail of another operation, with the example of an agent or tool that spins up a runner to delegate to a sub-agent. That is exactly <code>Runner.run</code> inside <code>ask_billing_agent</code>. The same section says application-defined workflows should be reported even when nested, with a sub-graph invoked as a node as the example, so <code>review</code> gains a span it does not have today.</p>
+<p>Span kind follows where the work runs. <code>invoke_agent</code> is CLIENT for an agent behind a remote service and INTERNAL for an agent in the same process, so the billing agent is INTERNAL. Inference spans stay CLIENT because the models are reached over HTTP. Tool spans are INTERNAL.</p>
+<p>Two attribute fixes. <code>gen_ai.workflow.name</code> must have low cardinality, so the run id comes out of it; the run id goes on the root span as an application attribute, and the trace id goes into the run record, so an on-call engineer can go from a stuck run to its trace and back. <code>gen_ai.conversation.id</code> is set only when the library has a real conversation identifier, and the conventions name a trace id as a fallback that should not be used.</p>
+<p>Content. Message content on inference spans is Opt-In in the conventions. At the stated figures, content on every span is 50,000 × 5 × 6 KB = 1,500,000 KB, about 1.5 GB a day, which is cheap to store. Cost is not the constraint; access is. A trace backend is usually readable by every engineer and kept for weeks, and invoices and customer emails should not live there. A defensible policy: no content on the default path; full content for runs that fail, hit a budget, are escalated by support, or fall in a small random sample (between 0.1 and 1 percent is reasonable, enough to compare good runs with bad ones), written to a separate store keyed by trace id, kept for days rather than months, and read through a logged request. Anthropic describes monitoring agent decision patterns and interaction structures without reading conversation content; the default path carries exactly that: operation names, tool names, token counts, finish reasons and errors. Capturing 100 percent into the main backend is unreasonable; capturing nothing leaves support with no way to debug a wrong answer.</p>
+<p>The cost of this answer. A run that fails in a way nobody flags, such as a confident wrong draft, has no content when someone comes looking a week later. The random sample is the only cover for that case, so its rate is the number to defend in review.</p>
+</Fragment>
+</Depth>
+
+The target tree:
+
+```text
+invoke_workflow triage                    INTERNAL   gen_ai.workflow.name=triage, app.run_id=8f2c41
+  chat model-a                            CLIENT     (classify)
+  execute_tool ask_billing_agent          INTERNAL
+    invoke_agent billing                  INTERNAL   was CLIENT; the agent runs in this process
+      chat model-b                        CLIENT
+      execute_tool lookup_invoice         INTERNAL
+      chat model-b                        CLIENT
+  chat model-a                            CLIENT     (draft)
+  invoke_workflow review                  INTERNAL   new: an application-defined sub-graph
+    chat model-a                          CLIENT
+removed: invoke_workflow under ask_billing_agent (internal detail of a tool)
+removed: gen_ai.conversation.id (no real conversation id exists)
+```
+
+The failure mode of this answer is that the rule depends on how the code is wired, not on what it does. If a later change turns `ask_billing_agent` into a LangGraph sub-graph node, the nested-workflow rule applies and an `invoke_workflow` span appears where none was before; a dashboard counting workflow spans per run jumps with no change in behaviour. The conventions also let framework-specific conventions decide which operations count as workflows, so two instrumentation libraries can disagree. A CI test that runs the graph against recorded model responses and asserts the span names and kinds of one run catches both, and it also catches an instrumentation upgrade that renames attributes while the conventions are still in Development.
+
+## Follow-ups
+
+- *The billing agent moves to its own service behind HTTP next quarter. What changes in the tree?* `invoke_agent billing` becomes CLIENT, its children now come from the other service through propagated context, and the tool span still wraps the network call. If the other team does not propagate trace context, the run splits into two traces and the run-to-trace link breaks.
+- *The client library retries a model call twice. How many inference spans?* One, covering all retries, per the conventions. An alert on retries per run therefore needs the retry count recorded on that span, not a span count.
+- *Support says the random sample never contains the bad run they are looking for. What do you change before raising the rate?* Add capture triggers they control: an escalation that captures the next runs for that customer, and a negative rating that marks the run for capture at completion. Raise the random rate only if those still miss the cases support reports.
+
+## Common mistakes
+
+- Reporting a workflow span for every framework runner call, which adds a layer under every agent-as-tool and makes "workflows per run" meaningless.
+- Marking in-process agents CLIENT because the instrumentation for a hosted agent API did so.
+- Putting the run id or customer id into `gen_ai.workflow.name`, which explodes the cardinality of every metric grouped by it.
+- Filling `gen_ai.conversation.id` with the trace id so that every span has one, the fallback the conventions name as one to avoid.
+- Treating content capture as a storage-cost question when it is an access and retention question.

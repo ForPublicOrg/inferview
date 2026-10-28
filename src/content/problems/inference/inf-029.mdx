@@ -1,0 +1,135 @@
+---
+id: inf-029
+title: Throughput collapsed at 2 a.m. with no deploy
+subtitle: four replicas, one new tenant, and an engine that is busy and produces almost nothing
+track: inference
+module: operating
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: true
+tags: [vllm, kv-cache, scheduling, incident, multi-tenant, metrics]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: vLLM V1 metrics loggers (source, main branch)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/v1/metrics/loggers.py
+    note: "metric names in the dashboard and the answer: vllm:num_requests_running, vllm:num_requests_waiting (and vllm:num_requests_waiting_by_reason, capacity or deferred), vllm:kv_cache_usage_perc (1 means 100%), vllm:num_preemptions (cumulative), vllm:iteration_tokens_total (tokens per engine step), vllm:prefix_cache_queries and vllm:prefix_cache_hits, vllm:generation_tokens, vllm:request_num_preemptions (per request), vllm:request_params_max_tokens, vllm:request_generation_tokens, vllm:request_success by finished_reason. Checked 2026-10-28."
+  - title: vLLM V1 scheduler (source, main branch)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/v1/core/sched/scheduler.py
+    note: "when a running request cannot get a new KV block, the scheduler preempts: under FCFS the last request in the running list, under the priority policy the lowest-priority one; the victim's blocks are freed, num_computed_tokens is reset to 0, it goes to the front of the waiting queue, and no waiting request is admitted in a step that preempted. Read on main, checked 2026-10-28."
+  - title: vLLM docs, Optimization and tuning
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: "preemption happens when KV cache space is insufficient for all batched requests; V1 defaults to recompute rather than swap; the warning reports the cumulative preemption count; remedies listed are raising gpu_memory_utilization, lowering max_num_seqs or max_num_batched_tokens, and more tensor or pipeline parallelism. Checked 2026-10-28."
+  - title: vLLM source, KV cache utilities (main branch)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/v1/core/kv_cache_utils.py
+    note: "the startup log line: KV cache size in tokens, and maximum concurrency for max_model_len tokens per request. Checked 2026-10-28."
+  - title: vLLM source, scheduler config (main branch)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/config/scheduler.py
+    note: "policy is fcfs by default, or priority, where a lower value is handled earlier and arrival time breaks ties. Checked 2026-10-28."
+choices:
+  - text: The new key's long requests outgrow the KV cache as they decode, so the engine evicts and recomputes running sequences in a loop
+    correct: true
+    why: "KV held per running sequence nearly doubles while the running count falls, preemptions start at full cache, and steps stay full while output collapses: the engine is redoing work."
+  - text: The night schedule pinned the fleet at four replicas with no room to scale, so tonight's traffic overloads engines that cannot grow
+    correct: false
+    why: "A real defect that made tonight worse, but the fleet has run at four replicas every night for weeks; fewer replicas alone would show a queue, not preemptions."
+  - text: The new key's prompts miss the shared chat prefix, so each pays a full prefill and that prefill work crowds every decode out of the step
+    correct: false
+    why: "Their prompts do miss the prefix, but a one-time prefill per request cannot keep steps full for twenty minutes; the falling hit rate is a result of eviction, not its cause."
+  - text: A slow KV block leak since the last engine restart has filled the cache, so fewer sequences fit per step and the rest wait in the queue
+    correct: false
+    why: "Usage was 24% at 01:30 and jumped within seven minutes of the new key's first request; a leak climbs over days and does not start preempting at a clock time."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Debug, 30 minutes">
+"Throughput on the chat endpoint fell by two thirds at 2 a.m. Nobody deployed anything. Here are the engine metrics. What happened, what else is wrong, and what do you do before you know more?"
+</Callout>
+
+The chat endpoint runs vLLM with an 8B model on single-GPU replicas, `max_model_len` 8,192, `max_num_seqs` 256, `max_num_batched_tokens` 2,048, prefix caching on, default scheduling policy. From 01:00 to 06:00 a schedule sets the deployment to four replicas, minimum and maximum, down from six. Each replica's startup log:
+
+```text
+INFO GPU KV cache size: 245,760 tokens, Maximum concurrency for 8,192 tokens per request: 30.00x
+```
+
+Per replica, averaged across the four:
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Metric</th><th>01:30</th><th>01:58</th><th>02:05</th><th>02:20</th></tr></thead>
+<tbody>
+<tr><td>Running requests</td><td>40</td><td>84</td><td>61</td><td>58</td></tr>
+<tr><td>Waiting requests</td><td>0</td><td>2</td><td>38</td><td>64</td></tr>
+<tr><td>KV cache usage</td><td>24%</td><td>76%</td><td>99%</td><td>99%</td></tr>
+<tr><td>Preemptions per minute</td><td>0</td><td>0</td><td>140</td><td>210</td></tr>
+<tr><td>Generation throughput</td><td>1,300 tok/s</td><td>2,600 tok/s</td><td>700 tok/s</td><td>450 tok/s</td></tr>
+<tr><td>Tokens per engine step, p50</td><td>41</td><td>330</td><td>2,048</td><td>2,048</td></tr>
+<tr><td>Prefix cache hit rate</td><td>46%</td><td>31%</td><td>12%</td><td>9%</td></tr>
+<tr><td>GPU utilisation</td><td>61%</td><td>88%</td><td>97%</td><td>97%</td></tr>
+</tbody>
+</table>
+</div>
+
+Gateway, requests per minute by API key (fleet):
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Key</th><th>01:30</th><th>01:58</th><th>02:20</th><th>Prompt tokens, p50</th></tr></thead>
+<tbody>
+<tr><td>chat-web, chat-mobile</td><td>620</td><td>610</td><td>590</td><td>1,150</td></tr>
+<tr><td>docs-summarizer (first request 01:57)</td><td>0</td><td>240</td><td>230</td><td>2,900</td></tr>
+</tbody>
+</table>
+</div>
+
+<p class="tiny">The configuration, metrics and gateway counts are synthetic, built for this exercise.</p>
+
+Pick the defect that explains the collapse. Then rank what else is wrong, say what you would collect, and say what you would do in the next ten minutes.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how much KV cache one running sequence holds at each timestamp, and whether that number is growing.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the new key's `max_tokens`, its output lengths so far, and how many requests its client keeps open at once.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask whether the four-replica schedule has run with this traffic before, and what it allows the autoscaler to do when the queue grows.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>A preemption loop driven by the new tenant. The cache holds 245,760 tokens per replica. At 01:30 each running sequence holds 0.24 × 245,760 / 40 ≈ 1,475 tokens; at 02:05 it is 0.99 × 245,760 / 61 ≈ 3,990, while the running count falls. The new key's requests start at 2,900 prompt tokens and keep growing as they decode, and the scheduler admitted them on what they needed at admission, not at the end. When a running sequence cannot get its next block, vLLM evicts the most recently admitted one, frees its blocks and resets it to zero computed tokens; it goes back to the front of the queue, is re-admitted, and becomes the newest again. Steps stay full at the 2,048-token budget doing prefill for work already done once, so the GPU reads 97% busy while output falls by two thirds. Next ten minutes: cap the new key's concurrency at the gateway, then fix the four-replica schedule.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Reading the rows.</strong> At 01:58 the new key's requests have been admitted and are mostly in prefill: running doubles, tokens per step rise, generation rises because nothing has run out yet. By 02:05 the cache is full, preemptions start, waiting climbs, and steps sit at the budget. Generation throughput falling while every step is full is the signature: the engine is computing tokens, just not new ones. Under the default FCFS policy the victim is the last request in the running list, and a victim that is re-admitted goes back on the end of that list, so the same sequences are evicted and recomputed again. Chat suffers too: by the per-sequence arithmetic, if the new key's sequences hold about 5,500 tokens each at 02:05, then 38 of them and 23 chat sequences fill the cache, down from 40 chat sequences at 01:30.</p>
+<p><strong>The ranking.</strong> First, the tenant whose sequences outgrow the cache: it explains preemptions, full steps and falling output together. Second, the schedule that pins the fleet at four replicas with minimum equal to maximum: a real defect, because it turns the autoscaler off for five hours, but it ran every night for weeks, and six replicas only spread the same problem thinner. Third, the prefix hit rate: real, and a consequence, since the new prompts share nothing with the chat system prompt and eviction is throwing away cached chat blocks too. GPU utilisation at 97% is not a finding; it is the reason the night autoscaler, had it been allowed to act on that signal, would have learned nothing.</p>
+<p><strong>What the evidence does not show.</strong> Nothing here says what `max_tokens` the new key sends, how long its outputs get, how many requests its client holds open, or whether its client times out and re-sends, which would multiply the load. Collect, per key: `vllm:request_params_max_tokens` and `vllm:request_generation_tokens` from finished requests, `vllm:request_num_preemptions`, aborts from `vllm:request_success` by finished reason, and the client's concurrency and timeout settings from the team that owns it. Also check whether chat's TTFT objective has already burned budget tonight.</p>
+<p><strong>The next ten minutes, without that evidence.</strong> Limit the new key at the gateway, which already enforces per-tenant limits, to a concurrency the cache can hold at worst case. That number is the quantity to choose. The startup log says 30 sequences fit at the full 8,192 tokens. Reserve room for night chat, 40 sequences × 1,475 ≈ 59,000 tokens, keep 10% of the cache free, and the new key gets (245,760 × 0.9 − 59,000) / 8,192 ≈ 19 sequences per replica, 76 across four. If the key's `max_tokens` turns out to be 4,096, the per-sequence reservation is about 2,900 + 4,096 ≈ 7,000 and the cap rises to 23 per replica. Reserving at an observed p95 output length instead of the maximum is defensible only with the priority policy below, because the tail will still preempt. Do not raise `gpu_memory_utilization` at 2 a.m.: it needs a restart and buys a few percent of cache against a tenant that wants far more.</p>
+<p><strong>The structural fix: two defensible answers.</strong></p>
+<ul>
+<li><em>Shared pool, per-key token budgets and priority.</em> The gateway reserves prompt plus `max_tokens` against each tenant's budget per replica, and the engine runs the priority policy with chat at a lower value, so when the cache runs out the batch tenant's requests are the ones evicted. Cost: reservations at `max_tokens` leave cache empty when outputs are short, so batch throughput is lower than the hardware allows; and the batch tenant still thrashes among its own requests if its budget is set too high.</li>
+<li><em>A separate night pool for batch keys.</em> The two replicas the schedule removes stay up and take only batch keys, with `max_num_seqs` set to what the cache holds at full length, 30. Cost: routing by key, two pools to watch, and two GPUs that idle on nights the job does not run, which is what the schedule was saving.</li>
+</ul>
+<p>I would take the first for this tenant, because it needs only configuration on systems that exist and protects chat directly. The constraint conflict is cost against isolation: the schedule saves two GPUs for five hours a night, and isolation spends them back.</p>
+<p><strong>Where the recommendation fails.</strong> The cap is sized for 40 chat sequences per replica at 2 a.m. Chat at night is not fixed: a launch in another time zone or a retry storm from a mobile client raises it, and the batch tenant's reservation then pushes the cache back into preemption with no change on the batch side. The token budget also trusts `max_tokens`: a client that sends the model's full length gets 8,192 reserved per request and the cap falls to 19, and a client that omits it gets whatever the gateway's default is. Alert on `vllm:num_preemptions` rising above zero for five minutes, not on GPU utilisation, so the next tenant's version of this pages someone at 02:05 instead of at the morning stand-up.</p>
+</Fragment>
+</Depth>
+
+**Why the wrong picks are tempting.** Fewer replicas is the first thing to blame when the outage starts after a scale-in, and here the schedule really did take away the autoscaler's room. A new tenant with long prompts and no shared prefix does cost a full prefill each, and the hit rate does fall, which makes caching look like the cause. A KV leak is the story a full cache invites when nobody has looked at the per-sequence size, and leaks in serving stacks do happen.
+
+## Follow-ups
+
+- *Pushback: the docs-summarizer team says a cap of 76 concurrent requests makes their job finish at 09:00 instead of 04:00, after chat traffic rises. Do you hold the cap, give them the separate night pool, or let the job run into the morning, and what risk do you accept in writing?*
+- *Reversal: what would you need to see in production to remove the per-key cap?* Output lengths for the key bounded well below `max_tokens`, measured over a month of nights, and zero preemptions at night with the priority policy on.
+- *Two senior engineers disagree: one says batch tenants never belong on the chat pool, the other says the pool exists to be filled at night. How do you decide without deciding by rank?* Price the two nightly GPUs against the chat budget burned in incidents like this one, and pick the arrangement whose worst night costs less.
+
+## Common mistakes
+
+- Reading 97% GPU utilisation as the engine doing useful work.
+- Blaming the scale-in because it happened at 01:00, without asking why four replicas worked on every earlier night.
+- Raising `max_num_seqs` or the step budget to get throughput back, which admits more sequences into a cache that is already full.
+- Capping the tenant by requests per minute rather than by concurrent sequences or reserved tokens; the cache fills with long sequences, not with arrivals.
+- Waiting for the batch team's confirmation before limiting their key, while chat burns its error budget.

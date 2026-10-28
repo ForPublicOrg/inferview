@@ -1,0 +1,198 @@
+---
+id: trn-020
+title: Simulate a ring all-reduce and hold it to its traffic budget
+subtitle: uneven buffers, neighbour-only sends and replicas that must agree bit for bit
+track: training
+module: distributed
+type: code
+difficulty: hard
+seniority: [senior, staff]
+minutes: 45
+core: false
+tags: [collectives, all-reduce, data-parallelism, bandwidth, determinism]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Hugging Face, The Ultra-Scale Playbook, appendix A0 (Ring AllReduce)
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: "ring all-reduce is a reduce-scatter followed by an all-gather; each GPU sends K/N values per transfer, 2 x (N - 1) x K / N in total, which tends to about 2K for large N. Checked 2026-10-28."
+  - title: Austin et al., How to Scale Your Model, GPUs chapter (JAX scaling book)
+    url: https://jax-ml.github.io/scaling-book/gpus/
+    note: "H100 NVLink 18 links x 25 GB/s = 450 GB/s per direction per GPU; scale-out InfiniBand NDR at 50 GB/s per GPU (8 x 400 Gbps NICs per 8-GPU node). Checked 2026-10-28."
+code:
+  starter: |
+    def ring_allreduce(buffers, send):
+        """Sum N equal-length buffers elementwise over a ring of N ranks.
+
+        buffers[r] is rank r's list of numbers. send(src, dst, values) must be called once
+        for every message a rank puts on the wire, with values the list it sends.
+        Return a list of N lists: rank r's copy of the sum. Do not modify the inputs.
+        """
+        raise NotImplementedError
+  tests: |
+    def make_wire(n):
+        log = {"sent": [0] * n, "messages": [0] * n}
+        def send(src, dst, values):
+            assert dst == (src + 1) % n, f"rank {src} may only send to rank {(src + 1) % n}"
+            log["sent"][src] += len(values)
+            log["messages"][src] += 1
+        return send, log
+
+    bufs = [[r * 10 + i for i in range(8)] for r in range(4)]
+    send, log = make_wire(4)
+    out = ring_allreduce(bufs, send)
+    assert out == [[60 + 4 * i for i in range(8)]] * 4
+
+    assert log["sent"] == [12, 12, 12, 12], log
+    assert bufs[2] == [20, 21, 22, 23, 24, 25, 26, 27], "the inputs are unchanged"
+
+    send, log = make_wire(1)
+    assert ring_allreduce([[1.5, 2.5]], send) == [[1.5, 2.5]] and log["sent"] == [0]
+  hidden: |
+    import math, random
+
+    def _budget(n, k):
+        return 2 * (n - 1) * -(-k // n)
+
+    _rng = random.Random(3)
+    _ok = True
+    for _ in range(60):
+        n = _rng.randint(2, 9)
+        k = _rng.randint(0, 40)
+        bufs = [[_rng.randint(-50, 50) for _ in range(k)] for _ in range(n)]
+        send, log = make_wire(n)
+        out = ring_allreduce(bufs, send)
+        want = [sum(col) for col in zip(*bufs)] if k else []
+        _ok = _ok and len(out) == n and all(o == want for o in out)
+        _ok = _ok and all(s <= _budget(n, k) for s in log["sent"]) and all(m <= 2 * (n - 1) for m in log["messages"])
+    assert _ok
+
+    _rng = random.Random(9)
+    _ok = True
+    for _ in range(30):
+        n = _rng.randint(2, 12)
+        k = _rng.randint(1, 50)
+        bufs = [[_rng.uniform(-1, 1) * 10 ** _rng.randint(-8, 8) for _ in range(k)] for _ in range(n)]
+        send, log = make_wire(n)
+        out = ring_allreduce(bufs, send)
+        same = all(o == out[0] for o in out)
+        close = all(abs(a - math.fsum(col)) <= 1e-9 * max(1.0, max(abs(x) for x in col)) * n for a, col in zip(out[0], zip(*bufs)))
+        _ok = _ok and same and close
+    assert _ok, "every rank must hold the same bits, and the sum must be right"
+
+    send, log = make_wire(5)
+    _b = [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]]
+    assert ring_allreduce(_b, send) == [[25, 30]] * 5 and max(log["sent"]) <= 8
+
+    _n, _k = 16, 40000
+    _bufs = [[(r * 7 + i) % 13 for i in range(_k)] for r in range(_n)]
+    _copy = [list(b) for b in _bufs]
+    send, log = make_wire(_n)
+    _out = ring_allreduce(_bufs, send)
+    _want = [sum(col) for col in zip(*_bufs)]
+    assert all(o == _want for o in _out) and _bufs == _copy
+    assert max(log["sent"]) <= 2 * (_n - 1) * _k // _n and sum(log["sent"]) == 2 * (_n - 1) * _k, log["sent"]
+  solution: |
+    def _bounds(k, n):
+        base, extra = divmod(k, n)
+        out, lo = [], 0
+        for c in range(n):
+            hi = lo + base + (1 if c < extra else 0)
+            out.append((lo, hi))
+            lo = hi
+        return out
+
+
+    def ring_allreduce(buffers, send):
+        n = len(buffers)
+        if n == 0:
+            return []
+        k = len(buffers[0])
+        if any(len(b) != k for b in buffers):
+            raise ValueError("every rank needs a buffer of the same length")
+        work = [list(b) for b in buffers]
+        if n == 1:
+            return work
+        bounds = _bounds(k, n)
+
+        # Reduce-scatter. At step t rank r forwards chunk (r - t) mod n to rank r + 1, which adds
+        # its own values. Every chunk is summed once, in one fixed order, along one chain of ranks.
+        for t in range(n - 1):
+            wire = []
+            for r in range(n):
+                lo, hi = bounds[(r - t) % n]
+                vals = work[r][lo:hi]
+                if vals:
+                    send(r, (r + 1) % n, vals)
+                wire.append(((r + 1) % n, lo, vals))
+            for dst, lo, vals in wire:
+                buf = work[dst]
+                buf[lo:lo + len(vals)] = [x + y for x, y in zip(vals, buf[lo:lo + len(vals)])]
+
+        # Rank r now owns the finished chunk (r + 1) mod n. The all-gather copies finished chunks
+        # around the ring and never adds, so every rank ends with the same bits.
+        for t in range(n - 1):
+            wire = []
+            for r in range(n):
+                lo, hi = bounds[(r + 1 - t) % n]
+                vals = work[r][lo:hi]
+                if vals:
+                    send(r, (r + 1) % n, vals)
+                wire.append(((r + 1) % n, lo, vals))
+            for dst, lo, vals in wire:
+                work[dst][lo:lo + len(vals)] = vals
+        return work
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Write an all-reduce over N ranks that sum their gradient buffers. Each rank can only send to its neighbour. Then tell me how much each rank sends and why that matters more than N."
+</Callout>
+
+Write `ring_allreduce(buffers, send)`. There are `N` ranks in a ring, rank `r` holds `buffers[r]`, a list of `K` numbers, and the result is the elementwise sum on every rank. The simulation runs in one process, but treat it as a network: a rank may only send to rank `(r + 1) mod N`, and every message goes through `send(src, dst, values)`, which the tests use as a meter. Return each rank's copy of the sum and leave the inputs alone.
+
+Two budgets apply, and the hidden tests enforce both:
+
+- **Traffic.** No rank sends more than `2 * (N - 1) * ceil(K / N)` values or more than `2 * (N - 1)` messages. For `N = 16` and `K = 40,000` that is 75,000 values per rank. A rank that forwards its whole buffer once around the ring sends 15 x 40,000 = 600,000; gathering at rank 0 and broadcasting makes rank 0 send the same 600,000.
+- **Agreement.** With floating-point inputs, every rank must return exactly the same bits, not values that are merely close. Replicas whose gradients differ in the last bit apply different updates and drift apart.
+
+`K` need not divide by `N`, and `K` may be smaller than `N`. How you cut the buffer into chunks, which chunk a rank owns after the first phase, and whether you send empty messages are your choice; only the result and the budgets are checked.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how many bytes each rank's link carries per second, and whether the slowest link or the total traffic sets the time.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask how large the gradient buckets are in the real job, and whether the collective is latency-bound or bandwidth-bound at that size.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Count how many times each element of the result is computed, and by how many different ranks.</p></details>
+
+## Answer
+
+The reference splits the buffer into `N` contiguous chunks whose sizes differ by at most one, then runs two phases of `N - 1` steps each.
+
+**Reduce-scatter.** At step `t`, rank `r` sends chunk `(r - t) mod N` to its neighbour, which adds the incoming values to its own copy of that chunk. After `N - 1` steps, chunk `c` has passed through every rank once and sits complete on rank `(c - 1) mod N`. Each rank sent one chunk per step, `(N - 1) * K / N` values.
+
+**All-gather.** Each rank forwards finished chunks for another `N - 1` steps, and receivers overwrite rather than add. That is another `(N - 1) * K / N` values per rank, so the total is `2 * (N - 1) * K / N`. For the visible case, `N = 4` and `K = 8`, that is 2 x 3 x 8 / 4 = 12, the number the test asserts.
+
+**Why the agreement test passes.** Every element of the result is computed exactly once, by one chain of additions in one fixed order, and then copied. The all-gather moves bits; it never recomputes. A design in which each rank sums all `N` buffers itself, starting from its own buffer, produces sums that differ in the last bits from rank to rank. The hidden test uses values spread over 16 orders of magnitude to make that visible.
+
+**Why the per-rank number matters more than `N`.** `2 * (N - 1) / N` approaches 2 as `N` grows, so the time for a large buffer depends on the buffer size and on the slowest link in the ring, not on how many ranks share the work. The gather-and-broadcast design sends `(N - 1) * K` from rank 0 alone, `N / 2` times the ring's per-rank traffic: 8 times at `N = 16`. The price the ring pays instead is `2 * (N - 1)` sequential steps, each paying a link's latency. At `N = 1,024` that is 2,046 hops, and for a small buffer the latency term outweighs the bandwidth term.
+
+**The slowest link.** On H100 nodes the scaling book gives 450 GB/s per direction per GPU over NVLink and 50 GB/s per GPU over InfiniBand. A ring that spans two nodes has at least one hop on the 50 GB/s link, and every step waits for it, so the whole collective runs at the scale-out rate: 9 times slower per byte than the same ring inside one node.
+
+**The decision with two defensible answers: how to cut uneven buffers.** The reference uses near-equal chunks, which meets the budget and leaves the last chunks one element short. The alternative pads `K` to a multiple of `N` so every message has the same size, which is what a kernel that works in fixed-size slices prefers; it costs up to `2 * (N - 1)` padding values per rank, which the `ceil` in the budget allows. Near-equal chunks win when the buffer is small relative to `N`; padding wins when the kernel's efficiency depends on uniform message sizes. Both pass.
+
+**Where the reference fails.** It sums in the input type. In a real job the buffers are bf16 gradients, and accumulating many bf16 partial sums in bf16 loses low-order bits on every hop; the agreement test would still pass, because every rank agrees on the same rounded bits. Accumulating in fp32 and sending fp32 partial sums doubles the bytes on the wire; accumulating in fp32 locally and sending bf16 keeps the traffic and rounds once per hop instead. Which one to ship is a precision-against-bandwidth decision that depends on the gradient magnitudes in the job.
+
+## Follow-ups
+
+- *Your all-reduce over 2,048 ranks is twice as slow as the bandwidth arithmetic predicts for 25 MB buckets. You can change the bucket size or the algorithm, not the network. Which do you change first, and what measurement tells you it was the right call?*
+- *A colleague proposes a tree all-reduce for every bucket because it needs about `2 * log2(N)` steps. What would you measure before agreeing, and for which bucket sizes would you reverse your answer?*
+- *To run this in a real engine, what changes: where the chunks live, how each step overlaps with the next layer's backward pass, how rings map onto NVLink and InfiniBand inside and across 8-GPU nodes, and how two concurrent all-reduces avoid contending for the same links?*
+
+## Common mistakes
+
+- Reporting traffic as `2K` regardless of `N`, which is the limit, not the value; for `N = 2` it is `K`.
+- Recomputing the sum on every rank during the all-gather, which passes integer tests and fails the bitwise test with floats.
+- Forwarding whole buffers around the ring, which is correct and sends `N - 1` times the buffer per rank.
+- Applying a step's messages while the other ranks in the same step are still sending, so a rank forwards a chunk it has already changed in that step.

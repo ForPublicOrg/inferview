@@ -1,0 +1,132 @@
+---
+title: Why temperature 0 is not deterministic, and when it matters
+track: foundations
+module: sampling
+order: 2
+kind: lesson
+level: senior
+minutes: 13
+summary: Greedy decoding on a shared server varies with other people's traffic because common kernels are not batch-invariant, and fixing that costs throughput you pay for only where identical output is a requirement.
+prerequisites: [foundations/sampling/samplers]
+updated: 2026-10-28
+sources:
+  - title: Thinking Machines Lab, Defeating Nondeterminism in LLM Inference (Horace He and others, 10 Sept 2025)
+    url: https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+    note: "1,000 temperature-0 completions of Qwen3-235B-A22B-Instruct-2507 for 'Tell me about Richard Feynman' gave 80 unique outputs, the most common 78 times, identical for 102 tokens, 992 'Queens, New York' and 8 'New York City' at token 103; batch-invariant kernels made all 1,000 identical; 4 values plus negatives summed in 10,000 orders gave 102 results; a 2048x2048 bf16 matmul repeated 1,000 times was bitwise equal; forward pass has no atomic adds; RMSNorm, matmul and attention need batch-invariant versions; one matmul config loses about 20% against cuBLAS; fixed-size split-KV (KV length 1000 as three 256 splits and one 232); Qwen3-8B, 1,000 sequences of 90 to 110 tokens: 26 s default, 55 s unoptimised deterministic, 42 s with the improved attention kernel; RLVR on BigMath from Qwen 2.5-VL instruct 8B, rollouts up to 4,096: without importance weighting reward collapses with a loss spike near step 318, with it KL near 0.001, bitwise on-policy KL 0; checked 2026-10-28"
+  - title: vLLM docs, SamplingParams
+    url: https://docs.vllm.ai/en/latest/api/vllm/sampling_params.html
+    note: temperature 0 is greedy; seed switches to seeded random sampling; with batch invariance enabled and random sampling without a seed, vLLM warns that results may not be batch invariant and suggests a seed or temperature 0; checked 2026-10-28
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The decision
+
+Greedy decoding is a pure function of the logits, and the logits on a shared inference server are not a pure function of your request. They depend on how many other requests were batched with yours. Paying to remove that dependence costs serving throughput, so the decision is where identical output is a requirement (RL training, eval baselines, regulated replay) and where the product should be designed to tolerate variance instead.
+
+## What was measured
+
+In September 2025 Thinking Machines ran one prompt, "Tell me about Richard Feynman", 1,000 times through Qwen3-235B-A22B-Instruct-2507 at temperature 0, each completion 1,000 tokens long. They got 80 unique completions; the most common appeared 78 times. All 1,000 agreed for the first 102 tokens, through "Feynman was born on May 11, 1918, in", and split at token 103: 992 continued "Queens, New York" and 8 "New York City". With batch-invariant kernels, all 1,000 were identical.
+
+The common explanation, that floating-point non-associativity plus concurrent threads finishing in a random order gives random results, is half right, and the half that is wrong decides the fix. Non-associativity is real: the post sums four values and their negatives in 10,000 shuffled orders and gets 102 distinct results. But run-to-run randomness in a single kernel is not the cause. The same 2048 x 2048 bfloat16 matmul run 1,000 times on a GPU gave bitwise-equal results, and the forward pass of an LLM uses essentially no atomic adds, the usual source of order that depends on which thread finishes first. Given identical inputs, including an identical batch, the forward pass is run-to-run deterministic.
+
+What changes is the batch. A kernel picks its reduction strategy from the shapes it is given, and the batch dimension is one of those shapes. When a server is busy, your sequence shares a batch with many others; when it is quiet, with few. Each batch size can select a different reduction order for the same row, so your row's logits differ in the low bits depending on load. From the user's side, load is random, so the output is random. The post's phrase for kernels that avoid this is batch-invariant: the result for one element does not depend on what else is in the batch.
+
+## Where the order changes
+
+Three operations in a transformer forward pass reduce over a dimension, and each has a reason to change strategy with batch size.
+
+- **RMSNorm** reduces over the hidden dimension. With enough rows, one core per row is batch-invariant. With few rows, a kernel that splits each row's reduction across cores to keep the GPU busy changes the order.
+- **Matmul** reduces over the inner dimension. Small batches tempt kernels into split-K, which partitions the reduction and adds the partial sums, and libraries pick tile configurations per shape. The post's batch-invariant version compiles one configuration for all shapes and reports losing about 20% against cuBLAS.
+- **Attention** reduces over the keys. During decoding the query is one token, so parallelism comes from splitting the KV sequence (split-KV, the FlashDecoding approach). Splitting into a fixed number of chunks makes the chunk boundaries depend on the KV length and on scheduling; the fix is a fixed chunk size, so a KV length of 1,000 always splits as three chunks of 256 and one of 232. The KV cache also has to be laid out and read the same way whether a token's keys came from prefill or from earlier decode steps.
+
+The effect is small per operation and large per sequence, because decoding is a chain. A difference in the eighth significant digit changes nothing until it lands on a step where the top two logits are closer than that difference, and from then on the two runs are conditioning on different text. The Feynman prompt hit such a step at token 103.
+
+## Seeing it on a CPU
+
+The code below sums the same 4,096 float32 values with six split counts, the shape of a split-K reduction where the number of splits depends on the batch, and then uses each sum as a logit against a fixed competitor.
+
+```python
+import random, struct
+
+def f32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+def reduce_split(xs, splits):
+    size = -(-len(xs) // splits)
+    partials = []
+    for i in range(0, len(xs), size):
+        acc = 0.0
+        for x in xs[i:i + size]:
+            acc = f32(acc + x)
+        partials.append(acc)
+    total = 0.0
+    for p in partials:
+        total = f32(total + p)
+    return total
+
+rng = random.Random(0)
+xs = [f32(rng.gauss(0, 1)) for _ in range(4096)]
+competitor = 27.10479
+for splits in (1, 2, 4, 8, 16, 32):
+    logit = reduce_split(xs, splits)
+    print(splits, repr(logit), "this token" if logit > competitor else "competitor")
+```
+
+Six split counts give four distinct sums between 27.1047859 and 27.1047935, and the argmax flips between them: with 1, 2, 8, 16 or 32 splits the competitor wins, with 4 this token does. Nothing here is random. Each line is reproducible forever; what varies in production is which line you get.
+
+## Why seeds do not help
+
+At temperature 0 nothing is sampled, so a seed has nothing to fix. At temperature above 0, a seed pins the sequence of uniform numbers used for the draws, but the draw compares those numbers against cumulative probabilities computed from the logits, and the logits are what moved. A seeded draw on load-dependent logits is still load-dependent. vLLM's SamplingParams reflects this from the other side: with batch invariance enabled and random sampling without a seed, it warns that results may not be batch invariant and suggests setting a seed or using temperature 0. Determinism needs both halves, invariant logits and a pinned draw.
+
+## What it costs
+
+The post measured Qwen3-8B on one GPU generating 1,000 sequences of 90 to 110 tokens: 26 seconds with default vLLM, 55 seconds with batch-invariant kernels before optimisation, and 42 seconds once the attention kernel was improved. That is one model, one GPU and one offline workload, not a serving benchmark, but it is the published order of magnitude, and it turns into capacity directly.
+
+<Predict id="nondeterminism-gpus" question="A self-hosted fleet serves its load on 10 GPUs with default kernels. If deterministic serving slows throughput in the ratio measured above (26 s against 42 s), how many GPUs does the same load need?" answer={17} tolerance={1} unit="GPUs">
+<p><b>About 17.</b> Throughput falls to 26 / 42 = 0.62 of the default, so the same load needs 10 x 42 / 26 = 16.2 GPUs, which rounds up to 17. Against the unoptimised kernels (55 s) it would be 10 x 55 / 26 = 21.2, so 22. The ratio comes from one offline benchmark on an 8B model; before using it for a capacity plan, measure it on your model, your batch sizes and your context lengths.</p>
+</Predict>
+
+## Where identical output matters
+
+**RL training.** On-policy RL assumes the policy that generated the rollouts is the policy being trained. When the sampler runs on an inference engine and the trainer runs a different implementation of the same weights, their numerics differ, and the rollouts are slightly off-policy. The post's experiment ran RLVR on BigMath with a policy initialised from Qwen 2.5-VL instruct 8B and rollouts of up to 4,096 tokens. Without importance weighting to correct for the mismatch, reward collapsed partway through training, with a loss spike near step 318 and a matching spike in KL divergence between sampler and trainer. With importance weighting, training was smooth and the KL stayed near 0.001 with occasional spikes. With a bitwise-identical sampler and trainer, the KL was flat at 0. There are two defensible answers here: pay for identical kernels in both, or keep fast kernels and correct with importance weighting, which the same experiment shows works at the cost of a correction term and its variance.
+
+**Evals.** A regression suite whose cases flip under load produces failures that are not regressions. Determinism makes a diff between two runs mean something. The alternative is to design the eval for variance: run each case several times and compare pass rates. That costs more calls, and it needs enough runs to separate a real change from noise; a case that flips one run in ten will fail at least once in five runs with probability 1 - 0.9^5 = 0.41.
+
+**Replay and audit.** If a regulator or an incident review needs to reproduce exactly what the model said, the cheaper answer is usually to store the output rather than to regenerate it. Regeneration needs the same weights, engine version, kernels, parallelism layout and hardware, and every one of those is a dependency you would have to pin for years.
+
+**Products.** For chat, drafting and most generation, users never see two runs of the same request, so variance between them is invisible. Where the product shows it (a regenerate button, a classifier whose label flips on retry), the flip says the model is near a tie at a decision token, and that is a product signal: the next lesson's logprobs make it measurable.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"Your team self-hosts the model behind an internal claims-triage tool and runs a 400-case eval nightly on the production fleet. Compliance now requires that any triage decision can be reproduced on demand for seven years, and the platform team says deterministic kernels would need roughly 60% more GPUs, which is not in this year's budget. Propose what you ship this quarter."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Reproducibility for compliance means producing the same record, not regenerating it: store the prompt, the retrieved context, the model and engine versions and the output, keyed by decision, and reproduce from the store. That needs no new GPUs. For the eval, run it on a small dedicated deterministic pool or at a fixed batch size, not on the shared fleet, so its diffs mean something. I would not make production serving deterministic, because its only buyer is regeneration, which the store already covers.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The requirement as stated is reproduction on demand. Regeneration would need the same weights, engine version, kernels, parallelism layout and hardware for seven years, plus deterministic kernels on the production fleet; the platform estimate says that alone is out of budget. Storing the decision record satisfies the same request and is a storage problem: per decision, the full prompt after templating, retrieved context, model identifier, engine version and output. I would get compliance to agree in writing that a stored record counts as reproduction, because if they insist on regeneration the cost moves from storage to a frozen fleet.</p>
+<p>The nightly eval is a separate problem with a cheaper fix. Its flips come from sharing batches with production traffic. Two options: a small pool running batch-invariant kernels, where the throughput cost applies only to the eval's own load, or the eval run with variance by design, several runs per case and pass rates compared. The first makes a single diff meaningful; the second costs more calls and hides near-ties unless the per-case flip rate is tracked as its own metric.</p>
+<p>The failure mode of the stored-record answer is drift in what was stored: a template or retrieval change that is not captured in the record makes the record incomplete. The record schema needs a version, and a check that every field the prompt depends on is in it.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Compliance rejects the stored record and insists the model must be re-run. What do you freeze, for how long, and what does it cost against the 60% estimate?</em></li>
+<li><em>The eval pool runs deterministic kernels and production does not. A case passes in eval and fails for a user. Is your eval still evidence, and what would you need to see to move production to deterministic kernels?</em></li>
+<li><em>An RL team wants to share the deterministic pool for rollouts. Who gets priority when both want it on the same night?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+This lesson is about self-hosted serving, where you choose kernels. On a hosted API you choose nothing below the request: the provider's batch composition, kernels, hardware and model build are invisible, and some current hosted models reject temperature entirely. Treat hosted outputs as non-reproducible and design around that.
+
+Batch invariance removes one source of variation, not all of them. Changing tensor-parallel degree, engine version, GPU type or quantisation changes the numerics even with batch-invariant kernels, so a deterministic pool is deterministic only while all of those are pinned. And the experiment that motivates the lesson is one prompt on one model; the fraction of prompts that hit a near-tie, and how early, varies by model, prompt and output length. Measure the flip rate on your own traffic before deciding the problem is large enough to pay for.
+
+<SelfRate id="lesson:foundations/sampling/nondeterminism" />

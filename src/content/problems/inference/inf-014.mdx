@@ -1,112 +1,147 @@
 ---
 id: inf-014
 title: p99 inter-token latency doubled after a deploy
-subtitle: no model change
+subtitle: same weights, three changed lines, one SLO already near its edge
 track: inference
 module: operating
 type: debug
 difficulty: hard
 seniority: [senior, staff]
-minutes: 25
+minutes: 30
 core: false
-tags: [latency, chunked-prefill, vllm, incident, metrics]
+tags: [latency, chunked-prefill, vllm, incident, slo, metrics]
 companies: []
 updated: 2026-10-28
 sources:
-  - title: amitshekhariitbhu, AI engineering interview questions
+  - title: amitshekhariitbhu, AI engineering interview questions (GitHub)
     url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
-    note: "Your LLM endpoint's p99 latency doubled after a deploy with no model change. How do you diagnose it?"
-  - title: vLLM docs, optimization and tuning
+    note: "candidate-prep list, no company named: asks how to diagnose p99 latency that doubled after a deploy with no model change. Checked 2026-10-28."
+  - title: vLLM docs, Optimization and tuning
     url: https://docs.vllm.ai/en/latest/configuration/optimization.html
-    note: smaller max_num_batched_tokens (for example 2048) gives better ITL, larger gives better TTFT, more than 8192 suggested for throughput
-  - title: "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve (2024)"
+    note: "chunked prefill is on by default in V1 and decodes are batched before prefills; a smaller max_num_batched_tokens (for example 2048) gives better inter-token latency, a larger one better time to first token, and more than 8192 is suggested for throughput. Checked 2026-10-28."
+  - title: vLLM source, scheduler config (main branch)
+    url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/config/scheduler.py
+    note: "long_prefill_token_threshold caps the tokens one long prompt may take in a step (0 disables it, and the cap is skipped when the request is alone); max_num_seqs is the default admission limit for the running batch. Read on main, checked 2026-10-28; confirm against the version you run."
+  - title: "Agrawal et al., Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve (arXiv 2403.02310, v3 2024-06-17)"
     url: https://arxiv.org/abs/2403.02310
-    note: chunked prefills batched with decodes to avoid generation stalls
-  - title: vLLM V1 metrics loggers (source)
+    note: "chunked prefills split a prompt into near-equal chunks, and stall-free schedules add new requests without pausing ongoing decodes. Checked 2026-10-28."
+  - title: vLLM V1 metrics loggers (source, main branch)
     url: https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/v1/metrics/loggers.py
-    note: metric names used in the dashboard
+    note: "metric names used in the dashboard and the answer: vllm:inter_token_latency_seconds, vllm:time_to_first_token_seconds, vllm:iteration_tokens_total (tokens per engine step), vllm:num_requests_running, vllm:num_requests_waiting, vllm:kv_cache_usage_perc, vllm:num_preemptions, vllm:prefix_cache_queries and vllm:prefix_cache_hits. Checked 2026-10-28."
 choices:
-  - text: The larger per-step token budget lets big prefill chunks share steps with decodes, so whenever a long prompt arrives every streaming user's next token waits for a much heavier step.
+  - text: The larger step budget lets a long prompt's prefill land in the same step as every decode, so all streams stall when it arrives
     correct: true
-    why: It explains a tail-only ITL regression with better throughput and TTFT, and it matches the one line in the diff that changes step composition.
-  - text: A prompt template change broke prefix caching, so every request pays full prefill.
+    why: "It is the only change that alters what a single step contains, and it fits a tail-only ITL regression with better TTFT and throughput."
+  - text: Doubling max_num_seqs lets the running batch grow past the size the ITL objective was tuned for, so every engine step gets a little slower
     correct: false
-    why: The prefix cache hit rate is unchanged, and a prefill-cost problem would hurt TTFT first, which improved.
-  - text: The KV cache is running out, and requests are being preempted and recomputed.
+    why: "A real latent defect, but the busiest minute held 112 running requests, under both the old cap of 128 and the new one, so it did not bind."
+  - text: The new base image ships a slower attention kernel, so each decode step costs more and the slowest tokens stretch the most
     correct: false
-    why: Preemptions are flat at zero and KV usage barely moved; preemption would also show as TTFT and queue-time spikes.
-  - text: The new base image ships a slower CUDA library, so every kernel is slower.
+    why: "A slower kernel moves every step, so p50 ITL and throughput would both get worse; p50 moved by 1 ms and throughput rose."
+  - text: Something in the new image stopped prefix-cache matches, so each request pays a full prefill and steps grow heavier for all
     correct: false
-    why: A uniformly slower kernel would raise p50 ITL and lower throughput. p50 barely moved and throughput rose.
-  - text: The autoscaler scaled in after the deploy, leaving fewer replicas for the same traffic.
+    why: "The hit rate is 47% before and after, and lost cache hits would raise TTFT first, which fell."
+  - text: The higher limits let the KV cache fill under load, so the engine preempts and recomputes streams and they pause mid-answer
     correct: false
-    why: Replica count and the waiting queue are unchanged, and fewer replicas would show up as queueing and worse TTFT.
+    why: "Preemptions are zero in both weeks and KV usage moved three points; a preemption pause would also show as waiting requests."
 ---
 import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
 
 ## Question
 
-<Callout kind="interview" label="As asked">
-"Your LLM endpoint's p99 latency doubled after a deploy with no model change. How do you diagnose it?"
+<Callout kind="interview" label="Debug, 30 minutes">
+The question as candidate-prep lists put it: "p99 latency doubled after a deploy with no model change." Here are the deploy, the dashboard and one measurement. Which change explains the regression, what else in the deploy is wrong, and what do you ship tonight?
 </Callout>
 
-The endpoint streams chat responses from a vLLM deployment. Traffic is mostly short prompts with an occasional long document pasted in. After Tuesday's deploy, users report answers "freezing for a moment" mid-stream. The deploy diff:
+The endpoint streams chat answers from vLLM on six replicas. Most prompts are short; a few times a minute a user pastes a long document. The SLOs (scenario): p99 inter-token latency under 80 ms, p99 time to first token under 2 s. Since Tuesday's deploy, users report answers that freeze for a moment mid-stream. The change request says: raise engine limits for next month's launch, since the load test showed more throughput.
 
 ```diff
 -image: serving-base:2026.10.1
 +image: serving-base:2026.10.2
  engine:
    model: same weights, same revision
+-  max_num_seqs: 128
++  max_num_seqs: 256
 -  max_num_batched_tokens: 2048
-+  max_num_batched_tokens: 16384     # "raise throughput", per the change request
++  max_num_batched_tokens: 16384
    enable_prefix_caching: true
- log_level: info
+   gpu_memory_utilization: 0.90
 ```
 
-Same-hour comparison, one week apart:
+Same hour, one week apart, per replica unless stated:
 
 <div class="tablewrap">
 <table class="scale">
 <thead><tr><th>Metric</th><th>Before</th><th>After</th></tr></thead>
 <tbody>
-<tr><td>Replicas, waiting requests (mean)</td><td>6, 0.4</td><td>6, 0.3</td></tr>
-<tr><td>Output throughput per replica</td><td>2,500 tok/s</td><td>2,700 tok/s</td></tr>
+<tr><td>Replicas (fleet)</td><td>6</td><td>6</td></tr>
+<tr><td>Running requests, mean / busiest minute</td><td>58 / 110</td><td>60 / 112</td></tr>
+<tr><td>Waiting requests, mean</td><td>0.4</td><td>0.3</td></tr>
+<tr><td>Output throughput</td><td>2,500 tok/s</td><td>2,700 tok/s</td></tr>
 <tr><td>TTFT p50 / p99</td><td>310 / 1,900 ms</td><td>270 / 1,300 ms</td></tr>
 <tr><td>ITL p50 / p99</td><td>31 / 58 ms</td><td>32 / 121 ms</td></tr>
-<tr><td>KV cache usage (mean)</td><td>58%</td><td>61%</td></tr>
+<tr><td>KV cache usage, mean</td><td>58%</td><td>61%</td></tr>
 <tr><td>Prefix cache hit rate</td><td>47%</td><td>47%</td></tr>
 <tr><td>Preemptions per minute</td><td>0</td><td>0</td></tr>
 </tbody>
 </table>
 </div>
 
-<p class="tiny">The diff and dashboard are synthetic, built for this exercise.</p>
+The team's own step-time measurement on one replica of this build: the duration of one engine step that carries the running decodes plus some number of prompt tokens.
 
-Pick the root cause.
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Prompt tokens in the step</th><th>0</th><th>2,000</th><th>4,000</th><th>8,000</th><th>16,000</th></tr></thead>
+<tbody>
+<tr><td>Step time, 60 decoding sequences</td><td>30 ms</td><td>52 ms</td><td>75 ms</td><td>120 ms</td><td>215 ms</td></tr>
+<tr><td>Step time, 110 decoding sequences</td><td>38 ms</td><td>61 ms</td><td>84 ms</td><td>130 ms</td><td>226 ms</td></tr>
+</tbody>
+</table>
+</div>
+
+<p class="tiny">The diff, dashboard and step times are synthetic, built for this exercise.</p>
+
+Pick the change that explains the symptom. Then rank the other defects, say what you would collect before you are sure, and choose the value you would ship for the step budget.
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>Which metrics got better, and which got worse only at the tail?</p></details>
-<details class="hint"><summary>Hint 2</summary><p>What does one engine step contain when a 10,000-token prompt arrives while 60 users are streaming?</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Which rows got better, and which got worse only at the tail?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask for the distribution of tokens per engine step before and after the deploy, and whether the slow gaps line up in time with long prompts arriving.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask how many requests were running at the busiest minute of the comparison hour, next to both values of every changed limit.</p></details>
 
 ## Answer
 
-The pattern is a tail-only inter-token regression with better throughput and better TTFT, and only one change in the diff affects what goes into a step. With chunked prefill, the per-step token budget caps how many prompt tokens join each step alongside the decodes. At 2,048, a long pasted document is processed over several light steps and streaming users barely notice. At 16,384, most of it lands in one or two heavy steps, and every running sequence waits for those steps before getting its next token. That is the "freeze" users describe, and it shows at p99 because long prompts are occasional. vLLM's tuning docs describe exactly this trade: a smaller `max_num_batched_tokens` gives better inter-token latency, a larger one better TTFT and throughput.
+<Depth>
+<Fragment slot="short">
+<p>The step budget. With chunked prefill, `max_num_batched_tokens` caps the tokens in one engine step, decodes first and prompt chunks after. At 2,048 a pasted document is fed in chunks of about 2,000 tokens and each step takes about 52 ms; at 16,384 most of it lands in one step, and the step table puts that at 120 to 215 ms. Every streaming user waits for that step before their next token, so p99 ITL doubles while p50 does not move, and TTFT improves because prefill gets about twice the tokens per second. The new `max_num_seqs` is a second defect that has not fired yet. Tonight I ship the budget back to 2,048 and `max_num_seqs` back to 128, knowing that puts p99 TTFT back at 1.9 s against a 2 s objective, and I write that down.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Why the budget, from the rows.</strong> ITL p50 moved by 1 ms and p99 doubled, so the regression is in rare steps, not every step. Throughput rose and TTFT fell, so the engine is not slower; it is spending some steps differently. The image change would move every step; prefix hits, preemptions, KV usage, replicas and waiting requests rule out caching, memory and capacity. That leaves the two limits, and only one of them changes what a single step contains. The prefill rate makes the TTFT gain concrete: a full step at the old budget carries about 2,000 prompt tokens in 52 ms, about 38,000 tokens a second; 16,000 tokens in 215 ms is about 74,000. The big budget doubles prefill speed and pays for it in the decode gaps of everyone sharing the step.</p>
+<p><strong>The ranking.</strong> First, the step budget: it explains the symptom. Second, `max_num_seqs` from 128 to 256: the busiest minute held 112 running requests, under both caps, so it changed nothing this week, but the launch is when the batch grows past 128, and the step table shows the 110-sequence row already 8 to 11 ms slower than the 60-sequence row at every prompt size. Nobody has measured step times at 200 sequences, and that is what the launch will run. Third, the image: probably harmless, since p50 did not move, but unreviewed. Ask for its diff before closing the incident.</p>
+<p><strong>What the evidence does not show, and what to collect.</strong> The dashboard shows correlation with a deploy. It does not show that the slow gaps coincide with long prompts. Collect `vllm:iteration_tokens_total` before and after (a step-size distribution with a new tail near 16,000 confirms it); per-request ITL p99 split by whether a prompt over, say, 6,000 tokens arrived during the request; and a replay of an hour of logged traffic against the old and new budget on one replica. Without them, ship the revert anyway: it is one line, it returns a configuration that met the ITL objective for weeks, and it is reversible.</p>
+<p><strong>The value you choose, and the conflict.</strong> The ITL objective is 80 ms at p99. A full step must stay under it at the batch size you expect, with room for jitter. At 110 decoding sequences, 2,000 prompt tokens give 61 ms and 4,000 give 84 ms. Anything from 2,048 to about 3,000 is defensible (interpolating, about 72 ms at 3,000); 4,096 is not, because the busiest minute already breaks the objective with it. The TTFT objective pulls the other way: the smaller budget halves prefill speed, and p99 TTFT was 1.9 s against 2 s before this deploy. Latency between tokens and latency to the first token cannot both be bought with this one knob.</p>
+<p><strong>Two defensible structural answers, each with a cost.</strong></p>
+<ul>
+<li><em>Keep a large budget and cap per-request prefill.</em> vLLM's `long_prefill_token_threshold` limits the tokens one prompt takes per step, so short prompts still share a big budget and a pasted document is fed in small chunks. Cost: the cap is per request, so three long prompts arriving together can still fill the step, and long prompts take more steps to their first token. It needs its own replay test, and the option is read from the main-branch source, so check that the version you run has it.</li>
+<li><em>Route long prompts to their own replicas.</em> The gateway sends prompts above a length threshold to a pool tuned for prefill throughput; the chat pool keeps a small budget. Cost: two pools to size and autoscale, a threshold to maintain, and the long-prompt pool idles between documents.</li>
+</ul>
+<p>I would revert tonight and test the per-request cap next week, because it changes one setting and keeps one pool; the separate pool becomes the answer if long documents grow past a share of traffic the replay says the cap cannot absorb.</p>
+<p><strong>Where the recommendation fails.</strong> The revert restores last month's state, and last month's state had 0.1 s of TTFT margin. Any growth in long documents, or the launch traffic itself, breaches the TTFT objective with no deploy to blame. The step table was also measured at 60 and 110 sequences; it says nothing about 128 running sequences plus a 2,000-token chunk, which is where the launch puts the busiest minute. Before the launch the team needs a load test at launch concurrency with the real prompt-length mix, and a written note saying which of the two objectives gives way first if the budget cannot hold both.</p>
+</Fragment>
+</Depth>
 
-Diagnosis steps you would describe in the room: compare percentiles, not means; split TTFT from ITL; line up the regression with the deploy and read the diff; check the engine's own metrics (queue, KV usage, preemptions, prefix hits) to eliminate memory and caching; then confirm by replaying traffic with a few long prompts against both budget values.
-
-Fix: revert to a budget chosen from the ITL objective, or a middle value, and if long documents are frequent, route them to separate replicas or use prefill-decode disaggregation. Record the ITL objective next to the setting so the next "raise throughput" change is checked against it.
-
-Why the others tempt. Prompt changes that break prefix caching are a classic cause of latency regressions, but the hit rate did not move. Preemption storms do cause stalls, but the counter is at zero. A slower library is plausible whenever an image changes, but it would move p50 and throughput too. Scale-in is ruled out by the replica and queue rows.
+**Why the wrong picks are tempting.** A larger batch is the textbook cause of slower decode steps, and `max_num_seqs` did double, but the running count never reached the old cap. Image changes are the usual suspect when nothing else is visible, and a kernel regression would show up as a uniform slowdown, which is not what the p50 row shows. Broken prefix caching is the most common latency regression after a prompt or tokenizer change; here the hit rate is flat. Preemption pauses look exactly like a stream freezing, but the counter is at zero.
 
 ## Follow-ups
 
-- *How would you have caught it before users did?* A canary with an SLO check on p99 ITL, and a load test that includes long prompts.
-- *Why did TTFT improve?* Long prompts finish prefill in fewer steps, so their first token arrives sooner, and short prompts are admitted with more room per step.
-- *What if you need both good TTFT and good ITL?* Separate pools for prefill and decode, which is the case for disaggregated serving.
+- *Pushback: product says the launch needs the TTFT gain, and the revert takes p99 TTFT back to 1.9 s against a 2 s objective. Which objective do you let slip during the launch week, and who signs that in writing?*
+- *Reversal: what would you need to see in a replay before you raise the budget again?* Per-request ITL p99 under 80 ms at launch concurrency, with the logged long-prompt mix and the per-request prefill cap on, across at least a day of traffic shapes.
+- *Two senior engineers disagree: one wants separate long-prompt replicas now, the other wants the per-request cap and one pool. How do you decide without deciding by rank?* Agree on the share of long prompts each design must absorb, replay both at that share, and pick the one that holds both objectives at the lower GPU count.
 
 ## Common mistakes
 
-- Looking at mean latency, which barely moved.
-- Treating "no model change" as "no behaviour change"; engine settings change latency as much as weights do.
-- Rolling back the whole deploy without identifying the line, so the next attempt repeats it.
+- Reading mean latency, which barely moved, or one blended latency number that hides that TTFT improved while ITL regressed.
+- Reverting the whole deploy without naming the line, so the next change request repeats it.
+- Stopping at the cause and leaving `max_num_seqs` at 256 into a launch nobody has load-tested at that concurrency.
+- Choosing the step budget from the vLLM docs' example values instead of from step times measured at the batch size the service runs.

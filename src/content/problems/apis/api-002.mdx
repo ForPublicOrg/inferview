@@ -1,240 +1,382 @@
 ---
 id: api-002
 title: Retry a model call without making the outage worse
-subtitle: backoff with full jitter
+subtitle: classify, honour retry-after, share a budget
 track: apis
 module: api-anatomy
 type: code
 difficulty: medium
-seniority: [mid, senior]
-minutes: 30
+seniority: [senior]
+minutes: 35
 core: true
-tags: [retries, backoff, jitter, rate-limits, error-handling]
+tags: [retries, backoff, jitter, rate-limits, retry-budget, error-handling]
 companies:
   - name: Sierra
     url: https://www.aced.io/blog/ai-engineer-interview-questions
-  - name: Decagon
-    url: https://www.techinterview.org/companies/decagon-interview-guide/
 updated: 2026-10-28
 sources:
-  - title: aced.io, AI engineer interview questions
+  - title: aced.io, AI engineer interview questions (2026 guide)
     url: https://www.aced.io/blog/ai-engineer-interview-questions
-    note: "Sierra task: Debug and extend a Python codebase to add an async exponential retry mechanism with timeouts and backoff."
-  - title: techinterview.org, Decagon interview guide
-    url: https://www.techinterview.org/companies/decagon-interview-guide/
-    note: third-party guide listing retrying failed API calls with backoff among coding-round examples
+    note: "Candidate report, aggregated by aced.io: a Sierra task to debug and extend a Python codebase to add an async exponential retry mechanism with timeouts and backoff. Checked 2026-10-28."
+  - title: Claude docs, rate limits (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: spend-cap 429 has no retry-after and error_code enforced_spend_limit_reached; retries, including the SDK's, fail until access resumes
+  - title: Claude docs, API errors (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/errors
+    note: 400 invalid_request_error, 429 rate_limit_error, 529 overloaded_error; the SDK retries twice by default
+  - title: OpenAI API docs, rate limits (checked 2026-10-28)
+    url: https://developers.openai.com/api/docs/guides/rate-limits
+    note: treat Retry-After as a minimum and add a small random delay; limit attempts and total retry time; do not retry quota or billing errors
+  - title: Timeouts, retries and backoff with jitter (Marc Brooker, Amazon Builders' Library)
+    url: https://builder.aws.com/content/3EumjoZascWd1oZiEgL8ORlv3qE/timeouts-retries-and-backoff-with-jitter
+    note: a local token bucket limits retries once its tokens run out; no ratio given
   - title: Exponential Backoff And Jitter (Marc Brooker, AWS Architecture Blog)
     url: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
-    note: Full, Equal and Decorrelated Jitter; Equal Jitter the weakest of the three
-  - title: Claude docs, rate limits
-    url: https://platform.claude.com/docs/en/api/rate-limits
-    note: spend-cap 429 has no retry-after and error_code enforced_spend_limit_reached; retries keep failing
-  - title: Claude docs, API errors
-    url: https://platform.claude.com/docs/en/api/errors
-    note: 400 invalid_request_error, 429 rate_limit_error, 529 overloaded_error
-  - title: OpenAI API docs, rate limits
-    url: https://developers.openai.com/api/docs/guides/rate-limits
-    note: treat Retry-After as a minimum, cap attempts and total retry time, do not retry quota or billing errors
-  - title: Anthropic Python SDK
-    url: https://platform.claude.com/docs/en/cli-sdks-libraries/sdks/python
-    note: the SDK already retries 2 times by default
+    note: Full, Equal and Decorrelated Jitter compared; jitter cut calls by more than half with 100 clients
 code:
   starter: |
+    import collections
+
+
     class RateLimited(Exception):
-        """HTTP 429 with a retry-after header (seconds), or None if the header was absent."""
+        """HTTP 429 rate_limit_error with a retry-after header (seconds), or None when absent."""
         def __init__(self, retry_after=None):
             super().__init__("rate limited")
             self.retry_after = retry_after
 
+
     class Overloaded(Exception):
-        """HTTP 529: the provider is short of capacity."""
+        """HTTP 529 overloaded_error."""
+
 
     class SpendCapReached(Exception):
-        """HTTP 429 with error_code enforced_spend_limit_reached and no retry-after."""
+        """HTTP 429 rate_limit_error, no retry-after, error_code enforced_spend_limit_reached."""
+
 
     class BadRequest(Exception):
-        """HTTP 400: the request itself is wrong."""
+        """HTTP 400 invalid_request_error."""
 
 
-    def call_with_retry(fn, *, sleep, rng, max_attempts=5, base=0.5, cap=8.0, budget=30.0):
-        """Call fn() and return its result, retrying RateLimited and Overloaded.
+    class Retrier:
+        """One retry layer shared by every model call in the process.
 
-        Before retry number k (k = 0 for the first retry) wait
-        rng() * min(cap, base * 2 ** k) seconds, but never less than the
-        error's retry_after when it has one. Make at most max_attempts calls
-        and re-raise the last error. Never wait so that the total time slept
-        would exceed budget: re-raise instead. Any other exception propagates
-        at once. Use sleep(seconds) to wait and rng() for a number in [0, 1).
+        call(fn) calls fn() and returns its result.
+
+        Rules:
+        - RateLimited and Overloaded may be retried. Every other exception
+          propagates on the attempt that raised it.
+        - At most max_attempts calls of fn per call(fn); no sleep after the last.
+        - The wait before retry k (k = 0 for the first retry) comes from your jitter
+          policy, drawn with rng() (a float in [0, 1)), between 0 and
+          min(cap, base * 2 ** k). When the error has a retry_after, the wait is
+          never shorter than it.
+        - The sleeps inside one call(fn) never add up to more than deadline:
+          if the next wait would cross it, re-raise instead of sleeping.
+        - Shared budget: when fn has just failed, a retry is allowed only if
+          (retries already made in (now - window, now]) + 1
+              <= min_retries + ratio * (first attempts made in (now - window, now]),
+          where now = clock() and every attempt is timed by clock() when fn is called.
+          Otherwise re-raise.
+        - clock() returns seconds; sleep(seconds) waits. Both are injected.
+        - 20,000 calls inside one window must take well under a second of CPU.
         """
-        raise NotImplementedError
+
+        def __init__(self, *, clock, sleep, rng, max_attempts=4, base=0.5, cap=8.0,
+                     deadline=30.0, ratio=0.1, min_retries=10, window=60.0):
+            raise NotImplementedError
+
+        def call(self, fn):
+            raise NotImplementedError
   tests: |
-    def script(*outcomes):
-        """Build fn() that raises or returns the given outcomes in order, and counts calls."""
-        state = {"calls": 0}
+    class Clock:
+        """Fake time: sleep() advances it and records the wait."""
+        def __init__(self):
+            self.t, self.waits = 0.0, []
+        def __call__(self):
+            return self.t
+        def sleep(self, s):
+            assert s >= 0, "negative sleep"
+            self.waits.append(s)
+            self.t += s
+
+    def script(clock, *outcomes):
+        """fn() that raises or returns the outcomes in order and logs each call time."""
+        log = []
         def fn():
-            out = outcomes[state["calls"]]
-            state["calls"] += 1
+            out = outcomes[len(log)]
+            log.append(clock())
             if isinstance(out, Exception):
                 raise out
             return out
-        return fn, state
+        return fn, log
 
-    waits = []
-    fn, st = script(RateLimited(), RateLimited(), "ok")
-    assert call_with_retry(fn, sleep=waits.append, rng=lambda: 0.5) == "ok"
-    assert waits == [0.25, 0.5], "full jitter: rng() * min(cap, base * 2 ** attempt)"
-    assert st["calls"] == 3
+    c = Clock()
+    r = Retrier(clock=c, sleep=c.sleep, rng=lambda: 0.5)
+    fn, log = script(c, RateLimited(), Overloaded(), "ok")
+    assert r.call(fn) == "ok" and len(log) == 3, "429 and 529 are retried"
+    assert all(0 <= w <= 0.5 * 2 ** k for k, w in enumerate(c.waits)), "wait k stays within min(cap, base * 2 ** k)"
 
-    waits = []
-    fn, st = script(RateLimited(retry_after=3.0), "ok")
-    call_with_retry(fn, sleep=waits.append, rng=lambda: 0.5)
-    assert waits == [3.0], "retry-after is a floor"
+    c = Clock()
+    r = Retrier(clock=c, sleep=c.sleep, rng=lambda: 0.5)
+    fn, log = script(c, RateLimited(retry_after=3.0), "ok")
+    assert r.call(fn) == "ok" and c.waits[0] >= 3.0, "retry-after is a floor"
 
-    waits = []
-    fn, st = script(RateLimited(), RateLimited(), RateLimited(), RateLimited(), RateLimited(), RateLimited(), "ok")
-    call_with_retry(fn, sleep=waits.append, rng=lambda: 1.0, max_attempts=7, budget=100)
-    assert waits == [0.5, 1.0, 2.0, 4.0, 8.0, 8.0], "the backoff ceiling stops at cap"
-
-    waits = []
-    fn, st = script(Overloaded(), "ok")
-    assert call_with_retry(fn, sleep=waits.append, rng=lambda: 0.5) == "ok", "529 is retryable"
-
-    waits = []
-    fn, st = script(SpendCapReached(), "ok")
+    c = Clock()
+    r = Retrier(clock=c, sleep=c.sleep, rng=lambda: 0.5)
+    fn, log = script(c, BadRequest(), "ok")
     try:
-        call_with_retry(fn, sleep=waits.append, rng=lambda: 0.5)
-        raise AssertionError("a spend cap must not be retried")
-    except SpendCapReached:
-        pass
-    assert st["calls"] == 1 and waits == [], "spend cap: one call, no sleep"
-
-    fn, st = script(BadRequest(), "ok")
-    try:
-        call_with_retry(fn, sleep=waits.append, rng=lambda: 0.5)
+        r.call(fn)
         raise AssertionError("a 400 must not be retried")
     except BadRequest:
         pass
-    assert st["calls"] == 1
+    assert len(log) == 1 and c.waits == []
 
-    waits = []
-    fn, st = script(*[RateLimited()] * 5)
+    c = Clock()
+    r = Retrier(clock=c, sleep=c.sleep, rng=lambda: 0.5, max_attempts=3)
+    fn, log = script(c, Overloaded(), Overloaded(), Overloaded(), "ok")
     try:
-        call_with_retry(fn, sleep=waits.append, rng=lambda: 0.5, max_attempts=5)
-        raise AssertionError("expected the last RateLimited to propagate")
+        r.call(fn)
+        raise AssertionError("expected the third Overloaded to propagate")
+    except Overloaded:
+        pass
+    assert len(log) == 3 and len(c.waits) == 2, "three attempts, two waits, no sleep after the last"
+
+    c = Clock()
+    r = Retrier(clock=c, sleep=c.sleep, rng=lambda: 0.5, deadline=30.0)
+    fn, log = script(c, RateLimited(retry_after=20.0), RateLimited(retry_after=20.0), "ok")
+    try:
+        r.call(fn)
+        raise AssertionError("a second 20 s wait would cross the 30 s deadline")
     except RateLimited:
         pass
-    assert st["calls"] == 5 and len(waits) == 4, "five attempts, four waits, no sleep after the last"
+    assert c.waits == [20.0]
+  hidden: |
+    import random as _random
+    import time as _time
 
-    waits = []
-    fn, st = script(RateLimited(retry_after=20.0), RateLimited(retry_after=20.0), "ok")
+    def _check_call(c, log, before, errs):
+        waits = c.waits[before:]
+        assert len(log) <= 4, "more calls than max_attempts"
+        assert len(waits) == len(log) - 1, "one sleep between consecutive attempts, none after the last"
+        assert sum(waits) <= 30.0 + 1e-9, "sleeps add up to more than the deadline"
+        for w, e in zip(waits, errs):
+            ra = getattr(e, "retry_after", None)
+            if ra is not None:
+                assert w >= ra, "wait shorter than retry_after"
+            assert 0 <= w <= max(8.0, ra or 0), "wait outside [0, max(cap, retry_after)]"
+
+    c = Clock()
+    r = Retrier(clock=c, sleep=c.sleep, rng=lambda: 0.3)
+    fn, log = script(c, RateLimited(retry_after=1.0), SpendCapReached(), "ok")
     try:
-        call_with_retry(fn, sleep=waits.append, rng=lambda: 0.5, budget=30.0)
-        raise AssertionError("waiting 40 s would exceed the 30 s budget")
-    except RateLimited:
+        r.call(fn)
+        raise AssertionError("SpendCapReached must propagate")
+    except SpendCapReached:
         pass
-    assert waits == [20.0], "stop before a wait that would exceed the budget"
+    assert len(log) == 2 and len(c.waits) == 1, "a spend cap after a rate limit is not retried"
+
+    c = Clock()
+    r = Retrier(clock=c, sleep=c.sleep, rng=lambda: 0.3)
+    fn, log = script(c, SpendCapReached())
+    try:
+        r.call(fn)
+        raise AssertionError("SpendCapReached must propagate")
+    except SpendCapReached:
+        pass
+    assert len(log) == 1 and c.waits == [], "a spend cap on the first attempt: one call, no sleep"
+
+    rnd = _random.Random(7)
+    c = Clock()
+    r = Retrier(clock=c, sleep=c.sleep, rng=_random.Random(3).random, ratio=1.0, min_retries=1000)
+    for _ in range(300):
+        outs = []
+        for _ in range(4):
+            x = rnd.random()
+            outs.append(RateLimited(retry_after=rnd.choice([None, 0.5, 2.0, 12.0])) if x < 0.4
+                        else Overloaded() if x < 0.6 else "ok")
+        fn, log = script(c, *outs)
+        before = len(c.waits)
+        try:
+            assert r.call(fn) == "ok" and outs[len(log) - 1] == "ok"
+        except (RateLimited, Overloaded) as e:
+            assert e is outs[len(log) - 1], "re-raise the error from the last attempt"
+        _check_call(c, log, before, outs)
+
+    c = Clock()
+    r = Retrier(clock=c, sleep=c.sleep, rng=_random.Random(11).random, ratio=1.0)
+    first_waits = []
+    for _ in range(20):
+        fn, log = script(c, Overloaded(), "ok")
+        before = len(c.waits)
+        r.call(fn)
+        first_waits.append(c.waits[before])
+    assert len(set(first_waits)) > 1, "no jitter: clients that failed together retry together"
+
+    c = Clock()
+    calls = []
+    r = Retrier(clock=c, sleep=c.sleep, rng=_random.Random(5).random, ratio=0.1, min_retries=5, window=60.0)
+    for _ in range(400):
+        state = {"n": 0}
+        def storm():
+            calls.append((c(), state["n"] > 0))
+            state["n"] += 1
+            raise Overloaded()
+        try:
+            r.call(storm)
+        except Overloaded:
+            pass
+        c.t += 0.05
+    retries = [i for i, (_, is_retry) in enumerate(calls) if is_retry]
+    assert retries, "the budget should allow some retries"
+    for i in retries:
+        d = calls[i - 1][0]
+        prior = sum(1 for t2, rt2 in calls[:i] if rt2 and d - 60.0 < t2 <= d)
+        firsts_in = sum(1 for t2, rt2 in calls[:i] if not rt2 and d - 60.0 < t2 <= d)
+        assert prior + 1 <= 5 + 0.1 * firsts_in + 1e-9, "a retry was made past the shared budget"
+    assert len(retries) < 400, "the budget should stop most retries in a storm"
+
+    c = Clock()
+    r = Retrier(clock=c, sleep=c.sleep, rng=lambda: 0.0, ratio=1.0, window=1e9)
+    start = _time.perf_counter()
+    for _ in range(20000):
+        flip = {"n": 0}
+        def once():
+            flip["n"] += 1
+            if flip["n"] == 1:
+                raise Overloaded()
+            return "ok"
+        assert r.call(once) == "ok"
+    assert _time.perf_counter() - start < 4.0, "budget bookkeeping is too slow for 20,000 calls in one window"
   solution: |
+    import collections
+
+
     class RateLimited(Exception):
-        """HTTP 429 with a retry-after header (seconds), or None if the header was absent."""
+        """HTTP 429 rate_limit_error with a retry-after header (seconds), or None when absent."""
         def __init__(self, retry_after=None):
             super().__init__("rate limited")
             self.retry_after = retry_after
 
+
     class Overloaded(Exception):
-        """HTTP 529: the provider is short of capacity."""
+        """HTTP 529 overloaded_error."""
+
 
     class SpendCapReached(Exception):
-        """HTTP 429 with error_code enforced_spend_limit_reached and no retry-after."""
+        """HTTP 429 rate_limit_error, no retry-after, error_code enforced_spend_limit_reached."""
+
 
     class BadRequest(Exception):
-        """HTTP 400: the request itself is wrong."""
+        """HTTP 400 invalid_request_error."""
 
 
-    def call_with_retry(fn, *, sleep, rng, max_attempts=5, base=0.5, cap=8.0, budget=30.0):
-        slept = 0.0
-        for attempt in range(max_attempts):
-            try:
-                return fn()
-            except (RateLimited, Overloaded) as e:
-                if attempt == max_attempts - 1:
-                    raise
-                delay = rng() * min(cap, base * 2 ** attempt)
-                retry_after = getattr(e, "retry_after", None)
-                if retry_after is not None:
-                    delay = max(delay, retry_after)
-                if slept + delay > budget:
-                    raise
-                sleep(delay)
-                slept += delay
+    class Retrier:
+        def __init__(self, *, clock, sleep, rng, max_attempts=4, base=0.5, cap=8.0,
+                     deadline=30.0, ratio=0.1, min_retries=10, window=60.0):
+            self.clock, self.sleep, self.rng = clock, sleep, rng
+            self.max_attempts, self.base, self.cap, self.deadline = max_attempts, base, cap, deadline
+            self.ratio, self.min_retries, self.window = ratio, min_retries, window
+            self.firsts = collections.deque()    # call times, oldest on the left
+            self.retries = collections.deque()
+
+        def _budget_allows(self):
+            now = self.clock()
+            edge = now - self.window
+            for q in (self.firsts, self.retries):
+                while q and q[0] <= edge:
+                    q.popleft()
+            return len(self.retries) + 1 <= self.min_retries + self.ratio * len(self.firsts)
+
+        def call(self, fn):
+            slept = 0.0
+            for attempt in range(self.max_attempts):
+                (self.retries if attempt else self.firsts).append(self.clock())
+                try:
+                    return fn()
+                except (RateLimited, Overloaded) as e:
+                    if attempt == self.max_attempts - 1 or not self._budget_allows():
+                        raise
+                    wait = self.rng() * min(self.cap, self.base * 2 ** attempt)   # full jitter
+                    retry_after = getattr(e, "retry_after", None)
+                    if retry_after is not None:
+                        wait = max(wait, retry_after)
+                    if slept + wait > self.deadline:
+                        raise
+                    self.sleep(wait)
+                    slept += wait
 ---
 import Callout from '../../../components/Callout.astro';
 import Depth from '../../../components/Depth.astro';
 
 ## Question
 
-<Callout kind="interview" label="As public interview guides report it">
-Add "an async exponential retry mechanism with timeouts and backoff" to a client that calls an LLM API. Public guides report variants of this task in Sierra and Decagon loops. This version is synchronous so it runs in the browser.
+<Callout kind="interview" label="As a candidate report describes it">
+Add "an async exponential retry mechanism with timeouts and backoff" to a client that calls an LLM API. A candidate report collected by aced.io attributes a version of this task to Sierra. This version is synchronous so it runs in the browser, and it adds the part that matters when many workers share one provider: a retry budget.
 </Callout>
 
-Write `call_with_retry(fn, *, sleep, rng, max_attempts=5, base=0.5, cap=8.0, budget=30.0)`. It calls `fn()` and returns its result. The exception classes are in the starter:
+Implement `Retrier`. One instance is shared by every model call in a process, and `call(fn)` returns `fn()`'s result. The docstring in the starter is the contract:
 
-- `RateLimited` (HTTP 429 with an optional `retry_after` in seconds) and `Overloaded` (HTTP 529) are retryable.
-- `SpendCapReached` (a 429 with no `retry-after` whose error code says the spend limit is reached) and `BadRequest` (HTTP 400) are not. Let them propagate on the first occurrence.
+- `RateLimited` (a 429 with an optional `retry_after`) and `Overloaded` (a 529) may be retried. `SpendCapReached`, `BadRequest` and anything else propagate on the attempt that raised them.
+- At most `max_attempts` calls per `call(fn)`, and no sleep after the last.
+- The jitter policy is yours, drawn from the injected `rng()`, within `[0, min(cap, base * 2 ** k)]` for retry `k`, and never shorter than `retry_after`.
+- The sleeps inside one `call(fn)` stay within `deadline`.
+- The retry budget is shared across calls: a retry is allowed only while the retries in the last `window` seconds stay within `min_retries + ratio × first attempts` in the same window.
+- 20,000 calls inside one window must stay fast.
 
-The wait before retry number *k*, where *k* is 0 for the first retry:
-
-1. Full jitter: `rng() * min(cap, base * 2 ** k)`.
-2. If the error has a `retry_after`, wait at least that long.
-3. Make at most `max_attempts` calls, then re-raise the last error. Do not sleep after the last attempt.
-4. Never let the total time slept exceed `budget`. If the next wait would cross it, re-raise instead.
-
-`sleep` and `rng` are injected so the tests run instantly and deterministically.
+`clock`, `sleep` and `rng` are injected so the tests run in milliseconds and see every wait. The visible tests show the shape; hidden tests check invariants over random error scripts, a spend cap arriving after a rate limit, an overload storm against the budget, and the speed of the bookkeeping.
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>Catch only the two retryable classes; anything else should leave the function untouched.</p></details>
-<details class="hint"><summary>Hint 2</summary><p>`getattr(e, "retry_after", None)` works for both retryable classes, because `Overloaded` has no such attribute.</p></details>
-<details class="hint"><summary>Hint 3</summary><p>Check "is this the last attempt" before computing a delay, and check the budget before calling `sleep`.</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask which errors can succeed later without anyone changing anything, and which need a person.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Measure how many timestamps your budget check touches per retry when 20,000 calls sit in one window.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the provider sees when every worker that failed at the same instant draws the same wait.</p></details>
 
 ## Answer
 
-The reference solution keeps a running total of time slept. On a retryable error it re-raises if this was the last attempt, otherwise computes the jittered delay, raises it to `retry_after` when present, re-raises if the delay would cross the budget, and sleeps. Non-retryable exceptions are never caught, so they leave on the first call.
+The reference solution keeps two deques of call times, first attempts and retries, oldest on the left. Before each retry it drops entries older than the window from the left of both, which is amortised constant time because each timestamp is appended once and removed once. A naive version that filters the whole history on every retry does the same arithmetic in time proportional to the window's contents, and 20,000 one-retry calls inside one window make that quadratic: the hidden speed test fails it.
+
+On a retryable error the order of checks is: last attempt, then budget, then the jittered wait raised to `retry_after`, then the deadline. Checking the budget before computing the wait means an exhausted budget fails immediately rather than after a sleep. Non-retryable errors are never caught, so a spend cap after a rate limit leaves on the second call.
 
 Why each rule exists:
 
-- **Full jitter** spreads clients that failed at the same moment across the whole window. Exponential backoff without jitter keeps them in lockstep; the retry simulator in the API anatomy lesson shows the same number of attempts arriving in the same waves, only spaced further apart.
-- **`retry-after` as a floor.** The server knows when capacity returns. A random draw shorter than that asks for another 429.
-- **No retry on a spend cap or a 400.** The spend-cap 429 looks like a rate limit but does not clear by waiting; Claude's docs say retries, including the SDK's own, keep failing until access resumes. A 400 fails identically every time.
-- **A budget as well as a count.** Five attempts against a server asking for 20 seconds each is 80 seconds of spinner. A time budget turns that into a fast, explainable failure.
+- **The spend cap is not a rate limit.** Claude returns `rate_limit_error` for both, but the spend cap has no `retry-after`, carries `enforced_spend_limit_reached`, and the docs say retries fail until access resumes, at 00:00 UTC on the first of the next month or when the tier is raised. A client keyed on status code retries it at every layer.
+- **`retry-after` is a floor.** OpenAI's guide says the same for its header: wait at least that long and add a small random delay.
+- **Jitter is a policy, so the tests check bounds.** Full jitter (`rng() * ceiling`) is the reference. Equal jitter (`ceiling / 2 + rng() * ceiling / 2`) passes as well. Pure exponential backoff fails the hidden test that first-retry waits are not all equal, because clients that failed together would retry together.
+- **The budget is what stops a storm.** Attempts and deadline bound one call. They do not bound what 400 workers do together during a provider incident: each still sends up to `max_attempts` requests. A budget tied to recent first attempts caps the extra load at a ratio you choose; Brooker describes the same mechanism as a local token bucket for retries and gives no ratio. The floor (`min_retries`) lets a quiet process still retry.
+
+The choice that stays open is the ratio. At `ratio=0.1`, a provider returning 529 to everything gets at most about 10 percent more requests than the first attempts, plus the floor; most callers fail fast. At `ratio=1.0`, each call keeps its own retries and a full outage doubles the load. A user-facing path with a short deadline and an idempotent call can justify a higher ratio than a batch path that can re-queue.
+
+Failure mode of the reference: the budget is per process. Fifty processes each holding a 10 percent budget still add 10 percent in total, but a process that starts during an incident, with an empty history, gets its full floor of retries at once. A fleet that restarts during the incident spends `min_retries` per process at the worst moment.
 
 <Depth>
 <Fragment slot="short">
-<p>Retry only what can succeed later (429 with retry-after, 529, connection errors), wait <code>random() * min(cap, base * 2**k)</code> but never less than <code>retry-after</code>, cap both attempts and total wait, and retry in exactly one layer: turn off the SDK's own retries if your code owns the policy.</p>
+<p>Retry only what can succeed later: 429 with <code>retry-after</code>, 529, connection errors. Wait a jittered, capped exponential delay, never less than <code>retry-after</code>. Bound attempts and total sleep per call, and bound retries across calls with a budget tied to recent traffic. Never retry the spend cap or a 400. Keep one retry layer: set the SDK's own <code>max_retries</code> to 0.</p>
 </Fragment>
 <Fragment slot="long">
-<p>Retry code fails in two ways: retrying the wrong things and retrying in too many places. The first wastes time on errors that cannot succeed, such as a spend cap or a malformed request. The second multiplies load: both official Python SDKs already retry twice, so a three-attempt loop around them sends up to nine requests per call, and each layer above multiplies again.</p>
-<p>Jitter fixes synchronisation, not capacity. If the provider is short of capacity for minutes, fail over to another model or degrade the feature instead of retrying harder. A retry budget, which limits retries to a share of recent traffic, stops one client from amplifying an outage.</p>
-<p>For calls with side effects, a retry is only safe with an idempotency key, because a timeout does not tell you whether the server did the work.</p>
+<p>Retry code fails in two ways: retrying what cannot succeed, and retrying in too many places at once. Classification fixes the first. The SDK's default of two retries plus a loop around it is the second, so one layer owns the policy.</p>
+<p>A per-call cap does not protect the provider; a budget does. Sliding-window counts in deques keep the check constant-time; a token bucket that earns a fraction of a token per first attempt and spends one per retry is the same idea with less memory and a slightly different shape at window edges.</p>
+<p>For calls with tools that write, a retry is only safe with an idempotency key, because a timeout does not say whether the work happened.</p>
 </Fragment>
 <Fragment slot="followups">
 <ul>
-<li><em>Make it async.</em> The same logic with <code>await asyncio.sleep(delay)</code>, and <code>asyncio.wait_for</code> around each attempt for a per-attempt timeout.</li>
-<li><em>How do you test it without waiting?</em> Inject sleep and the random source, as here, and assert the exact sequence of waits.</li>
-<li><em>What changes for streaming calls?</em> An error can arrive after HTTP 200. Retry only if nothing has been shown yet, or recover with a "continue" turn.</li>
+<li>Fifty worker processes share one provider. Where does the budget live, and what do you lose if it stays per process?</li>
+<li>What changes to run this in an async client: <code>asyncio.sleep</code>, a per-attempt <code>asyncio.wait_for</code>, and what happens to the budget when a waiting task is cancelled?</li>
+<li>A streamed call fails after the user has seen text. Is that a retry, a resume or an error, and which layer decides?</li>
 </ul>
 </Fragment>
 </Depth>
 
 ## Follow-ups
 
-- *The SDK you use already retries. What do you do?* Pick one layer. If the application owns the policy, set `max_retries=0` on the client.
-- *Which jitter variant would you pick?* Marc Brooker's AWS post compares Full, Equal and Decorrelated Jitter and finds Equal Jitter the weakest; full jitter is the simple default.
-- *How would you share one rate limit across 50 workers?* A client-side token bucket in shared storage, sized from the remaining and reset headers, so workers slow down before the server says no.
+- *Running it for real:* the SDK raises typed exceptions, so the classification maps `anthropic.RateLimitError` to `RateLimited` or `SpendCapReached` by reading `error.details.error_code` and the `retry-after` header from the response, and the SDK's `max_retries` goes to 0 so this is the only layer.
+- *Budget storage:* with fifty processes, a shared budget in Redis gives a global ratio at the cost of a network call per retry decision and a new dependency in the failure path. Which failure of Redis should make the client stop retrying, and which should make it retry freely?
+- *Telemetry:* which three counters tell you during an incident that the budget, not the provider, is now the reason calls fail?
 
 ## Common mistakes
 
-- Retrying every exception, including 400s and spend caps.
-- Sleeping after the final attempt, which only delays the error.
-- Ignoring `retry-after` and drawing a wait shorter than the server asked for.
-- A fixed sleep with no jitter, so every worker returns at the same instant.
-- Wrapping an SDK that already retries in another retry loop.
+- Catching `Exception`, so spend caps and 400s are retried.
+- Sleeping after the final attempt.
+- Recomputing the budget by filtering a growing list on every retry.
+- Drawing a wait shorter than `retry-after`.
+- Pure exponential backoff with no jitter.
+- Leaving the SDK's own retries on under this layer.

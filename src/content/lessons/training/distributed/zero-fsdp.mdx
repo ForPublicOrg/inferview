@@ -1,0 +1,150 @@
+---
+title: Data parallelism, ZeRO and FSDP2
+track: training
+module: distributed
+order: 3
+kind: lesson
+level: senior
+minutes: 13
+summary: ZeRO shards optimizer states, then gradients, then parameters across data-parallel ranks, the first two stages for free in bandwidth and the third for 1.5 times the traffic, and FSDP2 implements the third with per-parameter DTensor sharding whose overlap depends on how the model is wrapped.
+prerequisites: [training/distributed/step-memory]
+updated: 2026-10-28
+sources:
+  - title: Rajbhandari et al., ZeRO, Memory Optimizations Toward Training Trillion Parameter Models (arXiv 1910.02054v3)
+    url: https://arxiv.org/html/1910.02054v3
+    note: 16 bytes per parameter; 7.5B model at N_d = 64 needs 120 GB per device with standard DP, 31.4 GB with optimizer partitioning, 16.6 GB adding gradients, 1.88 GB adding parameters; up to 4x and 8x reduction, then linear in N_d; communication 2 Psi for baseline DP and for P_os+g, 3 Psi for P_os+g+p, 1.5x baseline; abstract reports over 100B parameters on 400 GPUs at 15 petaflops. Checked 2026-10-28.
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: per-GPU memory 2Psi + 2Psi + kPsi/N_d for ZeRO-1, 2Psi + (2Psi + kPsi)/N_d for ZeRO-2, (2Psi + 2Psi + kPsi)/N_d for ZeRO-3; ZeRO-3 costs about 3Psi against 2Psi and needs 2 x num_layers - 1 extra all-gathers per step; prefetching overlaps the next layer's all-gather with the current layer's compute, which works as a rule of thumb only while DP does not exceed 512; add 4Psi/N_d for FP32 gradient accumulation under ZeRO-2 or 3; ZeRO-3 prefers large micro-batch and sequence length to hide communication. Checked 2026-10-28.
+  - title: PyTorch 2.14 documentation, torch.distributed.fsdp.fully_shard
+    url: https://docs.pytorch.org/docs/2.14/distributed.fsdp.fully_shard.html
+    note: parameters become DTensors sharded on dim 0 with torch.chunk; applying fully_shard only to the root makes all communication two large blocking operations with no overlap; reshard_after_forward True, False, None (True for non-root, False for root) or an int world size such as the intra-node size; MixedPrecisionPolicy param_dtype, reduce_dtype, output_dtype, cast_forward_inputs; set_modules_to_forward_prefetch and set_modules_to_backward_prefetch trade more overlap for more reserved memory; set_requires_gradient_sync replaces FSDP1 no_sync. Page last updated 2026-04-24. Checked 2026-10-28.
+  - title: Liang et al., TorchTitan (arXiv 2410.06511v3)
+    url: https://arxiv.org/html/2410.06511v3
+    note: FSDP2 per-parameter DTensor sharding against FSDP1 FlatParameter, about 7% lower per-GPU memory and 1.5% average throughput gain on Llama 2 7B; BF16 parameter all-gather and compute, FP32 gradient reduce-scatter by default. Checked 2026-10-28.
+  - title: Dubey et al., The Llama 3 Herd of Models (arXiv 2407.21783)
+    url: https://arxiv.org/html/2407.21783
+    note: data parallelism implemented as FSDP sharding optimizer states and gradients; model shards not resharded after forward, avoiding an extra all-gather in backward. Checked 2026-10-28.
+  - title: NVIDIA A100 Tensor Core GPU
+    url: https://www.nvidia.com/en-us/data-center/a100/
+    note: A100 80GB SXM, 312 TFLOPS dense BF16, 2,039 GB/s HBM, NVLink 600 GB/s. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Redundancy is the cost of plain data parallelism
+
+Plain data parallelism replicates everything: N GPUs hold N identical copies of 16 bytes per parameter, and each step ends with an all-reduce of the gradients. The bandwidth bill is 2 Psi bytes per GPU per step in the ring model (Psi is the parameter count, and BF16 gradients make Psi elements 2Psi bytes; this lesson follows the ZeRO paper and counts in elements). The memory bill is what makes it stop working: a model whose 16 bytes per parameter exceed one GPU cannot use it at all.
+
+ZeRO removes the redundancy in three cumulative stages, each defined by what one data-parallel rank stops holding in full.
+
+## Three stages, and what each one sends
+
+**ZeRO-1 shards the optimizer states.** Each rank keeps the FP32 master weights and Adam moments for 1/N of the parameters. The step becomes: reduce-scatter the gradients so each rank holds the summed gradient for its slice, update its slice, then all-gather the updated BF16 parameters. Reduce-scatter plus all-gather is exactly an all-reduce's traffic, so ZeRO-1 costs nothing extra in bytes.
+
+**ZeRO-2 also shards the gradients.** Since each rank only updates its own slice, it never needs the rest of the summed gradient; it can free gradient buckets as soon as they are reduce-scattered. Same traffic again.
+
+**ZeRO-3 also shards the parameters.** Now no rank holds a full layer at rest. Before each layer's forward pass, the ranks all-gather its parameters, compute, and free them; before its backward pass they all-gather again; after it they reduce-scatter its gradients. That is Psi for the forward all-gather, Psi for the backward all-gather and Psi for the reduce-scatter: 3Psi against 2Psi, the 1.5 times the ZeRO paper reports.
+
+The Playbook's per-GPU memory, with k = 12 and N_d data-parallel ranks:
+
+```
+ZeRO-1:  2Psi + 2Psi + 12Psi / N_d
+ZeRO-2:  2Psi + (2Psi + 12Psi) / N_d
+ZeRO-3:  (2Psi + 2Psi + 12Psi) / N_d
+```
+
+The ZeRO paper's worked example is a 7.5B model on 64 ranks: 120 GB per device with plain data parallelism, 31.4 GB with ZeRO-1, 16.6 GB with ZeRO-2 and 1.88 GB with ZeRO-3. Each is the formula above with Psi = 7.5B; 31.4 is 30 + 90/64.
+
+<Predict id="trn-dist-zero2" question="A 13B model trains on 32 data-parallel ranks with ZeRO-2 and BF16 gradients. How many GB of model states does each GPU hold?" answer={31.7} tolerance={0.3} unit=" GB">
+<p>2 x 13 + (2 x 13 + 12 x 13) / 32 = 26 + 182 / 32 = 26 + 5.69 = <b>31.7 GB</b>. ZeRO-1 would hold 52 + 4.9 = 56.9 GB and ZeRO-3 would hold 208 / 32 = 6.5 GB. The 26 GB of replicated BF16 parameters is the floor for ZeRO-1 and ZeRO-2; only ZeRO-3 or model parallelism goes below it. With FP32 gradient accumulation, add 4 x 13 / 32 = 1.6 GB under ZeRO-2.</p>
+</Predict>
+
+## When ZeRO-3's traffic hides
+
+ZeRO-3 trades memory for 2 x num_layers - 1 extra all-gathers per step, by the Playbook's count, and they sit in front of every layer. Whether they cost step time depends on whether each all-gather finishes while the previous layer computes. The ratio is derivable.
+
+For one layer with P_l parameters and T tokens per GPU in the micro-batch, the forward pass costs 2 x P_l x T FLOPs and the all-gather moves about 2 x P_l bytes (BF16) per GPU. With achieved throughput F in FLOP/s and per-GPU bandwidth B in bytes per second:
+
+```
+compute time = 2 * P_l * T / F
+gather time  = 2 * P_l / B
+hidden if T >= F / B
+```
+
+P_l cancels. The condition is on tokens per GPU per micro-batch, which is why the Playbook says ZeRO-3 prefers large micro-batch and sequence length. The backward pass does twice the FLOPs and moves an all-gather plus a reduce-scatter, so it lands on the same condition.
+
+<Predict id="trn-dist-zero3-hide" question="An A100 reaches 40% of its 312 TFLOP/s dense BF16 peak, and each GPU has 50 GB/s to other nodes. How many tokens per GPU per micro-batch does a ZeRO-3 layer need for its parameter all-gather to hide behind the previous layer's forward pass?" answer={2496} tolerance={30} unit=" tokens">
+<p>F = 0.4 x 312e12 = 1.248e14 FLOP/s. F / B = 1.248e14 / 5e10 = <b>2,496 tokens</b>. One 4,096-token sequence per GPU clears it; a 2,048-token micro-batch does not. Inside one node at NVLink speed (NVIDIA quotes 600 GB/s for the A100, an aggregate figure), the threshold falls to about 208 tokens, which is why ZeRO-3 confined to a node, or sharded inside the node and replicated across nodes, is so much easier to hide.</p>
+</Predict>
+
+Two further limits come from outside the formula. The all-gathers are latency-bound for small layers, so a model with many thin layers misses the threshold even when T is large. And the Playbook gives a rule of thumb that prefetching only keeps up while data parallelism stays at or below 512 ranks; past that, per-layer collectives over that many ranks stop overlapping.
+
+## FSDP2: the PyTorch implementation
+
+FSDP2's `fully_shard` is ZeRO-3 with a different unit of sharding from FSDP1. FSDP1 flattened a module's parameters into one FlatParameter and sharded that; FSDP2 makes each parameter a DTensor sharded on dimension 0, using `torch.chunk` across the data-parallel mesh. TorchTitan's paper reports about 7% lower per-GPU memory and a 1.5% average throughput gain over FSDP1 on Llama 2 7B, and per-parameter sharding is what lets FSDP2 compose with tensor parallelism and Float8 on the same DTensor.
+
+The communication unit is the module `fully_shard` is applied to, not the parameter. Every call creates one group whose parameters are all-gathered together. The documentation is blunt about the degenerate case: apply it only to the root and all communication happens as two large blocking operations with no overlap with compute. The working pattern applies it to each transformer block and then to the root.
+
+```python
+import torch
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+
+mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+for block in model.layers:
+    fully_shard(block, mp_policy=mp)            # one all-gather group per block
+fully_shard(model, mp_policy=mp)                # root: embeddings, final norm, output head
+```
+
+This needs an initialised process group and GPUs, so it does not run in the browser; the arguments are what matter.
+
+**`reshard_after_forward`.** True frees the gathered parameters after forward and gathers again in backward, which is full ZeRO-3. False keeps them gathered until backward, saving one all-gather per layer at the memory of the unsharded parameters, which is ZeRO-2's memory for those modules. The default is True for non-root modules and False for the root, whose parameters are needed first in backward anyway. An integer reshards to a smaller group after forward, for example the 8 GPUs of a node, so the backward all-gather runs over NVLink only. Llama 3's report describes its FSDP as sharding optimizer states and gradients while not resharding parameters after forward, which is the False setting chosen for the same reason.
+
+**`MixedPrecisionPolicy`.** `param_dtype` sets the dtype of the all-gather and of compute; `reduce_dtype` sets the dtype of the gradient reduce-scatter. TorchTitan's default is BF16 gathers and compute with FP32 reductions, so the reduce-scatter carries twice the bytes of the all-gathers.
+
+**Prefetching.** By default each block's forward all-gather is issued as the previous block starts. `set_modules_to_forward_prefetch` and `set_modules_to_backward_prefetch` let a block prefetch two or more blocks ahead, which the documentation describes as more overlap at the cost of more reserved memory. This is the knob to turn when the all-gather is exposed but memory has headroom.
+
+**Gradient accumulation.** `set_requires_gradient_sync(False)` skips the reduce-scatter on micro-batches that do not end a step, the FSDP2 counterpart of FSDP1's `no_sync`. The unsharded gradients then accumulate locally, which costs their full memory until the last micro-batch.
+
+## HSDP: shard inside, replicate across
+
+A 2D mesh with a shard dimension inside the node and a replicate dimension across nodes gives hybrid sharding: parameter all-gathers and gradient reduce-scatters stay on NVLink, and only a gradient all-reduce of each rank's shard crosses nodes, once per step. Memory is ZeRO-3 over 8 ranks instead of over the whole cluster. It is the same hierarchical move as the hierarchical all-reduce in the collectives lesson, applied to the ZeRO-3 schedule.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"A 30B dense model must train on 128 A100-80GB GPUs, 16 nodes, at 2,048-token sequences, starting in ten days. The training lead wants FSDP across all 128 because it needs no model code changes. The infrastructure lead wants HSDP with sharding inside each node. Profiling time is limited to one day. Which do you start with, and what makes you switch?"**
+</Callout>
+
+<p class="tiny">The model, cluster and positions are a scenario.</p>
+
+<Depth>
+<Fragment slot="short">
+<p>Check memory first: 30B x 16 bytes is 480 GB, which is 60 GB per GPU sharded over 8 and 3.75 GB over 128. HSDP over 8 leaves 20 GB for activations at selective recomputation, which may not fit; FSDP over 128 fits easily but needs about 2,500 tokens per GPU per micro-batch to hide its cross-node all-gathers at A100 rates, and one 2,048-token sequence misses that. So I would start with full FSDP at micro-batch 2 if activations allow, measure exposed all-gather on day one, and switch to HSDP with a 16-GPU shard group if exposure is high.</p>
+</Fragment>
+<Fragment slot="long">
+<p>The two proposals fail in different directions. HSDP over a node shards model states 8 ways: 480 / 8 = 60 GB per GPU before activations, leaving about 20 GB on an 80 GB card, minus buffers. FSDP over 128 needs only 3.75 GB for model states but runs every per-layer all-gather across InfiniBand; by T at least F/B with 40% of 312 TFLOP/s and 50 GB/s, a micro-batch needs about 2,496 tokens per GPU to hide it, so one 2,048-token sequence leaves part of every gather exposed.</p>
+<p>A middle layout exists: shard over 16 GPUs (two nodes) and replicate 8 ways, 30 GB of model states per GPU, with half the gather traffic crossing one node boundary. Or keep full FSDP with micro-batch 2, 4,096 tokens per GPU, if activations fit at selective recomputation. With one day of profiling I would run both micro-batch 2 FSDP and 16-way HSDP for 200 steps each and pick by tokens per second at equal global batch. Failure mode of FSDP over 128: the step time becomes sensitive to any slow link in the cluster, because every layer waits on a 128-rank collective. Written down: the memory plan for each layout and the exposure threshold that triggers the switch.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The micro-batch 2 run fits but the loss curve is noisier than the reference at the same global batch. Is that the layout, and what would you check?</li>
+<li>The infrastructure lead points out that HSDP checkpoints are 8 copies of the same shard. Does that change the choice?</li>
+<li>Six weeks in, the cluster grows to 256 GPUs. Which layout scales without a restart from a resharded checkpoint, and what is the cost of the one that does not?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The 3Psi count assumes reshard after forward everywhere. Keeping the root, or every module, gathered after forward moves ZeRO-3 back toward 2Psi at the memory of the unsharded parameters, so real traffic sits between the two figures.
+
+The hiding condition assumes about 2 FLOPs per parameter per token. An embedding table is a lookup: many parameters, almost no FLOPs, so the root group that holds it is gathered with nothing to hide behind. Profiling shows this as a gap at the start of forward, which is one reason the root defaults to staying gathered.
+
+ZeRO does not shard activations. A model whose activations alone exceed the card needs recomputation, tensor and sequence parallelism, context parallelism or pipeline parallelism; adding data-parallel ranks does not help.
+
+Finally, the Playbook's rule of thumb of 512 data-parallel ranks is a measurement on its cluster, not a law. A faster fabric moves it; a cluster with stragglers moves it down.
+
+<SelfRate id="lesson:training/distributed/zero-fsdp" />

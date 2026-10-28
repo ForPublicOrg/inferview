@@ -1,0 +1,424 @@
+---
+title: Build an attention block
+track: foundations
+module: attention
+kind: lab
+minutes: 120
+summary: Grow one attention layer over six steps, from a stable softmax to a cached decode step that matches a full recompute and an online normaliser that never holds a whole score row.
+updated: 2026-10-28
+sources:
+  - title: Attention Is All You Need (Vaswani et al., 2017)
+    url: https://arxiv.org/abs/1706.03762
+    note: softmax(QK^T / sqrt(d_k)) V and multi-head attention, the operations in steps 1 to 3
+  - title: "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints (Ainslie et al., 2023)"
+    url: https://arxiv.org/abs/2305.13245
+    note: grouped-query attention, an intermediate number of key-value heads shared by groups of query heads (step 4)
+  - title: Online normalizer calculation for softmax (Milakov and Gimelshein, 2018)
+    url: https://arxiv.org/abs/1805.02867
+    note: the running maximum and running denominator computed in one pass, step 6
+  - title: Dao-AILab/flash-attention README (checked 2026-10-28)
+    url: https://github.com/Dao-AILab/flash-attention
+    note: from version 2.1, when seqlen_q != seqlen_k and causal=True the causal mask is aligned to the bottom-right corner, the convention step 2 uses
+  - title: Flash-Decoding for long-context inference (Dao, Haziza, Massa and Sizov, 2023)
+    url: https://crfm.stanford.edu/2023/10/12/flashdecoding.html
+    note: splits the keys and values into chunks, keeps a log-sum-exp per split and rescales in a final reduction, the merge in step 6
+steps:
+  - title: Scaled dot-product attention
+    brief: |
+      Write the kernel every later step calls. softmax subtracts the row maximum before exponentiating, and a row whose every entry is minus infinity returns zeros instead of NaN, because minus infinity minus minus infinity is NaN. sdpa takes rows of queries, keys and values and an optional boolean mask where mask[i][j] is True when query i may read key j; blocked scores become minus infinity before the softmax, never zeroed weights after it.
+    starter: |
+      import math
+
+      def softmax(row):
+          """Stable softmax of a list of floats. A row of all -inf returns all zeros."""
+          raise NotImplementedError
+
+      def sdpa(Q, K, V, mask=None):
+          """Scaled dot-product attention. Q, K, V are lists of rows. mask[i][j] is True when query i may read key j.
+          Returns a list of len(Q) output rows, each of len(V[0])."""
+          raise NotImplementedError
+    tests: |
+      close = lambda a, b, tol=1e-6: len(a) == len(b) and all(abs(x - y) < tol for x, y in zip(a, b))
+      assert close(softmax([0.0, 0.0]), [0.5, 0.5])
+      assert softmax([float("-inf")] * 3) == [0.0, 0.0, 0.0], "an all-masked row is zeros, not NaN"
+      assert close(softmax([1000.0, 0.0]), [1.0, 0.0]), "subtract the maximum so exp never overflows"
+      Q = K = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
+      V = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+      out = sdpa(Q, K, V)
+      assert close(out[0], [3.0, 4.0]), f"query 0 weighs keys 0 and 2 equally, got {out[0]}"
+      tri = [[j <= i for j in range(3)] for i in range(3)]
+      out = sdpa(Q, K, V, tri)
+      assert close(out[0], V[0]), "a query that can read one key returns that key's value"
+      assert sdpa(Q, K, V, [[False] * 3] * 3)[1] == [0.0, 0.0], "a fully masked query returns zeros"
+    hidden: |
+      import random
+      rng = random.Random(7)
+      Q = [[rng.uniform(-3, 3) for _ in range(4)] for _ in range(5)]
+      K = [[rng.uniform(-3, 3) for _ in range(4)] for _ in range(6)]
+      V = [[rng.uniform(-3, 3) for _ in range(3)] for _ in range(6)]
+      out = sdpa(Q, K, V)
+      shifted = sdpa(Q, K, [[x + 10.0 for x in v] for v in V])
+      assert all(abs(b - a - 10.0) < 1e-9 for r1, r2 in zip(out, shifted) for a, b in zip(r1, r2)), "weights sum to 1, so adding c to every value adds c to every output"
+      big = sdpa([[x * 400 for x in q] for q in Q], K, V)
+      assert all(x == x and abs(x) < 1e6 for r in big for x in r), "large scores stay finite"
+    solution: |
+      import math
+
+      def softmax(row):
+          m = max(row)
+          if m == float("-inf"):
+              return [0.0] * len(row)
+          e = [math.exp(x - m) for x in row]
+          z = sum(e)
+          return [x / z for x in e]
+
+      def sdpa(Q, K, V, mask=None):
+          scale = 1 / math.sqrt(len(K[0]))
+          out = []
+          for i, q in enumerate(Q):
+              scores = [
+                  scale * sum(a * b for a, b in zip(q, k)) if mask is None or mask[i][j] else float("-inf")
+                  for j, k in enumerate(K)
+              ]
+              w = softmax(scores)
+              out.append([sum(w[j] * V[j][c] for j in range(len(V))) for c in range(len(V[0]))])
+          return out
+  - title: Causal mask
+    brief: |
+      A decoder lets query i read keys 0 to i during training and prefill. Once a cache holds earlier keys, the queries in a call are the last n_q positions of a longer sequence, so the mask is aligned to the bottom-right corner: query i reads key j when j <= i + (n_k - n_q). FlashAttention made that alignment its default in version 2.1. The property the tests check is the one chunked prefill and speculative decoding rely on: attending with only the last few queries gives the same rows as the full square computation.
+    starter: |
+      def causal_mask(n_q, n_k):
+          """Bottom-right aligned: query i may read key j when j <= i + (n_k - n_q)."""
+          raise NotImplementedError
+
+      def causal_attention(Q, K, V):
+          """sdpa with the bottom-right aligned causal mask."""
+          raise NotImplementedError
+    tests: |
+      close = lambda a, b, tol=1e-9: all(abs(x - y) < tol for x, y in zip(a, b))
+      assert causal_mask(3, 3) == [[True, False, False], [True, True, False], [True, True, True]]
+      assert causal_mask(2, 4) == [[True, True, True, False], [True, True, True, True]], "the last query reads every key"
+      Q = K = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, -1.0]]
+      V = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]
+      full = causal_attention(Q, K, V)
+      tail = causal_attention(Q[2:], K, V)
+      assert close(tail[0], full[2]) and close(tail[1], full[3]), "the last queries alone give the same rows as the square"
+    hidden: |
+      import random
+      rng = random.Random(11)
+      Q = [[rng.uniform(-2, 2) for _ in range(3)] for _ in range(7)]
+      K = [[rng.uniform(-2, 2) for _ in range(3)] for _ in range(7)]
+      V = [[rng.uniform(-2, 2) for _ in range(2)] for _ in range(7)]
+      full = causal_attention(Q, K, V)
+      for start in range(7):
+          part = causal_attention(Q[start:], K, V)
+          assert all(abs(x - y) < 1e-9 for r1, r2 in zip(part, full[start:]) for x, y in zip(r1, r2))
+      K2 = [k[:] for k in K]; K2[6] = [9.0, 9.0, 9.0]
+      assert all(abs(x - y) < 1e-12 for r1, r2 in zip(causal_attention(Q, K2, V)[:6], full[:6]) for x, y in zip(r1, r2)), "no query reads a later key"
+    solution: |
+      def causal_mask(n_q, n_k):
+          off = n_k - n_q
+          return [[j <= i + off for j in range(n_k)] for i in range(n_q)]
+
+      def causal_attention(Q, K, V):
+          return sdpa(Q, K, V, causal_mask(len(Q), len(K)))
+  - title: Multi-head attention
+    brief: |
+      Multi-head attention runs the causal kernel on h slices of width d_model / h and concatenates the results; the projections are left out so the tests can see each head. A head only ever reads its own slice of the keys and values, which is the property the hidden test checks, and a width that does not divide by the head count is a configuration error to reject, not to round.
+    starter: |
+      def split_heads(row, n_heads):
+          """Split one row of width d_model into n_heads rows of width d_model // n_heads. Raise ValueError if it does not divide."""
+          raise NotImplementedError
+
+      def mha(Q, K, V, n_heads):
+          """Causal multi-head attention on rows of width d_model; returns rows of width d_model (heads concatenated in order)."""
+          raise NotImplementedError
+    tests: |
+      close = lambda a, b, tol=1e-9: all(abs(x - y) < tol for x, y in zip(a, b))
+      assert split_heads([1.0, 2.0, 3.0, 4.0], 2) == [[1.0, 2.0], [3.0, 4.0]]
+      try:
+          split_heads([1.0, 2.0, 3.0], 2)
+          raise AssertionError("a width of 3 cannot split into 2 heads")
+      except ValueError:
+          pass
+      Q = K = [[1.0, 0.0, 0.5, 0.5], [0.0, 1.0, -0.5, 1.0], [1.0, 1.0, 0.0, -1.0]]
+      V = [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]]
+      one = mha(Q, K, V, 1)
+      ref = causal_attention(Q, K, V)
+      assert all(close(a, b) for a, b in zip(one, ref)), "one head is plain causal attention"
+      two = mha(Q, K, V, 2)
+      assert len(two) == 3 and all(len(r) == 4 for r in two)
+    hidden: |
+      import random
+      rng = random.Random(5)
+      Q = [[rng.uniform(-2, 2) for _ in range(6)] for _ in range(5)]
+      K = [[rng.uniform(-2, 2) for _ in range(6)] for _ in range(5)]
+      V = [[rng.uniform(-2, 2) for _ in range(6)] for _ in range(5)]
+      base = mha(Q, K, V, 3)
+      K2 = [k[:2] + [x * 3.0 for x in k[2:4]] + k[4:] for k in K]
+      moved = mha(Q, K2, V, 3)
+      assert all(abs(a[c] - b[c]) < 1e-12 for a, b in zip(base, moved) for c in (0, 1, 4, 5)), "changing head 1's keys leaves heads 0 and 2 alone"
+      assert any(abs(a[c] - b[c]) > 1e-6 for a, b in zip(base, moved) for c in (2, 3)), "and does change head 1"
+    solution: |
+      def split_heads(row, n_heads):
+          if n_heads < 1 or len(row) % n_heads:
+              raise ValueError(f"width {len(row)} does not split into {n_heads} heads")
+          d = len(row) // n_heads
+          return [row[h * d:(h + 1) * d] for h in range(n_heads)]
+
+      def mha(Q, K, V, n_heads):
+          qs = [split_heads(r, n_heads) for r in Q]
+          ks = [split_heads(r, n_heads) for r in K]
+          vs = [split_heads(r, n_heads) for r in V]
+          per_head = [causal_attention([r[h] for r in qs], [r[h] for r in ks], [r[h] for r in vs]) for h in range(n_heads)]
+          return [[x for h in range(n_heads) for x in per_head[h][t]] for t in range(len(Q))]
+  - title: Grouped-query attention
+    brief: |
+      Grouped-query attention keeps n_q query heads but only n_kv key and value heads, so keys and values are n_q / n_kv times narrower and so is everything a cache stores. Query head h reads key-value head h // (n_q // n_kv), the contiguous grouping of the repeat_kv helper in Hugging Face transformers. The test that matters is equivalence: GQA must equal multi-head attention run on keys and values repeated per group, without building that repeated copy to get there.
+    starter: |
+      def gqa(Q, K, V, n_q_heads, n_kv_heads):
+          """Causal GQA. Q rows have width n_q_heads * d; K and V rows have width n_kv_heads * d.
+          Returns rows of width n_q_heads * d. Raise ValueError unless n_q_heads is a positive multiple of n_kv_heads."""
+          raise NotImplementedError
+    tests: |
+      close = lambda a, b, tol=1e-9: all(abs(x - y) < tol for x, y in zip(a, b))
+      Q = [[1.0, 0.0, 0.5, 0.5], [0.0, 1.0, -0.5, 1.0], [1.0, 1.0, 0.0, -1.0]]
+      K = [[1.0, 0.5], [0.0, 1.0], [1.0, -1.0]]
+      V = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
+      out = gqa(Q, K, V, 2, 1)
+      rep = lambda rows, g: [r * g for r in rows]
+      ref = mha(Q, rep(K, 2), rep(V, 2), 2)
+      assert all(close(a, b) for a, b in zip(out, ref)), "GQA equals MHA on repeated keys and values"
+      assert all(close(a, b) for a, b in zip(gqa(Q, Q, Q, 2, 2), mha(Q, Q, Q, 2))), "n_kv == n_q is MHA"
+      try:
+          gqa(Q, K, V, 3, 2)
+          raise AssertionError("3 query heads cannot share 2 KV heads evenly")
+      except ValueError:
+          pass
+    hidden: |
+      import random
+      rng = random.Random(3)
+      d, nq, nkv = 2, 4, 2
+      Q = [[rng.uniform(-2, 2) for _ in range(nq * d)] for _ in range(5)]
+      K = [[rng.uniform(-2, 2) for _ in range(nkv * d)] for _ in range(5)]
+      V = [[rng.uniform(-2, 2) for _ in range(nkv * d)] for _ in range(5)]
+      out = gqa(Q, K, V, nq, nkv)
+      expand = lambda rows: [[x for h in range(nq) for x in r[(h // 2) * d:(h // 2 + 1) * d]] for r in rows]
+      ref = mha(Q, expand(K), expand(V), nq)
+      assert all(abs(x - y) < 1e-9 for a, b in zip(out, ref) for x, y in zip(a, b)), "contiguous groups: head h reads kv head h // (nq // nkv)"
+    solution: |
+      def gqa(Q, K, V, n_q_heads, n_kv_heads):
+          if n_kv_heads < 1 or n_q_heads % n_kv_heads:
+              raise ValueError("n_q_heads must be a positive multiple of n_kv_heads")
+          group = n_q_heads // n_kv_heads
+          qs = [split_heads(r, n_q_heads) for r in Q]
+          ks = [split_heads(r, n_kv_heads) for r in K]
+          vs = [split_heads(r, n_kv_heads) for r in V]
+          per_head = [
+              causal_attention([r[h] for r in qs], [r[h // group] for r in ks], [r[h // group] for r in vs])
+              for h in range(n_q_heads)
+          ]
+          return [[x for h in range(n_q_heads) for x in per_head[h][t]] for t in range(len(Q))]
+  - title: KV-cache decode equal to a full recompute
+    brief: |
+      Decode appends one token's keys and values to the cache and attends with that token's queries only, so each step costs work linear in the cache length instead of recomputing the square. Because row t of causal attention reads nothing after position t, the output of step t must equal row t of a full recompute; the tests compare every step. The cache stores n_kv heads, never the repeated copy, and nothing else that grows with the sequence: the hidden test counts the floats it holds.
+    starter: |
+      class KVCache:
+          def __init__(self, n_q_heads, n_kv_heads, head_dim):
+              raise NotImplementedError
+
+          def __len__(self):
+              """Number of positions cached."""
+              raise NotImplementedError
+
+          def step(self, q_row, k_row, v_row):
+              """Append one position (k_row, v_row of width n_kv_heads * head_dim) and return the output row
+              (width n_q_heads * head_dim) of the new query attending over every cached position."""
+              raise NotImplementedError
+    tests: |
+      import random
+      rng = random.Random(1)
+      d, nq, nkv, T = 2, 4, 2, 6
+      Q = [[rng.uniform(-2, 2) for _ in range(nq * d)] for _ in range(T)]
+      K = [[rng.uniform(-2, 2) for _ in range(nkv * d)] for _ in range(T)]
+      V = [[rng.uniform(-2, 2) for _ in range(nkv * d)] for _ in range(T)]
+      full = gqa(Q, K, V, nq, nkv)
+      cache = KVCache(nq, nkv, d)
+      for t in range(T):
+          row = cache.step(Q[t], K[t], V[t])
+          assert all(abs(x - y) < 1e-9 for x, y in zip(row, full[t])), f"step {t} differs from the full recompute"
+      assert len(cache) == T
+    hidden: |
+      import random
+      def floats(obj, seen=None):
+          seen = set() if seen is None else seen
+          if id(obj) in seen:
+              return 0
+          seen.add(id(obj))
+          if isinstance(obj, float):
+              return 1
+          if isinstance(obj, dict):
+              return sum(floats(v, seen) for v in obj.values())
+          if isinstance(obj, (list, tuple, set)):
+              return sum(floats(v, seen) for v in obj)
+          if hasattr(obj, "typecode"):
+              return len(obj)
+          if hasattr(obj, "__dict__"):
+              return floats(vars(obj), seen)
+          return 0
+      rng = random.Random(9)
+      d, nq, nkv, T = 3, 6, 2, 40
+      Q = [[rng.uniform(-3, 3) for _ in range(nq * d)] for _ in range(T)]
+      K = [[rng.uniform(-3, 3) for _ in range(nkv * d)] for _ in range(T)]
+      V = [[rng.uniform(-3, 3) for _ in range(nkv * d)] for _ in range(T)]
+      full = gqa(Q, K, V, nq, nkv)
+      cache = KVCache(nq, nkv, d)
+      for t in range(T):
+          row = cache.step(Q[t], K[t], V[t])
+          assert all(abs(x - y) < 1e-9 for x, y in zip(row, full[t])), f"step {t} differs from the full recompute"
+      held = floats(cache)
+      assert held <= 2 * T * nkv * d + 16, f"the cache holds {held} floats; keys and values for {T} positions need {2 * T * nkv * d}"
+    solution: |
+      import math
+
+      class KVCache:
+          def __init__(self, n_q_heads, n_kv_heads, head_dim):
+              if n_kv_heads < 1 or n_q_heads % n_kv_heads:
+                  raise ValueError("n_q_heads must be a positive multiple of n_kv_heads")
+              self.nq, self.nkv, self.d = n_q_heads, n_kv_heads, head_dim
+              self.group = n_q_heads // n_kv_heads
+              self.keys = [[] for _ in range(n_kv_heads)]
+              self.values = [[] for _ in range(n_kv_heads)]
+
+          def __len__(self):
+              return len(self.keys[0])
+
+          def step(self, q_row, k_row, v_row):
+              ks, vs, qs = split_heads(k_row, self.nkv), split_heads(v_row, self.nkv), split_heads(q_row, self.nq)
+              for g in range(self.nkv):
+                  self.keys[g].append(ks[g])
+                  self.values[g].append(vs[g])
+              out = []
+              for h in range(self.nq):
+                  g = h // self.group
+                  out.extend(sdpa([qs[h]], self.keys[g], self.values[g])[0])
+              return out
+  - title: Online softmax normaliser for long rows
+    brief: |
+      A long row does not need its scores in memory at once. Keep a state of three things, the running maximum m, the running denominator l and the unnormalised output acc; when a block raises the maximum, rescale l and acc by exp(m_old - m_new) before adding the block. That is the one-pass normaliser of Milakov and Gimelshein, the inner loop of FlashAttention, and, applied to two finished states, the merge Flash-Decoding uses to split one long cache across workers. The hidden test streams 100,000 keys through a generator under a memory ceiling and merges partial states in shuffled order.
+    starter: |
+      def empty_state(d_v):
+          """The identity state: (m, l, acc) = (-inf, 0.0, [0.0] * d_v)."""
+          raise NotImplementedError
+
+      def update(state, q, keys, values, scale):
+          """Fold one block of keys and values into state; return the new state."""
+          raise NotImplementedError
+
+      def merge(a, b):
+          """Combine two states computed over disjoint key sets."""
+          raise NotImplementedError
+
+      def finish(state):
+          """Output vector acc / l, or zeros if no key was seen."""
+          raise NotImplementedError
+
+      def online_attend(q, blocks, d_v):
+          """blocks is an iterable of (keys, values); read it once, never hold more than one block."""
+          raise NotImplementedError
+    tests: |
+      import math
+      close = lambda a, b, tol=1e-9: all(abs(x - y) < tol for x, y in zip(a, b))
+      q = [1.0, -0.5]
+      K = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, -1.0], [-1.0, 0.5]]
+      V = [[1.0], [2.0], [3.0], [4.0], [5.0]]
+      ref = sdpa([q], K, V)[0]
+      blocks = [(K[0:2], V[0:2]), (K[2:3], V[2:3]), (K[3:5], V[3:5])]
+      assert close(online_attend(q, iter(blocks), 1), ref), "blocked result equals one-shot attention"
+      s = 1 / math.sqrt(2)
+      a = update(empty_state(1), q, K[:3], V[:3], s)
+      b = update(empty_state(1), q, K[3:], V[3:], s)
+      assert close(finish(merge(a, b)), ref) and close(finish(merge(b, a)), ref), "merge is order independent"
+      assert finish(empty_state(2)) == [0.0, 0.0]
+    hidden: |
+      import random, math
+      rng = random.Random(21)
+      d = 4
+      q = [rng.uniform(-1, 1) * 300 for _ in range(d)]
+      K = [[rng.uniform(-1, 1) for _ in range(d)] for _ in range(300)]
+      V = [[rng.uniform(-1, 1) for _ in range(2)] for _ in range(300)]
+      ref = sdpa([q], K, V)[0]
+      states = [update(empty_state(2), q, K[i:i + 37], V[i:i + 37], 1 / math.sqrt(d)) for i in range(0, 300, 37)]
+      rng.shuffle(states)
+      acc = empty_state(2)
+      for st in states:
+          acc = merge(acc, st)
+      assert all(abs(x - y) < 1e-9 for x, y in zip(finish(acc), ref)), "shuffled merges of partial states equal the full row, even with scores in the hundreds"
+      N, B = 100_000, 250
+      def gen():
+          r = random.Random(4)
+          for _ in range(N // B):
+              ks = [[r.uniform(-1, 1) for _ in range(d)] for _ in range(B)]
+              vs = [[r.uniform(-1, 1)] for _ in range(B)]
+              yield ks, vs
+      try:
+          import tracemalloc
+      except ImportError:
+          tracemalloc = None
+      if tracemalloc:
+          tracemalloc.start()
+      out = online_attend([0.5] * d, gen(), 1)
+      if tracemalloc:
+          peak = tracemalloc.get_traced_memory()[1]
+          tracemalloc.stop()
+          assert peak < 2_000_000, f"peak {peak} bytes: a 100,000-key row was held in memory"
+      assert len(out) == 1 and -1 <= out[0] <= 1
+    solution: |
+      import math
+
+      def empty_state(d_v):
+          return (float("-inf"), 0.0, [0.0] * d_v)
+
+      def update(state, q, keys, values, scale):
+          m, l, acc = state
+          scores = [scale * sum(a * b for a, b in zip(q, k)) for k in keys]
+          if not scores:
+              return state
+          m_new = max(m, max(scores))
+          c = math.exp(m - m_new) if m != float("-inf") else 0.0
+          l = l * c
+          acc = [x * c for x in acc]
+          for s, v in zip(scores, values):
+              p = math.exp(s - m_new)
+              l += p
+              for i, x in enumerate(v):
+                  acc[i] += p * x
+          return (m_new, l, acc)
+
+      def merge(a, b):
+          (ma, la, xa), (mb, lb, xb) = a, b
+          if ma == float("-inf"):
+              return b
+          if mb == float("-inf"):
+              return a
+          m = max(ma, mb)
+          ca, cb = math.exp(ma - m), math.exp(mb - m)
+          return (m, la * ca + lb * cb, [x * ca + y * cb for x, y in zip(xa, xb)])
+
+      def finish(state):
+          m, l, acc = state
+          return [0.0] * len(acc) if l == 0.0 else [x / l for x in acc]
+
+      def online_attend(q, blocks, d_v):
+          scale = 1 / math.sqrt(len(q))
+          state = empty_state(d_v)
+          for keys, values in blocks:
+              state = update(state, q, keys, values, scale)
+          return finish(state)
+---
+
+This lab builds the attention layer from the mechanics lesson as one program. Each step adds functions to the same file and runs its tests against everything written so far, so the decode step in step 5 is checked against the `gqa` you wrote in step 4.
+
+Steps 1 to 4 are the forward pass in the shapes serving code uses: a stable softmax, a causal mask aligned for a query block that sits at the end of a longer sequence, heads, and grouped key-value heads. Step 5 is the decode loop, tested against a full recompute at every position, with the cache's size checked against what grouped-query attention promises. Step 6 is the normaliser that lets a kernel or a pool of workers process one long row in pieces.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

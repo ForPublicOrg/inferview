@@ -1,0 +1,106 @@
+---
+id: wfl-019
+title: Capping spend inside an agent trace you can only price at the end
+track: workflows
+module: retries-flow-control
+type: workflow
+difficulty: hard
+seniority: [staff]
+minutes: 40
+core: false
+tags: [budgets, billing, metering, agents, ledger, cost-control]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: techinterview.org, AI agent infrastructure interview (published 2026-05-04, updated 2026-06-30)
+    url: https://www.techinterview.org/post/3233474928/ai-agent-infrastructure-interview/
+    note: the two questions this problem is built on, how to bill per trace when cost is unknown until completion and how to cap a customer's spend mid-trace; a synthesised guide, so no company is tagged
+  - title: Claude Agent SDK docs, track cost and usage (checked 2026-10-28)
+    url: https://code.claude.com/docs/en/agent-sdk/cost-tracking
+    note: total_cost_usd is a client-side estimate and must not be used to bill end users; parallel tool calls share a message ID; per-step output_tokens is a placeholder; max_budget_usd counts only the call's own spend; an error_max_budget_usd result includes the response that crossed the budget; a crashed session may report zeroed totals
+  - title: Claude docs, pricing (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/about-claude/pricing
+    note: Claude Opus 5.5 per million tokens, $4 base input, $5 for a 5-minute cache write, $0.20 for a cache hit, $20 output; 1.1x multiplier for US-only inference
+  - title: Claude API docs, rate limits (checked 2026-10-28)
+    url: https://platform.claude.com/docs/en/api/rate-limits
+    note: input tokens are estimated at the start of a request; output tokens are counted as generated and max_tokens does not count toward OTPM
+checklist:
+  - Bills from the usage object of each provider response and reconciles against the provider's own usage reporting, never from the SDK's client-side cost estimate
+  - States the worst-case overshoot as calls in flight times worst-case cost per call, and picks a cap policy from that number
+  - Reserves before a model call (input at the highest rate it could be billed, plus max_tokens at the output rate), settles from actual usage and releases the rest
+  - Makes reserve and settle atomic per customer, so two traces cannot both spend the last of a balance
+  - Pauses a capped trace at a step boundary in a durable state, never mid tool call, with a stated rule for resuming or closing it
+  - Records usage events append-only, keyed by provider request ID, so retries, replays and duplicate messages from parallel tool calls are counted once
+  - Prices events with a versioned price table that covers cache writes, cache reads, the data-residency multiplier and per-call tool fees
+  - Closes traces that never finish with a sweeper and a grace window, and waits for subagent usage before closing a parent
+  - Writes exactly one invoice record per trace, idempotent on the trace ID, to fit the finance system
+  - Says what it gives up, either balance locked by worst-case reservations or overshoot allowed up to a stated bound
+  - "Judgement call: metering after the fact without reservations is acceptable while a customer's balance exceeds the worst-case exposure of everything in flight"
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"How do you cap a customer's spend in the middle of a trace, and how do you bill a trace whose cost you only know when it finishes?"
+</Callout>
+
+The platform and its traffic are a scenario; the prices are Anthropic's. A platform runs customers' agents on Claude Opus 5.5 and sells them on prepaid credit at list price plus a margin. One trace is one agent run: up to 200 model calls, tool calls (some with a per-call fee), and up to four subagents running in parallel with the main loop. A customer can run 50 traces at once.
+
+Measured on last month's traces, a typical model call reads 115,000 cached tokens, sends 5,000 uncached input tokens and produces 1,500 output tokens. The largest context the platform allows is 120,000 tokens, every call sets `max_tokens` to 8,000, and the platform uses 5-minute caching on global routing. Prices on 28 October 2026, per million tokens: $4 base input, $5 for a 5-minute cache write, $0.20 for a cache read, $20 output.
+
+The requirements, each from a different owner:
+
+- Finance: a customer is never charged more than their balance plus $20, and the invoicing system takes exactly one usage record per trace. It will not change this quarter.
+- Sales: no trace stops while the customer still has money.
+- Platform: the spend check may add at most a few milliseconds to a model call at p99.
+
+Design the workflow: the steps around each model and tool call, the state you keep, what happens at the cap, how a trace is closed and billed, and the rollout.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Work out the most a single call can cost and the most that can be in flight for one customer at once. How does that compare with $20?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask which number the provider bills you from, and which number your SDK reports. Are they the same?</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask finance what one record per trace means for usage that arrives after the trace has been closed.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>The cap and the bill are two systems. The cap works on reservations: before each call, hold its worst-case cost against the customer's balance in an atomic ledger, settle from the response's usage, release the rest, and when a hold is refused, pause the trace at the next step boundary. The bill works on immutable usage events keyed by provider request ID, priced from a versioned table and summed into one record when the trace closes. Because worst-case holds lock about ten times the real spend, reserve only when the balance is near the floor and meter after the fact above it.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>The two numbers that size everything.</b> Worst case for one call: 120,000 tokens all billed as a cache write at $5 per million is $0.60, plus 8,000 output tokens at $20 per million is $0.16, so $0.76. A typical call: 115,000 cache reads at $0.20 per million ($0.023), 5,000 input at $4 per million ($0.02) and 1,500 output at $20 per million ($0.03), about $0.073. One customer can have 50 traces × 5 loops = 250 calls in flight, a worst-case exposure of 250 × $0.76 = $190 against a typical $18. Metering only after responses arrive can overshoot by up to $190, which breaks finance's $20. Reserving the worst case on every call never overshoots, but a customer with $100 left can hold only 131 calls, so traces stall while about $90 of their money is unspent (131 calls at a typical $0.073 spend under $10), which breaks the sales requirement.</p>
+<p><b>The decision.</b> Two policies are defensible. Always reserve: simple to reason about and never over the cap, at the cost of locked balance and a ledger round trip on every call. Reserve near the floor: while balance minus open holds exceeds the in-flight worst case ($190) plus the $20 allowance, calls proceed and settle afterwards; below it, each call must win a hold first. It costs a mode switch that has to be right under concurrency, and buys back the throughput for every customer not near empty. Pick the second for this platform, and say that the threshold is a function of concurrency: raise the trace limit and the threshold rises with it. Near the floor, shrinking max_tokens shrinks the hold, which lets more small calls through before the trace has to pause.</p>
+<p><b>Per call, in order.</b> Check the mode for the customer. In reservation mode, hold the worst case with an atomic operation (a Lua script in Redis or a conditional update on the customer's balance row) that fails if balance minus holds is too small; one round trip fits the few-millisecond budget. Make the call. Write a usage event from the response's usage fields (input, cache creation, cache read, output) keyed by the provider's request ID, priced with the current price-table version, including the 1.1 multiplier for any customer later pinned to US-only inference, whose worst-case hold rises to 1.1 × $0.76 ≈ $0.84. Settle the hold to the event's amount. Tool fees follow the same path with the tool call's ID. If the agents run on the Claude Agent SDK, two details of its stream matter: parallel tool calls in one turn arrive as several assistant messages carrying the same message ID and the same usage, so count each ID once or the turn counts twice; and per-step output_tokens is a placeholder taken at the start of the response, so output for billing comes from the final usage of the response (the stream's message_delta usage), not from the step message.</p>
+<p><b>At the cap.</b> A refused hold never interrupts a call already running. The trace finishes the step it is in, writes a checkpoint, and moves to suspended_budget; the customer is told, a top-up resumes it from the checkpoint, and a trace suspended for a chosen period (seven days, say) is closed and billed for what it used. A per-trace budget the customer sets is the same mechanism at a smaller scope. The Agent SDK's own max_budget_usd shows why: its error result includes the response that crossed the budget, so a per-run cap enforced after the fact always overshoots by one response.</p>
+<p><b>Closing and billing.</b> A trace closes when the main loop and every subagent have ended; the parent waits for children rather than closing on its own exit. A sweeper closes traces with no event for a grace window and marks them closed_by_sweeper. At close, sum the trace's events and write one invoice record, idempotent on the trace ID. Usage that arrives after close (a subagent the sweeper did not see) goes to an adjustments table that rolls into the customer's next trace record, which keeps finance's one-record rule. Never bill from total_cost_usd: Anthropic's docs call it a client-side estimate and say not to bill end users from it, and a crashed session can report it as zero.</p>
+<p><b>Reconciliation.</b> Daily, compare the sum of events with the provider's usage reporting for the same period. Drift above a chosen share (0.5% is a reasonable line) pages the owner. Expect drift from things the ledger cannot see, such as a stream cut mid-response, whose billing is a question to put to the provider rather than a number to assume.</p>
+<p><b>How the design fails.</b> The mode switch is the weak point. If the in-flight count it uses is stale, a burst of new traces can start in metering mode just above the threshold and overshoot it. Count in-flight calls in the same atomic operation as the holds, and start new traces in reservation mode whenever the count is unknown.</p>
+<p><b>What you give up.</b> Near the floor, customers see traces pause with money apparently left, because holds are worst-case. Finance gives up per-call line items. The platform takes on a ledger in the call path, so when it is unreachable every call is refused or every call is allowed; choose refused for customers in reservation mode and allowed for the rest, and write that down.</p>
+<p><b>Rollout.</b> Two weeks of shadow ledger: holds and settlements computed and logged, nothing refused, and the summed events compared daily with the provider's reporting. Then enforce for prepaid customers with low balances, then everyone. Roll back to shadow if reconciliation drift crosses the line for two days, or if any trace pauses for a customer whose balance minus holds is above $210, which means the mode switch is wrong.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>A customer's trace pauses with $60 left. What do you show them, and what do they do next?</em></li>
+<li><em>The price table changes at midnight while a trace is running. Which price does each event get?</em></li>
+<li><em>A subagent's usage arrives two hours after the trace closed. Where does it go?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Pushback: the ledger round trip costs 3 ms at p99 and the platform team wants zero. Which half do you cut, and what risk do you accept in writing?* Keep reservations only for customers below the threshold and do the metering-mode check from a local cache refreshed every second; the accepted risk is one second of stale balance, bounded by the calls one customer can start in a second times $0.76.
+- *Reversal: what would you need to see in production to drop reservations entirely and meter after the fact?* Months of data showing no customer's in-flight worst case ever came within $20 of their balance, or a product change to postpaid billing with credit limits, where overshoot is a collections problem instead of a promise.
+- *Operating: Opus 5.5 is retired in sixty days and the replacement's output price is higher. Twelve customers are on prepaid plans priced from the old model. Which traces run degraded, and who signs off?* The price table gets a new version with an effective date; finance decides whether prepaid credit converts at the old or the new rate, and the platform shows customers the new per-trace estimate before switching their traces.
+- *Two senior engineers disagree: one wants holds in Redis, the other in Postgres with row locks. How do you decide without deciding by rank?* Load-test both at the platform's peak call rate for the hottest customer, compare p99 hold latency and behaviour under failover, and pick the one that meets the few-millisecond budget with a failure mode you can state.
+
+## Common mistakes
+
+- Billing from the SDK's cost estimate because it is already on the result message.
+- Capping per trace and calling it a customer cap, while fifty traces run at once.
+- Killing a trace mid tool call when the cap is reached, leaving a half-finished side effect.
+- Counting usage per message in a stream where parallel tool calls share a message ID.
+- Closing a trace when the main loop exits while subagents are still spending.

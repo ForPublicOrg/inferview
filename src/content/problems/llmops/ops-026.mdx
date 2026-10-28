@@ -1,0 +1,140 @@
+---
+id: ops-026
+title: The tuned drafting model sounds like the customer
+subtitle: a v4 run, a config diff and 300 held-out replies
+track: llmops
+module: fine-tuning
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [fine-tuning, sft, chat-template, trl, loss-masking, overfitting]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Hugging Face TRL documentation, SFT Trainer (v1.16.0, checked 2026-10-28)
+    url: https://huggingface.co/docs/trl/sft_trainer
+    note: "completion_only_loss None resolves to loss on the completion for prompt-completion datasets and on the full sequence for language modeling datasets; assistant_only_loss defaults to False and requires {% generation %} and {% endgeneration %} in the chat template, patched automatically only for known families; max_length defaults to 1024 with truncation_mode keep_start; padding and masked positions use the ignore index -100; chat_template_path accepts a Jinja file."
+  - title: Unsloth documentation, LoRA hyperparameters guide (checked 2026-10-28)
+    url: https://unsloth.ai/docs/get-started/fine-tuning-llms-guide/lora-hyperparameters-guide
+    note: "training loss below 0.2 likely means overfitting; 2e-4 as a LoRA starting learning rate; 1 to 3 epochs; training on completions only increases accuracy, especially for multi-turn conversational fine-tunes."
+choices:
+  - text: Loss covers every role, as a messages dataset trains on the full sequence by default and the template has no markers to mask by
+    correct: true
+    why: "User text inside replies appears at the same rate in short and long conversations, and v3's prompt-completion pairs were masked by default while v4's messages are not."
+  - text: The learning rate doubled while epochs stayed at three, so the adapter overfit, with training loss under the usual 0.2 warning line
+    correct: false
+    why: "It did overfit, but an adapter trained only on agent replies would copy agent replies; it would not learn to write in the customer's voice."
+  - text: The new template's end-of-turn token differs from the configured EOS, so generation runs past the reply into the next user turn
+    correct: false
+    why: "Replies end at the end-of-turn token 99% of the time in both versions, and the customer-voice text sits inside the reply, not after it."
+  - text: max_length fell to 1,024 with keep_start truncation, so long conversations lose their last replies and train mostly on user text
+    correct: false
+    why: "Truncation is real here, but conversations under 1,024 tokens, which are never cut, show the symptom at 22% against 19% for long ones."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Debug, 30 minutes">
+"Our v4 fine-tune drafts replies that read like the customer wrote them. v3 never did this. Here is what changed and what we measured. What happened, what else is wrong with this run, and what ships this sprint?"
+</Callout>
+
+The setup is a scenario. A support team uses a LoRA adapter on an 8B open-weight instruct model, trained with TRL, to draft replies that agents edit and send. v3 has been in production for two months; it was trained on 9,000 single-turn pairs in prompt-completion format. v4 is meant to handle multi-turn conversations and two tools, so the data moved to 12,000 full conversations in `messages` format with a `tools` column, and the team wrote a chat template that renders the `tool` role in their house format. The sprint ends in eight days, and the v4 launch is on the roadmap.
+
+The training change:
+
+```diff
+ config = SFTConfig(
+-    learning_rate=1e-4,
++    learning_rate=2e-4,
+     num_train_epochs=3,
+-    max_length=2048,
++    max_length=1024,
+     per_device_train_batch_size=2,
+     gradient_accumulation_steps=8,
++    packing=True,
++    chat_template_path="templates/support_v4.jinja",
+ )
+-train = load_dataset("json", data_files="v3_pairs.jsonl")
++train = load_dataset("json", data_files="v4_convos.jsonl")
+ trainer = SFTTrainer(model=BASE, args=config, train_dataset=train, peft_config=lora)
+```
+
+The template:
+
+```jinja
+{%- for m in messages %}
+<|start|>{{ m.role }}{% if m.role == "tool" %} name={{ m.name }}{% endif %}
+{{ m.content }}{% if m.tool_calls %}{{ m.tool_calls | tojson }}{% endif %}<|end|>
+{%- endfor %}
+{%- if add_generation_prompt %}<|start|>assistant
+{% endif %}
+```
+
+The v4 dataset: median 5 turns and 780 tokens per conversation; 18% of conversations exceed 1,024 tokens. By role, tokens are 6% system, 52% user, 34% assistant and 8% tool output.
+
+The training log: training loss 1.42 at step 10, 0.61 at the end of epoch 1, 0.31 at the end of epoch 2, 0.17 at the end of epoch 3. Eval loss on 300 held-out conversations was lowest at the end of epoch 2 (0.66) and 0.71 at the end of epoch 3. The final checkpoint was evaluated.
+
+Generation on the 300 held-out conversations, drafting the last agent turn:
+
+| Measure | v3 | v4 |
+|---|---|---|
+| Draft opens by restating the customer's message in the first person ("I was charged twice and...") | 1% | 21% |
+| Draft contains a request addressed to the agent ("Can you check my account?") | 0% | 9% |
+| Of those 300, conversations under 1,024 tokens: drafts with either symptom | 2% | 22% |
+| Of those 300, conversations over 1,024 tokens: drafts with either symptom | 1% | 19% |
+| Draft ends at the end-of-turn token | 99% | 99% |
+| Draft contains a sentence of 20 or more tokens copied from a training reply | 0.3% | 2.1% |
+| Valid tool-call JSON when a tool call is expected | not trained | 93% |
+
+<p class="tiny">The team, data and measurements are synthetic, built for this exercise.</p>
+
+Pick the hypothesis that explains the symptom, rank the other defects, say what you would collect before you are sure, and decide what ships.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the share of tokens in the preprocessed training set that carry a training label, broken down by role, for v3 and for v4.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask to see one v4 training example rendered through the template, next to the same example rendered through the vendor's original template.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask which checkpoint the eval used and whether the others were kept.</p></details>
+
+## Answer
+
+**Why the loss mask.** The symptom is customer-voice text inside the draft: first-person restatements and requests addressed to the agent. A model writes like a customer when it was trained to predict customer tokens. v3 used prompt-completion pairs, and TRL's `completion_only_loss` default resolves to loss on the completion only for that format, so v3 never trained on the customer's words. v4 switched to `messages`, a conversational language-modeling dataset, where the same default resolves to loss on the full sequence. Restricting loss to assistant turns needs `assistant_only_loss=True`, and that needs `{% generation %}` and `{% endgeneration %}` around assistant content in the template; the house template has neither, and TRL only patches templates of families it knows. So v4 trained on all four roles, and user tokens were 52% of what it learned to predict, more than the assistant's 34%. The defect is a line that is not in the diff, sitting behind two lines that are.
+
+What the evidence does not show is the mask itself. The table is consistent with the hypothesis but does not prove it. Collect, in this order: the share of tokens with a label other than -100 in the preprocessed v4 set (near 100% confirms it; near 34 to 42% rules it out), one example rendered through the template to confirm the markers are missing, and a confirmation run on 1,000 conversations with the mask fixed, which on this setup takes minutes of GPU time. If none of that is available before the decision, the decision does not change: v4 does not ship as trained.
+
+**Why the other picks are tempting, and how they rank as defects.**
+
+1. *Truncation.* Real, and the most damaging of the secondary defects. `max_length` went from 2,048 to 1,024 with `keep_start` truncation, so the 18% of conversations over 1,024 tokens lose their endings, which is where agents resolve the issue. It does not explain the symptom: short conversations, never truncated, show it at 22%.
+2. *Overfitting.* Real. Training loss ended at 0.17, under Unsloth's 0.2 warning line, eval loss rose from 0.66 to 0.71 in epoch 3, and the share of drafts copying a 20-token sentence from training went from 0.3% to 2.1%. The epoch-2 checkpoint is better, and the learning rate doubling with no schedule change made it likelier. But overfitting on agent replies reproduces agent replies; it cannot teach the customer's voice.
+3. *Tool-call validity.* 93% valid JSON has no baseline: nobody measured the prompted base model on the same cases, so it is not yet a defect or a success.
+4. *EOS.* Not a defect on this evidence: drafts end at the end-of-turn token 99% of the time in both versions, and the customer text sits inside the draft.
+
+**The fix, two defensible ways.**
+
+- *Add generation markers to the house template and set `assistant_only_loss=True`.* One template, one dataset, the format the team wanted. Cost: the template is now the training contract and must render byte-identically to the serving template outside the markers, and someone has to decide where tool calls and tool outputs fall relative to the markers.
+- *Convert each conversation into conversational prompt-completion examples, one per assistant turn.* Completion-only loss is TRL's default for that format, so the template needs no markers and the mask cannot silently turn off. Cost: a 5-turn conversation becomes several examples sharing a prefix, so tokens processed grow with the number of turns, and the earlier turns are re-encoded each time.
+
+I would take the first and keep the second as the fallback if the template work slips. Either way: `max_length` back to 2,048 or set from the length distribution, take the checkpoint at the eval peak, and run the prompted base through the same 300 conversations so tool-call validity has a baseline.
+
+**Where the fix fails.** The markers have to wrap the assistant's tool calls and not the tool outputs. If they wrap the whole assistant message including the house format's rendered `tool_calls`, that is right; if the tool role is rendered inside an assistant block by mistake, the model is trained to write tool outputs and will invent API results. Check the rendered mask on a tool-calling example before training, not after.
+
+**The sprint decision.** The deadline conflicts with a measured regression: 21% of drafts opening in the customer's voice is visible to every agent who uses it. v3 stays in production. v4 with the fixes needs a retrain (minutes to hours), a re-run of this table and the baseline, and a short agent pilot, which fits eight days if the template is fixed by day three. If it is not, v4 misses the sprint and the roadmap moves; that is the written risk, signed by whoever owns the roadmap.
+
+## Follow-ups
+
+- *Pushback: the fixed v4 drafts are better on multi-turn conversations but 4 points worse than v3 on single-turn ones, which are 60% of traffic. Ship it, route by turn count, or hold, and who signs?*
+- *Reversal: what would the label-mask count have to show for you to drop the loss-mask hypothesis and go back to the overfitting one?* A trained-token share near the assistant share (roughly 34 to 42% here) would mean the mask worked, and the customer-voice text came from somewhere else, such as assistant turns in the data that quote the customer.
+- *Operating: the base model's vendor ships a new template version next month. What in your pipeline catches a template change that drops the generation markers?* A pre-training check that fails the job when the trained-token share is above a threshold, run on every build.
+- *Two engineers disagree: one wants the template fix, one wants per-turn prompt-completion examples. How do you decide without deciding by rank?* Run both on a 1,000-conversation subset, compare the trained-token share, the held-out table and the tokens processed, and pick by the table.
+
+## Common mistakes
+
+- Picking overfitting because training loss is under 0.2, without asking whether overfitting could produce text in the customer's voice.
+- Looking for the bug in the changed lines only; the defect is a setting the new data format needed and the diff never added.
+- Treating the EOS hypothesis as live when the drafts end at the end-of-turn token as often as before.
+- Fixing the mask and shipping the final checkpoint, keeping the truncation and the overfitting.
+- Reporting 93% tool-call validity as a win without a baseline.

@@ -1,0 +1,99 @@
+---
+id: trn-057
+title: PPO across two thousand GPUs
+subtitle: where the policy, value, reward and reference models live, and what you expect to bottleneck
+track: training
+module: rl
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 45
+core: false
+tags: [ppo, rl-infrastructure, placement, colocation, generation, weight-sync]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: techinterview.org, RLHF and post-training interview topics 2026 (updated 2026-07-12)
+    url: https://www.techinterview.org/post/3233475333/rlhf-post-training-interview-topics-2026/?format=md
+    note: "lists \"Design distributed PPO training over thousands of GPUs\" as a system design prompt; a synthesised question bank that names no company for it, so none is tagged. Checked 2026-10-28."
+  - title: Shao et al., DeepSeekMath (v3, 2024-04-27)
+    url: https://arxiv.org/html/2402.03300
+    note: "PPO's value function is typically another model of comparable size to the policy, a memory and compute burden that GRPO removes by using the group mean reward as the baseline. Checked 2026-10-28."
+  - title: Hu et al., OpenRLHF (v6, 2025-10-09)
+    url: https://arxiv.org/html/2405.11143
+    note: "built on Ray, vLLM and DeepSpeed; Ray assigns GPUs to distinct roles and a hybrid engine mode is supported; the authors write that inference often accounts for over 90% of RLHF or RLVR runtime and that the slowest generation can bottleneck a synchronous pipeline. Checked 2026-10-28."
+  - title: Sheng et al., HybridFlow, A Flexible and Efficient RLHF Framework (2024-09-28)
+    url: https://arxiv.org/abs/2409.19256
+    note: "each node of the RLHF dataflow is a distributed training or generation program and each edge a many-to-many multicast; the 3D-HybridEngine reshards the actor between training and generation with zero memory redundancy; the authors report 1.53x to 20.57x throughput over baselines. Checked 2026-10-28."
+  - title: Kimi Team, Kimi K2 (2025)
+    url: https://arxiv.org/html/2507.20534
+    note: "colocated training and inference engines that offload in turn; training parameters offloaded to DRAM during rollout; a checkpoint engine broadcasts the full parameter set and inference workers pull their shards; vendor's own figure of under 30 seconds for a full parameter update of the 1T-parameter model; partial rollouts for long-tail trajectories. Checked 2026-10-28."
+  - title: Yu et al., DAPO (2025)
+    url: https://arxiv.org/html/2503.14476
+    note: "response length does not always rise steadily during RL and can stagnate or decline. Checked 2026-10-28."
+  - title: Yao et al., On the Rollout-Training Mismatch in Modern RL Systems (NeurIPS 2025, OPT workshop)
+    url: https://neurips.cc/virtual/2025/124259
+    note: "separate rollout and training stacks give different token probabilities for the same weights; truncated importance sampling corrects it. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The round">
+"Design PPO training for a 70B policy over a couple of thousand GPUs. Where do the policy, value, reward and reference models go, how does a step flow, and what do you expect to be the bottleneck?"
+</Callout>
+
+The operating constraints, as a scenario: 2,048 GPUs with 80 GB each, in nodes of 8 with fast links inside a node and slower links between pods. The existing training stack (a tensor- and pipeline-parallel trainer the team has run for pre-training) cannot be rewritten in the six weeks before the run must start. The reward model is a 70B model trained by another team. Responses average 1,000 tokens with a long tail to the 8,192-token cap.
+
+Design the placement and the step, choose the value model's size, say what you give up, and write a one-paragraph decision memo.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask what fraction of a step the team's current small-scale PPO runs spend generating.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask how long it takes today to move a new policy checkpoint from the trainer into the inference engine.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask whether the reward team will accept a smaller reward model distilled from theirs.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Memory is not the constraint at this scale; generation is. The four models' weights and optimiser state come to about 2.5 TB, which fits on a few dozen of the 2,048 GPUs. A PPO step is generate, then score with reward, reference and value models, then train policy and value; the generation phase is memory-bandwidth-bound decoding with a long tail, and OpenRLHF's authors put inference at over 90% of runtime. I would split the cluster: a large generation pool running an inference engine, a small training pool running the existing trainer for policy and value, and the reward and reference models as inference services. That keeps the trainer unchanged and lets each pool use its own parallelism. The alternative, colocating everything and time-sharing every GPU, has no idle pools but needs resharding between phases that the existing trainer does not do. The bottlenecks I expect, in order: the long tail of generation, weight sync from trainer to engine, then the reward model's throughput.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Memory, computed.</strong> With bf16 weights and gradients and fp32 master weights and Adam moments, training state is 16 bytes per parameter: 70 × 10<sup>9</sup> × 16 = 1.12 TB for the policy and the same for a 70B value model. The reward and reference models are inference-only at 2 bytes per parameter, 140 GB each. Total 2.52 TB, or 31.5 GPUs of 80 GB before activations and KV cache. Even with activations and a generous KV cache, the four models fit on a small fraction of the cluster; the rest exists to go faster.</p>
+<p><strong>The value model's size is the quantity to choose.</strong> DeepSeekMath notes PPO's value model is typically comparable in size to the policy. A 70B value model doubles training state and training compute. An 8B value model initialised from the reward model's family cuts the value model's training state from 1.12 TB to 0.13 TB and its compute by about nine times, at the cost of worse value estimates on long responses and so noisier advantages. Same size as the policy or one size class down are both reasonable; a value model too small to read the response the policy wrote is not. A third answer is to drop the value model and use group baselines (GRPO), which changes the algorithm the brief asked for, so I would raise it rather than assume it.</p>
+<p><strong>Placement: two defensible designs.</strong></p>
+<ul>
+<li><em>Disaggregated.</em> Generation pool: inference-engine replicas with tensor parallelism inside a node, many replicas for throughput. Scoring pool: the reward and reference models as batched inference services, plus the value model's forward pass. Training pool: the existing trainer for policy and value. New policy weights are broadcast from trainer to engine after each step. Cost: idle capacity when the ratio between pools is wrong, a weight broadcast across the slower inter-pod links every step, and a sampler-trainer numerics gap that makes the data slightly off-policy, which Yao et al. correct with truncated importance sampling.</li>
+<li><em>Colocated.</em> Every GPU holds every phase in turn, offloading what it is not running, as Kimi K2 and HybridFlow's 3D-HybridEngine do. No pool sits idle, and the weight update stays in the node. Cost: a resharding path between training and generation layouts, which the existing trainer does not have and which is six weeks of work at least; and every phase still waits for the slowest generation.</li>
+</ul>
+<p>The constraint conflict is utilisation against the deadline: colocation uses the hardware better, disaggregation can start on time with the stack the team has. I choose disaggregation, with the pool ratio as the second quantity to choose. If generation is about nine tenths of the work and training one tenth, a first split is roughly 1,792 GPUs for generation and scoring and 256 for training; the training pool then holds 2.24 TB of policy and value state across 256 GPUs, 8.75 GB per GPU, leaving room for activations at long sequence lengths. Measure the real split in the first day's steps and rebalance.</p>
+<p><strong>The step and the bottlenecks.</strong> Generate a batch; score it with reward, reference and value; compute advantages with GAE and the KL penalty against the reference; run a few PPO epochs on policy and value; broadcast weights. The long tail is first: a synchronous step waits for the longest response, and with an 8,192-token cap against a 1,000-token mean, most of the generation pool idles at the end of every step. Mitigations are over-generation with a cutoff, or carrying unfinished responses into the next step as Kimi K2's partial rollouts do, which makes those samples one version stale. Weight sync is second: Kimi K2 report under 30 seconds for a 1T-parameter model with a purpose-built checkpoint engine, their own measurement; time yours before assuming it is negligible. Reward scoring is third, because a 70B reward model reads every token of every response.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>The pool ratio drifts as responses lengthen during training, and the training pool idles half of every step. Do you re-partition mid-run, and what does it cost?</li>
+<li>What would you need to see in the first week to switch to the colocated design for the next run?</li>
+<li>The reward team refuses a distilled reward model. What do you do about scoring throughput?</li>
+</ul>
+</Fragment>
+</Depth>
+
+**Decision memo.** We will run PPO with a disaggregated layout: about seven eighths of the cluster for generation and scoring, one eighth for the existing trainer running policy and a value model one size class below the policy. We accept idle capacity at the end of each step and a per-step weight broadcast, and we correct the sampler-trainer gap with truncated importance sampling. We give up the utilisation a colocated design would reach, in exchange for starting on the current stack within six weeks. We will revisit after the first week with measured phase times, and move to colocation for the next run if the generation pool's idle share at step end stays above the threshold we set from those measurements.
+
+**Failure mode of the recommendation.** The fixed split is tuned to the response lengths at the start. Response length moves during RL (DAPO reports it rising, stagnating and falling at different points of a run), and a pool sized for 1,000-token responses is wrong for 3,000-token ones: generation becomes the whole step and the training pool idles. Without elastic reassignment the layout that started on time loses its advantage within the run.
+
+## Follow-ups
+
+- Weight sync across pods takes a fifth of each step. Do you sync every other step and accept two-version staleness, or buy the engineering for a checkpoint engine, and what risk do you write down for each?
+- Two senior engineers disagree: one wants a 70B value model for stable advantages, the other an 8B one for throughput. What experiment, run in a day, settles it?
+- The reward model's scores drift upward while human spot checks do not. Which part of this design catches that, and which part makes it worse?
+- What changes if the policy is a mixture-of-experts model with the same active parameters but four times the total?
+
+## Common mistakes
+
+- Sizing the cluster by memory, which is not the constraint here.
+- Placing all four models identically without asking which ones train and which only infer.
+- Ignoring the long tail of generation in a synchronous step.
+- Assuming weight sync is free.

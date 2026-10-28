@@ -1,0 +1,500 @@
+---
+title: GRPO on a toy verifiable task
+track: training
+module: rl
+kind: lab
+minutes: 120
+summary: Build GRPO by hand on a tabular policy with a strict verifier, then watch groups where every sample scores the same contribute nothing, the KL term hold the policy near its reference, and per-sequence loss normalisation make wrong answers longer.
+updated: 2026-10-28
+sources:
+  - title: Shao et al., DeepSeekMath, Pushing the Limits of Mathematical Reasoning in Open Language Models (v3, 2024-04-27)
+    url: https://arxiv.org/abs/2402.03300
+    note: "GRPO drops PPO's value model, which is typically comparable in size to the policy, and uses the mean reward of a group of sampled outputs as the baseline, normalised by the group's standard deviation; the ratio is against the policy that sampled; KL to the reference is added to the loss with the r - log r - 1 estimator; steps 3, 4 and 6. Checked 2026-10-28."
+  - title: Yu et al., DAPO, An Open-Source LLM Reinforcement Learning System at Scale (2025)
+    url: https://arxiv.org/html/2503.14476
+    note: "clip-higher with epsilon_low 0.2 and epsilon_high 0.28; groups whose samples are all correct get zero advantage and zero gradient, which shrinks the effective batch, and dynamic sampling refills the batch with groups whose accuracy is neither 0 nor 1; the KL term is dropped for long reasoning; steps 4, 5 and 6. Checked 2026-10-28."
+  - title: Liu et al., Understanding R1-Zero-Like Training, A Critical Perspective (v2, 2025-10-06)
+    url: https://arxiv.org/abs/2503.20783
+    note: "dividing each response's loss by its length penalises long incorrect responses less per token, so incorrect responses grow longer; Dr. GRPO divides by a constant such as the generation budget instead; step 7. Checked 2026-10-28."
+  - title: Hugging Face TRL, GRPO Trainer (main branch docs)
+    url: https://huggingface.co/docs/trl/main/en/grpo_trainer
+    note: "defaults on main as of 2026-10-28: beta 0.0 (no KL term, no reference model loaded), loss_type 'dapo', epsilon 0.2 with epsilon_high falling back to epsilon, num_generations 8; steps 4, 6 and 7."
+steps:
+  - title: Softmax policy over a small action set
+    brief: |
+      The policy in this lab is a table: one vector of logits per prompt over a fixed list of candidate responses, so sampling a response is one draw from a softmax and its log-probability is one entry of a log-softmax. Write a log-softmax that stays finite for logits of 1,000 or -1,000, a softmax built on it, and a sampler that consumes exactly one rng.random() per draw by inverting the cumulative distribution, so a seeded run is reproducible and two runs that sample the same number of times stay in step.
+    starter: |
+      import math
+      import random
+
+
+      def log_softmax(logits):
+          """Log-probabilities for a list of logits, finite for any finite input."""
+          raise NotImplementedError
+
+
+      def softmax(logits):
+          raise NotImplementedError
+
+
+      def sample(logits, rng):
+          """One action index drawn from softmax(logits), using exactly one call to rng.random()."""
+          raise NotImplementedError
+    tests: |
+      import math, random
+      assert all(abs(p - 0.25) < 1e-12 for p in softmax([0.0, 0.0, 0.0, 0.0]))
+      lp = log_softmax([1000.0, 1000.0])
+      assert all(abs(v + math.log(2)) < 1e-12 for v in lp), "large equal logits give log 0.5 each"
+      p = softmax([1000.0, -1000.0])
+      assert abs(p[0] - 1.0) < 1e-12 and p[1] >= 0.0
+      rng = random.Random(0)
+      draws = [sample([0.0, math.log(3.0)], rng) for _ in range(20000)]
+      assert abs(draws.count(1) / 20000 - 0.75) < 0.02, "the sampler follows the softmax"
+      a, b = random.Random(5), random.Random(5)
+      sample([0.1, 0.2, 0.3], a)
+      b.random()
+      assert a.random() == b.random(), "one draw consumes exactly one rng.random()"
+    hidden: |
+      import math, random
+      rng = random.Random(11)
+      for _ in range(200):
+          z = [rng.uniform(-50, 50) for _ in range(rng.randint(2, 12))]
+          c = rng.uniform(-500, 500)
+          assert all(abs(x - y) < 1e-9 for x, y in zip(softmax(z), softmax([v + c for v in z]))), "adding a constant to every logit changes nothing"
+          assert abs(sum(softmax(z)) - 1.0) < 1e-12
+          assert all(v <= 1e-12 for v in log_softmax(z))
+      seen = {sample([0.0, 0.0, 0.0], rng) for _ in range(500)}
+      assert seen == {0, 1, 2}, "every action of a uniform policy is drawn"
+      assert sample([0.0, -1e9, -1e9], random.Random(1)) == 0, "an action with negligible probability is not drawn"
+    solution: |
+      import math
+      import random
+
+
+      def log_softmax(logits):
+          m = max(logits)
+          lse = m + math.log(sum(math.exp(z - m) for z in logits))
+          return [z - lse for z in logits]
+
+
+      def softmax(logits):
+          return [math.exp(v) for v in log_softmax(logits)]
+
+
+      def sample(logits, rng):
+          u = rng.random()
+          acc = 0.0
+          probs = softmax(logits)
+          for i, p in enumerate(probs):
+              acc += p
+              if u < acc:
+                  return i
+          return len(probs) - 1
+  - title: A verifier
+    brief: |
+      The task is verifiable: a prompt is a pair (a, b) and the target is a times b modulo 8. The candidate responses include every well-formed answer, a hedge that names two numbers, a response that lists all eight, and a refusal. A verifier that checks whether the target appears anywhere in the text pays the list-all response on every prompt, and an RL run finds that response within a few steps. Write verify(prompt, text) so that it returns 1.0 only for a response that is exactly one well-formed answer equal to the target, and 0.0 for everything else, including text it cannot parse. The tests check that each prompt has exactly one rewarded response in the action list and that no string makes the verifier raise.
+    starter: |
+      import re
+
+      K = 8
+      ACTIONS = [f"answer: {n}" for n in range(K)] + ["answer: 3 or 5", "answer: 0 1 2 3 4 5 6 7", "I am not sure"]
+
+
+      def target(prompt):
+          a, b = prompt
+          return (a * b) % K
+
+
+      def verify(prompt, text):
+          """1.0 if text is one well-formed answer equal to target(prompt), else 0.0."""
+          raise NotImplementedError
+    tests: |
+      assert verify((3, 5), "answer: 7") == 1.0
+      assert verify((3, 5), "answer: 6") == 0.0
+      assert verify((1, 3), "answer: 3 or 5") == 0.0, "a hedge that contains the target is not an answer"
+      assert verify((2, 2), "answer: 0 1 2 3 4 5 6 7") == 0.0, "listing every answer earns nothing"
+      assert verify((2, 2), "I am not sure") == 0.0
+    hidden: |
+      import random
+      for a in range(8):
+          for b in range(8):
+              rewarded = [t for t in ACTIONS if verify((a, b), t) == 1.0]
+              assert len(rewarded) == 1, f"prompt {(a, b)} must reward exactly one response, got {rewarded}"
+      rng = random.Random(3)
+      alphabet = "answer: 0123456789 or,\n\t-+x"
+      for _ in range(2000):
+          s = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 20)))
+          r = verify((rng.randrange(8), rng.randrange(8)), s)
+          assert r in (0.0, 1.0)
+      assert verify((3, 5), "answer: 7\nanswer: 6") == 0.0, "two answers on two lines are still a hedge"
+    solution: |
+      import re
+
+      K = 8
+      ACTIONS = [f"answer: {n}" for n in range(K)] + ["answer: 3 or 5", "answer: 0 1 2 3 4 5 6 7", "I am not sure"]
+      _ANSWER = re.compile(r"answer: (\d+)")
+
+
+      def target(prompt):
+          a, b = prompt
+          return (a * b) % K
+
+
+      def verify(prompt, text):
+          m = _ANSWER.fullmatch(text.strip())
+          if m is None:
+              return 0.0
+          return 1.0 if int(m.group(1)) == target(prompt) else 0.0
+  - title: Group-relative advantages
+    brief: |
+      GRPO replaces the value model with a baseline computed from the group itself: sample G responses to one prompt, score each, subtract the group mean and divide by the group's standard deviation. Write group_advantages(rewards, scale=True, eps=1e-6) with the population standard deviation and eps added to it, and scale=False returning only the centred rewards. A group where every reward is equal must come back as zeros, not as a division by zero. The function runs once per group per step on groups that can be large, so it must be linear in the group size: the hidden tests time a group of 200,000.
+    starter: |
+      def group_advantages(rewards, scale=True, eps=1e-6):
+          """(r - mean) / (population std + eps) per sample, or r - mean when scale is False."""
+          raise NotImplementedError
+    tests: |
+      import math
+      assert group_advantages([1.0, 0.0, 0.0, 0.0], scale=False) == [0.75, -0.25, -0.25, -0.25]
+      adv = group_advantages([1.0, 0.0, 0.0, 0.0])
+      assert abs(adv[0] - 0.75 / (math.sqrt(0.75 * 0.25) + 1e-6)) < 1e-9
+      assert group_advantages([1.0, 1.0, 1.0, 1.0]) == [0.0, 0.0, 0.0, 0.0], "a group where every sample is correct has no signal"
+      assert group_advantages([0.0] * 8) == [0.0] * 8
+    hidden: |
+      import math, random, time
+      rng = random.Random(9)
+      for _ in range(300):
+          g = [float(rng.random() < 0.4) for _ in range(rng.randint(2, 32))]
+          adv = group_advantages(g)
+          assert abs(sum(adv)) < 1e-9, "advantages sum to zero within a group"
+          if len(set(g)) > 1:
+              std = math.sqrt(sum(a * a for a in adv) / len(adv))
+              assert abs(std - 1.0) < 1e-4, "scaled advantages have unit spread"
+              assert all((x > y) == (ax > ay) for x, ax in zip(g, adv) for y, ay in zip(g, adv)), "order is preserved"
+          else:
+              assert all(abs(a) < 1e-9 for a in adv)
+      assert all(abs(a) < 1e-9 for a in group_advantages([0.1] * 7)), "equal rewards that are not round numbers still give zeros"
+      big = [float(rng.random() < 0.5) for _ in range(200000)]
+      t0 = time.perf_counter()
+      adv = group_advantages(big)
+      assert time.perf_counter() - t0 < 2.0, "group_advantages must be linear in the group size"
+      assert len(adv) == 200000
+    solution: |
+      def group_advantages(rewards, scale=True, eps=1e-6):
+          n = len(rewards)
+          mean = sum(rewards) / n
+          centred = [r - mean for r in rewards]
+          if not scale:
+              return centred
+          std = math.sqrt(sum(c * c for c in centred) / n)
+          return [c / (std + eps) for c in centred]
+  - title: Clipped ratio
+    brief: |
+      Each step samples a group per prompt from the current policy, freezes those logits as the old policy, and then takes several gradient steps on the same samples, so the ratio of new to old probability drifts from 1 and the clip starts to matter. Write clipped_grad, the gradient with respect to the logits of the mean over samples of min(ratio times A, clip(ratio, 1 - eps_low, 1 + eps_high) times A), using DAPO's asymmetric defaults. For a softmax the gradient of log p(a) is the one-hot vector of a minus p, so a sample whose clipped branch is active contributes nothing, and an unclipped one contributes A times ratio times that vector. Then write rollout and train; train starts from zero logits, runs `inner` updates per batch of rollouts and returns the policy and the mean reward per step. The tests check that reward rises from the uniform policy's 1 in 11.
+    starter: |
+      def clipped_grad(logits, old_logits, actions, advs, eps_low=0.2, eps_high=0.28):
+          """Gradient w.r.t. logits of mean_i min(ratio_i * A_i, clip(ratio_i) * A_i), ratio_i = p(a_i) / p_old(a_i)."""
+          raise NotImplementedError
+
+
+      def rollout(logits, prompt, G, rng):
+          """G sampled action indices and their verifier rewards."""
+          raise NotImplementedError
+
+
+      def train(prompts, steps=40, G=8, lr=1.0, inner=4, seed=0, eps_low=0.2, eps_high=0.28):
+          """Returns (policy, history): policy maps prompt to logits, history[t] is the mean reward at step t."""
+          raise NotImplementedError
+    tests: |
+      import math
+      z = [0.3, -0.2, 0.1]
+      p = softmax(z)
+      g = clipped_grad(z, z, [0, 2], [1.0, -0.5])
+      want = [(1.0 * ((k == 0) - p[k]) - 0.5 * ((k == 2) - p[k])) / 2 for k in range(3)]
+      assert all(abs(a - b) < 1e-12 for a, b in zip(g, want)), "at ratio 1 the gradient is A times (one-hot minus p)"
+      old = [0.0, 0.0, 0.0]
+      new = [1.0, 0.0, 0.0]
+      assert clipped_grad(new, old, [0], [1.0]) == [0.0, 0.0, 0.0], "a positive-advantage sample above 1 + eps_high is clipped"
+      assert any(abs(v) > 0 for v in clipped_grad(new, old, [0], [-1.0])), "a negative-advantage sample above the clip still pushes down"
+      prompts = [(a, b) for a in range(1, 4) for b in range(2, 4)]
+      policy, hist = train(prompts, steps=40, seed=1)
+      assert sum(hist[:5]) / 5 < 0.3 and sum(hist[-5:]) / 5 > 0.8, f"reward rises: {hist[:5]} -> {hist[-5:]}"
+    hidden: |
+      import math, random
+      rng = random.Random(4)
+      for _ in range(200):
+          z = [rng.uniform(-2, 2) for _ in range(5)]
+          zo = [v + rng.uniform(-0.6, 0.6) for v in z]
+          acts = [rng.randrange(5) for _ in range(6)]
+          advs = [rng.uniform(-1, 1) for _ in range(6)]
+          g = clipped_grad(z, zo, acts, advs)
+          assert abs(sum(g)) < 1e-9, "softmax gradients sum to zero over the logits"
+      z = [0.0, 0.0]
+      assert clipped_grad(z, z, [0, 1], [0.0, 0.0]) == [0.0, 0.0], "zero advantage, zero gradient"
+      lp_new, lp_old = log_softmax([0.0, 1.0]), log_softmax([0.0, 0.0])
+      ratio = math.exp(lp_new[0] - lp_old[0])
+      assert ratio < 0.8
+      assert clipped_grad([0.0, 1.0], [0.0, 0.0], [0], [-1.0]) == [0.0, 0.0], "a negative-advantage sample below 1 - eps_low is clipped"
+      _, h1 = train([(2, 3)], steps=10, seed=7)
+      _, h2 = train([(2, 3)], steps=10, seed=7)
+      assert h1 == h2, "a seeded run is reproducible"
+    solution: |
+      def clipped_grad(logits, old_logits, actions, advs, eps_low=0.2, eps_high=0.28):
+          p = softmax(logits)
+          lp = log_softmax(logits)
+          lo = log_softmax(old_logits)
+          g = [0.0] * len(logits)
+          n = len(actions)
+          for a, adv in zip(actions, advs):
+              ratio = math.exp(lp[a] - lo[a])
+              if adv == 0 or (adv > 0 and ratio > 1 + eps_high) or (adv < 0 and ratio < 1 - eps_low):
+                  continue
+              w = adv * ratio / n
+              for k in range(len(g)):
+                  g[k] -= w * p[k]
+              g[a] += w
+          return g
+
+
+      def rollout(logits, prompt, G, rng):
+          acts = [sample(logits, rng) for _ in range(G)]
+          return acts, [verify(prompt, ACTIONS[a]) for a in acts]
+
+
+      def train(prompts, steps=40, G=8, lr=1.0, inner=4, seed=0, eps_low=0.2, eps_high=0.28):
+          rng = random.Random(seed)
+          policy = {pr: [0.0] * len(ACTIONS) for pr in prompts}
+          history = []
+          for _ in range(steps):
+              batch = []
+              total = 0.0
+              for pr in prompts:
+                  acts, rewards = rollout(policy[pr], pr, G, rng)
+                  total += sum(rewards) / G
+                  batch.append((pr, list(policy[pr]), acts, group_advantages(rewards)))
+              history.append(total / len(prompts))
+              for _ in range(inner):
+                  for pr, old, acts, advs in batch:
+                      g = clipped_grad(policy[pr], old, acts, advs, eps_low, eps_high)
+                      policy[pr] = [z + lr * gk for z, gk in zip(policy[pr], g)]
+          return policy, history
+  - title: Zero-variance groups
+    brief: |
+      A group where every sample is correct, or every sample is wrong, has zero advantage everywhere and so contributes no gradient; it still costs a full group of generations and, under a token-mean loss, still sits in the denominator. As the policy improves, more groups land there and the effective batch shrinks. DAPO's dynamic sampling keeps drawing groups until the batch holds only groups whose rewards differ. Write dynamic_batch, which draws a prompt with rng.choice, samples a group with rollout, keeps it only if its rewards are not all equal, and stops when it holds batch_size groups or has drawn max_groups. The budget matters more than the filter: on a policy that has solved everything, an unbounded loop never returns.
+    starter: |
+      def dynamic_batch(policy, prompts, G, rng, batch_size, max_groups):
+          """Returns (kept, drawn): kept is a list of (prompt, actions, rewards) with non-constant rewards, at most
+          batch_size long; drawn is the number of groups sampled, at most max_groups."""
+          raise NotImplementedError
+    tests: |
+      import random
+      z = [0.2, -0.1, 0.4]
+      assert clipped_grad(z, z, [0, 1, 2, 0], group_advantages([1.0, 1.0, 1.0, 1.0])) == [0.0, 0.0, 0.0], "an all-correct group contributes zero gradient"
+      prompts = [(a, b) for a in range(1, 4) for b in range(2, 4)]
+      fresh = {pr: [0.0] * len(ACTIONS) for pr in prompts}
+      kept, drawn = dynamic_batch(fresh, prompts, 8, random.Random(0), batch_size=4, max_groups=100)
+      assert len(kept) == 4 and drawn >= 4
+      assert all(len(set(r)) > 1 for _, _, r in kept), "every kept group has signal"
+    hidden: |
+      import random
+      prompts = [(a, b) for a in range(1, 4) for b in range(2, 4)]
+      solved = {}
+      for pr in prompts:
+          z = [0.0] * len(ACTIONS)
+          z[ACTIONS.index(f"answer: {target(pr)}")] = 60.0
+          solved[pr] = z
+      kept, drawn = dynamic_batch(solved, prompts, 8, random.Random(1), batch_size=4, max_groups=50)
+      assert kept == [] and drawn == 50, "a solved policy exhausts the budget and returns"
+      rng = random.Random(2)
+      for _ in range(30):
+          mixed = {pr: [rng.uniform(-1, 1) for _ in ACTIONS] for pr in prompts}
+          bs, mg = rng.randint(1, 6), rng.randint(1, 40)
+          kept, drawn = dynamic_batch(mixed, prompts, 8, rng, batch_size=bs, max_groups=mg)
+          assert len(kept) <= bs and drawn <= mg and len(kept) <= drawn
+          assert all(len(a) == 8 and len(set(r)) > 1 for _, a, r in kept)
+    solution: |
+      def dynamic_batch(policy, prompts, G, rng, batch_size, max_groups):
+          kept = []
+          drawn = 0
+          while len(kept) < batch_size and drawn < max_groups:
+              pr = rng.choice(prompts)
+              acts, rewards = rollout(policy[pr], pr, G, rng)
+              drawn += 1
+              if len(set(rewards)) > 1:
+                  kept.append((pr, acts, rewards))
+          return kept, drawn
+  - title: KL term on and off
+    brief: |
+      GRPO as published adds beta times an estimate of KL from the policy to a frozen reference to the loss, per sampled token, with the estimator r - log r - 1 where r is the reference probability over the policy probability; it is never negative and its expectation under the policy is the exact KL. DAPO drops the term for long reasoning and TRL's default is now beta 0. Write kl_k3, kl_exact, kl_grad (the gradient with respect to the logits of the mean of kl_k3 over the sampled actions, holding the samples fixed, as an autograd framework computes it) and train_kl, which is train started from a given reference and with beta times kl_grad subtracted from each update. The tests compare where beta 0 and beta 0.5 leave the policy.
+    starter: |
+      def kl_k3(logp, logp_ref):
+          """Estimate of KL(policy || ref) from one sample: r - log r - 1 with r = exp(logp_ref - logp)."""
+          raise NotImplementedError
+
+
+      def kl_exact(logits, ref_logits):
+          raise NotImplementedError
+
+
+      def kl_grad(logits, ref_logits, actions):
+          """Gradient w.r.t. logits of mean over actions of kl_k3, with the sampled actions held fixed."""
+          raise NotImplementedError
+
+
+      def train_kl(prompts, ref, beta, steps=40, G=8, lr=1.0, inner=4, seed=0):
+          """train, starting every prompt from the reference logits ref[prompt], with beta * kl_grad subtracted."""
+          raise NotImplementedError
+    tests: |
+      import math
+      z, zr = [0.5, -0.3, 0.1, 0.0], [0.0, 0.2, -0.4, 0.3]
+      lp, lr_ = log_softmax(z), log_softmax(zr)
+      est = sum(math.exp(lp[a]) * kl_k3(lp[a], lr_[a]) for a in range(4))
+      assert abs(est - kl_exact(z, zr)) < 1e-12, "the estimator's expectation under the policy is the exact KL"
+      assert kl_k3(-1.0, -1.0) == 0.0 and kl_exact(z, z) == 0.0
+      prompts = [(a, b) for a in range(1, 4) for b in range(2, 4)]
+      ref = {pr: [0.0] * len(ACTIONS) for pr in prompts}
+      p0, h0 = train_kl(prompts, ref, beta=0.0, seed=3)
+      p5, h5 = train_kl(prompts, ref, beta=0.5, seed=3)
+      k0 = sum(kl_exact(p0[pr], ref[pr]) for pr in prompts)
+      k5 = sum(kl_exact(p5[pr], ref[pr]) for pr in prompts)
+      assert k5 < k0, f"the KL term holds the policy nearer the reference: {k5:.3f} vs {k0:.3f}"
+      assert sum(h5[-5:]) / 5 > 0.5, "with beta 0.5 the policy still learns the task"
+    hidden: |
+      import math, random
+      rng = random.Random(8)
+      for _ in range(500):
+          a, b = rng.uniform(-30, 0), rng.uniform(-30, 0)
+          assert kl_k3(a, b) >= 0.0
+      for _ in range(100):
+          z = [rng.uniform(-2, 2) for _ in range(6)]
+          zr = [rng.uniform(-2, 2) for _ in range(6)]
+          acts = [rng.randrange(6) for _ in range(5)]
+          g = kl_grad(z, zr, acts)
+          assert abs(sum(g)) < 1e-9
+          h = 1e-6
+          k = rng.randrange(6)
+          zp, zm = list(z), list(z)
+          zp[k] += h
+          zm[k] -= h
+          f = lambda w: sum(kl_k3(log_softmax(w)[a], log_softmax(zr)[a]) for a in acts) / len(acts)
+          assert abs((f(zp) - f(zm)) / (2 * h) - g[k]) < 1e-5, "kl_grad matches central differences"
+      prompts = [(1, 2)]
+      ref = {(1, 2): [0.0] * len(ACTIONS)}
+      pa, ha = train_kl(prompts, ref, beta=0.0, seed=5)
+      _, hb = train(prompts, seed=5)
+      assert ha == hb, "beta 0 from a zero reference is the same run as train"
+    solution: |
+      def kl_k3(logp, logp_ref):
+          x = logp_ref - logp
+          return math.exp(x) - x - 1.0
+
+
+      def kl_exact(logits, ref_logits):
+          lp, lr_ = log_softmax(logits), log_softmax(ref_logits)
+          return sum(math.exp(a) * (a - b) for a, b in zip(lp, lr_))
+
+
+      def kl_grad(logits, ref_logits, actions):
+          lp, lr_ = log_softmax(logits), log_softmax(ref_logits)
+          p = softmax(logits)
+          g = [0.0] * len(logits)
+          for a in actions:
+              w = (1.0 - math.exp(lr_[a] - lp[a])) / len(actions)
+              for k in range(len(g)):
+                  g[k] -= w * p[k]
+              g[a] += w
+          return g
+
+
+      def train_kl(prompts, ref, beta, steps=40, G=8, lr=1.0, inner=4, seed=0):
+          rng = random.Random(seed)
+          policy = {pr: list(ref[pr]) for pr in prompts}
+          history = []
+          for _ in range(steps):
+              batch = []
+              total = 0.0
+              for pr in prompts:
+                  acts, rewards = rollout(policy[pr], pr, G, rng)
+                  total += sum(rewards) / G
+                  batch.append((pr, list(policy[pr]), acts, group_advantages(rewards)))
+              history.append(total / len(prompts))
+              for _ in range(inner):
+                  for pr, old, acts, advs in batch:
+                      g = clipped_grad(policy[pr], old, acts, advs)
+                      if beta:
+                          kg = kl_grad(policy[pr], ref[pr], acts)
+                          g = [a - beta * b for a, b in zip(g, kg)]
+                      policy[pr] = [z + lr * gk for z, gk in zip(policy[pr], g)]
+          return policy, history
+  - title: Length-bias demonstration
+    brief: |
+      In a language model every token of a response carries a gradient, and the original GRPO loss divides each response's summed token loss by its own length before averaging over the group. Liu et al. point out what that does to wrong answers: the per-token penalty on a long wrong response is smaller than on a short one, so wrong responses drift longer. This step isolates the effect with a three-response policy (a correct answer of 40 tokens, a wrong answer of 40 and a wrong answer of 400) and exact expected gradients, no sampling, so the result is the same on every run. The length decision is one token; its weight is A over the response length under 'seq', A over the policy's expected length under 'token' (DAPO's token mean), and A over l_max under 'constant' (Dr. GRPO). Write expected_grad and length_demo, then compare how the two wrong answers end up under each mode.
+    starter: |
+      DEMO_REWARDS = [1.0, 0.0, 0.0]
+      DEMO_LENGTHS = [40, 40, 400]
+
+
+      def expected_grad(logits, rewards, lengths, mode, l_max):
+          """Exact expected gradient at ratio 1: sum_i p_i * A_i * c_i * (onehot(i) - p), A_i = r_i - E_p[r],
+          c_i = 1 / lengths[i] ('seq'), 1 / E_p[length] ('token') or 1 / l_max ('constant')."""
+          raise NotImplementedError
+
+
+      def length_demo(mode, steps=300, lr=200.0, l_max=400):
+          """Gradient ascent from zero logits on DEMO_REWARDS and DEMO_LENGTHS; returns the final probabilities."""
+          raise NotImplementedError
+    tests: |
+      ps = length_demo("seq")
+      pc = length_demo("constant")
+      pt = length_demo("token")
+      assert ps[2] / ps[1] > 2.0, f"under per-sequence normalisation the long wrong answer outlives the short one: {ps}"
+      assert pc[1] == pc[2] and pt[1] == pt[2], "with one weight per token, the two wrong answers fall together"
+      for p in (ps, pc, pt):
+          assert p[0] > 1 / 3, "every mode still raises the correct answer"
+    hidden: |
+      import random
+      rng = random.Random(12)
+      for _ in range(100):
+          z = [rng.uniform(-2, 2) for _ in range(4)]
+          r = [float(rng.random() < 0.5) for _ in range(4)]
+          L = rng.randint(5, 50)
+          a = expected_grad(z, r, [L] * 4, "seq", L)
+          b = expected_grad(z, r, [L] * 4, "constant", L)
+          c = expected_grad(z, r, [L] * 4, "token", L)
+          assert all(abs(x - y) < 1e-12 and abs(x - w) < 1e-12 for x, y, w in zip(a, b, c)), "equal lengths make the three modes agree"
+          assert abs(sum(a)) < 1e-12
+      assert expected_grad([0.0, 0.0], [1.0, 1.0], [10, 300], "seq", 300) == [0.0, 0.0], "equal rewards, no gradient in any mode"
+      ps = length_demo("seq")
+      wrong_len = (ps[1] * 40 + ps[2] * 400) / (ps[1] + ps[2])
+      assert wrong_len > 220, "the mean length of wrong answers grows from its starting 220"
+    solution: |
+      DEMO_REWARDS = [1.0, 0.0, 0.0]
+      DEMO_LENGTHS = [40, 40, 400]
+
+
+      def expected_grad(logits, rewards, lengths, mode, l_max):
+          p = softmax(logits)
+          mean_r = sum(pi * ri for pi, ri in zip(p, rewards))
+          mean_len = sum(pi * li for pi, li in zip(p, lengths))
+          g = [0.0] * len(logits)
+          for i, (pi, ri, li) in enumerate(zip(p, rewards, lengths)):
+              c = {"seq": 1.0 / li, "token": 1.0 / mean_len, "constant": 1.0 / l_max}[mode]
+              w = pi * (ri - mean_r) * c
+              for k in range(len(g)):
+                  g[k] -= w * p[k]
+              g[i] += w
+          return g
+
+
+      def length_demo(mode, steps=300, lr=200.0, l_max=400):
+          z = [0.0, 0.0, 0.0]
+          for _ in range(steps):
+              g = expected_grad(z, DEMO_REWARDS, DEMO_LENGTHS, mode, l_max)
+              z = [a + lr * b for a, b in zip(z, g)]
+          return softmax(z)
+---
+
+The lessons on PPO and the GRPO family state the objective; this lab builds it from parts small enough to check by hand. The policy is a table of logits per prompt over eleven candidate responses, and the reward comes from a verifier you write, so every quantity in GRPO is a few lines of arithmetic and a seeded run gives the same numbers every time. No model is trained in the browser.
+
+Steps 1 and 2 are the policy and the verifier, including the hedged answers a loose verifier pays for. Steps 3 and 4 add group-relative advantages and the clipped ratio and show reward rising from the uniform policy. Step 5 shows why a group where every sample scores the same is wasted compute and bounds the resampling that DAPO uses to replace it. Step 6 turns the KL term on and off. Step 7 reproduces, with exact expected gradients, the length bias that per-response loss normalisation puts on wrong answers.
+
+Your code is saved with your progress as you type. Passing a step's tests unlocks the next step and counts toward your streak. Python runs in your browser with the standard library only.

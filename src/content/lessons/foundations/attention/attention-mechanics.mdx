@@ -1,0 +1,175 @@
+---
+title: Attention, causal masks and the online softmax
+track: foundations
+module: attention
+order: 1
+kind: lesson
+level: senior
+minutes: 18
+summary: Attention stated once, then the two details serving code gets wrong, the causal mask once queries sit at the end of a longer sequence and the online normaliser that lets a decode step equal a full recompute.
+prerequisites: []
+updated: 2026-10-28
+sources:
+  - title: Attention Is All You Need (Vaswani et al., 2017)
+    url: https://arxiv.org/abs/1706.03762
+    note: softmax(QK^T / sqrt(d_k)) V; footnote, q·k has variance d_k for independent unit-variance components; Table 1, self-attention O(n^2 d) per layer; base model d_model 512, h 8, d_k 64
+  - title: Online normalizer calculation for softmax (Milakov and Gimelshein, 2018)
+    url: https://arxiv.org/abs/1805.02867
+    note: one-pass running maximum and normaliser; the paper reports softmax up to 1.3x faster and softmax fused with top-k up to 5x, part of it from fusion
+  - title: "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness (Dao et al., 2022)"
+    url: https://arxiv.org/abs/2205.14135
+    note: tiled exact attention that never writes the score matrix to HBM, built on the online normaliser
+  - title: Dao-AILab/flash-attention README (checked 2026-10-28)
+    url: https://github.com/Dao-AILab/flash-attention
+    note: from version 2.1, when seqlen_q != seqlen_k and causal=True the mask is aligned to the bottom-right corner, where earlier versions aligned it top-left; flash_attn_with_kvcache for inference from 2.2
+  - title: Flash-Decoding for long-context inference (Dao, Haziza, Massa and Sizov, 2023)
+    url: https://crfm.stanford.edu/2023/10/12/flashdecoding.html
+    note: splits keys and values into chunks, stores the log-sum-exp per split and rescales in a final reduction
+  - title: Meta Llama 3.1 8B Instruct, config.json (unsloth mirror of the Meta release, checked 2026-10-28)
+    url: https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct/blob/main/config.json
+    note: 32 layers, hidden size 4096, 32 attention heads, 8 key-value heads, head_dim 128, intermediate size 14336
+  - title: gpt-oss-120b and gpt-oss-20b model card (OpenAI, 2025)
+    url: https://arxiv.org/html/2508.10925
+    note: each head has a learned bias in the softmax denominator, so a head can attend to no token
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+import FoundationsAttention from '../../../../components/widgets/FoundationsAttention.astro';
+
+<Callout kind="aside" label="Attempt first">
+Problem [fnd-029](/problems/fnd-029), a batched decode that disagrees with a full recompute, is this module's opening problem. Try it before reading on; the lesson explains the mechanism it turns on.
+</Callout>
+
+## The operation, stated once
+
+Attention is softmax(QKᵀ / √d_k) V, a weighted gather over values whose weights come from query-key dot products. The √d_k is there because, for independent unit-variance components, q·k has variance d_k, and unscaled scores at realistic head sizes push the softmax towards one-hot. That is the whole of the definition this module needs.
+
+Two costs follow from it. Prefill computes all n queries against all n keys, so the score work is O(n² d) per layer, the figure in Table 1 of the 2017 paper. Decode computes one new query against n cached keys, so once keys and values are kept, each generated token costs O(n d) attention work and the cache costs memory proportional to n. Every serving decision in this module is a choice about one of those two terms.
+
+The widget runs the arithmetic on four tokens with 2-dimensional vectors. Pick "sat" as the query: the raw dot products against The, cat and sat are 0.26, 1.12 and 0.90, the scaled weights are 0.227, 0.417 and 0.357, and "down" gets exactly 0 because the mask set its score to minus infinity before the softmax.
+
+<FoundationsAttention />
+
+The rest of this lesson is about the two places where serving code departs from that picture: the mask when the queries are not the whole sequence, and the normaliser when the scores are not all in memory at once.
+
+## The causal mask at training versus inference
+
+In training and in a single-pass prefill, query i may read keys 0 to i. The mask is the lower triangle of a square, and it is what lets one forward pass produce n next-token losses without any position reading its own future. Nothing about it is subtle while the query count equals the key count.
+
+Serving breaks that equality in three common paths.
+
+- **Decode with a cache.** One query, n keys. The query is the newest position, every cached key is in its past, and no mask is needed for causality. A mask is still needed for padding when rows of different lengths share a batch, and the positions fed to the rotary embedding must count real tokens, not padded columns; that is the bug in fnd-029.
+- **Chunked prefill.** A 100,000-token prompt is processed in chunks, so a chunk of c queries attends over all keys written so far plus its own. The queries are the last c positions of a longer sequence.
+- **Speculative verification.** The target model scores k drafted tokens in one call against a cache of n tokens. Again the queries are the last k positions.
+
+For the last two, the mask must be aligned to the bottom-right corner of the c × (n + c) score matrix: query i reads key j when j ≤ i + (n_k − n_q). Aligned to the top-left instead, query 0 of the chunk reads only key 0, and the outputs are wrong without any error being raised. This is a version-sensitive fact: the FlashAttention README states that from version 2.1, with unequal query and key lengths and causal=True, the mask is aligned bottom-right, where earlier versions aligned it top-left. A serving stack that pinned an older version, or a hand-written reference kernel used in tests, can disagree with production on exactly these paths.
+
+The property that makes chunking and verification correct is simple to test and worth testing in CI: running only the last c queries against all keys must give the same rows as the full square computation. Step 2 of the lab tests it.
+
+## The online softmax normaliser
+
+The textbook stable softmax reads a row three times: once for the maximum, once for the sum of exponentials, once to normalise. Milakov and Gimelshein showed that the first two passes fold into one. Keep a running maximum m and a running denominator l. For each new score s:
+
+m' = max(m, s), l' = l × exp(m − m') + exp(s − m')
+
+When the maximum rises, every term already in l was computed relative to the old maximum, so l is rescaled by exp(m − m') and the result is exact. The paper reports the softmax alone up to 1.3 times faster and, fused with top-k, up to 5 times, part of which it attributes to the fusion.
+
+Attention adds one more running quantity, the unnormalised output acc, rescaled the same way: acc' = acc × exp(m − m') + exp(s − m') × v. The output is acc / l at the end. That triple (m, l, acc) is the state FlashAttention carries for each query row while key and value tiles stream past, and it is why the n × n score matrix never has to exist in high-bandwidth memory.
+
+The same rule merges two finished states. Given (m_a, l_a, acc_a) over one set of keys and (m_b, l_b, acc_b) over a disjoint set, rescale both to m = max(m_a, m_b) and add. Flash-Decoding uses exactly this for long-context decode: it splits the cache into chunks, computes a partial state per chunk in parallel, keeps one log-sum-exp per split and combines them in a final reduction, so a single long row can occupy the whole GPU.
+
+<Predict id="online-merge" question="A row's state after some keys is m = 2.0, l = 3.0, acc = 6.0 (one value dimension, so the output so far is 2.0). The next key has scaled score 5.0 and value 4.0. What is the output after folding it in? Two decimals." answer={3.74} tolerance={0.02}>
+<p>The maximum rises to 5.0, so the old terms are rescaled by exp(2 − 5) = 0.0498. New l = 3 × 0.0498 + exp(0) = 1.1494. New acc = 6 × 0.0498 + 1 × 4 = 4.2987. Output = 4.2987 / 1.1494 = <b>3.74</b>. One key with a score 3 above the old maximum takes 1 / 1.1494 = 87% of the weight.</p>
+</Predict>
+
+## A decode step that equals the recompute
+
+Decode output at step t must equal row t of a full causal recompute, because row t reads keys 0 to t only and a key depends only on its own position's input. The code below computes both: a full recompute with the three-pass softmax, and a decode loop that appends to a cache and uses the one-pass normaliser.
+
+```python
+import math, random
+
+def full(Q, K, V):
+    out = []
+    for t, q in enumerate(Q):
+        s = [sum(a * b for a, b in zip(q, K[j])) / math.sqrt(len(q)) for j in range(t + 1)]
+        m = max(s)
+        w = [math.exp(x - m) for x in s]
+        z = sum(w)
+        out.append([sum(w[j] * V[j][c] for j in range(t + 1)) / z for c in range(len(V[0]))])
+    return out
+
+def decode(Q, K, V):
+    keys, values, out = [], [], []
+    for q, k, v in zip(Q, K, V):
+        keys.append(k)
+        values.append(v)
+        m, l, acc = float("-inf"), 0.0, [0.0] * len(v)
+        for kj, vj in zip(keys, values):
+            s = sum(a * b for a, b in zip(q, kj)) / math.sqrt(len(q))
+            m_new = max(m, s)
+            c = math.exp(m - m_new)
+            p = math.exp(s - m_new)
+            l = l * c + p
+            acc = [x * c + p * y for x, y in zip(acc, vj)]
+            m = m_new
+        out.append([x / l for x in acc])
+    return out
+
+rng = random.Random(0)
+T, d = 200, 16
+Q, K, V = ([[rng.gauss(0, 3) for _ in range(d)] for _ in range(T)] for _ in range(3))
+diff = max(abs(a - b) for r1, r2 in zip(full(Q, K, V), decode(Q, K, V)) for a, b in zip(r1, r2))
+print(f"max abs difference over {T} steps: {diff:.1e}")   # 1.2e-14 with Python 3.12 floats
+```
+
+The two agree to 1.2e-14, not exactly. The arithmetic is the same in exact terms and the order of operations is not: one path divides once at the end, the other rescales as it goes. Production kernels differ in the same way and more, because a prefill kernel and a split-sequence decode kernel reduce in different orders, and the order can depend on batch size. Tests that compare decode with recompute need a tolerance chosen for the dtype, and a bitwise comparison belongs only in a mode that fixes the reduction order.
+
+## Where the per-token cost goes
+
+The quadratic term is real and it is not the whole layer. For one token at context n in Llama 3.1 8B, per layer: the four attention projections cost 2 × (2 × 4,096 × 4,096 + 2 × 4,096 × 1,024) = 83,886,080 floating-point operations, because the key and value projections are 1,024 wide with 8 key-value heads of 128. The gated MLP costs 2 × 3 × 4,096 × 14,336 = 352,321,536. The score and weighted-sum products cost 2 × 2 × 4,096 × n = 16,384n.
+
+<Predict id="score-crossover" question="Using the three figures above, at what context length n does the score and weighted-sum work for one token equal the projections and MLP combined?" answer={26624} tolerance={1500} unit="tokens">
+<p>(83,886,080 + 352,321,536) / 16,384 = 436,207,616 / 16,384 = <b>26,624 tokens</b>. Below that, a token's compute is dominated by the matrix multiplies that do not depend on context, and doubling the prompt does not double the per-token cost, let alone quadruple it. Above it, attention dominates and keeps growing.</p>
+</Predict>
+
+That count is arithmetic, not time. Decode at short context is limited by reading the weights from memory, and at long context by reading the cache, so measured step time follows bytes moved more closely than FLOPs. Measure at your real prompt lengths before quoting a scaling law to anyone.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+Your team turns on chunked prefill to cut first-token latency on 100K-token prompts. In bf16, the regression test that compares chunked with single-pass prefill shows logit differences up to the third decimal and one greedy-token flip in 500 prompts. The release is on Friday. Do you ship?
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Only after one experiment that separates numerics from a bug: rerun both paths in fp32. If the differences fall to rounding level and show no pattern at chunk boundaries, they come from reduction order, and I ship with the tolerance documented. If they persist in fp32 or cluster at positions just after each chunk boundary, the mask or position offset for the chunk is wrong, and I do not ship.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Two explanations fit the symptom. Reduction order: chunked prefill splits each row's softmax across chunks and merges partial states, so bf16 sums happen in a different order from the single pass. That produces small differences everywhere and, rarely, a flip where two tokens were nearly tied. A real defect: the chunk's causal mask aligned top-left instead of bottom-right, or rotary positions restarting at zero per chunk. That produces large differences concentrated after chunk boundaries, and they grow with chunk index.</p>
+<p>The experiment is cheap. Run the 500 prompts in fp32 through both paths and plot the per-position difference against the chunk boundaries. Rounding-level agreement in fp32 says the bf16 gap is numerics. Then check the one flip: if the reference's top two logits were within the observed difference, it was a near-tie.</p>
+<p>The decision has two defensible answers. Ship with chunking on and a written tolerance: first-token latency improves for every long prompt, and the cost is that outputs for the same prompt now depend on the chunk size, which customers who need reproducible outputs will notice. Or ship with chunking off for the tier that promises reproducibility and on elsewhere: the cost is two code paths and slower first tokens for that tier. I would take the second if any customer contract mentions reproducibility, the first otherwise, and write the tolerance into the release note.</p>
+<p>Failure mode of shipping on numerics: the fp32 run passes, but the release also changes the chunk size under load, so the reference and production no longer share a configuration and the regression test stops testing what runs.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Product says one flip in 500 is acceptable and a large customer requires reproducible outputs. Which do you give up, and what do you put in writing?</em></li>
+<li><em>What would you need to see in a week of production traffic to turn chunked prefill off again?</em></li>
+<li><em>The test suite compares bitwise today. A colleague wants it relaxed to a tolerance so the release can go out. How do you choose the tolerance without choosing it to make the test pass?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The normaliser above starts from l = 0. gpt-oss gives each head a learned bias in the softmax denominator, so a head can put weight on no token at all; its state starts from that bias instead, and a kernel or reference that drops it computes a different function while every shape still matches.
+
+Linear-attention layers, used in several hybrid models, have no softmax over the history and no growing cache; they keep a fixed-size state. Nothing in this lesson about masks, normalisers or quadratic cost applies to those layers, and a model that mixes them with full attention needs the analysis per layer type.
+
+"Decode equals recompute" is a statement about exact arithmetic on one sequence. With a sliding window, both paths must apply the same window, or the test compares two wrong answers that agree. With batch-dependent kernels, the same prompt can produce different outputs depending on what else is in the batch, which no single-sequence equality test will catch.
+
+The FLOP crossover ignores memory traffic and assumes the published Llama 3.1 8B shapes. For a model with a different MLP width or head layout, recompute it from the config.
+
+<SelfRate id="lesson:foundations/attention/attention-mechanics" />

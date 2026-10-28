@@ -1,0 +1,136 @@
+---
+id: ops-003
+title: Rolled back at 14:47, still failing at 15:05
+subtitle: explain the twenty minutes
+track: llmops
+module: prompt-lifecycle
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 25
+core: false
+tags: [prompt-registry, rollback, langfuse, incident, configuration]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Langfuse documentation, Prompt caching (checked 2026-10-28)
+    url: https://langfuse.com/docs/prompt-management/features/caching
+    note: "default cache TTL is 60 seconds; when it has expired, stale prompts are served immediately while the SDK revalidates in the background, asynchronously; cache_ttl_seconds configures it and 0 disables caching; a fallback prompt is used when the local cache is empty and the API is unavailable. The page does not say what happens to a stale entry when the background refresh fails."
+  - title: Langfuse documentation, Prompt management overview (checked 2026-10-28)
+    url: https://langfuse.com/docs/prompt-management/overview
+    note: "prompts are cached client-side by the SDK, so retrieving them is as fast as reading from memory"
+  - title: Langfuse documentation, Prompt management data model (checked 2026-10-28)
+    url: https://langfuse.com/docs/prompt-management/data-model
+    note: "an unlabelled fetch resolves to the production label; rollback reassigns production to a previous version without a code change"
+  - title: Langfuse documentation, Link prompts to traces (checked 2026-10-28)
+    url: https://langfuse.com/docs/prompt-management/features/link-to-traces
+    note: "pass the prompt to the generation to link it; only generation observations are linked; metrics are then aggregated per prompt version"
+choices:
+  - text: Each worker keeps the version it fetched for twenty minutes before it asks again
+    correct: true
+    why: The TTL went from 60 to 1,200 seconds last week; each process holds v15 until its own entry expires, so errors drain over 20 minutes, the same shape as the ramp after 14:31.
+  - text: The fallback file, still at v12, is served whenever the prompt API is slow
+    correct: false
+    why: A real defect, but the fallback is used only with an empty cache and an unreachable API, and v12 still emits the queue key, so it cannot raise KeyError 'queue'.
+  - text: Background refreshes now time out at 2 s, so workers keep serving the stale copy
+    correct: false
+    why: Plausible, and worth checking in the SDK logs, but the prompts API answered in 140 ms and refresh failures would not end every error at exactly twenty minutes.
+  - text: The prompts API kept answering with the old label from its edge cache for a while
+    correct: false
+    why: The curl at 14:48 returned version 14, so the API had the rollback a minute after the label moved; the stale copies were on the client side.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Debug, 25 minutes">
+"A prompt edit broke ticket triage. On-call rolled it back in the registry within sixteen minutes, and the errors kept going for another twenty. Explain the twenty minutes, rank whatever else you find, and tell me what changes so the next rollback is fast."
+</Callout>
+
+Everything below is constructed for this problem. Triage runs as 24 pods with 4 worker processes each, and each process creates its own Langfuse client at start-up. Traffic is steady at about 750 tickets a minute.
+
+```text
+timeline (UTC)
+14:31  ticket-triage v15 labelled production in the Langfuse UI; one edit: the output key "queue" is now "route"
+14:32  first KeyError: 'queue' in triage_worker.parse_reply
+14:47  on-call moves production back to v14 in the Langfuse UI
+14:48  on-call fetches ticket-triage, label production, from the Langfuse API with curl: version 14, 140 ms
+
+KeyError: 'queue' per minute, all pods
+14:31    0    14:36  190    14:41  375    14:46  560    14:47  600
+14:51  600    14:55  450    14:59  300    15:03  150    15:07    0
+```
+
+```python
+# triage/prompts.py
+from langfuse import get_client
+from triage.settings import settings
+
+langfuse = get_client()
+FALLBACK = open("prompts/ticket_triage_v12.txt").read()
+
+def triage_prompt():
+    return langfuse.get_prompt(
+        "ticket-triage",
+        cache_ttl_seconds=settings.prompt_cache_ttl,
+        fallback=FALLBACK,
+    )
+
+# triage/worker.py (excerpt)
+def classify(ticket):
+    prompt = triage_prompt()
+    reply = llm.complete(prompt.compile(ticket=ticket.text))
+    return parse_reply(reply)          # reads reply["queue"]
+```
+
+Last week's change, merged as "cut Langfuse calls and tune the HTTP pool":
+
+```diff
+ class Settings(BaseSettings):
+-    prompt_cache_ttl: int = 60
+-    http_pool_size: int = 10
+-    request_timeout_s: float = 5.0
++    prompt_cache_ttl: int = 1200
++    http_pool_size: int = 32
++    request_timeout_s: float = 2.0
+```
+
+The generations in Langfuse carry the ticket id and the model, but not the prompt version. You do not have the SDK's debug logs. Which defect explains why errors continued after the rollback?
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Compare how long the errors took to reach their peak after 14:31 with how long they took to end after 14:47.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask which prompt version each failing generation was compiled from, and where you would read that today.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask what the SDK logs when a background refresh fails, and for one pod's logs between 14:47 and 15:07.</p></details>
+
+## Answer
+
+**The shape gives it away.** After v15 was labelled at 14:31, errors did not jump to 750 a minute; they climbed by about 37 a minute for sixteen minutes (190 at 14:36, 375 at 14:41, 560 at 14:46). That is the rate at which 96 processes, each holding v14 in a cache entry fetched at a different moment, reached the end of a TTL and picked up v15. A 1,200-second TTL spreads those expiries over twenty minutes, and 16 / 20 × 750 = 600 is the error rate at 14:47. After the rollback the same mechanism ran the other way: the 80% of processes holding v15 had fetched it between 14:31 and 14:47, so they expire between 14:51 and 15:07, which is where the errors stay flat and then fall to zero. The stale-while-revalidate behaviour adds one more stale request per process at expiry, which is noise at this rate.
+
+**Why the API was not the cause.** The curl at 14:48 returned version 14. The registry had the rollback a minute after the label moved. Everything after that is client state.
+
+**Ranking the rest.**
+
+1. *No prompt version on the generations.* A real defect, and the one that made this slow to diagnose: nobody could filter the failing generations by version. Langfuse links a prompt version to a generation only when the prompt is passed to the generation. With the link, the 14:51 to 15:07 tail would have shown v15 on every error.
+2. *The 2-second request timeout.* Lowering it can make background refreshes fail under load, and the caching page does not say what the SDK does with a stale entry after a failed refresh. It did not cause this incident (the API answered in 140 ms and the tail ends on the TTL boundary), but it can lengthen the next one. The SDK logs from one pod would settle it.
+3. *The fallback pinned to v12.* A copy two versions old, used only when the cache is empty and the API unreachable, for example on a cold start during a Langfuse outage. It did not fire here, and it would not raise this error because v12 still emits `queue`. It is the defect that will surprise someone during an outage.
+4. *A breaking output-schema change shipped as a prompt edit.* Renaming `queue` to `route` changed the contract with `parse_reply`. That is a code change delivered through the prompt registry, and it needed the parser to accept both keys first.
+
+**The decision, with two defensible answers.** Put the TTL back to 60 seconds: rollback then completes within about a minute plus one request per process, and the cost is 96 processes refreshing every minute, which is about 1.6 refresh calls a second for the whole fleet, off the request path. Or keep the long TTL and add an explicit path for rollback: an internal endpoint, or a restart of the deployment, that empties every process's cache when the production label moves. The cost is another moving part that has to work during an incident. I would take the 60-second TTL, because the change that motivated 1,200 seconds was "cut Langfuse calls", and nobody measured a problem those calls caused.
+
+**How the recommendation fails.** A short TTL makes rollback fast in both directions, so a bad label move reaches every process within a minute as well. With 1,200 seconds the bad version reached 80% of processes in sixteen minutes; with 60 it reaches all of them in about one. The protection against that is not the TTL; it is a canary label that a hashed slice of tickets reads before production moves.
+
+**What to collect, and what to do without it.** Ask for the SDK logs from one pod between 14:47 and 15:07, to rule the timeout in or out, and the prompt version on each failing generation once linking is added. Without them, the error curve and the settings diff are enough to act: revert the TTL, link the prompt to the generation, and make `parse_reply` accept both keys before any prompt renames a field again.
+
+## Follow-ups
+
+- *Pushback: the platform team set 1,200 seconds because Langfuse latency showed up in triage p99 last month. What do you measure before you revert, and what do you accept if they are right?*
+- *Reversal: what would the SDK logs have to show for you to rank the timeout above the TTL?* Failed refreshes on processes that kept serving v15 after their TTL had passed.
+- *Two senior engineers disagree: one wants prompt changes to require a pod restart, the other wants a cache TTL of zero. How do you decide without deciding by rank?*
+
+## Common mistakes
+
+- Stopping at "the label was moved" and treating the registry as the system that serves prompts.
+- Blaming the API because rollback "did not take", when one curl shows the API had it.
+- Missing that the ramp after 14:31 and the tail after 14:47 have the same length.
+- Shortening the TTL without adding a canary label, so bad versions spread as fast as rollbacks.

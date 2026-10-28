@@ -1,0 +1,110 @@
+---
+id: trn-044
+title: Choose the expert configuration for a training and serving budget
+subtitle: expert count, top-k and shared experts, with a serving stack you cannot change
+track: training
+module: moe
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 40
+core: false
+tags: [mixture-of-experts, sparsity, model-design, serving-cost, expert-parallelism]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: Moonshot AI, Kimi K2 technical report (arXiv 2507.20534)
+    url: https://arxiv.org/html/2507.20534
+    note: "sparsity = total over activated experts; scaling law with activated parameters fixed; at validation loss 1.5, sparsity 48 needs 1.69x, 1.39x and 1.15x fewer FLOPs than sparsity 8, 16 and 32; more sparsity brings more infrastructure complexity; 384 experts, 8 active, 1 shared; 64 heads chosen over 128 because of an 83% inference FLOP increase at 128k. Checked 2026-10-28."
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: "1 shared and 256 routed experts, 8 active; at most 4 nodes per token; redundant experts at serving re-chosen every 10 minutes; prefill EP32, decode EP320. Checked 2026-10-28."
+  - title: Qwen Team, Qwen3 Technical Report (arXiv 2505.09388)
+    url: https://arxiv.org/html/2505.09388
+    note: "128 experts with 8 active and no shared experts, unlike Qwen2.5-MoE; global-batch load balancing loss. Checked 2026-10-28."
+  - title: Dai et al., DeepSeekMoE (arXiv 2401.06066)
+    url: https://arxiv.org/abs/2401.06066
+    note: "fine-grained expert segmentation and isolated shared experts. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+"Choose the expert count, top-k and shared experts for our next model. Defend the choice to research, who want more experts, and to serving, who want fewer."
+</Callout>
+
+The scenario, with every number a scenario input:
+
+- The architecture is fixed apart from the MoE choice: 48 MoE layers, hidden size 6144, each expert a gated FFN with three 6144 x 1536 matrices, about 20 GB of non-expert weights at one byte per parameter.
+- Training: 64 nodes of 8 GPUs, one 50 GB/s NIC per GPU, ten weeks, a fixed token budget.
+- Serving: one 8-GPU node per replica with 640 GB of HBM in total, weights in fp8. The serving engine supports expert parallelism only inside a node and has no redundant-expert support; it cannot be rewritten before launch.
+- Product: a coding agent whose sessions often run past 64k tokens, so KV cache per replica decides concurrency.
+- Research cites Kimi K2's sparsity law and wants 384 experts with 8 active. Serving wants 128.
+
+Write the decision as a one-page memo: the configuration, the numbers behind it, what you give up, and what would reopen the decision.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask serving for the KV-cache memory one long session needs and the concurrency target per replica.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Ask research whether their evidence for the sparsity gain comes from runs at our activated size and loss target.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask for routing skew measured on the current model's production traffic.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Hold activated compute fixed at top-8 and choose the expert count by serving memory. One expert is 28.3M parameters; 48 layers of 128, 256 or 384 experts are about 174, 348 or 522 GB in fp8. With 20 GB of other weights on a 640 GB node, that leaves about 446, 272 or 98 GB for KV cache and workspace. 384 does not fit a long-session product on one node. I would pick 256 routed plus 1 shared, unless the session data says 272 GB of KV is too little, in which case 128.</p>
+</Fragment>
+<Fragment slot="long">
+<p><b>Training side.</b> Kimi K2's law, measured on its recipe, says sparsity 48 needs 1.15 times fewer FLOPs than 32 and 1.39 times fewer than 16 at a validation loss of 1.5. From those, 32 needs about 1.39 / 1.15 = 1.21 times fewer than 16. With a fixed token budget, that saving shows up as lower loss at the same cost, not as a shorter run. Expert-parallel traffic does not change with E at fixed k, but memory per GPU does: 384 experts need 1.5 times the expert-parallel ranks of 256 for the same memory per GPU.</p>
+<p><b>Serving side.</b> The engine cannot spread experts beyond a node, so total weights must fit in 640 GB alongside the KV cache. At decode batch sizes most experts are touched every step, so weight reads scale with total size, not activated size.</p>
+<p><b>Shared expert.</b> Adding one costs 28.3M x 48 = 1.36B parameters per token, 1 more expert of FLOPs on top of 8 routed (12.5% more expert compute), and about 1.4 GB of memory. DeepSeek-V3 keeps one; Qwen3 removed them. With in-node EP and no redundant experts, a shared expert also gives every GPU a predictable dense share of the work, which slightly dampens the effect of routing skew on step time.</p>
+<p><b>Choice.</b> 256 routed, top-8, 1 shared: sparsity 32, the DeepSeek-V3 point, with about 271 GB left on a replica once the shared expert's 1.4 GB is counted.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>Research comes back with a sweep at our activated size showing sparsity 48 beating 32 by 1.3 times in FLOPs. Serving still cannot exceed one node. What do you change, and who signs off?</li>
+<li>Skew on production traffic puts 2 times the mean load on four experts, all on one GPU under the default placement. Without redundant-expert support, what do you do before launch?</li>
+<li>The serving engine adds cross-node EP six months after launch. What would you need to see then to move to 384 experts in the next model?</li>
+</ul>
+</Fragment>
+</Depth>
+
+**Two defensible answers, with costs.**
+
+*256 routed, top-8, 1 shared (sparsity 32).* Costs about 349 GB of expert weights and leaves about 271 GB per replica for KV cache and workspace. Gives up the 1.15 times FLOP advantage K2 measured for sparsity 48, which on a fixed budget is a somewhat higher final loss than research wants.
+
+*128 routed, top-8, no shared (sparsity 16, the Qwen3 shape).* Costs 174 GB and leaves about 446 GB, roughly 1.6 times the headroom of the first option, so more concurrent long sessions per replica and fewer replicas for the same traffic. Gives up a further 1.21 times in training FLOPs at the same loss by K2's numbers, and without a shared expert relies entirely on routing for common features.
+
+*384 routed (sparsity 48)* is not defensible under these constraints: about 98 GB of headroom on a replica serving sessions past 64k tokens.
+
+**The quantity you choose and defend.** The KV reserve per replica. If one long session needs on the order of a few GB of KV, 271 GB supports a large batch and 256 experts is right; if the agent's sessions need tens of GB each, 128 experts wins on cost per session. This is the number to get from serving before the memo is final, and the answer should state which choice is reasonable at each value.
+
+**The constraint conflict.** Training efficiency against serving concurrency, with the serving engine as the operating constraint you cannot change before launch. Research is right about the training curve and wrong about the bill; serving is right about the bill and would leave training efficiency unclaimed if the KV reserve turns out to be small.
+
+**What you give up.** Choosing 256 gives up K2's measured sparsity gain and accepts more expert weights per GPU (32 per GPU per layer at EP8) than a cross-node layout would need, which makes routing skew on one GPU visible as decode latency.
+
+**How the recommended answer fails.** With 32 experts per GPU and no redundant copies, a few hot experts that share a GPU set the decode step time for the whole replica. The balancer during training does not control serving traffic. Mitigate with a placement step at load time that spreads the experts that are hottest on measured traffic across GPUs, and log per-GPU expert time from day one.
+
+**The memo.**
+
+> Decision: 256 routed experts, top-8, 1 shared expert per MoE layer (sparsity 32).
+> Numbers: about 349 GB of expert weights in fp8, shared expert included, plus 20 GB other weights on a 640 GB node; about 271 GB for KV and workspace. K2 reports 1.15 times fewer FLOPs at sparsity 48 than 32, at loss 1.5 on its recipe.
+> We give up: the sparsity-48 training gain; some decode latency headroom to routing skew.
+> Reopen if: serving gains cross-node EP or redundant experts; measured KV per long session leaves fewer than the target concurrency; a sweep at our activated size shows the 32 to 48 gain above 1.3 times.
+> Owners: research lead and serving lead sign together.
+
+## Follow-ups
+
+- *Serving's numbers say 271 GB supports only 60% of target concurrency. Research says dropping to 128 experts costs them a measurable loss they cannot recover. Which do you cut, and what risk do you write down?*
+- *Two senior engineers disagree on the shared expert, citing DeepSeek-V3 and Qwen3. How do you decide without deciding by rank, inside the ten weeks?*
+- *What would you need to see in the first month of production to reverse to 128 experts for the next model?*
+
+## Common mistakes
+
+- Sizing serving memory from activated parameters.
+- Citing K2's FLOP ratios as if they hold at any scale and loss target.
+- Treating the shared expert as free because its memory is small; it adds an expert's worth of FLOPs to every token.
+- Writing "what you give up" as a list of risks without a trigger that would change the decision.

@@ -1,0 +1,156 @@
+---
+title: Memory anatomy of a training step
+track: training
+module: distributed
+order: 2
+kind: lesson
+level: senior
+minutes: 13
+summary: Mixed-precision Adam costs 16 bytes per parameter before a single activation is stored, activations grow linearly with batch and faster than linearly with sequence length, and selective recomputation with sequence parallelism is what lets a large model fit without paying full recomputation.
+prerequisites: [training/distributed/collectives]
+updated: 2026-10-28
+sources:
+  - title: Rajbhandari et al., ZeRO, Memory Optimizations Toward Training Trillion Parameter Models (arXiv 1910.02054v3)
+    url: https://arxiv.org/html/1910.02054v3
+    note: mixed-precision Adam needs 2 + 2 + K bytes per parameter with K = 12, 16 bytes in total; a 1.5B GPT-2 needs at least 24 GB for model states; its activations at sequence length 1K and batch 32 need about 60 GB, about 8 GB with activation checkpointing at roughly 33% recomputation overhead. Checked 2026-10-28.
+  - title: Hugging Face, The Ultra-Scale Playbook
+    url: https://nanotron-ultrascale-playbook.static.hf.space/
+    note: 16 bytes per parameter, 20 with an FP32 gradient accumulation buffer; activation memory L x seq x bs x h x (34 + 5 x n_heads x seq / h); full recomputation typically costs up to 30-40% more compute; selective recomputation on GPT-3 175B gives a 70% activation memory reduction at 2.7% compute cost; FlashAttention recomputes attention scores in the backward pass, so its users already get selective recomputation; gradient accumulation keeps gradient buffers alive through the step. Checked 2026-10-28.
+  - title: Korthikanti et al., Reducing Activation Recomputation in Large Transformer Models (arXiv 2205.05198)
+    url: https://arxiv.org/html/2205.05198
+    note: activation bytes per layer sbh(34 + 5as/h); with tensor parallelism sbh(10 + 24/t + 5as/(ht)); with tensor and sequence parallelism sbh(34/t + 5as/(ht)); with selective recomputation sbh(34/t); about 5x activation memory reduction, over 90% less recomputation overhead; 530B model on 2,240 A100s at 54.2% MFU against 42.1% with full recomputation, 29% faster. Checked 2026-10-28.
+  - title: DeepSeek-AI, DeepSeek-V3 Technical Report (arXiv 2412.19437v2)
+    url: https://arxiv.org/html/2412.19437v2
+    note: recomputes RMSNorm and MLA up-projections, keeps the parameter EMA in CPU memory, shares embedding and output head between the MTP module and the main model. Checked 2026-10-28.
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## Two budgets
+
+A training step's memory splits into two budgets that scale with different things. Model states scale with parameter count and nothing else. Activations scale with layers, hidden size, micro-batch and sequence length, and not with the optimizer. Every technique in this module shrinks one of the two, and choosing among them starts with knowing which budget is over.
+
+## Model states: 16 bytes per parameter
+
+The ZeRO paper's accounting for mixed-precision Adam, with Psi parameters:
+
+| Tensor | Bytes per parameter |
+|---|---|
+| BF16 (or FP16) parameters, used in forward and backward | 2 |
+| BF16 gradients | 2 |
+| FP32 master copy of the parameters | 4 |
+| FP32 Adam first moment | 4 |
+| FP32 Adam second moment | 4 |
+| Total | 16 |
+
+The optimizer's share, the last three rows, is the paper's K = 12. That is the piece ZeRO-1 shards first, because it is three quarters of the total and is touched once per step. The Playbook adds a fifth row that many stacks carry: an FP32 gradient accumulation buffer of 4 bytes, for 20 bytes per parameter. Llama 3's report says it accumulates gradients in FP32 across micro-batches, so a stack configured that way pays the 20.
+
+The arithmetic is not optional. The ZeRO paper's own example: a 1.5B-parameter GPT-2 needs at least 1.5B x 16 = 24 GB for model states, before any activation, while its BF16 weights alone are 3 GB. The ratio of training memory to inference weights is 8 to 1 before activations.
+
+<Predict id="trn-dist-model-states" question="A scenario GPT-style model has 32 layers, hidden size 4096, a 4h MLP and an untied 32,000-token vocabulary, so 12 x 32 x 4096^2 + 2 x 32,000 x 4096 parameters. How many GB of model states does unsharded mixed-precision Adam need, with FP32 gradient accumulation?" answer={134.1} tolerance={1} unit=" GB">
+<p>Parameters: 12 x 32 x 16,777,216 = 6,442,450,944 in the blocks, plus 262,144,000 in the embeddings, 6,704,594,944 in all. At 20 bytes each that is <b>134.1 GB</b>; at 16 bytes, 107.3 GB. Neither fits on one 80 GB GPU, before activations. A 6.7B model cannot train on one 80 GB card with plain Adam, though it serves comfortably from one at 13.4 GB of BF16 weights.</p>
+</Predict>
+
+## Activations: where sequence length bites
+
+Korthikanti et al. count the bytes each transformer layer stores for the backward pass, with 16-bit activations, sequence length s, micro-batch b, hidden size h and a attention heads:
+
+```
+per layer = s * b * h * (34 + 5 * a * s / h)
+```
+
+The 34 is the sum of every intermediate kept by the attention block and the MLP: inputs to the QKV projection, the attention output, the MLP's 4h intermediate, layer-norm inputs, dropout masks. The 5as/h term is the attention score matrix, its softmax output and its dropout mask, each of size a x s x s per sequence. That term is quadratic in s; the 34 term is linear.
+
+<Predict id="trn-dist-act-layer" question="For the same scenario model (h = 4096, a = 32) at s = 4096 and b = 1, how many GB of activations does one layer store, using sbh(34 + 5as/h)?" answer={3.25} tolerance={0.05} unit=" GB">
+<p>sbh = 4096 x 1 x 4096 = 16,777,216. 5as/h = 5 x 32 x 4096 / 4096 = 160, so the bracket is 194, and one layer stores 16,777,216 x 194 = <b>3.25 GB</b>. Thirty-two layers store 104.2 GB. At s = 2048 the bracket falls to 34 + 80 = 114 and the total to 30.6 GB: halving the sequence cut activations by 3.4 times, because the attention term dominates at this size.</p>
+</Predict>
+
+So for this model at 4K tokens, activations are as large as the model states, and they scale with the micro-batch: b = 4 is 417 GB. The ZeRO paper's own figure lands in the same place: its 1.5B GPT-2 at sequence length 1K and batch 32 needs about 60 GB of activations against 24 GB of model states.
+
+## The four levers on activations
+
+**Full recomputation.** Store only each layer's input, 2sbh bytes, and recompute the layer in the backward pass. For the scenario model that is 2 x 16,777,216 = 33.5 MB per layer and 1.07 GB for all 32, a 97 times cut. The price is an extra forward pass: the Playbook puts it at up to 30 to 40% more compute and time, and the ZeRO paper cites about 33% for its example. Full recomputation is the fallback that always fits and always costs.
+
+**Selective recomputation.** Recompute only what is cheap in FLOPs and expensive in bytes: the attention scores, softmax and dropout, the 5as/h term. The per-layer cost becomes sbh x 34, 570 MB for the scenario layer. The Playbook reports a 70% activation memory reduction at 2.7% compute cost for GPT-3 175B. FlashAttention never materialises the score matrix and recomputes it in the backward pass, so, as the Playbook notes, most stacks using it already have selective recomputation of attention without configuring it.
+
+**Tensor parallelism.** Sharding the matmuls over t GPUs shards the activations inside them, but not the layer-norm and dropout regions between them. Korthikanti's formula with tensor parallelism alone is sbh(10 + 24/t + 5as/(ht)): the 10 is the part every rank still stores in full.
+
+**Sequence parallelism.** Shard those layer-norm and dropout regions along the sequence dimension too, and the 10 joins the shard: sbh(34/t + 5as/(ht)). With selective recomputation on top, a layer stores sbh x 34/t. For the scenario model at t = 8, that is 71.3 MB per layer and 2.28 GB for 32 layers, against 104.2 GB with none of the levers. The communication is the same, because the all-reduces become pairs of reduce-scatter and all-gather.
+
+Korthikanti et al. report that sequence parallelism plus selective recomputation cut activation memory by about 5 times and removed over 90% of the time overhead of full recomputation. On a 530B model on 2,240 A100s, that moved MFU from 42.1% with full recomputation to 54.2%, 29% faster. That number is the reason the default for large dense models moved from "recompute everything" to "recompute attention, shard the rest".
+
+## What else is on the card
+
+The two budgets do not exhaust the card. Communication buffers for bucketed gradients and all-gathered parameters, temporary workspace for kernels, the logits tensor at the output (s x b x vocabulary, large at 128K vocabularies) and allocator fragmentation all take memory that no formula above counts. Gradient accumulation adds its own term: the Playbook notes that accumulation keeps gradient buffers alive through the whole step, where a single micro-batch could free activations as gradients are produced.
+
+Production reports show the remaining tricks are specific. DeepSeek-V3 recomputes RMSNorm and the MLA up-projections, keeps the exponential moving average of the parameters in CPU memory, and shares the embedding and output head between the multi-token prediction module and the main model, which together let it train without tensor parallelism.
+
+## A planner in a dozen lines
+
+```python
+def step_memory_gb(psi, L, h, a, s, b, t=1, dp=1, zero=0, recompute="none", fp32_acc=False):
+    """Per-GPU memory in GB for a dense GPT-style model; pipeline parallelism ignored."""
+    psi_gpu = psi / t                                     # tensor parallelism shards weights
+    grads = 4 if fp32_acc else 2
+    p_b, g_b, o_b = 2 * psi_gpu, grads * psi_gpu, 12 * psi_gpu
+    if zero >= 1: o_b /= dp
+    if zero >= 2: g_b /= dp
+    if zero >= 3: p_b /= dp
+    sbh = s * b * h
+    per_layer = {
+        "none": sbh * (10 + 24 / t + 5 * a * s / (h * t)),    # TP without SP
+        "sp": sbh * (34 / t + 5 * a * s / (h * t)),
+        "selective_sp": sbh * 34 / t,
+        "full": 2 * sbh,
+    }[recompute]
+    return (p_b + g_b + o_b + L * per_layer) / 1e9
+
+
+psi = 12 * 32 * 4096**2 + 2 * 32000 * 4096
+print(round(step_memory_gb(psi, 32, 4096, 32, 4096, 1), 1))                                      # 211.4
+print(round(step_memory_gb(psi, 32, 4096, 32, 4096, 1, t=8, recompute="selective_sp"), 1))      # 15.7
+print(round(step_memory_gb(psi, 32, 4096, 32, 4096, 1, dp=32, zero=1, recompute="full"), 1))    # 30.4
+```
+
+The [training memory planner lab](/labs/training-memory-planner) extends this to pipeline splits and a search over layouts.
+
+The second and third lines are two ways to fit the same model on 80 GB cards: tensor parallelism over a node with selective recomputation, or ZeRO-1 over 32 GPUs with full recomputation. The first pays tensor-parallel communication inside every layer; the second pays a third more compute. Which is cheaper depends on the interconnect, which is the subject of the next three lessons.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"A 13B dense model trains at 4K context on 64 H100-80GB GPUs with ZeRO-1 and selective recomputation. Product wants a 16K-context checkpoint in three weeks, on the same GPUs, without slowing the main run's schedule by more than 15%. What do you change for the 16K stage, and what do you give up?"**
+</Callout>
+
+<p class="tiny">The model, cluster and constraints are a scenario.</p>
+
+<Depth>
+<Fragment slot="short">
+<p>Activations per layer grow four times in the linear term at 16K, and the attention term is already gone under selective recomputation, so the stage needs about four times the activation memory. Options in order of cost: drop the micro-batch to 1 if it is not already, add tensor plus sequence parallelism inside the node, or fall back to full recomputation. I would try TP 2 or 4 with SP first, since it stays on NVLink, and keep full recomputation as the fallback.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Under selective recomputation a layer stores sbh x 34 bytes, linear in s, so 16K costs four times the 4K activations per sample. With a fixed global batch in tokens, the number of sequences per step falls by four, so if the micro-batch was 4 sequences it can drop to 1 and the activation footprint per micro-batch is unchanged. That is free if the micro-batch was above 1.</p>
+<p>If it was already 1, the choices are TP with SP, which divides the 34 by t and pays per-layer collectives on NVLink, or full recomputation, which costs up to 30 to 40% more compute by the Playbook's figure and breaks the 15% limit. Context parallelism is the third option and becomes the right one only if a single sequence's activations do not fit even at TP 8. The failure mode of TP here: model states also shard by t, but ZeRO-1 already sharded the optimizer, so the memory freed is mainly activations, and the per-layer all-reduces cost real throughput even inside a node. Written down: the per-GPU memory plan at 16K with headroom, the measured tokens per second at TP 2 against the 15% limit, and a rule to fall back to full recomputation if TP misses it.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li>TP 2 meets memory but costs 18% of throughput on your profile, full recomputation costs 31%. Which ships, and who signs off on missing the limit?</li>
+<li>Someone proposes FP8 activations for the stored tensors instead. What does it save in this formula and what would you need to see to trust it?</li>
+<li>What measurement on the first 500 steps of the 16K stage would make you reverse the layout?</li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+The 34 in Korthikanti's formula is for a specific GPT block with a 4h MLP, layer norms, dropout and 16-bit activations. SwiGLU MLPs, RMSNorm without dropout, grouped-query attention, MLA and MoE layers each change the constant. Rederive it for the block you train, or measure peak memory on one layer and scale.
+
+The formula counts what autograd saves, not what the allocator holds. Fragmentation, communication buffers and the output logits can add several gigabytes, and the peak usually occurs at a specific moment in the step, often the first backward layer, not at the sum of all terms. Plan with headroom and confirm with a memory profile.
+
+FP8 training mostly changes the activation side. DeepSeek-V3 runs its matmuls in FP8 with fine-grained scaling and dispatches MoE activations in FP8; how it stores optimizer state changes the per-parameter row, so recount the 16 bytes from the report or the code of the stack you use rather than assuming them.
+
+Pipeline parallelism adds a dimension this lesson ignored: a stage holds activations for several micro-batches in flight, and the count depends on the schedule. The pipeline lesson computes it.
+
+<SelfRate id="lesson:training/distributed/step-memory" />

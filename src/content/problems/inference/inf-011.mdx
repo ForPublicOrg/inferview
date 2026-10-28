@@ -1,49 +1,43 @@
 ---
 id: inf-011
-title: Accuracy fell after 4-bit quantization
-subtitle: find the cause
+title: Accuracy fell after 4-bit quantisation on one task family only
+subtitle: three changes shipped together, one eval slice collapsed
 track: inference
 module: faster-cheaper
 type: debug
 difficulty: medium
-seniority: [mid, senior]
-minutes: 20
+seniority: [senior]
+minutes: 25
 core: false
-tags: [quantization, int4, gptq, awq, evals]
+tags: [quantization, int4, gptq, awq, fp8, kv-cache, evals]
 companies: []
 updated: 2026-10-28
 sources:
   - title: amitshekhariitbhu, AI engineering interview questions
     url: https://github.com/amitshekhariitbhu/ai-engineering-interview-questions
-    note: "You quantized your LLM, but accuracy dropped significantly. How do you minimize quantization loss?"
-  - title: "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers (ICLR 2023)"
+    note: "Synthesised question bank, so no company tag; the LLMOps section asks \"You quantized your LLM, but accuracy dropped significantly. How do you minimize quantization loss?\" Checked 2026-10-28."
+  - title: "Frantar et al., GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers (ICLR 2023)"
     url: https://arxiv.org/abs/2210.17323
-    note: one-shot 3 or 4 bit weight quantization using approximate second-order information, applied to models up to 175B
-  - title: "AWQ: Activation-aware Weight Quantization (MLSys 2024)"
+    note: "The per-layer objective is argmin over quantised W of the squared error of WX on calibration inputs X; the paper's calibration data is 128 random 2,048-token segments of C4, which it calls generic text data from randomly crawled websites; group size 128 costs about 0.15 extra bits and brings 3-bit 175B models to within 0.1 to 0.3 perplexity of uncompressed. The abstract reports 3 or 4 bits at 175B parameters in about four GPU hours. Checked 2026-10-28."
+  - title: "Lin et al., AWQ: Activation-aware Weight Quantization (MLSys 2024)"
     url: https://arxiv.org/abs/2306.00978
-    note: protecting 1% of salient weights, found from activation statistics, greatly reduces quantization error
-  - title: llama.cpp, ggml-common.h
-    url: https://raw.githubusercontent.com/ggml-org/llama.cpp/master/ggml/src/ggml-common.h
-    note: Q8_0 stores one scale per block of 32 weights
-  - title: Hugging Face Hub docs, GGUF
-    url: https://huggingface.co/docs/hub/gguf
-    note: K-quant types store scales per block, which is why Q4_K is 4.5 bits per weight
+    note: "Salient channels are found from activation statistics, and protecting 1% of salient weights greatly reduces error; the authors argue that because AWQ uses no backpropagation or reconstruction it generalises to different domains and modalities without overfitting the calibration set. Checked 2026-10-28."
+  - title: vLLM documentation, quantized KV cache
+    url: https://docs.vllm.ai/en/latest/features/quantization/quantized_kvcache.html
+    note: "kv_cache_dtype fp8_e4m3 or fp8_e5m2; without calibration all scales are 1.0; dataset calibration with llm-compressor is the recommended path; some layers can be left at the native dtype. Checked 2026-10-28."
 choices:
-  - text: One scale per tensor with round-to-nearest lets a few large-magnitude weights stretch the scale, so most weights collapse onto a handful of the 16 levels. Use finer-grained scales (per group or block) and a calibrated method such as GPTQ or AWQ, then re-run the evals.
+  - text: GPTQ fitted its error compensation to English web text, so channels that Korean and Japanese inputs rely on absorbed the rounding error.
     correct: true
-    why: It explains why the loss is concentrated in long reasoning tasks, matches the outlier statistic, and points to the fixes that target exactly this error.
-  - text: The KV cache is still BF16 while the weights are INT4, and the precision mismatch corrupts attention. Quantize the KV cache to INT4 as well.
+    why: GPTQ minimises the layer's output error on the calibration inputs, so error lands where those inputs rarely look, and only the slice far from English web text collapsed.
+  - text: The FP8 KV cache runs with default scales of 1.0, so attention reads lossy keys and values on every request the quantised model serves.
     correct: false
-    why: Engines routinely mix low-bit weights with a higher-precision KV cache. Quantizing the cache too adds error rather than removing it.
-  - text: 4 bits is too few for a 70B model. Return to BF16 or FP8.
+    why: A real defect that needs fixing, but it would hit the long-document slice hardest, since it reads the most cached keys, and that slice lost 2 points.
+  - text: Group size 128 is too coarse at 4 bits, so one outlier weight in a group stretches its scale and flattens the other 127 weights in it.
     correct: false
-    why: Tempting after a bad result, but GPTQ and AWQ were built for 3 and 4 bit weights on large models. The method used here is the problem, not the bit width alone.
-  - text: The quantized model is more sensitive to temperature. Lower the temperature from 0.7 to 0.2.
+    why: Coarse groups would degrade every slice; the GPTQ paper reports group size 128 within 0.1 to 0.3 perplexity of uncompressed at 3 bits on its 175B models.
+  - text: The Korean and Japanese slice has only 300 items, so a drop of this size sits inside the sampling error of an eval slice that small.
     correct: false
-    why: The eval ran greedy decoding, so temperature is not in play, and sampling settings cannot restore information lost in the weights.
-  - text: The quantization tool rewrote the tokenizer, so prompts are encoded differently.
-    correct: false
-    why: Weight-only quantization does not touch the tokenizer, and the token counts per prompt in the report are identical before and after.
+    why: At about 0.7 accuracy the standard error of a 300-item proportion is about 0.026, and a 19-point drop is roughly five standard errors of the difference.
 ---
 import Callout from '../../../components/Callout.astro';
 
@@ -53,56 +47,77 @@ import Callout from '../../../components/Callout.astro';
 "You quantized your LLM, but accuracy dropped significantly. How do you minimize quantization loss?"
 </Callout>
 
-A team quantized a 70B model's weights to 4 bits to fit it on one GPU. Here is their quantization config and evaluation report.
+The version here. A team moved a 70B dense chat model from BF16 to 4-bit weights so that it fits on half the GPUs. The release changed three things at once:
 
 ```yaml
-scheme: int4, weight-only
-method: round-to-nearest, symmetric
-scale granularity: one scale per weight tensor
-calibration data: none
-kv cache: bf16 (unchanged)
+weights:
+  method: gptq
+  bits: 4
+  group_size: 128
+  desc_act: true
+  calibration: 128 random 2,048-token segments of C4
+kv_cache_dtype: fp8_e4m3
+kv_cache_scales: none
 ```
+
+The eval report, all slices greedy, scored by the same graders before and after:
 
 <div class="tablewrap">
 <table class="scale">
-<thead><tr><th>Eval slice (greedy decoding)</th><th>BF16</th><th>INT4</th></tr></thead>
+<thead><tr><th>Slice</th><th>Items</th><th>BF16</th><th>4-bit release</th></tr></thead>
 <tbody>
-<tr><td>Short factual QA</td><td>0.81</td><td>0.77</td></tr>
-<tr><td>Multi-step math</td><td>0.64</td><td>0.31</td></tr>
-<tr><td>Code generation (tests pass)</td><td>0.58</td><td>0.29</td></tr>
-<tr><td>Tokens per prompt (mean)</td><td>412</td><td>412</td></tr>
+<tr><td>English support replies</td><td>400</td><td>0.86</td><td>0.85</td></tr>
+<tr><td>English contract QA, 20k to 30k token documents</td><td>300</td><td>0.79</td><td>0.77</td></tr>
+<tr><td>Python code generation, tests pass</td><td>250</td><td>0.61</td><td>0.59</td></tr>
+<tr><td>Korean and Japanese support replies</td><td>300</td><td>0.82</td><td>0.63</td></tr>
+<tr><td>Perplexity, English held-out text</td><td></td><td>3.41</td><td>3.47</td></tr>
 </tbody>
 </table>
 </div>
 
-A weight inspection notes that in many MLP projection tensors, the largest absolute weight is about 40 times the 99th-percentile absolute weight.
+<p class="tiny">Scenario: the config is one a team could plausibly ship; the scores are synthetic, built for this exercise, and are not measurements of a named model.</p>
 
-<p class="tiny">The config, scores and statistic are synthetic, built for this exercise.</p>
-
-Pick the root cause and the fix.
+The release owner signed off on the perplexity row and the three English slices. Which explanation accounts for the collapse on one slice, and what do you collect before re-releasing?
 
 ## Hints
 
-<details class="hint"><summary>Hint 1</summary><p>A symmetric 4-bit format has 16 levels spread from minus the scale to plus the scale. What sets the scale here?</p></details>
-<details class="hint"><summary>Hint 2</summary><p>Why would short answers survive while long reasoning chains collapse?</p></details>
+<details class="hint"><summary>Hint 1</summary><p>Ask what text the quantiser saw while it chose the rounded weights.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Which slice would an attention-side change hurt most, and how much did that slice move?</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Request one eval run with only the weight change applied, before arguing about which change did it.</p></details>
 
 ## Answer
 
-With one scale per tensor, the scale must cover the largest weight in the whole tensor. If that weight is 40 times the 99th percentile, almost every weight lies within a small fraction of the range and gets rounded to one of a few levels near zero. The model loses most of its fine-grained information. Short factual answers degrade a little; long chains of reasoning, where small errors compound over many tokens, collapse, which is the pattern in the report.
+GPTQ quantises a layer by choosing rounded weights that minimise the squared error of the layer's output, WX, on the calibration inputs X. When it rounds one weight it updates the remaining weights to compensate, and the compensation uses the calibration inputs' statistics. Error ends up in the input directions that the calibration set rarely exercises. Here the calibration set is the GPTQ paper's own default: 128 random 2,048-token segments of C4, generic English web text. Korean and Japanese tokens drive activation patterns that set barely covered, so their outputs absorb error the English slices never see. The table fits that: English perplexity moved by 0.06, three English slices moved 1 or 2 points, and the one slice far from the calibration distribution lost 19.
 
-The fixes attack that error directly. Use finer-grained scales so an outlier only stretches the range of its own group or block; GGUF's formats do this (Q8_0 stores one scale per 32 weights, and the K-quants' per-block scales are why Q4_K costs 4.5 bits per weight rather than 4). Use a calibrated method: GPTQ adjusts the remaining weights to compensate for each rounding error using second-order information from calibration data, and AWQ finds the small share of salient weight channels from activation statistics and protects them. Then re-run the same eval slices, because the loss is task specific: report per slice, not just an average. If 4 bits still fails the bar on the slices that matter, FP8 or a mixed scheme that keeps sensitive layers at higher precision is the fallback.
+The evidence is circumstantial, and three changes shipped together. Collect, in this order:
 
-Why the others tempt. Mixing INT4 weights with a BF16 KV cache is normal, and quantizing the cache too would add error. Blaming the bit width is an understandable reaction, but published methods quantize large models to 3 and 4 bits; this config used the crudest available scheme. Temperature cannot be the cause under greedy decoding. The tokenizer is untouched, as the identical token counts show.
+1. One eval run with the 4-bit weights and a BF16 KV cache. This separates the weight change from the cache change in one run.
+2. Per-layer output error on held-out Korean and Japanese prompts against held-out English prompts. If the weights are the cause, the gap concentrates in specific layers.
+3. A re-quantisation calibrated on a sample of production prompts in proportion to served traffic, including Korean and Japanese, then the same slice.
+4. AWQ on the same model as a comparison. Its authors argue it does not overfit the calibration set because it fits no reconstruction, and that claim is worth testing on this slice rather than assuming.
+
+Without those runs, keep Korean and Japanese traffic on the BF16 deployment and ship the 4-bit model for the English traffic it passed on. Treat the KV change as unreviewed. If the weight-only run still fails after recalibration, keep the most affected layers at higher precision. FP8 weights are the fallback that costs back half the memory saving.
+
+Ranking the real defects:
+
+1. **Calibration data that does not cover the served traffic.** This explains the symptom.
+2. **An FP8 KV cache with no calibrated scales.** The vLLM documentation sets every scale to 1.0 without calibration and recommends dataset calibration. It is a real defect and shipped in the same release, so attribution is impossible until it is ablated. It does not explain this pattern: the long-document slice, which reads the most cached keys and values, lost 2 points.
+3. **Signing off on perplexity and English slices.** This is the process defect that let the first two through.
+
+Why the others tempt:
+
+- Coarse groups are the classic cause of 4-bit damage, but they would hurt every slice. The GPTQ paper reports group size 128 within 0.1 to 0.3 perplexity of uncompressed at 3 bits on its 175B models, so at 4 bits it is not the first suspect.
+- "The slice is too small" is a reflex worth checking. At 300 items and about 0.7 accuracy, the standard error of each score is about √(0.7 × 0.3 / 300) = 0.026, so the difference has a standard error near 0.037, and 0.19 is about five of them.
 
 ## Follow-ups
 
-- *What calibration data would you use?* A few hundred samples resembling production prompts, including the languages and tasks you serve; calibration on generic web text can miss your domain.
-- *How do you decide between INT4 and FP8?* Measure both on your evals and your hardware: FP8 halves bytes and runs natively on recent GPUs; INT4 halves them again but needs a good method and an efficient kernel.
-- *Does quantization speed up prefill?* Weight-only INT4 mostly helps bandwidth-bound decode; prefill is compute bound and gains less unless the kernels compute in low precision.
+- *The recalibrated model recovers the slice to 0.79 but costs 0.01 on English support. Ship it?*
+- *How big should the calibration set be, and drawn from where?* Sampled from production prompts in the proportions you serve, with every language and task family present. Then check that adding more samples no longer moves the weakest slice.
+- *Which eval would have caught this before sign-off?* A slice per language and task family that the product serves, gated individually, not one averaged score and not perplexity on English text.
 
 ## Common mistakes
 
-- Judging a quantized model by perplexity or a short QA set alone.
-- Quantizing with per-tensor scales and no calibration, then concluding 4 bits does not work.
-- Reporting one averaged score that hides the collapse on reasoning tasks.
-- Quantizing the KV cache in the same change, so you cannot tell which change caused the loss.
+- Signing off on perplexity, which here moved by 0.06 while one product slice lost 19 points.
+- Shipping weight and KV-cache quantisation in one release, so no eval can say which one did the damage.
+- Blaming the bit width and returning to BF16 without trying a calibration set that matches the traffic.
+- Dismissing a large drop on a small slice as noise without computing the standard error.

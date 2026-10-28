@@ -1,0 +1,125 @@
+---
+id: inf-022
+title: p99 time to first token doubled after a config change
+subtitle: two changed lines and a feature launch
+track: inference
+module: batching
+type: debug
+difficulty: hard
+seniority: [senior, staff]
+minutes: 30
+core: false
+tags: [chunked-prefill, token-budget, head-of-line-blocking, ttft, vllm, debugging]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: vLLM docs, Optimization and tuning (latest, checked 2026-10-28)
+    url: https://docs.vllm.ai/en/latest/configuration/optimization.html
+    note: "V1 batches all pending decodes before any prefill and chunks a prefill that does not fit max_num_batched_tokens; smaller values such as 2048 give better inter-token latency, higher values better time to first token, and above 8192 is recommended for throughput. Checked 2026-10-28."
+  - title: vLLM docs, Engine arguments (latest, checked 2026-10-28)
+    url: https://docs.vllm.ai/en/latest/configuration/engine_args.html
+    note: "--long-prefill-token-threshold: for chunked prefill, a request is long if its prompt is longer than this number of tokens; default 0. --scheduling-policy defaults to fcfs. Checked 2026-10-28."
+  - title: vLLM source, v1/core/sched/scheduler.py (main branch, read 2026-10-28)
+    url: https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/sched/scheduler.py
+    note: "RUNNING requests are scheduled first from the step's token budget; in that loop a positive long_prefill_token_threshold caps a request's new tokens for the step. On main the threshold is set to zero unless more than one request is eligible, and an adaptive mode floors it at a fair share of the budget. Checked 2026-10-28."
+  - title: "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve (Agrawal et al., arXiv 2403.02310, v3 2024-06-17)"
+    url: https://arxiv.org/abs/2403.02310
+    note: "chunked prefills split a prefill into chunks so new requests join a batch without pausing ongoing decodes. Checked 2026-10-28."
+choices:
+  - text: The 100,000-token prompt is a running request once admitted, so each step gives it all the budget decodes leave, and no waiting prompt is admitted until its prefill ends.
+    correct: true
+    why: A contract prefill now lasts about 4.2 s, in which no chat prompt is admitted, and at 15 contracts an hour that window covers enough arrivals to set the p99.
+  - text: Raising the budget to 16,384 made every step that carries a prefill chunk about six times longer, so each chat prompt queued behind it waits far longer for every step.
+    correct: false
+    why: The steps are longer but there are fewer of them; the same contract prefill at 2,048 tokens per step would block chat prompts for about 5.1 s, longer than now.
+  - text: Raising max_model_len to 131,072 makes the engine reserve KV space for the full context of every sequence, so fewer chat requests fit at once and the rest queue for memory.
+    correct: false
+    why: Paged KV is allocated as tokens are written, not reserved per sequence; peak KV usage is 44% and there were no preemptions.
+  - text: Contract prompts fill the prefix cache and evict the blocks of the chat system prompt, so chat prompts now recompute their shared prefix before they produce a first token.
+    correct: false
+    why: The prefix-cache hit rate on chat prompts moved from 81% to 80%, which cannot double the p99.
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+One replica pool serves a chat product. A contract-review feature launched on Monday, with prompts of 60,000 to 120,000 tokens; until then the gateway rejected them, because they exceeded the model length. The same deploy changed the engine config:
+
+```yaml
+model: <dense chat model>
+-max_model_len: 32768
++max_model_len: 131072
+-max_num_batched_tokens: 2048
++max_num_batched_tokens: 16384
+max_num_seqs: 64
+enable_chunked_prefill: true
+enable_prefix_caching: true
+```
+
+Peak hour, one replica:
+
+<div class="tablewrap">
+<table class="scale">
+<thead><tr><th>Metric</th><th>Week before</th><th>Week after</th></tr></thead>
+<tbody>
+<tr><td>Chat requests per hour</td><td>9,000</td><td>9,000</td></tr>
+<tr><td>Contract requests per hour</td><td>15 rejected</td><td>15 served, about 100,000 prompt tokens each</td></tr>
+<tr><td>Running sequences (mean)</td><td>40</td><td>41</td></tr>
+<tr><td>Chat time to first token, p50</td><td>180 ms</td><td>170 ms</td></tr>
+<tr><td>Chat time to first token, p99</td><td>0.9 s</td><td>1.9 s</td></tr>
+<tr><td>Inter-token latency, p50</td><td>25 ms</td><td>25 ms</td></tr>
+<tr><td>Longest gap between two tokens of one stream</td><td>110 ms</td><td>680 ms</td></tr>
+<tr><td>KV cache usage (peak), preemptions</td><td>38%, 0</td><td>44%, 0</td></tr>
+<tr><td>Prefix-cache hit rate, chat prompts</td><td>81%</td><td>80%</td></tr>
+</tbody>
+</table>
+</div>
+
+<p class="tiny">Scenario: the config and dashboard are synthetic, built for this exercise. The team measured this replica's step time at about 20 ms plus 0.04 ms per scheduled token, and chat prompts average 1,500 tokens; the rows are consistent with those two numbers.</p>
+
+Nobody has a step-level trace of a slow chat request. Which explanation accounts for the p99 time to first token, and what do you do before you have the trace?
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask how long one contract takes to reach its first token, and how often one is in flight.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request the step log for one slow chat request: what was scheduled in every step between its arrival and its first token.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask which scheduler settings the deploy left at their defaults.</p></details>
+
+## Answer
+
+**How long a contract prefill blocks.** The scheduler serves running requests first, decodes before prefills, and admits waiting requests only from the budget left over. Once a contract is admitted it is a running request with a partial prefill, and nothing caps its share: `long_prefill_token_threshold` is not set, so it is 0. Each step, the 40 decodes take 40 tokens and the contract takes the other 16,344. A 100,000-token prompt takes 7 steps, six full ones at 20 + 0.04 × 16,384 = 675 ms and a last one of about 100 ms, so about 4.2 s. No chat prompt is admitted in that time.
+
+**Whether that sets the p99.** Fifteen contracts an hour at 4.2 s each means a contract prefill is in flight 15 × 4.2 / 3,600 = 1.75% of the time. A chat prompt that arrives in that window waits anywhere from 0 to 4.2 s. For the slowest 1% of all chat prompts, the wait x satisfies 0.0175 × (4.2 − x) / 4.2 = 0.01, so x is about 1.8 s. Add the normal time to a first token and the p99 lands near the dashboard's 1.9 s.
+
+**Ranking the defects.**
+
+1. **No per-request cap on prefill tokens per step.** This explains the symptom. It existed before the deploy too, but a 32,768-token limit kept any one prefill short.
+2. **The budget raise.** A real regression, but in a different metric. Every step that carries a contract chunk takes 675 ms, so 41 streams freeze for most of a second, 15 times an hour: the 680 ms gap row. It does not explain the time to first token. At 2,048 tokens per step the same contract takes 50 steps of about 102 ms, roughly 5.1 s, so reverting this line alone would make the p99 worse.
+3. **The `max_model_len` raise** is why contracts now arrive. It is the trigger, not the defect.
+
+Why the other options tempt. The budget is the changed line, and longer steps sound like longer waits. Reserving the full context per sequence is how contiguous KV allocators behave, and the KV row rules it out here. Prefix-cache eviction by large prompts happens in real pools, and the hit-rate row rules it out here.
+
+**What to collect.** Chat time to first token split by whether a contract prefill was running when the request arrived; if the split shows the whole tail in the overlapping group, the cause is confirmed. A scheduler step log for one hour. The number of contracts in flight at once, since everything above assumes one at a time.
+
+**What to do without the trace.** Two fixes are defensible, and each has a cost.
+
+- *Cap a request's prefill tokens per step.* Set `long_prefill_token_threshold` so a contract takes at most that many tokens a step and chat prompts are admitted from the rest. The threshold is the quantity to defend. Chat prompts keep arriving at about 3.75 tokens per millisecond (9,000 an hour at 1,500 tokens), so a step of length s carries 40 decodes, the contract's chunk and about 3.75 × s chat tokens. At 2,048, s = 20 + 0.04 × (2,088 + 3.75 s) gives s of about 122 ms; the contract needs 49 steps, so its first token arrives after about 6 s instead of 4.2 s, and no stream freezes longer than about 122 ms. At 8,192 the same equation gives about 410 ms a step: the contract waits about 5 s and streams freeze for up to 410 ms. Anything from 2,048 to 8,192 is a defensible trade between contract latency and chat. At 256 the contract needs 391 steps of about 38 ms and waits about 15 s; 16,384 is the current behaviour. This is a config change on one canary replica, reversible in minutes. Check the release you run: on vLLM's main branch the threshold applies only when more than one request is eligible, and an adaptive mode raises it to a fair share of the budget.
+- *Route contracts to their own replicas* by prompt length at the gateway. Chat is isolated completely, and the budget on chat replicas can go back to 2,048 for the gap metric. The cost: 15 contracts an hour need about 15 × 4.2 = 63 s of prefill an hour, so a dedicated pool sits nearly idle unless other long-context traffic shares it, and it needs its own capacity plan.
+
+I would set the cap at 2,048 on a canary today and compare the chat p99 split by overlap within a day.
+
+**Where the cap fails.** It is per request, not per step. If eight contracts are in their prefills at once, 8 × 2,048 = 16,384 tokens go to contracts every step and chat is blocked again. One customer uploading a folder of contracts is enough. The cap needs a companion limit on concurrent long prefills per replica, which the gateway can enforce by counting contracts in flight.
+
+## Follow-ups
+
+- *Pushback: the contract team says 6 s to a first token breaks their progress indicator and asks you to remove the cap. What do you offer them, and what do you write down about the cost to chat?*
+- *Reversal: what would you need to see to move contracts to their own replicas instead?* Contracts in flight at once often exceeding what the cap can absorb, or contract volume large enough to keep a dedicated pool busy, measured over a month.
+- *A customer uploads 40 contracts at 09:00. Walk through the next minute on one replica with your fix in place, and say what you add before it happens again.*
+
+## Common mistakes
+
+- Reverting the changed budget line, which lengthens each contract's blocking window from about 4.2 s to about 5.1 s.
+- Treating decode-first scheduling as protection for time to first token. It protects streams that are already running, not prompts that are waiting.
+- Reading the 680 ms gap as the cause of the p99 rather than a second, separate regression.
+- Assuming a per-request cap bounds the total, with several long prompts in flight.
+- Applying the fix to the whole pool before comparing a canary against the overlap split.

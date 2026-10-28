@@ -1,0 +1,168 @@
+---
+title: "Routing across accelerators, regions and caches"
+track: inference
+module: fleet
+order: 1
+kind: lesson
+level: staff
+minutes: 13
+summary: A fleet router filters replicas by correctness constraints first, then trades prefix-cache affinity against load, and keeps research demand from evicting production's cache and stretching its decode steps.
+prerequisites: [inference/batching/paged-attention, inference/inference-anatomy/roofline-serving]
+updated: 2026-10-28
+sources:
+  - title: "Anthropic job posting: Staff + Senior Software Engineer, Inference (Greenhouse)"
+    url: https://boards-api.greenhouse.io/v1/boards/anthropic/jobs/5385998008
+    note: "Official posting, checked 2026-10-28. Responsibilities include request routing and load balancing across thousands of accelerators; autoscaling and orchestrating production, research and experimental workloads; deployment pipelines for new models; multi-region deployments and geographic routing. Names multiple accelerator families and multiple cloud platforms, without naming chips."
+  - title: "A postmortem of three recent issues (Anthropic, 17 September 2025)"
+    url: https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues
+    note: "Claude served on AWS Trainium, NVIDIA GPUs and Google TPUs. Context window routing error from 5 August: 0.8% of Sonnet 4 requests misrouted to servers configured for the 1M-token context window; a 29 August load balancing change raised it to 16% of Sonnet 4 requests at the worst hour on 31 August; routing was sticky, so follow-up requests tended to reach the same wrong server. Output corruption and the approximate top-k miscompilation were confined to TPU servers."
+  - title: "vLLM design docs: Automatic Prefix Caching"
+    url: https://docs.vllm.ai/en/latest/design/prefix_caching.html
+    note: "Checked 2026-10-28. Block hash = hash of parent block hash, the block's tokens, and extra keys (LoRA ID, multimodal input hashes, cache salt); only full blocks are cached; sha256 default since v0.11; LRU free queue, a finished request's blocks freed in reverse order; cache_salt injected into the first block's hash so only requests with the same salt share blocks."
+  - title: "SGLang Model Gateway documentation"
+    url: https://docs.sglang.io/advanced_features/sgl_model_gateway.html
+    note: "Checked 2026-10-28. cache_aware is the default policy; --cache-threshold 0.3 (minimum prefix match ratio), --balance-abs-threshold 64, --balance-rel-threshold 1.5, --eviction-interval-secs 120; router replicas do not synchronise their radix trees, and the project's HA table says cache hits may drop by 10 to 20%."
+  - title: "SGLang v0.4 release blog (LMSYS, 4 December 2024)"
+    url: https://lmsys.org/blog/2024-12-04-sglang-v0-4
+    note: "Cache-aware load balancer keeps an approximate radix tree of each worker's cache, updated lazily from requests. On a workload of balanced long-prefix groups on 8x A100 80GB: 82,665 against 158,596 tokens/s and cache hit rate 20% against 75%, v0.3 against v0.4. Project-measured."
+  - title: "DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving (Zhong et al., OSDI 2024)"
+    url: https://arxiv.org/abs/2401.09670
+    note: "The paper reports 7.4x more requests or a 12.6x tighter SLO than colocated systems. Body (arxiv.org/html/2401.09670): one 512-token OPT-66B request holds about 1.13 GB of KV; at 10 requests/s that is 11.3 GB/s, about 90 Gbps; the testbed had 25 Gbps between nodes, so its low node-affinity placement keeps prefill and decode of a stage on one node and moves KV over NVLink."
+---
+import Callout from '../../../../components/Callout.astro';
+import Depth from '../../../../components/Depth.astro';
+import Predict from '../../../../components/Predict.astro';
+import SelfRate from '../../../../components/SelfRate.astro';
+
+## The router is where cost is decided
+
+On one replica the scheduler decides throughput. Across a fleet, the router decides it first: which accelerator family runs the request, in which region, on which replica, and next to which other requests. Each of those choices changes how much prefill is recomputed, how long a decode step takes, and whether the request reaches a server that is configured correctly for it at all.
+
+Anthropic's inference job posting reads as a specification of this job. It lists request routing and load balancing "across thousands of accelerators", autoscaling that orchestrates production, research and experimental workloads, multi-region deployment with geographic routing, and deployment pipelines for new models, on multiple accelerator families and multiple clouds. Anthropic's September 2025 postmortem names the families: AWS Trainium, NVIDIA GPUs and Google TPUs. The posting does not describe the router's design, and nothing below claims to; it is a design for the requirements the posting states.
+
+A router for that fleet makes three decisions in a fixed order: which replicas are allowed to serve the request, which allowed replica is cheapest given what it has cached and how loaded it is, and what the request is allowed to displace.
+
+## Eligibility is a correctness filter
+
+The first decision has no cost trade-off in it. A replica is eligible only if it runs the model build the request needs (weights, context-length configuration, adapter, accelerator-specific compilation), sits in a region the request may be processed in, and belongs to a pool the request's traffic class may use. Get this wrong and the response is wrong or slow, not merely expensive.
+
+The postmortem shows the failure. From 5 August 2025, 0.8% of Sonnet 4 requests were routed to servers configured for the upcoming 1M-token context window. A load-balancing change on 29 August raised the share, and at the worst hour on 31 August 16% of Sonnet 4 requests were affected. Routing was sticky: once a conversation reached a wrong server, its follow-ups tended to go back there, so some users saw the degradation on every turn. The misrouted servers returned answers, so no error rate moved.
+
+Two design consequences follow. Pool membership is part of the request's contract and should be checked by the router against a declared build identifier, not inferred from a pool name or a capacity label. And stickiness, which the next section argues for on cost grounds, multiplies the damage of any eligibility bug, so the stickiness key has to include the build identifier: a conversation pinned to a replica stays pinned only while that replica still serves the build the conversation started on.
+
+## Prefix affinity is the cost term
+
+Inside the eligible set, the dominant cost difference is prefill that the chosen replica has already done. In vLLM a cached block is found by a hash of its parent block's hash, its own tokens, and extra keys: the LoRA ID, multimodal input hashes and an optional cache salt. Only full blocks are cached. Free blocks sit in an LRU queue, and a finished request's blocks are freed in reverse order so its last, least shareable block is evicted first. Two facts matter to a router. The cache is per replica, so a request reuses a prefix only on a replica that computed it recently. And the hash chain means a hit requires the same tokens from the first one: a timestamp or a request ID near the top of a system prompt makes every request a miss, on any replica.
+
+Conversations are the case where routing alone moves the number. Turn n+1 carries all of turn n's tokens plus a few new ones, so the replica that served turn n holds almost the whole prompt.
+
+<Predict id="inf-fleet-affinity" question="A pool has 16 replicas. A conversation has 20,000 tokens of history and adds 500 new tokens per turn. Assume only the replica that served the previous turn holds the history. With uniform random routing, how many prompt tokens does the next turn prefill on average?" answer={19250} tolerance={250} unit="tokens">
+<p>The next turn lands on the previous replica with probability 1/16 and prefills 500 tokens; otherwise it prefills all 20,500. 500 + (15/16) × 20,000 = <b>19,250 tokens</b>, against 500 with affinity, 38.5 times more prefill. The assumption overstates the gap a little, because replicas that served earlier turns hold a shorter prefix of the same conversation, but random routing still recomputes most of the history on most turns.</p>
+</Predict>
+
+Affinity has a price: it concentrates load. A popular system prompt or a long agent session pins work to the replicas that hold it, and pure affinity routes the next request to a replica whose queue is already the longest. Production routers therefore bound it. SGLang's gateway makes the trade-off explicit in its defaults: the `cache_aware` policy needs a prefix match of at least 30% of the request (`--cache-threshold 0.3`) to count as a hit, and it rebalances on load past an absolute difference of 64 and a ratio of 1.5 between workers (`--balance-abs-threshold`, `--balance-rel-threshold`). The router does not ask workers what they cache. It keeps an approximate radix tree per worker, built from the requests it sent. When the policy was introduced, the project measured 158,596 against 82,665 tokens per second and a hit rate of 75% against 20%, on a workload of long prefix groups chosen to be balanced. Those are the project's numbers on a favourable workload.
+
+The approximation has a fleet-scale failure that the same docs state: router replicas do not share their trees, each builds its own, and the HA table estimates 10 to 20% fewer cache hits. If a fleet runs a dozen router instances behind a plain load balancer, each instance's view of each worker is built from a twelfth of the traffic. Hashing a session key to a router instance, so that a conversation's requests always reach the same router, recovers most of it without a shared store.
+
+## Accelerator type: a pool before it is a cost choice
+
+With two accelerator families, the tempting rule is to send each request to the family whose roofline suits it: long prompts, compute-bound in prefill, to the family with more FLOPs per dollar; long generations, bandwidth-bound in decode, to the family with more bandwidth per dollar. That rule assumes both families run numerically equivalent builds of the same model. The postmortem is a counterexample: two of its three bugs, an output-corruption misconfiguration and an approximate top-k miscompilation in XLA:TPU, were confined to TPU servers. Each family is a separate build that fails separately, so the family is part of the eligibility key first and a cost choice second.
+
+Routing by phase is disaggregation. DistServe puts prefill and decode on different GPUs and reports 7.4 times more requests or a 12.6 times tighter latency objective than colocated systems. Its body gives the constraint a router has to respect: the KV cache produced by prefill has to move to the decode instance.
+
+<Predict id="inf-fleet-kv-move" question="Llama 3 70B caches 327,680 bytes per token in BF16. How many GB move from prefill to decode for one 8,000-token prompt?" answer={2.62} tolerance={0.05} unit="GB">
+<p>327,680 × 8,000 = 2,621,440,000 bytes, <b>2.62 GB</b> per request. At four such requests per second the link carries 10.5 GB/s, about 84 Gbps. DistServe's own example is 1.13 GB for a 512-token OPT-66B request and about 90 Gbps at 10 requests per second; its testbed had 25 Gbps between nodes, so its placement keeps both phases of a pipeline stage on one node and moves KV over NVLink.</p>
+</Predict>
+
+For a router this settles placement: a prefill pool and its decode pool belong to one high-bandwidth domain, and a request is never split across regions or across accelerator families. The cross-family split is worse than a bandwidth problem, because KV layouts and numerics differ between builds, so the decode side would have to recompute.
+
+## Regions: residency first, then cache
+
+Regions add a hard constraint and a soft one. Residency is hard: a tenant whose data may only be processed in the EU is eligible only for EU replicas, and if the EU is out of capacity the request queues or fails; it does not spill. For everyone else a region is a latency and capacity choice, and spillover has a cache cost the router should count: a conversation moved to another region loses its whole prefix, so the first spilled turn pays the full prefill computed above. Spill whole sessions and keep them in the new region afterwards, rather than spilling individual turns and paying the miss on every one.
+
+## Production and research on one fleet
+
+The posting asks for production, research and experimental workloads orchestrated across one fleet. Sharing raises utilisation; the question is what research traffic may displace. Three things, each with a different control.
+
+Batch slots. A decode step's latency grows with batch size and with any prefill chunk in the same step, so research requests in a production replica's batch raise production's inter-token latency directly. Admission by priority, with a cap on research tokens per step, bounds it.
+
+Cache. Research and evaluation traffic is mostly unique prompts. Every one of them allocates blocks from the same LRU queue that holds production's hot prefixes, so a research burst evicts the system prompts production depends on, and production's TTFT stays high after the burst ends while the prefixes are recomputed. A cache salt does not help: it partitions sharing, not capacity. Separate replicas, or an engine-level cap on blocks per traffic class where the engine has one, do.
+
+Preemption. When production demand returns, preempting research work frees blocks, but a preempted request either recomputes or swaps, and long research jobs that are preempted repeatedly never finish. Give research a floor of reserved capacity it cannot lose and a ceiling it cannot exceed, and let it use anything between when production is below its forecast.
+
+## The router in code
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class Replica:
+    name: str
+    region: str
+    accel: str
+    builds: set                 # declared build ids, e.g. {"m1@200k"}
+    load: int = 0               # queued plus running requests
+    prefixes: set = field(default_factory=set)   # router's estimate, not the engine's truth
+
+def route(req, replicas, abs_slack=64, rel_slack=1.5):
+    ok = [r for r in replicas
+          if req["build"] in r.builds
+          and (req["region_lock"] is None or r.region == req["region_lock"])]
+    if not ok:
+        raise LookupError(f"no replica serves {req['build']} in {req['region_lock']}")
+    lightest = min(ok, key=lambda r: r.load)
+    warm = [r for r in ok if req["prefix_key"] in r.prefixes]
+    if warm:
+        best = min(warm, key=lambda r: r.load)
+        overloaded = (best.load - lightest.load > abs_slack
+                      and best.load > rel_slack * max(lightest.load, 1))
+        if not overloaded:
+            return best
+    return lightest
+
+fleet = [
+    Replica("eu-a-1", "eu", "A", {"m1@200k"}, load=40, prefixes={"sys:v7"}),
+    Replica("eu-b-1", "eu", "B", {"m1@200k"}, load=10),
+    Replica("us-b-1", "us", "B", {"m1@200k", "m1@1m"}, prefixes={"sys:v7"}),
+]
+req = {"build": "m1@200k", "region_lock": "eu", "prefix_key": "sys:v7"}
+print(route(req, fleet).name)      # eu-a-1: warm, and 40 is within the slack
+fleet[0].load = 200
+print(route(req, fleet).name)      # eu-b-1: the warm replica is overloaded, so pay the miss
+```
+
+The order is the design: eligibility raises instead of degrading, affinity applies only inside the eligible set, and load overrides affinity only past both thresholds. A real router replaces `prefix_key` with a match length over a token radix tree and `load` with queued tokens rather than requests, because one 100,000-token prompt is not one unit of load.
+
+## In the room
+
+<Callout kind="interview" label="Interview question">
+**"You run one model on two accelerator families in three regions (US, EU, Asia). EU tenants require EU processing. Research wants a third of the EU fleet every night for evaluations, and the agent product's prefix-cache hit rate is the main reason its cost per task is acceptable. In four weeks a launch doubles agent traffic. Design the router, and say what you give up."**
+</Callout>
+
+<Depth>
+<Fragment slot="short">
+<p>Filter by build, region lock and traffic class; then route by session affinity bounded by load; keep each family a separate eligibility pool, never a per-request choice. Research gets dedicated EU replicas at night with a floor and a ceiling, not shared batches, because its unique prompts would evict the agent product's prefixes. I give up some night-time utilisation in exchange for production's hit rate and latency.</p>
+</Fragment>
+<Fragment slot="long">
+<p>Eligibility comes first and fails closed: each replica declares the build ids it serves (model, context configuration, family), the router matches them exactly, and EU-locked requests never spill. Inside a pool the router keys stickiness on session id plus build id, routes to the replica with the longest estimated prefix match, and falls back to the lightest replica when the warm one exceeds both load thresholds. Router instances are chosen by a hash of the session id so each instance's cache estimate stays dense.</p>
+<p>Families are pools, not a per-request routing dimension: a conversation stays on one family for its life, because a switch costs the whole prefix and because numerical bugs are family-specific. Families get separate release tracks for the same reason. Research gets a reserved set of EU replicas each night, sized from the night-time production forecast, with a floor it keeps and a ceiling it cannot cross; it never shares a production replica's batch or block pool.</p>
+<p>What I give up: research capacity sits idle when production is below forecast, residency means EU shortfalls queue instead of spilling, and bounded affinity accepts some misses on hot prefixes to keep queues even. What I write down: hit rate and TTFT per pool as launch gates, and a rollback trigger on hit rate after any router change, because the August 2025 incident started with a load-balancing change that raised no errors.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Finance shows the dedicated research replicas idle 40% of the night. The research and production leads disagree on sharing; how do you decide without deciding by rank, and what measurement settles it?</em></li>
+<li><em>The launch doubles traffic in the EU only, and EU capacity cannot grow for six weeks. Do you relax affinity, cap agent sessions, or move non-locked EU traffic to the US, and who signs off on the latency change?</em></li>
+<li><em>A family-B build ships a faster kernel that family A does not have yet. What would you need to see before letting the router prefer B for new sessions, and what would make you reverse it?</em></li>
+</ul>
+</Fragment>
+</Depth>
+
+## When this is wrong
+
+Affinity only pays when prefixes repeat. A workload of one-shot requests over unique documents has nothing to reuse, and bounded affinity reduces to least-loaded routing with extra bookkeeping. Read the engine's prefix hit counters per pool before building session stickiness; if the hit rate is low under ideal routing, routing will not raise it.
+
+The router's view of caches is an estimate. Engines evict under memory pressure without telling the router, so a replica the router thinks is warm may be cold, and the estimate degrades when the fleet is busiest, which is when misses cost most. Engines that publish cache events to the router, or a KV store shared across replicas, change the calculus, and the comparison above assumes neither.
+
+Family pools and single-domain disaggregation assume the binding constraint is compute. When it is a region's power or a family's supply, the router's job becomes rationing, and the policy is set by contracts and traffic priorities rather than by cache hits.
+
+<SelfRate id="lesson:inference/fleet/fleet-routing" />

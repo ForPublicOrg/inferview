@@ -1,0 +1,102 @@
+---
+id: rag-035
+title: Vector search for a million workspaces
+subtitle: index per tenant or shared, cold starts, freshness and a fixed RAM budget
+track: rag
+module: vector-systems
+type: design
+difficulty: hard
+seniority: [staff]
+minutes: 45
+core: false
+tags: [multi-tenancy, sharding, object-storage, freshness, quantization, cold-start]
+companies: []
+updated: 2026-10-28
+sources:
+  - title: turbopuffer documentation, architecture (page dated only by its 2026 footer)
+    url: https://turbopuffer.com/docs/architecture
+    note: "vendor's own figures: data on object storage with a prefix per namespace and a write-ahead log; after the first query a namespace is cached on NVMe; cold p50 874 ms and warm p50 14 ms for 1M documents; a cold query needs 3 to 4 object storage round trips of about 100 ms; one WAL entry per namespace per second, concurrent writes batched; committed but unindexed data is searched exhaustively from the WAL; strong consistency by default, eventual consistency staleness up to about an hour; a pre-flight query can warm the cache. Checked 2026-10-28."
+  - title: Pinecone documentation, implement multitenancy
+    url: https://docs.pinecone.io/guides/index-data/implement-multitenancy
+    note: "vendor docs: one namespace per tenant; 100 (Starter) to 1,000,000 (Enterprise) namespaces per serverless index; queries cost 1 RU per GB of namespace, so a filtered query over one 100 GB namespace costs 100 RUs where a 1 GB tenant namespace costs 1; metadata filters scan the whole namespace; $in and $nin take at most 10,000 values; deleting a namespace offboards a tenant. Checked 2026-10-28."
+  - title: Qdrant documentation, indexing
+    url: https://qdrant.tech/documentation/concepts/indexing/
+    note: "is_tenant on a payload field lays out each tenant's data together on disk; multitenant setups can disable the global graph and build per-tenant sub-indexes. Checked 2026-10-28."
+  - title: "DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node (NeurIPS 2019)"
+    url: https://proceedings.neurips.cc/paper/2019/hash/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Abstract.html
+    note: "the paper reports a billion-point index served from one workstation with 64 GB of RAM and an SSD, over 5,000 queries per second at under 3 ms mean latency and 95%+ 1-recall@1 on SIFT1B, and 5 to 10 times more points per node than HNSW and NSG at high recall. Checked 2026-10-28."
+  - title: Hugging Face blog, Embedding Quantization (2024-03-22)
+    url: https://huggingface.co/blog/embedding-quantization
+    note: "int8 is 4 times smaller and keeps about 99.3% of retrieval performance in their table; binary is 32 times smaller and keeps about 92.5%, about 96% with rescoring. Checked 2026-10-28."
+  - title: PracHub, Vector Database Interview Questions, HNSW, IVF, Filtering, and Recall vs Latency (2026-08-13)
+    url: https://prachub.com/resources/vector-database-interview-questions-hnsw-ivf-filtering-and-recall-vs-latency
+    note: "third-party guide: shared index with tenant predicates, per-tenant namespaces or partitions, or dedicated indexes for large or regulated tenants; authorization filters are correctness constraints and never relaxed to fill top-k; delta index for new writes, tombstones and compaction for deletes. Checked 2026-10-28."
+---
+import Callout from '../../../components/Callout.astro';
+import Depth from '../../../components/Depth.astro';
+
+## Question
+
+<Callout kind="interview" label="The round">
+"We have a million customer workspaces and one shared vector index, and small workspaces get empty or slow results. Redesign it. One index per tenant or shared? What happens on the first query after a workspace has been idle, how fresh is a note someone just saved, and what does it cost?"
+</Callout>
+
+The constraints, as a scenario:
+
+- 1,000,000 workspaces and 2 billion chunks of 1,024-dimension float32 embeddings. 900,000 workspaces hold under 1,000 chunks each, 270 million in total; 99,000 hold 1,000 to 100,000, 930 million in total; 1,000 hold over 100,000, 800 million in total.
+- On a weekday about 60,000 workspaces run a search. Most of them ran one the day before.
+- Search p95 of 200 ms for a workspace that searched in the last hour. The first search after a longer idle may be slower, but product wants it under a second.
+- A saved note must be searchable within 10 seconds. A deleted workspace must be gone from every index within 24 hours.
+- Today's system is one shared HNSW index with a workspace filter. Four engineers own it, and finance caps the vector tier at today's spend, which pays for about 1.5 TB of RAM across the fleet. Object storage and local NVMe are not the constraint.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>Ask for the size distribution of the workspaces that search on a typical day, not of all workspaces.</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Request a measured scan rate: how many int8 vectors one core scores per millisecond from local NVMe on this hardware.</p></details>
+<details class="hint"><summary>Hint 3</summary><p>Ask how often a workspace moves between size bands, and what an import of a large archive looks like.</p></details>
+
+## Answer
+
+<Depth>
+<Fragment slot="short">
+<p>Neither one index per tenant nor one shared index: tier by workspace size. Below a threshold I choose from a measured scan rate, about 20,000 chunks, a workspace gets no ANN index at all; its int8 vectors sit together on NVMe and object storage and a search scores all of them, then rescores the top candidates at full precision. Above it, a per-workspace graph index on NVMe, cached in RAM while active. The 1,000 largest workspaces get dedicated, RAM-resident, int8 indexes with full vectors on NVMe for the rescore. Freshness comes from a per-workspace write log that every search also scans exactly, so a note is searchable when its write commits and the index catches up in the background. The shared filtered index goes, because a 300-chunk workspace is one row in about 6.7 million of the shared table and no post-filtered graph search returns it reliably. The written artefact is a decision memo with the tiers, the threshold and the trigger that moves a workspace between tiers.</p>
+</Fragment>
+<Fragment slot="long">
+<p><strong>Why the shared index fails, computed.</strong> 2 billion / 300 = 6.7 million: a typical small workspace is one row in 6.7 million. A graph search that filters after scanning has to read millions of nodes to find ten of its rows, and a cap on the scan returns nothing. The filter is a correctness constraint: the guide on vector-database interviews says plainly that an authorization filter is never relaxed to fill top-k, so the fix is structural, not a larger scan.</p>
+<p><strong>The memory arithmetic decides the shape.</strong> 2 billion x 1,024 x 4 bytes = 8.2 TB at float32 against 1.5 TB of RAM. int8 is 2.05 TB and still does not fit; binary codes are 256 GB. So RAM holds only what is hot, and the source of truth is object storage, with NVMe as the cache. Hugging Face's measurements put int8 at about 99.3% of float32 retrieval performance and binary at about 96% with rescoring; those are their benchmarks, so measure on this corpus before choosing.</p>
+<p><strong>Two defensible designs.</strong></p>
+<ul>
+<li><strong>A namespace per workspace on an object-storage engine</strong>, bought (turbopuffer) or built on the same pattern. Writes go to a per-namespace write-ahead log, unindexed writes are searched exhaustively, indexes build in the background, and a namespace is cached on NVMe after its first query. Cost: the vendor's own figures give a cold p50 of 874 ms at 1 million documents, made of 3 to 4 object storage round trips of about 100 ms. That meets "under a second" at the median, not at p95, so cold searches need a warm-up on workspace open (the vendor documents a pre-flight query for this). A bought engine also puts deletion proofs and per-namespace write rates (one WAL entry per second per namespace, batched) in someone else's code. Pinecone's equivalent, a namespace per tenant, tops out at 1,000,000 namespaces per index on its Enterprise tier, which is this customer count with no headroom.</li>
+<li><strong>Size tiers, built in-house on the existing stack.</strong> Small workspaces: no index, an exact scan. Mid: a per-workspace graph on NVMe. Large: dedicated RAM-resident int8 graphs, 800 million x 1,024 bytes = 819 GB plus about 102 GB of links at M 16 (800 million x 128 bytes), which fits in 1.5 TB with room for caching active mid-tier workspaces. Cost: three code paths, a migration job between tiers, and four engineers who also run today's system.</li>
+</ul>
+<p>I would take the tiers, using the object-storage pattern underneath (a per-workspace log on object storage, NVMe cache), because the RAM budget forces most data off RAM anyway, and because 90% of workspaces need no index at all. If the team cannot staff three tiers, buying the namespace engine is the fallback, with the cold p95 measured on our data in a trial before signing.</p>
+<p><strong>The threshold is a number you choose.</strong> An exact scan of T int8 vectors reads T KB and does T x 1,024 multiply-adds. At T = 20,000 that is 20 MB per search, plus a rescore of perhaps 100 candidates at full precision. Pick T as the largest size whose measured scan p95, cold from NVMe and under the day's concurrency, stays inside 200 ms with room for the rescore. Values from about 10,000 to 50,000 are defensible depending on the scan rate you measure; a threshold chosen from the workspace count alone is not.</p>
+<p><strong>Freshness and deletes.</strong> Every search unions the index (or the flat file) with an exact scan of the workspace's unindexed log, so the 10-second target is met when the write commits, not when the index catches up. Bound the log: if it passes a few thousand entries, the indexer gets priority for that workspace. A deleted workspace in the small and mid tiers is a prefix delete on object storage and a cache eviction. In the large tier it is a tombstone filter at once and a rebuild or compaction inside 24 hours, so the large tier needs a compaction slot every day.</p>
+<p><strong>The constraint conflict</strong> is cost against cold-start latency. Everything that makes the first search after idle fast (keeping more in RAM, pre-warming more workspaces) spends the budget that the large tier needs.</p>
+<p><strong>The failure mode of the recommended design.</strong> A small workspace imports a 500,000-document archive on Monday. Until the migration job moves it, it is still in the flat tier: every search scans 500,000 x 1 KB = 512 MB, and because flat-tier workspaces share NVMe nodes, its neighbours' p95 rises with it. Trigger migration from the write path when a workspace crosses T, not from a nightly job; refuse to flat-scan above 2T and return results from the partial index with a flag; and alert on per-node scan bytes. The cold path is the other failure: a workspace evicted on Friday is cold on Monday morning for everyone at once, so warm the workspaces that searched last Monday before the working day starts.</p>
+<p><strong>What you give up.</strong> Cross-workspace search (an admin searching every workspace becomes a fan-out), a single code path, and an exactly equal first-search latency for every customer.</p>
+<p><strong>Written down.</strong> A decision memo: the three tiers and their sizes, T and the measurement behind it, the cold-search target and the warm-up rule, the deletion path and its proof per tier. Rollout: move the small tier first, behind a flag, compare result sets against the shared index on sampled queries for two weeks, and roll back a tier if its p95 exceeds 200 ms for an hour or a deletion check finds a deleted workspace's chunk in any result.</p>
+</Fragment>
+<Fragment slot="followups">
+<ul>
+<li><em>Why not binary codes for everything, 256 GB in RAM?</em> It fits, but the rescore needs full vectors from NVMe for every search, and on Hugging Face's own numbers binary keeps about 96% with rescoring; check that on this corpus before betting the design on it.</li>
+<li><em>How do you size the NVMe cache?</em> From the bytes of the workspaces that searched in each of the last 30 days, not from the total corpus.</li>
+</ul>
+</Fragment>
+</Depth>
+
+## Follow-ups
+
+- *Pushback: the tiered design needs three code paths and you have four engineers who also carry the pager for today's system. Which tier do you build last, or not at all, and what risk do you accept in writing?*
+- *Reversal: what would you need to see in the vendor trial, at p95 rather than p50, to buy the namespace engine instead of building tiers?*
+- *The 1,000 largest workspaces include ten regulated customers who want a dedicated cluster and a deletion certificate. What changes for them, and who pays for it?*
+- *Two staff engineers disagree: one wants T at 5,000 to keep scans cheap, the other at 50,000 to keep the mid tier small. How do you decide without deciding by rank?* Measure scan p95 at both under Monday-morning concurrency and count the indexes each choice creates.
+
+## Common mistakes
+
+- Keeping one shared index and raising the scan cap until small workspaces return results.
+- Building an ANN index for a workspace an exact scan serves in a few milliseconds.
+- Sizing RAM from the total corpus instead of from what is active.
+- Quoting a vendor's cold p50 as if it were the p95.
+- Promising 10-second freshness while the only searchable copy is the index.
+- Deleting a workspace from the results but not from a shared index.

@@ -1,0 +1,437 @@
+---
+id: wfl-013
+title: A timeout refund workflow that survives crashes
+track: workflows
+module: durable-execution
+type: code
+difficulty: hard
+seniority: [senior, staff]
+minutes: 50
+core: false
+tags: [idempotency, crash-safety, payments, scheduling, determinism]
+companies:
+  - name: DoorDash
+    url: https://prachub.com/coding-questions/implement-timeout-refund-workflow
+updated: 2026-10-28
+sources:
+  - title: PracHub, Implement Timeout Refund Workflow
+    url: https://prachub.com/coding-questions/implement-timeout-refund-workflow
+    note: candidate report via a question bank; the page names DoorDash, Software Engineer onsite, links the interview experience the question came from, and was last updated 13 June 2026; it states only the topic (idempotency and retry safety for external payment integrations, deterministic workflow design, tests for timeouts and duplicate execution), so the exercise here is original
+  - title: Stripe API reference, idempotent requests
+    url: https://docs.stripe.com/api/idempotent_requests
+    note: a retry with the same key returns the saved response; for API v1, keys can be removed once at least 24 hours old; keys up to 255 characters
+  - title: DBOS docs, workflow tutorial
+    url: https://docs.dbos.dev/python/tutorials/workflow-tutorial
+    note: steps are tried at least once and never re-executed after they complete; recovery resumes from the last completed step
+  - title: Temporal docs, Workflow Definition
+    url: https://docs.temporal.io/workflow-definition
+    note: read time through the SDK's replay-safe APIs, never the local clock
+code:
+  starter: |
+    import json
+
+
+    class Crash(BaseException):
+        """Process death in the tests. It derives from BaseException so `except Exception` cannot swallow it."""
+
+
+    class PaymentUnavailable(Exception):
+        """Transient: the provider did not take the request. Safe to retry."""
+
+
+    class PaymentRejected(Exception):
+        """Permanent: the provider refused this refund. Never retry it."""
+
+
+    class RefundWorkflow:
+        """Refund orders that miss their delivery deadline.
+
+        store     a durable mapping that survives crashes. Values are stored as JSON, so read, change and write back.
+        payments  has refund(order_id, amount_cents, idempotency_key) and may raise PaymentUnavailable or PaymentRejected.
+        clock     a function returning the current time in seconds. Never read the wall clock.
+        """
+
+        def __init__(self, store, payments, clock):
+            raise NotImplementedError
+
+        def place(self, order_id, amount_cents, deadline):
+            """Register an order. The event can be delivered more than once."""
+            raise NotImplementedError
+
+        def delivered(self, order_id):
+            """Record that the order was delivered now. The event can arrive late, and more than once."""
+            raise NotImplementedError
+
+        def tick(self):
+            """Called by a scheduler about once a second. Refund what is due."""
+            raise NotImplementedError
+
+        def status(self, order_id):
+            """One of "pending", "delivered", "refunded" or "review"."""
+            raise NotImplementedError
+  tests: |
+    from collections.abc import MutableMapping
+
+    class Store(MutableMapping):
+        """The durable store: values are kept as JSON text, so a change counts only once it is written back."""
+        def __init__(self):
+            self.data = {}
+        def __getitem__(self, key):
+            return json.loads(self.data[key])
+        def __setitem__(self, key, value):
+            self.data[key] = json.dumps(value, allow_nan=False)
+        def __delitem__(self, key):
+            del self.data[key]
+        def __iter__(self):
+            return iter(list(self.data))
+        def __len__(self):
+            return len(self.data)
+
+    class Payments:
+        """Deduplicates by idempotency key. Unavailable while clock() < down_until."""
+        def __init__(self, clock=None, down_until=None, reject=()):
+            self.by_key, self.calls, self.count = {}, 0, {}
+            self.clock, self.down_until, self.reject = clock, down_until, set(reject)
+            self.die_after_next_refund = False
+        def refund(self, order_id, amount_cents, idempotency_key):
+            self.calls += 1
+            if order_id in self.reject:
+                raise PaymentRejected(order_id)
+            if self.down_until is not None and self.clock() < self.down_until:
+                raise PaymentUnavailable("503")
+            if idempotency_key in self.by_key:
+                assert self.by_key[idempotency_key] == (order_id, amount_cents), "key reused with different parameters"
+                return {"replayed": True}
+            self.by_key[idempotency_key] = (order_id, amount_cents)
+            self.count[order_id] = self.count.get(order_id, 0) + 1
+            if self.die_after_next_refund:
+                self.die_after_next_refund = False
+                raise Crash("the process died after the provider applied the refund")
+            return {"id": "re_%d" % len(self.by_key)}
+        def refunds(self, order_id):
+            return self.count.get(order_id, 0)
+
+    now = [0]
+    clock = lambda: now[0]
+
+    store, pay = Store(), Payments()
+    wf = RefundWorkflow(store, pay, clock)
+    wf.place("A", 1250, 100)
+    wf.place("B", 900, 100)
+    now[0] = 60
+    wf.delivered("A")
+    now[0] = 101
+    wf.tick()
+    assert wf.status("A") == "delivered" and pay.refunds("A") == 0, "delivered before the deadline: no refund"
+    assert wf.status("B") == "refunded" and pay.refunds("B") == 1, "missed the deadline: refunded once"
+
+    now[0] = 0
+    store, pay = Store(), Payments()
+    wf = RefundWorkflow(store, pay, clock)
+    wf.place("C", 500, 100)
+    now[0] = 100
+    wf.tick()
+    wf.delivered("C")
+    now[0] = 500
+    wf.tick()
+    assert wf.status("C") == "delivered" and pay.refunds("C") == 0, "delivered exactly at the deadline is on time"
+
+    now[0] = 0
+    store, pay = Store(), Payments(clock=clock, down_until=400)
+    wf = RefundWorkflow(store, pay, clock)
+    wf.place("D", 700, 100)
+    for t in range(101, 3700, 60):
+        now[0] = t
+        wf.tick()
+    assert wf.status("D") == "refunded" and pay.refunds("D") == 1, "an outage delays the refund, and tick does not raise"
+
+    now[0] = 0
+    store, pay = Store(), Payments()
+    wf = RefundWorkflow(store, pay, clock)
+    wf.place("E", 4000, 100)
+    now[0] = 101
+    pay.die_after_next_refund = True
+    try:
+        wf.tick()
+    except Crash:
+        wf = RefundWorkflow(store, pay, clock)
+    now[0] = 200
+    wf.tick()
+    assert pay.refunds("E") == 1 and wf.status("E") == "refunded", "a crash after the provider paid does not pay twice"
+  hidden: |
+    import time as _time
+
+    class _Boundaries:
+        def __init__(self, crash_at=None):
+            self.count, self.crash_at = 0, crash_at
+        def hit(self):
+            self.count += 1
+            if self.count == self.crash_at:
+                raise Crash("injected at boundary %d" % self.count)
+
+    class _CrashStore(Store):
+        def __init__(self, b):
+            super().__init__()
+            self.b = b
+        def __setitem__(self, key, value):
+            text = json.dumps(value, allow_nan=False)
+            self.b.hit()
+            self.data[key] = text
+            self.b.hit()
+        def __delitem__(self, key):
+            self.b.hit()
+            del self.data[key]
+            self.b.hit()
+
+    class _CrashPayments(Payments):
+        def __init__(self, b, **kw):
+            super().__init__(**kw)
+            self.b = b
+        def refund(self, order_id, amount_cents, idempotency_key):
+            self.b.hit()
+            out = super().refund(order_id, amount_cents, idempotency_key)
+            self.b.hit()
+            return out
+
+    _OPS = [("clock", 0), ("place", "A", 1000, 100), ("place", "B", 2000, 100), ("place", "C", 500, 200),
+            ("place", "D", 700, 100), ("place", "E", 300, 100), ("clock", 50), ("delivered", "A"),
+            ("clock", 101), ("tick",), ("clock", 120), ("delivered", "D"), ("place", "B", 2000, 100),
+            ("clock", 201), ("tick",), ("delivered", "C"), ("delivered", "A"), ("clock", 260), ("tick",)]
+
+    def _play(crash_at=None):
+        b = _Boundaries(crash_at)
+        t = [0]
+        store, pay = _CrashStore(b), _CrashPayments(b, reject={"E"})
+        wf = RefundWorkflow(store, pay, lambda: t[0])
+        for op in _OPS:
+            while True:
+                try:
+                    if op[0] == "clock":
+                        t[0] = op[1]
+                    elif op[0] == "place":
+                        wf.place(*op[1:])
+                    elif op[0] == "delivered":
+                        wf.delivered(op[1])
+                    else:
+                        wf.tick()
+                    break
+                except Crash:
+                    wf = RefundWorkflow(store, pay, lambda: t[0])
+                    if op[0] == "tick":
+                        break  # the scheduler fires again later; events are redelivered at once
+        for step in range(1, 40):
+            t[0] = 260 + step * 1000
+            wf.tick()
+        return b, store, pay, wf
+
+    def _broken(crash_at=None):
+        b, store, pay, wf = _play(crash_at)
+        bad = []
+        for o in "ABCDE":
+            s, n = wf.status(o), pay.refunds(o)
+            if n > 1 or s not in ("delivered", "refunded", "review") or (s == "refunded") != (n == 1):
+                bad.append((crash_at, o, s, n))
+        if [wf.status(o) for o in "ABE"] != ["delivered", "refunded", "review"]:
+            bad.append((crash_at, "outcome", [wf.status(o) for o in "ABCDE"]))
+        return bad
+
+    _clean = _play()[0]
+    _total = _clean.count
+    assert _broken() == [] and _total >= 20
+    _failures = [f for k in range(1, _total + 1) for f in _broken(k)]
+    assert _failures == [], _failures[:3]
+
+    now[0] = 0
+    store, pay = Store(), Payments(reject={"R"})
+    wf = RefundWorkflow(store, pay, clock)
+    wf.place("R", 100, 10)
+    for t in range(11, 2000, 7):
+        now[0] = t
+        wf.tick()
+    assert wf.status("R") == "review" and pay.calls == 1, "a permanent rejection is not retried"
+
+    now[0] = 0
+    store, pay = Store(), Payments()
+    wf = RefundWorkflow(store, pay, clock)
+    wf.place("L", 100, 10)
+    now[0] = 11
+    wf.tick()
+    now[0] = 30
+    wf.delivered("L")
+    wf.place("L", 100, 10)
+    wf.delivered("L")
+    now[0] = 99
+    wf.tick()
+    assert wf.status("L") == "refunded" and pay.refunds("L") == 1, "late and repeated events do not undo or repeat a refund"
+
+    now[0] = 0
+    store, pay = Store(), Payments(clock=clock, down_until=3600)
+    wf = RefundWorkflow(store, pay, clock)
+    wf.place("O", 100, 10)
+    for t in range(1, 3600):
+        now[0] = t
+        wf.tick()
+    _calls_down = pay.calls
+    for t in range(3600, 3600 + 7200):
+        now[0] = t
+        wf.tick()
+    assert 2 <= _calls_down <= 120 and pay.refunds("O") == 1 and wf.status("O") == "refunded", "an hour-long outage is retried with backoff"
+
+    def _load(n=20000, ticks=6000):
+        t = [0]
+        store, pay = Store(), Payments()
+        wf = RefundWorkflow(store, pay, lambda: t[0])
+        for i in range(n):
+            wf.place("o%d" % i, 100 + i % 7, 10 + (i * 7919) % ticks)
+        for i in range(n):
+            if i % 10 < 9:
+                wf.delivered("o%d" % i)
+        spent, start = 0.0, _time.perf_counter()
+        for k in range(1, ticks + 50):
+            t[0] = k
+            wf.tick()
+            spent = _time.perf_counter() - start
+            if spent > 3.0:
+                return False, spent, k
+        refunded = sum(1 for i in range(n) if i % 10 == 9 and pay.refunds("o%d" % i) == 1)
+        return refunded == n // 10 and pay.calls == n // 10, spent, ticks
+
+    _ok, _spent, _reached = _load()
+    assert _ok, "6,000 ticks over 20,000 orders took more than 3 s (reached tick %d)" % _reached
+  solution: |
+    import heapq
+    import json
+
+
+    class Crash(BaseException):
+        """Process death in the tests. It derives from BaseException so `except Exception` cannot swallow it."""
+
+
+    class PaymentUnavailable(Exception):
+        """Transient: the provider did not take the request. Safe to retry."""
+
+
+    class PaymentRejected(Exception):
+        """Permanent: the provider refused this refund. Never retry it."""
+
+
+    class RefundWorkflow:
+        RETRY_FIRST = 30   # seconds after the first transient failure
+        RETRY_MAX = 900    # cap on the backoff
+
+        def __init__(self, store, payments, clock):
+            self.store, self.payments, self.clock = store, payments, clock
+            # (act_after, order_id): an order is due once the clock is strictly past act_after.
+            # The heap lives in memory only; the store is the truth, so a restart rebuilds it in one pass.
+            self.due = []
+            for key in self.store:
+                if key.startswith("order:"):
+                    o = self.store[key]
+                    if o["state"] in ("pending", "refunding"):
+                        self.due.append((o["next"], o["id"]))
+            heapq.heapify(self.due)
+
+        def place(self, order_id, amount_cents, deadline):
+            key = "order:" + order_id
+            if key in self.store:
+                return  # a redelivered event must not reset an order that has moved on
+            self.store[key] = {"id": order_id, "amount": amount_cents, "deadline": deadline,
+                               "state": "pending", "attempts": 0, "next": deadline}
+            heapq.heappush(self.due, (deadline, order_id))
+
+        def delivered(self, order_id):
+            key = "order:" + order_id
+            o = self.store.get(key)
+            # Policy: a late delivery still cancels the refund, but only until the refund intent is written.
+            # After that the provider may already have paid, so the refund is finished instead.
+            if o is None or o["state"] != "pending":
+                return
+            o["state"] = "delivered"
+            self.store[key] = o
+
+        def tick(self):
+            now = self.clock()
+            while self.due and self.due[0][0] < now:
+                when, order_id = heapq.heappop(self.due)
+                key = "order:" + order_id
+                o = self.store.get(key)
+                if o is None or o["state"] not in ("pending", "refunding") or o["next"] != when:
+                    continue  # delivered, finished, or a stale heap entry
+                if o["state"] == "pending":
+                    o["state"] = "refunding"
+                    self.store[key] = o  # the intent, written before the external call
+                try:
+                    # The key depends only on the order, so every attempt, before or after a crash, is the same request.
+                    self.payments.refund(order_id, o["amount"], "refund:" + order_id)
+                except PaymentUnavailable:
+                    o["attempts"] += 1
+                    o["next"] = now + min(self.RETRY_MAX, self.RETRY_FIRST * 2 ** (o["attempts"] - 1))
+                    self.store[key] = o
+                    heapq.heappush(self.due, (o["next"], order_id))
+                    continue
+                except PaymentRejected:
+                    o["state"] = "review"
+                    self.store[key] = o
+                    continue
+                o["state"] = "refunded"
+                self.store[key] = o
+
+        def status(self, order_id):
+            o = self.store.get("order:" + order_id)
+            if o is None:
+                raise KeyError(order_id)
+            return "pending" if o["state"] == "refunding" else o["state"]
+---
+import Callout from '../../../components/Callout.astro';
+
+## Question
+
+<Callout kind="interview" label="Interview question">
+Build a workflow that refunds an order when it is not delivered by its deadline. It must be deterministic and safe to retry against an external payment API, and the tests will kill it at every boundary.
+</Callout>
+
+Write `RefundWorkflow(store, payments, clock)` with `place(order_id, amount_cents, deadline)`, `delivered(order_id)`, `tick()` and `status(order_id)`.
+
+- `store` is the only thing that survives a crash. It keeps values as JSON, so a value you read is a copy: change it and write it back.
+- `payments.refund(order_id, amount_cents, idempotency_key)` deduplicates by key, like the Stripe API: a repeated key returns the first response instead of paying again. It raises `PaymentUnavailable` (transient) or `PaymentRejected` (permanent).
+- `clock()` is the only source of time. Delivery at or before the deadline is on time.
+- A crash is a `Crash` exception, which derives from `BaseException`, raised at any write to the store or just before or after the provider applies a refund. After a crash the test builds a new `RefundWorkflow` on the same store. Events (`place`, `delivered`) are redelivered at least once; the scheduler calls `tick()` again later.
+- `tick()` runs about once a second against tens of thousands of open orders, so its cost must not grow with the number of orders that are not due.
+
+The outcome the tests hold you to, at every crash point: an order delivered on time is never refunded; an order that missed its deadline is refunded exactly once or, if the provider rejects it, ends in `review` without another call; `status` says `refunded` if and only if the provider paid once; a provider outage delays refunds without making `tick()` raise or calling the provider on every tick.
+
+Two decisions are yours. What a delivery that arrives after the deadline, but before the refund, does to the refund. And the retry schedule while the provider is down.
+
+## Hints
+
+<details class="hint"><summary>Hint 1</summary><p>At the instant the provider has paid and your process dies, what does your store say about that order, and what does the next tick do with it?</p></details>
+<details class="hint"><summary>Hint 2</summary><p>Which idempotency key does the provider see on the second attempt for the same order, and is it the same after a restart?</p></details>
+<details class="hint"><summary>Hint 3</summary><p>How many orders does a tick read when nothing is due? Which structure can you rebuild from the store after a restart?</p></details>
+
+## Answer
+
+The reference solution keeps one JSON record per order in the store and a heap of `(act_after, order_id)` in memory. The heap is rebuilt from the store in the constructor, so a restart costs one pass over the open orders, and each tick pops only what is due: idle ticks cost nothing, which is what the performance test checks with 20,000 orders and 6,000 ticks under a 3-second budget.
+
+The crash safety comes from three choices. The idempotency key is `refund:<order_id>`: it depends only on the order, so a retry after a lost response, or after a restart, is the same request, and the provider returns the first refund. Before calling the provider, the order moves to an internal `refunding` state and that intent is written. From then on a late `delivered` event is ignored, because the provider may already have paid; without the intent record, a crash after the payment followed by a late delivery leaves an order marked delivered and refunded at the same time, which is the case the hidden crash sweep is built to find. And every change is written back before the next external call, so the record on disk is never behind what the provider has done by more than one step, and that step is always safe to repeat.
+
+The policy choices in the reference: a late delivery cancels the refund only while no refund has been attempted, and transient failures back off from 30 seconds, doubling to a 15-minute cap, with no limit on attempts. Ignoring every late delivery is also accepted by the tests and is simpler, at the cost of refunding customers who did receive their order. A limit on attempts that moves the order to `review` is also reasonable; the tests only require that a one-hour outage costs no more than 120 calls for one order and that the refund happens after the provider recovers.
+
+Where this design fails. The heap holds every open order in memory, so a store of millions of open orders makes restarts slow and memory heavy; a real system keeps a due-time index in the database and queries the next due slice. The provider's deduplication is the last line of defence, and Stripe's v1 API may drop keys once they are at least 24 hours old: an order stuck in `refunding` through a longer outage needs a reconciliation read (has this order been refunded?) before it retries, or the key no longer protects it.
+
+## Follow-ups
+
+- What changes to run this in a durable execution engine such as Temporal or DBOS? A timer per order replaces the heap, the provider call becomes a step or Activity with the order-derived key, the intent record becomes the engine's journal, and the clock comes from the engine's replay-safe API.
+- The provider's dashboard shows a refund your store has no record of. Which crash point produces that, and which job finds it?
+- Partial refunds are coming: an order can be refunded twice for different items. What happens to the key, and to the "refunded once" invariant?
+- *Pushback.* Operations says cancelling a refund on a late delivery generates support tickets from customers who were told a refund was coming, and asks you to ignore late deliveries. Finance says that pays for food that arrived. Which policy ships, and what does the losing side get in writing?
+- *Reversal.* What would you need to see in production to replace the in-memory heap with a due-time index in the database?
+- Finance wants a refund issued within 60 seconds of the deadline at the 99th percentile. Which part of this design sets that bound, and what do you measure?
+
+## Common mistakes
+
+- Generating the idempotency key per attempt, or from a random id that is not written before the call.
+- Writing the outcome only after the provider call, with nothing on disk to show a refund may be in progress.
+- Mutating the dict returned by the store and never writing it back.
+- Scanning every order on each tick.
+- Retrying in a loop inside `tick()` while the provider is down, which hammers it and blocks the scheduler.
+- Catching `Exception` around the provider call and treating every failure as transient, so a rejected refund is retried forever.
